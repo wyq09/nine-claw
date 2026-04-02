@@ -8,6 +8,7 @@ import type {
   InstalledSkillItem,
   PiStreamPayload,
   ProviderRuntimeConfig,
+  RuntimeDependencyStatus,
   SystemSkillCatalog,
 } from '../types'
 
@@ -42,11 +43,13 @@ export async function clearPiSessionForId(sessionId: string): Promise<void> {
 }
 
 export async function testLlmProviderConnection(payload: {
+  apiFormat: 'openai' | 'anthropic'
   baseUrl: string
   apiKey: string
   model: string
 }): Promise<string> {
   return invoke<string>('test_llm_provider_connection', {
+    apiFormat: payload.apiFormat,
     baseUrl: payload.baseUrl,
     apiKey: payload.apiKey,
     model: payload.model,
@@ -63,6 +66,10 @@ export async function saveHistoryState(payload: string): Promise<void> {
 
 export async function clearHistoryState(): Promise<void> {
   await invoke('clear_history_state')
+}
+
+export async function ensureRuntimeDependencies(): Promise<RuntimeDependencyStatus> {
+  return invoke<RuntimeDependencyStatus>('ensure_runtime_dependencies')
 }
 
 export async function listInstalledSkills(): Promise<InstalledSkillItem[]> {
@@ -150,6 +157,7 @@ export async function botStartWechat(
     baseUrl?: string
     routeTag?: string
     providerId?: string
+    providerApiFormat?: 'openai' | 'anthropic'
     model?: string
     apiKey?: string
     providerBaseUrl?: string
@@ -160,6 +168,7 @@ export async function botStartWechat(
     baseUrl: options?.baseUrl ?? null,
     routeTag: options?.routeTag ?? null,
     providerId: options?.providerId ?? null,
+    providerApiFormat: options?.providerApiFormat ?? null,
     model: options?.model ?? null,
     apiKey: options?.apiKey ?? null,
     providerBaseUrl: options?.providerBaseUrl ?? null,

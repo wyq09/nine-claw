@@ -254,6 +254,16 @@ export type AgentWorkspaceBundle = {
 
 export type BotChannelId = 'dingtalk' | 'lark' | 'wechat_work' | 'wechat_work_bot' | 'wechat'
 
+export type RuntimeDependencyStatus = {
+  platform: string
+  nodeAvailable: boolean
+  npmAvailable: boolean
+  piAvailable: boolean
+  autoInstallAttempted: boolean
+  autoInstallSucceeded: boolean
+  messages: string[]
+}
+
 export type BotDefinition = {
   id: BotChannelId
   name: string
@@ -283,7 +293,10 @@ export type CustomProviderMeta = {
   id: string
   name: string
   description: string
+  apiFormat: ProviderApiFormat
 }
+
+export type ProviderApiFormat = 'openai' | 'anthropic'
 
 export type ProviderDefinition = {
   id: ProviderId
@@ -291,6 +304,7 @@ export type ProviderDefinition = {
   defaultBaseUrl: string
   suggestedModel: string
   description: string
+  apiFormat: ProviderApiFormat
   /** 用户添加的 OpenAI 兼容供应商 */
   isCustom?: boolean
 }
@@ -298,6 +312,7 @@ export type ProviderDefinition = {
 export type ProviderConfig = {
   enabled: boolean
   added: boolean
+  apiFormat: ProviderApiFormat
   baseUrl: string
   apiKey: string
   model: string
@@ -324,6 +339,7 @@ export type AppearanceSettings = {
 
 export type ProviderRuntimeConfig = {
   providerId: ProviderId
+  apiFormat: ProviderApiFormat
   baseUrl: string
   apiKey: string
   model: string

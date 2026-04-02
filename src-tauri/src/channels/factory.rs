@@ -13,6 +13,7 @@ pub enum ChannelConfig {
         base_url: String,
         route_tag: Option<String>,
         ai_provider_id: String,
+        ai_api_format: String,
         ai_base_url: String,
         ai_api_key: String,
         ai_model: String,
@@ -43,13 +44,20 @@ pub fn create_channel(config: ChannelConfig) -> Result<Box<dyn Channel>, String>
             base_url,
             route_tag,
             ai_provider_id,
+            ai_api_format,
             ai_base_url,
             ai_api_key,
             ai_model,
         } => {
             use super::wechat::WeChatChannel;
             let mut ch = WeChatChannel::new(&token, &base_url, route_tag.as_deref());
-            ch.set_ai_config(&ai_provider_id, &ai_base_url, &ai_api_key, &ai_model);
+            ch.set_ai_config(
+                &ai_provider_id,
+                &ai_api_format,
+                &ai_base_url,
+                &ai_api_key,
+                &ai_model,
+            );
             Ok(Box::new(ch))
         }
     }

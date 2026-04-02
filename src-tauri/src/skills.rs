@@ -131,7 +131,12 @@ pub fn install_system_skill(app: &AppHandle, skill_id: &str) -> Result<Installed
 
 fn list_system_skill_catalog_with_roots(roots: &[PathBuf]) -> SystemSkillCatalog {
     let installed_ids = list_installed_skills()
-        .map(|skills| skills.into_iter().map(|skill| skill.id).collect::<HashSet<_>>())
+        .map(|skills| {
+            skills
+                .into_iter()
+                .map(|skill| skill.id)
+                .collect::<HashSet<_>>()
+        })
         .unwrap_or_default();
 
     let mut items = Vec::new();
@@ -244,7 +249,10 @@ fn discover_dev_system_skill_root() -> Option<PathBuf> {
 
     for start_point in start_points {
         for ancestor in start_point.ancestors() {
-            let candidate = ancestor.join("src-tauri").join("resources").join("system-skills");
+            let candidate = ancestor
+                .join("src-tauri")
+                .join("resources")
+                .join("system-skills");
             if candidate.is_dir() {
                 return Some(candidate);
             }
@@ -294,9 +302,8 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), String> {
     let entries = fs::read_dir(source)
         .map_err(|error| format!("读取系统技能目录失败 {}: {error}", source.display()))?;
     for entry in entries {
-        let entry = entry.map_err(|error| {
-            format!("读取系统技能目录条目失败 {}: {error}", source.display())
-        })?;
+        let entry = entry
+            .map_err(|error| format!("读取系统技能目录条目失败 {}: {error}", source.display()))?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
         let metadata = fs::metadata(&source_path)

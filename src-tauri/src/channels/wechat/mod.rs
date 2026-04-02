@@ -65,6 +65,7 @@ pub struct WeChatChannel {
     context_tokens: Arc<Mutex<HashMap<String, String>>>,
     /// AI provider config so the channel can run pi independently.
     ai_provider_id: String,
+    ai_api_format: String,
     ai_base_url: String,
     ai_api_key: String,
     ai_model: String,
@@ -86,6 +87,7 @@ impl WeChatChannel {
             sync_buf: Arc::new(Mutex::new(String::new())),
             context_tokens: Arc::new(Mutex::new(HashMap::new())),
             ai_provider_id: String::new(),
+            ai_api_format: "openai".to_string(),
             ai_base_url: String::new(),
             ai_api_key: String::new(),
             ai_model: String::new(),
@@ -93,8 +95,16 @@ impl WeChatChannel {
     }
 
     /// Configure the AI provider so the channel can call pi for replies.
-    pub fn set_ai_config(&mut self, provider_id: &str, base_url: &str, api_key: &str, model: &str) {
+    pub fn set_ai_config(
+        &mut self,
+        provider_id: &str,
+        api_format: &str,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+    ) {
         self.ai_provider_id = provider_id.to_string();
+        self.ai_api_format = api_format.to_string();
         self.ai_base_url = base_url.to_string();
         self.ai_api_key = api_key.to_string();
         self.ai_model = model.to_string();
@@ -323,6 +333,7 @@ impl Channel for WeChatChannel {
             let route_tag = self.route_tag.clone();
             let context_tokens = self.context_tokens.clone();
             let ai_pid = self.ai_provider_id.clone();
+            let ai_fmt = self.ai_api_format.clone();
             let ai_base = self.ai_base_url.clone();
             let ai_key = self.ai_api_key.clone();
             let ai_mdl = self.ai_model.clone();
@@ -338,7 +349,7 @@ impl Channel for WeChatChannel {
                     }
                 };
                 let api = WeChatApi::new(&base_url, &token, route_tag.as_deref());
-                let bridge = PiBridge::new(&ai_pid, &ai_base, &ai_key, &ai_mdl);
+                let bridge = PiBridge::new(&ai_pid, &ai_fmt, &ai_base, &ai_key, &ai_mdl);
 
                 while running.load(Ordering::SeqCst) {
                     let item = match work_rx.recv_timeout(Duration::from_secs(1)) {

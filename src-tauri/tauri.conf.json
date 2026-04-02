@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "NineClaw",
   "version": "0.1.0",
-  "identifier": "com.tauri.dev",
+  "identifier": "com.wuyq.nineclaw",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -40,6 +40,12 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      }
+    },
     "resources": [
       "resources/system-skills"
     ],

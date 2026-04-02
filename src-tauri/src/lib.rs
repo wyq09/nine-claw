@@ -8,6 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -67,10 +68,23 @@ struct PiStreamPayload {
     usage: Option<PiTokenUsagePayload>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeDependencyStatus {
+    platform: String,
+    node_available: bool,
+    npm_available: bool,
+    pi_available: bool,
+    auto_install_attempted: bool,
+    auto_install_succeeded: bool,
+    messages: Vec<String>,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderRuntimeConfig {
     provider_id: String,
+    api_format: String,
     base_url: String,
     api_key: String,
     model: String,
@@ -196,7 +210,47 @@ fn migrate_legacy_history_db(app_data_dir: &Path, target_path: &Path) -> Result<
     Ok(())
 }
 
+fn migrate_history_db_from_candidates(
+    candidate_dirs: &[PathBuf],
+    target_path: &Path,
+) -> Result<(), String> {
+    if target_path.exists() {
+        return Ok(());
+    }
+
+    for candidate_dir in candidate_dirs {
+        if !candidate_dir.exists() {
+            continue;
+        }
+        migrate_legacy_history_db(candidate_dir, target_path)?;
+
+        let legacy_target = candidate_dir.join(HISTORY_DB_FILE);
+        if !legacy_target.exists() || target_path.exists() {
+            continue;
+        }
+
+        fs::rename(&legacy_target, target_path)
+            .or_else(|rename_error| {
+                fs::copy(&legacy_target, target_path)
+                    .map_err(|copy_error| {
+                        std::io::Error::new(
+                            copy_error.kind(),
+                            format!("rename 失败({rename_error})，copy 也失败: {copy_error}"),
+                        )
+                    })
+                    .and_then(|_| fs::remove_file(&legacy_target))
+            })
+            .map_err(|error| format!("迁移历史数据库失败: {error}"))?;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn history_db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let workspace_root = agent_workspace::resolve_workspace_root()?;
+    fs::create_dir_all(&workspace_root)
+        .map_err(|error| format!("创建共享 workspace 根目录失败: {error}"))?;
+
     let app_data_dir = app
         .path()
         .app_data_dir()
@@ -204,8 +258,8 @@ pub(crate) fn history_db_path(app: &tauri::AppHandle) -> Result<PathBuf, String>
 
     fs::create_dir_all(&app_data_dir).map_err(|error| format!("创建应用数据目录失败: {error}"))?;
 
-    let target_path = app_data_dir.join(HISTORY_DB_FILE);
-    migrate_legacy_history_db(&app_data_dir, &target_path)?;
+    let target_path = workspace_root.join(HISTORY_DB_FILE);
+    migrate_history_db_from_candidates(&[workspace_root.clone(), app_data_dir], &target_path)?;
 
     Ok(target_path)
 }
@@ -371,18 +425,79 @@ fn default_provider_base_url(provider_id: &str) -> Option<&'static str> {
     }
 }
 
+fn default_provider_api_format(provider_id: &str) -> &'static str {
+    match provider_id {
+        "anthropic" => "anthropic",
+        _ => "openai",
+    }
+}
+
 fn normalize_provider_base_url(value: &str) -> &str {
     value.trim().trim_end_matches('/')
 }
 
-fn openai_compat_provider_object(
+fn normalize_anthropic_base_url(value: &str) -> String {
+    normalize_provider_base_url(value)
+        .trim_end_matches("/v1/messages")
+        .trim_end_matches("/messages")
+        .trim_end_matches("/v1")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn anthropic_messages_url(base_url: &str) -> String {
+    if base_url.ends_with("/v1") {
+        format!("{base_url}/messages")
+    } else {
+        format!("{base_url}/v1/messages")
+    }
+}
+
+fn normalize_provider_api_format(value: &str, provider_id: &str) -> &'static str {
+    match value.trim() {
+        "anthropic" => "anthropic",
+        "openai" => "openai",
+        _ => default_provider_api_format(provider_id),
+    }
+}
+
+fn normalized_provider_runtime_base_url(
+    base_url: &str,
+    api_format: &str,
+    provider_id: &str,
+) -> String {
+    match normalize_provider_api_format(api_format, provider_id) {
+        "anthropic" => normalize_anthropic_base_url(base_url),
+        _ => normalize_provider_base_url(base_url).to_string(),
+    }
+}
+
+fn scrub_anthropic_process_env(command: &mut Command) {
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_OAUTH_TOKEN",
+    ] {
+        command.env_remove(key);
+    }
+}
+
+fn custom_provider_object(
     provider_config: &ProviderRuntimeConfig,
 ) -> serde_json::Map<String, serde_json::Value> {
-    let base_url = normalize_provider_base_url(&provider_config.base_url);
+    let base_url = normalized_provider_runtime_base_url(
+        &provider_config.base_url,
+        &provider_config.api_format,
+        provider_config.provider_id.trim(),
+    );
     let model = provider_config.model.trim();
+    let api_format = normalize_provider_api_format(
+        &provider_config.api_format,
+        provider_config.provider_id.trim(),
+    );
     let mut provider = serde_json::Map::new();
     provider.insert("baseUrl".to_string(), json!(base_url));
-    provider.insert("api".to_string(), json!("openai-completions"));
     provider.insert(
         "apiKey".to_string(),
         json!(if provider_config.api_key.trim().is_empty() {
@@ -391,14 +506,39 @@ fn openai_compat_provider_object(
             provider_config.api_key.trim()
         }),
     );
-    provider.insert(
-        "compat".to_string(),
-        json!({
-          "supportsDeveloperRole": false,
-          "supportsReasoningEffort": false
-        }),
-    );
-    provider.insert("models".to_string(), json!([{ "id": model }]));
+    match api_format {
+        "anthropic" => {
+            provider.insert("api".to_string(), json!("anthropic-messages"));
+            provider.insert(
+                "models".to_string(),
+                json!([
+                  {
+                    "id": model,
+                    "api": "anthropic-messages"
+                  }
+                ]),
+            );
+        }
+        _ => {
+            provider.insert("api".to_string(), json!("openai-completions"));
+            provider.insert(
+                "compat".to_string(),
+                json!({
+                  "supportsDeveloperRole": false,
+                  "supportsReasoningEffort": false
+                }),
+            );
+            provider.insert(
+                "models".to_string(),
+                json!([
+                  {
+                    "id": model,
+                    "api": "openai-completions"
+                  }
+                ]),
+            );
+        }
+    }
     provider
 }
 
@@ -406,48 +546,52 @@ fn build_provider_models_config(
     provider_config: &ProviderRuntimeConfig,
 ) -> Option<serde_json::Value> {
     let provider_id = provider_config.provider_id.trim();
-    let base_url = normalize_provider_base_url(&provider_config.base_url);
+    let base_url = normalized_provider_runtime_base_url(
+        &provider_config.base_url,
+        &provider_config.api_format,
+        provider_id,
+    );
     let model = provider_config.model.trim();
+    let api_format = normalize_provider_api_format(&provider_config.api_format, provider_id);
 
     if provider_id.is_empty() || base_url.is_empty() || model.is_empty() {
         return None;
     }
 
-    match provider_id {
-        "openai" => {
+    match (provider_id, api_format) {
+        ("openai", "openai") => {
             let Some(default_base_url) = default_provider_base_url(provider_id) else {
                 return None;
             };
 
-            if base_url == default_base_url {
+            if base_url == normalize_provider_base_url(default_base_url) {
                 return None;
             }
 
-            let provider = openai_compat_provider_object(provider_config);
+            let provider = custom_provider_object(provider_config);
             let mut providers = serde_json::Map::new();
             providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
 
             Some(json!({ "providers": providers }))
         }
-        "anthropic" => {
+        ("anthropic", "anthropic") => {
             let Some(default_base_url) = default_provider_base_url(provider_id) else {
                 return None;
             };
 
-            if base_url == default_base_url {
+            if base_url == normalize_anthropic_base_url(default_base_url) {
                 return None;
             }
 
-            let mut provider = serde_json::Map::new();
-            provider.insert("baseUrl".to_string(), json!(base_url));
+            let provider = custom_provider_object(provider_config);
 
             let mut providers = serde_json::Map::new();
             providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
 
             Some(json!({ "providers": providers }))
         }
-        "deepseek" | "doubao" | "siliconflow" | _ => {
-            let provider = openai_compat_provider_object(provider_config);
+        _ => {
+            let provider = custom_provider_object(provider_config);
             let mut providers = serde_json::Map::new();
             providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
             Some(json!({ "providers": providers }))
@@ -766,6 +910,14 @@ async fn stream_pi_prompt(
             let runtime_dir = prepare_pi_runtime_dir(provider_config)?;
             command.env("PI_CODING_AGENT_DIR", runtime_dir);
 
+            if normalize_provider_api_format(
+                &provider_config.api_format,
+                provider_config.provider_id.trim(),
+            ) == "anthropic"
+            {
+                scrub_anthropic_process_env(&mut command);
+            }
+
             if !provider_config.provider_id.trim().is_empty() {
                 command.args(["--provider", provider_config.provider_id.trim()]);
             }
@@ -844,6 +996,7 @@ async fn stream_pi_prompt(
         let mut saw_message_done = false;
         let mut saw_model_abort_event = false;
         let mut final_usage: Option<PiTokenUsagePayload> = None;
+        let mut emitted_assistant_text = String::new();
 
         for line_result in BufReader::new(stdout).lines() {
             let line = match line_result {
@@ -953,6 +1106,7 @@ async fn stream_pi_prompt(
                         .unwrap_or_default()
                         .to_string();
                     if !delta_text.is_empty() {
+                        emitted_assistant_text.push_str(&delta_text);
                         emit_stream_event(
                             &app,
                             "delta",
@@ -1034,6 +1188,41 @@ async fn stream_pi_prompt(
                 }
 
                 if delta_type == "done" {
+                    let final_text =
+                        extract_text_content(assistant_event.and_then(|item| item.get("message")));
+                    if let Some(final_text) = final_text {
+                        let missing_text = if emitted_assistant_text.is_empty() {
+                            final_text
+                        } else if let Some(suffix) =
+                            final_text.strip_prefix(&emitted_assistant_text)
+                        {
+                            suffix.to_string()
+                        } else if final_text != emitted_assistant_text {
+                            final_text
+                        } else {
+                            String::new()
+                        };
+
+                        if !missing_text.is_empty() {
+                            emitted_assistant_text.push_str(&missing_text);
+                            emit_stream_event(
+                                &app,
+                                "delta",
+                                Some(normalized_session_id.clone()),
+                                Some(missing_text),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )?;
+                        }
+                    }
+
                     final_usage = extract_usage_payload(
                         assistant_event
                             .and_then(|item| item.get("message"))
@@ -1220,7 +1409,10 @@ async fn stream_pi_prompt(
         }
 
         if !status.success() {
-            if exit_outcome.timed_out && (saw_agent_end || saw_message_done) && stderr_text.trim().is_empty() {
+            if exit_outcome.timed_out
+                && (saw_agent_end || saw_message_done)
+                && stderr_text.trim().is_empty()
+            {
                 emit_stream_event(
                     &app,
                     "done",
@@ -1293,6 +1485,207 @@ fn channel_manager() -> &'static Mutex<ChannelManager> {
     CHANNEL_MANAGER.get_or_init(|| Mutex::new(ChannelManager::new()))
 }
 
+fn resolve_command_path(candidates: &[&str]) -> Option<PathBuf> {
+    let resolver = if cfg!(target_os = "windows") {
+        ("where", "/")
+    } else {
+        ("which", "")
+    };
+
+    for candidate in candidates {
+        let output = Command::new(resolver.0).arg(candidate).output().ok()?;
+        if !output.status.success() {
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(first_line) = stdout.lines().map(str::trim).find(|line| !line.is_empty()) {
+            return Some(PathBuf::from(first_line));
+        }
+    }
+
+    None
+}
+
+fn prepend_to_path(path: &Path) {
+    let Some(path_str) = path.to_str() else {
+        return;
+    };
+
+    let current = env::var_os("PATH").unwrap_or_default();
+    let already_present = env::split_paths(&current).any(|entry| entry == path);
+    if already_present {
+        return;
+    }
+
+    let mut updated = vec![path.to_path_buf()];
+    updated.extend(env::split_paths(&current));
+    if let Ok(joined) = env::join_paths(updated) {
+        env::set_var("PATH", joined);
+    } else {
+        let mut fallback = path_str.to_string();
+        if !current.is_empty() {
+            fallback.push(if cfg!(target_os = "windows") {
+                ';'
+            } else {
+                ':'
+            });
+            fallback.push_str(&current.to_string_lossy());
+        }
+        env::set_var("PATH", fallback);
+    }
+}
+
+fn windows_common_bin_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Some(app_data) = env::var_os("APPDATA") {
+        dirs.push(PathBuf::from(app_data).join("npm"));
+    }
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        dirs.push(
+            PathBuf::from(local_app_data)
+                .join("Microsoft")
+                .join("WinGet")
+                .join("Links"),
+        );
+    }
+    dirs.push(PathBuf::from(r"C:\Program Files\nodejs"));
+    dirs.push(PathBuf::from(r"C:\Program Files (x86)\nodejs"));
+
+    dirs
+}
+
+fn prime_runtime_path_for_platform() {
+    if cfg!(target_os = "windows") {
+        for dir in windows_common_bin_dirs() {
+            if dir.exists() {
+                prepend_to_path(&dir);
+            }
+        }
+    }
+}
+
+fn install_nodejs_with_winget(messages: &mut Vec<String>) -> bool {
+    let winget = resolve_command_path(&["winget"]);
+    let Some(winget_path) = winget else {
+        messages.push("未找到 winget，无法自动安装 Node.js。".to_string());
+        return false;
+    };
+
+    messages.push("检测到缺少 npm，尝试通过 winget 安装 Node.js LTS。".to_string());
+    match Command::new(winget_path)
+        .args([
+            "install",
+            "--id",
+            "OpenJS.NodeJS.LTS",
+            "-e",
+            "--silent",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            messages.push("Node.js LTS 安装完成，正在刷新 PATH。".to_string());
+            prime_runtime_path_for_platform();
+            true
+        }
+        Ok(status) => {
+            messages.push(format!("winget 安装 Node.js 失败，退出码: {status}"));
+            false
+        }
+        Err(error) => {
+            messages.push(format!("执行 winget 安装 Node.js 失败: {error}"));
+            false
+        }
+    }
+}
+
+fn install_pi_with_npm(messages: &mut Vec<String>) -> bool {
+    let npm = resolve_command_path(&["npm.cmd", "npm"]);
+    let Some(npm_path) = npm else {
+        messages.push("未找到 npm，无法自动安装 pi。".to_string());
+        return false;
+    };
+
+    messages.push("尝试通过 npm 全局安装 pi 运行时。".to_string());
+    match Command::new(npm_path)
+        .args(["install", "-g", "@mariozechner/pi-coding-agent"])
+        .status()
+    {
+        Ok(status) if status.success() => {
+            prime_runtime_path_for_platform();
+            true
+        }
+        Ok(status) => {
+            messages.push(format!("npm 安装 pi 失败，退出码: {status}"));
+            false
+        }
+        Err(error) => {
+            messages.push(format!("执行 npm 安装 pi 失败: {error}"));
+            false
+        }
+    }
+}
+
+fn ensure_runtime_dependencies_impl() -> RuntimeDependencyStatus {
+    prime_runtime_path_for_platform();
+
+    let platform = env::consts::OS.to_string();
+    let mut messages = Vec::new();
+    let mut node_available = resolve_command_path(&["node.exe", "node"]).is_some();
+    let mut npm_available = resolve_command_path(&["npm.cmd", "npm"]).is_some();
+    let mut pi_available = resolve_command_path(&["pi.cmd", "pi.exe", "pi"]).is_some();
+    let mut auto_install_attempted = false;
+    let mut auto_install_succeeded = false;
+
+    if cfg!(target_os = "windows") && !pi_available {
+        auto_install_attempted = true;
+
+        if !npm_available && !install_nodejs_with_winget(&mut messages) {
+            messages.push("自动安装中止：Node.js/npm 仍不可用。".to_string());
+        }
+
+        node_available = resolve_command_path(&["node.exe", "node"]).is_some();
+        npm_available = resolve_command_path(&["npm.cmd", "npm"]).is_some();
+
+        if npm_available {
+            let _ = install_pi_with_npm(&mut messages);
+        }
+
+        prime_runtime_path_for_platform();
+        pi_available = resolve_command_path(&["pi.cmd", "pi.exe", "pi"]).is_some();
+        auto_install_succeeded = pi_available;
+
+        if pi_available {
+            messages.push("pi 运行时已就绪。".to_string());
+        } else {
+            messages
+                .push("pi 仍不可用。请确认系统允许执行 winget / npm，并重新启动应用。".to_string());
+        }
+    } else if pi_available {
+        messages.push("pi 运行时已就绪。".to_string());
+    } else {
+        messages.push("当前平台未检测到 pi。".to_string());
+    }
+
+    RuntimeDependencyStatus {
+        platform,
+        node_available,
+        npm_available,
+        pi_available,
+        auto_install_attempted,
+        auto_install_succeeded,
+        messages,
+    }
+}
+
+#[tauri::command]
+async fn ensure_runtime_dependencies() -> Result<RuntimeDependencyStatus, String> {
+    Ok(ensure_runtime_dependencies_impl())
+}
+
 #[tauri::command]
 async fn bot_login_wechat(
     app: AppHandle,
@@ -1314,6 +1707,7 @@ async fn bot_start_wechat(
     base_url: Option<String>,
     route_tag: Option<String>,
     provider_id: Option<String>,
+    provider_api_format: Option<String>,
     model: Option<String>,
     api_key: Option<String>,
     provider_base_url: Option<String>,
@@ -1328,6 +1722,7 @@ async fn bot_start_wechat(
         base_url: base_url.unwrap_or_default(),
         route_tag,
         ai_provider_id: provider_id.unwrap_or_default(),
+        ai_api_format: provider_api_format.unwrap_or_else(|| "openai".to_string()),
         ai_base_url: provider_base_url.unwrap_or_default(),
         ai_api_key: api_key.unwrap_or_default(),
         ai_model: model.unwrap_or_default(),
@@ -1368,11 +1763,16 @@ async fn bot_send_message(
 
 #[tauri::command]
 async fn test_llm_provider_connection(
+    api_format: String,
     base_url: String,
     api_key: String,
     model: String,
 ) -> Result<String, String> {
-    let base = base_url.trim().trim_end_matches('/');
+    let api_format = normalize_provider_api_format(&api_format, "");
+    let base = match api_format {
+        "anthropic" => normalize_anthropic_base_url(&base_url),
+        _ => normalize_provider_base_url(&base_url).to_string(),
+    };
     let model = model.trim();
     if base.is_empty() {
         return Err("Base URL 不能为空".to_string());
@@ -1381,31 +1781,50 @@ async fn test_llm_provider_connection(
         return Err("模型名称不能为空".to_string());
     }
 
-    let url = format!("{}/chat/completions", base);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
         .build()
         .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))?;
 
-    let body = json!({
-        "model": model,
-        "messages": [{ "role": "user", "content": "ping" }],
-        "max_tokens": 8,
-    });
-
-    let mut request = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(&body);
-
-    if !api_key.trim().is_empty() {
-        request = request.header("Authorization", format!("Bearer {}", api_key.trim()));
-    }
+    let (url, request) = match api_format {
+        "anthropic" => {
+            let body = json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": "ping" }],
+                "max_tokens": 8,
+            });
+            let endpoint = anthropic_messages_url(&base);
+            let mut request = client
+                .post(endpoint.clone())
+                .header("Content-Type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .json(&body);
+            if !api_key.trim().is_empty() {
+                request = request.header("x-api-key", api_key.trim());
+            }
+            (endpoint, request)
+        }
+        _ => {
+            let body = json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": "ping" }],
+                "max_tokens": 8,
+            });
+            let mut request = client
+                .post(format!("{}/chat/completions", base))
+                .header("Content-Type", "application/json")
+                .json(&body);
+            if !api_key.trim().is_empty() {
+                request = request.header("Authorization", format!("Bearer {}", api_key.trim()));
+            }
+            (format!("{}/chat/completions", base), request)
+        }
+    };
 
     let response = request
         .send()
         .await
-        .map_err(|error| format!("网络请求失败: {error}"))?;
+        .map_err(|error| format!("网络请求失败({url}): {error}"))?;
 
     let status = response.status();
     let text = response
@@ -1425,15 +1844,25 @@ async fn test_llm_provider_connection(
         return Err(format!("API 返回错误: {err}"));
     }
 
-    let has_choice = parsed
-        .get("choices")
-        .and_then(|choices| choices.as_array())
-        .map(|choices| !choices.is_empty())
-        .unwrap_or(false);
+    let success = match api_format {
+        "anthropic" => parsed
+            .get("content")
+            .and_then(|content| content.as_array())
+            .map(|content| !content.is_empty())
+            .unwrap_or(false),
+        _ => parsed
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .map(|choices| !choices.is_empty())
+            .unwrap_or(false),
+    };
 
-    if !has_choice {
+    if !success {
         let preview: String = text.chars().take(200).collect();
-        return Err(format!("响应中无 choices: {preview}"));
+        return Err(match api_format {
+            "anthropic" => format!("响应中无 content: {preview}"),
+            _ => format!("响应中无 choices: {preview}"),
+        });
     }
 
     Ok("连通成功：已收到模型回复".to_string())
@@ -1476,6 +1905,10 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             resize_main_window_to_screen(&app.handle());
+            let status = ensure_runtime_dependencies_impl();
+            if !status.pi_available {
+                log::warn!("runtime dependency check: {}", status.messages.join(" | "));
+            }
 
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -1511,6 +1944,7 @@ pub fn run() {
             bot_get_status,
             bot_send_message,
             bot_send_media,
+            ensure_runtime_dependencies,
             test_llm_provider_connection
         ])
         .run(tauri::generate_context!())

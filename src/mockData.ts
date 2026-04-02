@@ -94,6 +94,7 @@ export const providerDefinitions: ProviderDefinition[] = [
     defaultBaseUrl: 'https://api.openai.com/v1',
     suggestedModel: 'gpt-4.1',
     description: '适合通用推理、代码和工具调用场景。',
+    apiFormat: 'openai',
   },
   {
     id: 'anthropic',
@@ -101,6 +102,7 @@ export const providerDefinitions: ProviderDefinition[] = [
     defaultBaseUrl: 'https://api.anthropic.com',
     suggestedModel: 'claude-sonnet-4-0',
     description: '适合长文本、复杂分析和稳健对话。',
+    apiFormat: 'anthropic',
   },
   {
     id: 'deepseek',
@@ -108,6 +110,7 @@ export const providerDefinitions: ProviderDefinition[] = [
     defaultBaseUrl: 'https://api.deepseek.com',
     suggestedModel: 'deepseek-chat',
     description: '适合成本敏感场景和中文任务。',
+    apiFormat: 'openai',
   },
   {
     id: 'doubao',
@@ -115,6 +118,7 @@ export const providerDefinitions: ProviderDefinition[] = [
     defaultBaseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
     suggestedModel: 'doubao-seed-1-6-thinking',
     description: '适合火山引擎体系内模型与企业接入。',
+    apiFormat: 'openai',
   },
   {
     id: 'siliconflow',
@@ -122,6 +126,7 @@ export const providerDefinitions: ProviderDefinition[] = [
     defaultBaseUrl: 'https://api.siliconflow.cn/v1',
     suggestedModel: 'deepseek-ai/DeepSeek-V3',
     description: '适合聚合多模型接入和快速试用。',
+    apiFormat: 'openai',
   },
 ]
 
@@ -139,6 +144,7 @@ export function emptyProviderConfig(): ProviderConfig {
   return {
     enabled: false,
     added: false,
+    apiFormat: 'openai',
     baseUrl: '',
     apiKey: '',
     model: '',
@@ -153,6 +159,7 @@ export function createInitialProviderConfigs(): Record<string, ProviderConfig> {
     openai: {
       enabled: false,
       added: false,
+      apiFormat: 'openai',
       baseUrl: 'https://api.openai.com/v1',
       apiKey: '',
       model: 'gpt-4.1',
@@ -163,6 +170,7 @@ export function createInitialProviderConfigs(): Record<string, ProviderConfig> {
     anthropic: {
       enabled: false,
       added: false,
+      apiFormat: 'anthropic',
       baseUrl: 'https://api.anthropic.com',
       apiKey: '',
       model: 'claude-sonnet-4-0',
@@ -173,6 +181,7 @@ export function createInitialProviderConfigs(): Record<string, ProviderConfig> {
     deepseek: {
       enabled: false,
       added: false,
+      apiFormat: 'openai',
       baseUrl: 'https://api.deepseek.com',
       apiKey: '',
       model: 'deepseek-chat',
@@ -183,6 +192,7 @@ export function createInitialProviderConfigs(): Record<string, ProviderConfig> {
     doubao: {
       enabled: false,
       added: false,
+      apiFormat: 'openai',
       baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
       apiKey: '',
       model: 'doubao-seed-1-6-thinking',
@@ -193,6 +203,7 @@ export function createInitialProviderConfigs(): Record<string, ProviderConfig> {
     siliconflow: {
       enabled: false,
       added: false,
+      apiFormat: 'openai',
       baseUrl: 'https://api.siliconflow.cn/v1',
       apiKey: '',
       model: 'deepseek-ai/DeepSeek-V3',

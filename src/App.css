@@ -56,6 +56,52 @@ button {
   grid-template-columns: 90px minmax(0, 1fr);
 }
 
+.runtime-banner {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  z-index: 30;
+  width: min(520px, calc(100vw - 36px));
+  border-radius: 18px;
+  padding: 16px 18px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.96);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-md);
+}
+
+.runtime-banner.success {
+  border-color: rgba(34, 160, 107, 0.3);
+  background: rgba(244, 252, 248, 0.98);
+}
+
+.runtime-banner.warning {
+  border-color: rgba(209, 141, 0, 0.28);
+  background: rgba(255, 250, 240, 0.98);
+}
+
+.runtime-banner-title {
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+
+.runtime-banner p {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.runtime-banner-list {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  color: var(--text-muted);
+}
+
+.runtime-banner-list li + li {
+  margin-top: 6px;
+}
+
 .sidebar,
 .content-panel {
   height: 100%;
@@ -379,6 +425,8 @@ button {
   min-height: 0;
   overflow: auto;
   display: grid;
+  align-content: start;
+  grid-auto-rows: max-content;
   gap: 2px;
   padding-right: 2px;
 }

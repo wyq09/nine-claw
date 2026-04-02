@@ -2,6 +2,8 @@ import { lazy, Suspense, startTransition, useCallback, useDeferredValue, useEffe
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { Check, Copy } from 'lucide-react'
 import './App.css'
+import { AppIcon, type IconName } from './components/AppIcon'
+import { SettingsModal } from './components/SettingsModal'
 import {
   botDefinitions,
   createInitialBotConfigs,
@@ -23,7 +25,6 @@ import type {
   AppearanceSettings,
   BotChannelId,
   BotConfig,
-  BotDefinition,
   ConversationAgentSnapshot,
   ConversationTurn,
   GeneralSettings,
@@ -34,7 +35,9 @@ import type {
   ProviderId,
   ProviderRuntimeConfig,
   CustomProviderMeta,
+  ProviderApiFormat,
   ResourceItem,
+  RuntimeDependencyStatus,
   SettingsTab,
   InstalledSkillItem,
   SkillLibraryTab,
@@ -51,6 +54,7 @@ import {
   botStartWechat,
   botStopWechat,
   createAgent,
+  ensureRuntimeDependencies,
   getDefaultAgent,
   installSystemSkill,
   listInstalledSkills,
@@ -60,7 +64,6 @@ import {
   setDefaultAgent,
   subscribeQrCode,
   subscribeBotStatus,
-  testLlmProviderConnection,
   updateAgent,
   writeAgentWorkspaceFile,
 } from './lib/piClient'
@@ -75,7 +78,7 @@ const ABSOLUTE_TIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
   second: '2-digit',
 })
 
-const STARTER_CHIPS = ['定时会话', '法律检索', '类案检索', '案件分析', '文书起草', '合同审查', '法律意见'] as const
+const STARTER_CHIPS = ['定时会话'] as const
 const GENERAL_SETTINGS_STORAGE_KEY = 'nineclaw.general-settings.v1'
 const APPEARANCE_SETTINGS_STORAGE_KEY = 'nineclaw.appearance-settings.v1'
 const PROVIDER_CONFIGS_STORAGE_KEY = 'nineclaw.provider-configs.v1'
@@ -213,16 +216,30 @@ function loadCustomProviderMeta(): CustomProviderMeta[] {
     if (!Array.isArray(parsed)) {
       return []
     }
-    return parsed.filter(
-      (x): x is CustomProviderMeta =>
-        typeof x === 'object' &&
-        x !== null &&
-        typeof (x as CustomProviderMeta).id === 'string' &&
-        typeof (x as CustomProviderMeta).name === 'string',
-    )
+    return parsed.flatMap((x) => {
+      if (
+        typeof x !== 'object' ||
+        x === null ||
+        typeof (x as CustomProviderMeta).id !== 'string' ||
+        typeof (x as CustomProviderMeta).name !== 'string'
+      ) {
+        return []
+      }
+
+      return [
+        {
+          ...(x as CustomProviderMeta),
+          apiFormat: normalizeProviderApiFormat((x as Partial<CustomProviderMeta>).apiFormat),
+        },
+      ]
+    })
   } catch {
     return []
   }
+}
+
+function normalizeProviderApiFormat(value: string | undefined, fallback: ProviderApiFormat = 'openai'): ProviderApiFormat {
+  return value === 'anthropic' ? 'anthropic' : fallback
 }
 
 function createInitialProviderState() {
@@ -637,6 +654,7 @@ function resolveActiveProviderConfig(
 
     return {
       providerId,
+      apiFormat: config.apiFormat,
       baseUrl: config.baseUrl.trim(),
       apiKey: config.apiKey.trim(),
       model: config.model.trim(),
@@ -664,6 +682,7 @@ function resolveBotRuntimeConfig(
 
     return {
       providerId,
+      apiFormat: config.apiFormat,
       baseUrl: config.baseUrl.trim(),
       apiKey: config.apiKey.trim(),
       model: config.model.trim(),
@@ -749,6 +768,7 @@ function resolveRuntimeFromSessionFields(
   }
   return {
     providerId,
+    apiFormat: cfg!.apiFormat,
     baseUrl: cfg!.baseUrl.trim(),
     apiKey: cfg!.apiKey.trim(),
     model: model.trim(),
@@ -937,6 +957,8 @@ function App() {
   const [qrStatus, setQrStatus] = useState<'waiting' | 'scanned' | 'confirmed' | 'error'>('waiting')
   const [botLoading, setBotLoading] = useState(false)
   const [botStatusLog, setBotStatusLog] = useState<BotStatusEvent[]>([])
+  const [runtimeDependencyStatus, setRuntimeDependencyStatus] = useState<RuntimeDependencyStatus | null>(null)
+  const [runtimeDependencyError, setRuntimeDependencyError] = useState('')
   /** 无选中会话时，输入区上方选择的模型（首条消息写入该会话） */
   const [composerSessionLlm, setComposerSessionLlm] = useState<{ providerId: ProviderId; model: string } | null>(null)
   const [composerAgent, setComposerAgent] = useState<ConversationAgentSnapshot | null>(null)
@@ -951,9 +973,10 @@ function App() {
     const custom = customProviderMeta.map((meta) => ({
       id: meta.id,
       name: meta.name,
-      defaultBaseUrl: 'https://api.openai.com/v1',
-      suggestedModel: 'gpt-4o-mini',
-      description: meta.description || '自定义 OpenAI 兼容接口。',
+      defaultBaseUrl: meta.apiFormat === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1',
+      suggestedModel: meta.apiFormat === 'anthropic' ? 'claude-sonnet-4-0' : 'gpt-4o-mini',
+      description: meta.description || `自定义 ${meta.apiFormat === 'anthropic' ? 'Anthropic' : 'OpenAI'} 兼容接口。`,
+      apiFormat: meta.apiFormat,
       isCustom: true,
     }))
     return [...providerDefinitions, ...custom]
@@ -1161,6 +1184,54 @@ function App() {
           providerConfigs[activeProviderConfig.providerId],
         )}`
       : '当前使用 · pi 默认'
+
+  useEffect(() => {
+    let cancelled = false
+
+    ensureRuntimeDependencies()
+      .then((status) => {
+        if (cancelled) {
+          return
+        }
+        setRuntimeDependencyStatus(status)
+        setRuntimeDependencyError('')
+      })
+      .catch((reason) => {
+        if (cancelled) {
+          return
+        }
+        setRuntimeDependencyError(String(reason))
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (customProviderMeta.length === 0) {
+      return
+    }
+
+    setProviderConfigs((previous) => {
+      let changed = false
+      const next = { ...previous }
+
+      for (const meta of customProviderMeta) {
+        const current = previous[meta.id]
+        if (!current || current.apiFormat === meta.apiFormat) {
+          continue
+        }
+        next[meta.id] = {
+          ...current,
+          apiFormat: meta.apiFormat,
+        }
+        changed = true
+      }
+
+      return changed ? next : previous
+    })
+  }, [customProviderMeta])
 
   useEffect(() => {
     const onResize = () => {
@@ -1879,14 +1950,19 @@ function App() {
     })
   }
 
-  const addCustomProvider = (name: string, description: string) => {
+  const addCustomProvider = (name: string, description: string, apiFormat: ProviderApiFormat) => {
     const id = `custom_${crypto.randomUUID().replace(/-/g, '')}`
-    setCustomProviderMeta((previous) => [...previous, { id, name, description }])
+    const defaultBaseUrl = apiFormat === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1'
+    const defaultModel = apiFormat === 'anthropic' ? 'claude-sonnet-4-0' : 'gpt-4o-mini'
+    setCustomProviderMeta((previous) => [...previous, { id, name, description, apiFormat }])
     setProviderConfigs((previous) => ({
       ...previous,
       [id]: {
         ...emptyProviderConfig(),
         added: true,
+        apiFormat,
+        baseUrl: defaultBaseUrl,
+        model: defaultModel,
         displayName: name.trim() || name,
         status: '未配置',
       },
@@ -1954,6 +2030,7 @@ function App() {
           await botStartWechat(loginToken, {
             baseUrl: loginBaseUrl || undefined,
             providerId: botRuntime.providerId,
+            providerApiFormat: botRuntime.apiFormat,
             model: botRuntime.model,
             apiKey: botRuntime.apiKey,
             providerBaseUrl: botRuntime.baseUrl,
@@ -1999,6 +2076,7 @@ function App() {
         baseUrl: config.clientSecret || undefined,
         routeTag: config.routeTag || undefined,
         providerId: botRuntime.providerId,
+        providerApiFormat: botRuntime.apiFormat,
         model: botRuntime.model,
         apiKey: botRuntime.apiKey,
         providerBaseUrl: botRuntime.baseUrl,
@@ -2148,6 +2226,34 @@ function App() {
           .filter(Boolean)
           .join(' ')}
       >
+        {runtimeDependencyError ? (
+          <div className="runtime-banner warning">
+            <div className="runtime-banner-title">运行环境自检失败</div>
+            <p>{runtimeDependencyError}</p>
+          </div>
+        ) : runtimeDependencyStatus && (!runtimeDependencyStatus.piAvailable || runtimeDependencyStatus.autoInstallAttempted) ? (
+          <div className={`runtime-banner ${runtimeDependencyStatus.piAvailable ? 'success' : 'warning'}`}>
+            <div className="runtime-banner-title">
+              {runtimeDependencyStatus.piAvailable ? '运行环境已准备完成' : '正在处理运行环境依赖'}
+            </div>
+            <p>
+              平台 {runtimeDependencyStatus.platform}
+              {runtimeDependencyStatus.autoInstallAttempted
+                ? runtimeDependencyStatus.autoInstallSucceeded
+                  ? '，已自动补齐缺失依赖。'
+                  : '，已尝试自动安装缺失依赖。'
+                : '。'}
+            </p>
+            {runtimeDependencyStatus.messages.length > 0 ? (
+              <ul className="runtime-banner-list">
+                {runtimeDependencyStatus.messages.map((message, index) => (
+                  <li key={`${message}-${index}`}>{message}</li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        ) : null}
+
         {shouldHideSidebar && sidebarOverlayOpen ? (
           <button
             type="button"
@@ -4385,1077 +4491,6 @@ function AgentsView({
         />
       ) : null}
     </div>
-  )
-}
-
-type SettingsModalProps = {
-  activeProviderBadge: string
-  allProviderDefinitions: ProviderDefinition[]
-  appearanceSettings: AppearanceSettings
-  botConfigs: Record<string, BotConfig>
-  botLoading: boolean
-  botStatusLog: BotStatusEvent[]
-  generalSettings: GeneralSettings
-  onAddCustomProvider: (name: string, description: string) => void
-  onProviderConfigChange: (providerId: ProviderId, updates: Partial<ProviderConfig>) => void
-  onBotConfigChange: (channelId: BotChannelId, updates: Partial<BotConfig>) => void
-  onClose: () => void
-  onRemoveCustomProvider: (providerId: ProviderId) => void
-  onWechatLogin: () => void
-  onWechatStart: () => void
-  onWechatStop: () => void
-  onSelectProvider: (id: ProviderId) => void
-  onSelectBot: (id: BotChannelId) => void
-  onSelectTab: (tab: SettingsTab) => void
-  providerConfigs: Record<string, ProviderConfig>
-  qrCodeUrl: string
-  qrDialogOpen: boolean
-  qrStatus: 'waiting' | 'scanned' | 'confirmed' | 'error'
-  selectedProviderConfig: ProviderConfig
-  selectedProviderDefinition: ProviderDefinition
-  selectedProviderId: ProviderId
-  selectedBotConfig: BotConfig
-  selectedBotDefinition: BotDefinition
-  selectedBotId: BotChannelId
-  setAppearanceSettings: (value: AppearanceSettings | ((previous: AppearanceSettings) => AppearanceSettings)) => void
-  setGeneralSettings: (value: GeneralSettings | ((previous: GeneralSettings) => GeneralSettings)) => void
-  setBotLoading: (loading: boolean) => void
-  setQrDialogOpen: (open: boolean) => void
-  tab: SettingsTab
-}
-
-function SettingsModal({
-  activeProviderBadge,
-  allProviderDefinitions,
-  appearanceSettings,
-  botConfigs,
-  botLoading,
-  botStatusLog,
-  generalSettings,
-  onAddCustomProvider,
-  onProviderConfigChange,
-  onBotConfigChange,
-  onClose,
-  onRemoveCustomProvider,
-  onWechatLogin,
-  onWechatStart,
-  onWechatStop,
-  onSelectProvider,
-  onSelectBot,
-  onSelectTab,
-  providerConfigs,
-  qrCodeUrl,
-  qrDialogOpen,
-  qrStatus,
-  selectedProviderConfig,
-  selectedProviderDefinition,
-  selectedProviderId,
-  selectedBotConfig,
-  selectedBotDefinition,
-  selectedBotId,
-  setAppearanceSettings,
-  setBotLoading,
-  setGeneralSettings,
-  setQrDialogOpen,
-  tab,
-}: SettingsModalProps) {
-  const [providerAddMode, setProviderAddMode] = useState(false)
-  const [customFormOpen, setCustomFormOpen] = useState(false)
-  const [customName, setCustomName] = useState('')
-  const [customDescription, setCustomDescription] = useState('')
-  const [providerTestLoading, setProviderTestLoading] = useState(false)
-  const [providerTestNote, setProviderTestNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
-  const [providerDeleteConfirmId, setProviderDeleteConfirmId] = useState<ProviderId | null>(null)
-
-  const addedProviders = allProviderDefinitions.filter((p) => providerConfigs[p.id]?.added)
-  const availableProviders = allProviderDefinitions.filter((p) => !providerConfigs[p.id]?.added)
-
-  const handleProviderSelect = (providerId: ProviderId) => {
-    if (providerAddMode) {
-      onProviderConfigChange(providerId, { added: true })
-      onSelectProvider(providerId)
-      setProviderAddMode(false)
-    } else {
-      onSelectProvider(providerId)
-    }
-  }
-
-  const handleRemoveProvider = (providerId: ProviderId) => {
-    if (selectedProviderId === providerId) {
-      const nextAdded = addedProviders.find((p) => p.id !== providerId)
-      if (nextAdded) {
-        onSelectProvider(nextAdded.id)
-      }
-    }
-    if (providerId.startsWith('custom_')) {
-      onRemoveCustomProvider(providerId)
-    } else {
-      onProviderConfigChange(providerId, { added: false, enabled: false })
-    }
-  }
-
-  useEffect(() => {
-    if (!providerDeleteConfirmId) {
-      return
-    }
-    const onKeyDown = (event: Event) => {
-      if (event instanceof KeyboardEvent && !isFnLikeKeyboardEvent(event) && event.key === 'Escape') {
-        setProviderDeleteConfirmId(null)
-      }
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [providerDeleteConfirmId])
-
-  const handleSubmitCustomProvider = () => {
-    const name = customName.trim()
-    if (!name) {
-      return
-    }
-    onAddCustomProvider(name, customDescription.trim())
-    setCustomFormOpen(false)
-    setCustomName('')
-    setCustomDescription('')
-    setProviderAddMode(false)
-  }
-
-  const pendingDeleteLabel =
-    providerDeleteConfirmId &&
-    (() => {
-      const def = allProviderDefinitions.find((p) => p.id === providerDeleteConfirmId)
-      const cfg = providerConfigs[providerDeleteConfirmId]
-      return def && cfg ? providerDisplayName(def, cfg) : providerDeleteConfirmId
-    })()
-
-  return (
-    <>
-      <div className="modal-backdrop">
-        <div className="settings-dialog" role="dialog" aria-modal="true" aria-label="设置">
-        <div className="settings-sidebar">
-          <header>
-            <h2>设置</h2>
-          </header>
-
-          <div className="settings-tab-list">
-            <SettingsTabButton active={tab === 'general'} icon="settings" label="通用" onClick={() => onSelectTab('general')} />
-            <SettingsTabButton active={tab === 'appearance'} icon="sparkles" label="个性化" onClick={() => onSelectTab('appearance')} />
-            <SettingsTabButton active={tab === 'providers'} icon="provider" label="大模型 Provider" onClick={() => onSelectTab('providers')} />
-            <SettingsTabButton active={tab === 'bots'} icon="message" label="IM 机器人" onClick={() => onSelectTab('bots')} />
-            <SettingsTabButton active={tab === 'shortcuts'} icon="keyboard" label="快捷键" onClick={() => onSelectTab('shortcuts')} />
-          </div>
-        </div>
-
-        <div className="settings-content">
-          <div className="settings-content-head">
-            <h2>
-              {tab === 'general'
-                ? '通用'
-                : tab === 'appearance'
-                  ? '个性化'
-                  : tab === 'providers'
-                    ? '大模型 Provider'
-                    : tab === 'bots'
-                      ? 'IM 机器人'
-                      : '快捷键'}
-            </h2>
-            <button type="button" className="icon-button subtle" onClick={onClose} aria-label="关闭设置">
-              <AppIcon name="close" size={20} />
-            </button>
-          </div>
-
-          {tab === 'general' ? (
-            <div className="settings-section-stack">
-              <div className="settings-row">
-                <div>
-                  <strong>语言</strong>
-                </div>
-                <label className="select-field">
-                  <select
-                    value={generalSettings.language}
-                    onChange={(event) =>
-                      setGeneralSettings((previous) => ({
-                        ...previous,
-                        language: event.target.value as GeneralSettings['language'],
-                      }))
-                    }
-                  >
-                    <option value="中文">中文</option>
-                    <option value="English">English</option>
-                  </select>
-                </label>
-              </div>
-
-              <SettingSwitch
-                checked={generalSettings.launchOnStartup}
-                description="系统启动时自动运行应用"
-                label="开机自启动"
-                onChange={() =>
-                  setGeneralSettings((previous) => ({
-                    ...previous,
-                    launchOnStartup: !previous.launchOnStartup,
-                  }))
-                }
-              />
-
-              <SettingSwitch
-                checked={generalSettings.useSystemProxy}
-                description="开启后网络请求将跟随系统代理（保存后生效）"
-                label="使用系统代理"
-                onChange={() =>
-                  setGeneralSettings((previous) => ({
-                    ...previous,
-                    useSystemProxy: !previous.useSystemProxy,
-                  }))
-                }
-              />
-            </div>
-          ) : null}
-
-          {tab === 'appearance' ? (
-            <div className="settings-section-stack">
-              <SettingSwitch
-                checked={appearanceSettings.compactSidebar}
-                description="压缩左侧导航宽度，适合更小的桌面窗口。"
-                label="紧凑侧栏"
-                onChange={() =>
-                  setAppearanceSettings((previous) => ({
-                    ...previous,
-                    compactSidebar: !previous.compactSidebar,
-                  }))
-                }
-              />
-              <SettingSwitch
-                checked={appearanceSettings.showExecutionRail}
-                description="在聊天页显示执行状态卡片，而不是直接暴露模型内部推理。"
-                label="显示执行轨迹"
-                onChange={() =>
-                  setAppearanceSettings((previous) => ({
-                    ...previous,
-                    showExecutionRail: !previous.showExecutionRail,
-                  }))
-                }
-              />
-              <SettingSwitch
-                checked={appearanceSettings.preferReducedMotion}
-                description="减少过渡动画，提升低性能机器上的响应感。"
-                label="减少动画"
-                onChange={() =>
-                  setAppearanceSettings((previous) => ({
-                    ...previous,
-                    preferReducedMotion: !previous.preferReducedMotion,
-                  }))
-                }
-              />
-            </div>
-          ) : null}
-
-          {tab === 'providers' ? (
-            <div className="bot-settings-layout">
-              <div className="bot-channel-list">
-                {providerAddMode ? (
-                  <>
-                    <div className="provider-add-header">
-                      <span>选择要添加的 Provider</span>
-                      <button
-                        type="button"
-                        className="link-button"
-                        onClick={() => {
-                          setProviderAddMode(false)
-                          setCustomFormOpen(false)
-                        }}
-                      >
-                        取消
-                      </button>
-                    </div>
-                    {customFormOpen ? (
-                      <div className="provider-custom-form">
-                        <label className="input-field">
-                          <span>供应商名称</span>
-                          <input
-                            value={customName}
-                            onChange={(event) => setCustomName(event.target.value)}
-                            placeholder="例如：公司内网网关"
-                          />
-                        </label>
-                        <label className="input-field">
-                          <span>说明（可选）</span>
-                          <input
-                            value={customDescription}
-                            onChange={(event) => setCustomDescription(event.target.value)}
-                            placeholder="OpenAI 兼容接口"
-                          />
-                        </label>
-                        <div className="provider-actions">
-                          <button type="button" className="outline-button" onClick={() => setCustomFormOpen(false)}>
-                            返回
-                          </button>
-                          <button type="button" className="outline-button primary" onClick={handleSubmitCustomProvider}>
-                            创建
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <>
-                        <button type="button" className="provider-add-button subtle" onClick={() => setCustomFormOpen(true)}>
-                          <AppIcon name="plus" size={18} />
-                          <span>添加自定义供应商（OpenAI 兼容）</span>
-                        </button>
-                        {availableProviders.map((provider) => {
-                          return (
-                            <button
-                              key={provider.id}
-                              type="button"
-                              className={`bot-channel-card ${selectedProviderId === provider.id ? 'active' : ''}`}
-                              onClick={() => handleProviderSelect(provider.id)}
-                            >
-                              <span className="bot-channel-copy">
-                                <strong>{provider.name}</strong>
-                                <span>{provider.description}</span>
-                              </span>
-                              <AppIcon name="plus" size={16} />
-                            </button>
-                          )
-                        })}
-                        {availableProviders.length === 0 && (
-                          <p className="settings-note">预设已全部添加；你仍可使用上方「自定义供应商」。</p>
-                        )}
-                      </>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      className="provider-add-button"
-                      onClick={() => {
-                        setProviderAddMode(true)
-                        setCustomFormOpen(false)
-                      }}
-                    >
-                      <AppIcon name="plus" size={18} />
-                      <span>添加 Provider</span>
-                    </button>
-                    {addedProviders.length === 0 ? (
-                      <p className="settings-note">暂未添加任何 Provider，请点击上方按钮添加。</p>
-                    ) : (
-                      addedProviders.map((provider) => {
-                        const config = providerConfigs[provider.id]
-                        return (
-                          <div
-                            key={provider.id}
-                            className={`bot-channel-card ${selectedProviderId === provider.id ? 'active' : ''}`}
-                            role="button"
-                            tabIndex={0}
-                            onClick={() => handleProviderSelect(provider.id)}
-                            onKeyDown={(event) => {
-                              if (event.key === 'Enter' || event.key === ' ') {
-                                event.preventDefault()
-                                handleProviderSelect(provider.id)
-                              }
-                            }}
-                          >
-                            <span className="bot-channel-copy">
-                              <strong>{providerDisplayName(provider, config)}</strong>
-                              <span>{config.status}</span>
-                            </span>
-                            <button
-                              type="button"
-                              className="provider-remove-button"
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                setProviderDeleteConfirmId(provider.id)
-                              }}
-                              aria-label={`移除 ${providerDisplayName(provider, config)}`}
-                            >
-                              <AppIcon name="close" size={14} />
-                            </button>
-                          </div>
-                        )
-                      })
-                    )}
-                  </>
-                )}
-              </div>
-
-              <div className="bot-detail-panel">
-                {addedProviders.length === 0 ? (
-                  <div className="provider-empty-state">
-                    <AppIcon name="provider" size={48} />
-                    <p>请先添加一个 Provider</p>
-                  </div>
-                ) : (
-                  <>
-                    <div className="bot-detail-head provider-detail-head">
-                      <div className="bot-detail-title">
-                        <AppIcon name="provider" size={18} />
-                        <strong className="bot-detail-heading">
-                          {providerDisplayName(selectedProviderDefinition, selectedProviderConfig)} 配置
-                        </strong>
-                        <span className="bot-status-tag">{selectedProviderConfig.status}</span>
-                      </div>
-                      <div className="provider-runtime-badge">{activeProviderBadge}</div>
-                    </div>
-
-                    <p className="settings-note provider-note">{selectedProviderDefinition.description}</p>
-
-                    <label className="input-field">
-                      <span>显示名称</span>
-                      <input
-                        value={selectedProviderConfig.displayName}
-                        onChange={(event) => onProviderConfigChange(selectedProviderId, { displayName: event.target.value })}
-                        placeholder={selectedProviderDefinition.name}
-                      />
-                    </label>
-
-                    <label className="input-field">
-                      <span>Base URL</span>
-                      <input
-                        value={selectedProviderConfig.baseUrl}
-                        onChange={(event) => onProviderConfigChange(selectedProviderId, { baseUrl: event.target.value })}
-                        placeholder={selectedProviderDefinition.defaultBaseUrl}
-                      />
-                    </label>
-
-                    <label className="input-field">
-                      <span>API Key</span>
-                      <input
-                        type="password"
-                        value={selectedProviderConfig.apiKey}
-                        onChange={(event) => onProviderConfigChange(selectedProviderId, { apiKey: event.target.value })}
-                        placeholder="请输入 API Key"
-                      />
-                    </label>
-
-                    <label className="input-field">
-                      <span>默认模型</span>
-                      <input
-                        value={selectedProviderConfig.model}
-                        onChange={(event) => onProviderConfigChange(selectedProviderId, { model: event.target.value })}
-                        placeholder={selectedProviderDefinition.suggestedModel}
-                      />
-                    </label>
-
-                    <label className="input-field">
-                      <span>备注</span>
-                      <input
-                        value={selectedProviderConfig.note}
-                        onChange={(event) => onProviderConfigChange(selectedProviderId, { note: event.target.value })}
-                        placeholder="例如：用于后续替换默认模型路由"
-                      />
-                    </label>
-
-                    <div className="provider-actions">
-                      <button
-                        type="button"
-                        className="outline-button"
-                        onClick={() =>
-                          onProviderConfigChange(selectedProviderId, {
-                            status: getProviderStatus(selectedProviderConfig, false),
-                          })
-                        }
-                      >
-                        <AppIcon name="refresh" size={18} />
-                        <span>校验配置</span>
-                      </button>
-                      <button
-                        type="button"
-                        className="outline-button"
-                        disabled={providerTestLoading}
-                        onClick={async () => {
-                          setProviderTestLoading(true)
-                          setProviderTestNote(null)
-                          try {
-                            const message = await testLlmProviderConnection({
-                              baseUrl: selectedProviderConfig.baseUrl,
-                              apiKey: selectedProviderConfig.apiKey,
-                              model: selectedProviderConfig.model,
-                            })
-                            onProviderConfigChange(selectedProviderId, { status: '测试通过' })
-                            setProviderTestNote({ kind: 'ok', text: message })
-                          } catch (error) {
-                            onProviderConfigChange(selectedProviderId, { status: '已配置' })
-                            setProviderTestNote({ kind: 'err', text: String(error) })
-                          } finally {
-                            setProviderTestLoading(false)
-                          }
-                        }}
-                      >
-                        <AppIcon name="broadcast" size={18} />
-                        <span>{providerTestLoading ? '测试中…' : '测试连通性'}</span>
-                      </button>
-                    </div>
-
-                    {providerTestNote ? (
-                      <p className={`settings-note ${providerTestNote.kind === 'err' ? 'error' : ''}`}>
-                        {providerTestNote.text}
-                      </p>
-                    ) : null}
-
-                    <p className="settings-note">
-                      启用后的 Provider 会直接参与后续对话执行。为避免冲突，界面会保持单一启用项。
-                    </p>
-                  </>
-                )}
-              </div>
-            </div>
-          ) : null}
-
-          {tab === 'bots' ? (
-            <div className="bot-settings-layout">
-              <div className="bot-channel-list">
-                {botDefinitions.map((channel) => {
-                  const config = botConfigs[channel.id]
-                  return (
-                    <div
-                      key={channel.id}
-                      className={`bot-channel-card ${selectedBotId === channel.id ? 'active' : ''}`}
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => onSelectBot(channel.id)}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter' || event.key === ' ') {
-                          event.preventDefault()
-                          onSelectBot(channel.id)
-                        }
-                      }}
-                    >
-                      <span className="bot-channel-copy">
-                        <strong>{channel.name}</strong>
-                        <span className={`bot-status-text ${config.status === '已连接' ? 'connected' : config.status === '错误' ? 'error' : ''}`}>{config.status}</span>
-                      </span>
-                      {channel.id === 'wechat' ? null : (
-                        <Toggle checked={config.enabled} onChange={() => onBotConfigChange(channel.id, { enabled: !config.enabled })} />
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
-
-              <div className="bot-detail-panel">
-                {/* ── WeChat: QR Login + Connect/Disconnect ── */}
-                {selectedBotId === 'wechat' ? (
-                  <>
-                    <div className="bot-detail-head">
-                      <div className="bot-detail-title">
-                        <AppIcon name="message" size={18} />
-                        <strong>微信 Bot 设置</strong>
-                        <span className={`bot-status-tag ${selectedBotConfig.status === '已连接' ? 'connected' : selectedBotConfig.status === '错误' ? 'error' : ''}`}>
-                          {selectedBotConfig.status}
-                        </span>
-                      </div>
-                    </div>
-
-                    {selectedBotConfig.status === '已连接' ? (
-                      <div className="bot-connected-info">
-                        <p>微信 Bot 正在运行，每 3 秒轮询一次新消息并自动 AI 回复。</p>
-                        <button
-                          type="button"
-                          className="outline-button danger"
-                          onClick={onWechatStop}
-                          disabled={botLoading}
-                        >
-                          <AppIcon name="stop" size={18} />
-                          <span>{botLoading ? '断开中...' : '断开连接'}</span>
-                        </button>
-                        {botStatusLog.length > 0 ? (
-                          <div className="bot-status-log">
-                            <strong>Bot 运行日志</strong>
-                            <div className="bot-status-entries">
-                              {botStatusLog.slice(0, 8).map((entry, i) => (
-                                <div key={i} className={`bot-status-entry ${entry.level}`}>
-                                  <span className="bot-status-level">{entry.level}</span>
-                                  <span className="bot-status-msg">{entry.message}</span>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        ) : null}
-                      </div>
-                    ) : (
-                      <>
-                        <label className="input-field">
-                          <span>iLink 服务地址</span>
-                          <input
-                            value={selectedBotConfig.clientSecret}
-                            onChange={(event) => onBotConfigChange(selectedBotId, { clientSecret: event.target.value })}
-                            placeholder="https://ilinkai.weixin.qq.com"
-                          />
-                        </label>
-
-                        <label className="input-field">
-                          <span>Bot Token (扫码后自动填入)</span>
-                          <input
-                            value={selectedBotConfig.clientId}
-                            onChange={(event) => onBotConfigChange(selectedBotId, { clientId: event.target.value })}
-                            placeholder="扫码登录后自动获取"
-                            readOnly
-                          />
-                        </label>
-
-                        <div className="bot-action-row">
-                          <button
-                            type="button"
-                            className="outline-button primary"
-                            onClick={onWechatLogin}
-                            disabled={botLoading}
-                          >
-                            <AppIcon name="qr" size={18} />
-                            <span>{botLoading ? '请稍候...' : '扫码登录'}</span>
-                          </button>
-
-                          {selectedBotConfig.clientId ? (
-                            <button
-                              type="button"
-                              className="outline-button"
-                              onClick={onWechatStart}
-                              disabled={botLoading}
-                            >
-                              <AppIcon name="broadcast" size={18} />
-                              <span>{botLoading ? '启动中...' : '启动 Bot'}</span>
-                            </button>
-                          ) : null}
-                        </div>
-
-                        {selectedBotConfig.errorMessage ? (
-                          <p className="settings-note error">{selectedBotConfig.errorMessage}</p>
-                        ) : null}
-
-                        <p className="settings-note">微信 Bot 使用 iLink 协议，扫码登录后即可接收消息并自动 AI 回复。</p>
-                      </>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    {/* ── Other Channels: original UI ── */}
-                    <div className="bot-detail-head">
-                      <div className="bot-detail-title">
-                        <AppIcon name="message" size={18} />
-                        <strong>{selectedBotDefinition.name} 设置</strong>
-                        <span className="bot-status-tag">{selectedBotConfig.status}</span>
-                      </div>
-                      <button type="button" className="outline-button">
-                        <AppIcon name="book" size={18} />
-                        <span>{selectedBotDefinition.guideLabel}</span>
-                      </button>
-                    </div>
-
-                    <label className="input-field">
-                      <span>{selectedBotDefinition.keyLabel}</span>
-                      <input
-                        value={selectedBotConfig.clientId}
-                        onChange={(event) => onBotConfigChange(selectedBotId, { clientId: event.target.value })}
-                        placeholder={selectedBotDefinition.keyPlaceholder}
-                      />
-                    </label>
-                    <label className="input-field">
-                      <span>{selectedBotDefinition.secretLabel}</span>
-                      <input
-                        type="password"
-                        value={selectedBotConfig.clientSecret}
-                        onChange={(event) => onBotConfigChange(selectedBotId, { clientSecret: event.target.value })}
-                        placeholder={selectedBotDefinition.secretPlaceholder}
-                      />
-                    </label>
-
-                    <button
-                      type="button"
-                      className="outline-button"
-                      onClick={() => onBotConfigChange(selectedBotId, { status: '待接入' })}
-                    >
-                      <AppIcon name="broadcast" size={18} />
-                      <span>测试连通性</span>
-                    </button>
-
-                    <p className="settings-note">该通道暂未接入真实后端，仅保留配置界面。</p>
-                  </>
-                )}
-              </div>
-
-              {/* ── QR Code Dialog ── */}
-              {qrDialogOpen && selectedBotId === 'wechat' ? (
-                <div className="qr-dialog-overlay" onClick={() => { setQrDialogOpen(false); setBotLoading(false); }}>
-                  <div className="qr-dialog" onClick={(event) => event.stopPropagation()}>
-                    <div className="qr-dialog-header">
-                      <strong>微信扫码登录</strong>
-                      <button type="button" className="qr-dialog-close" onClick={() => { setQrDialogOpen(false); setBotLoading(false); }}>
-                        &times;
-                      </button>
-                    </div>
-                    <div className="qr-dialog-body">
-                      {qrStatus === 'waiting' && !qrCodeUrl ? (
-                        <div className="qr-loading">正在获取二维码...</div>
-                      ) : qrStatus === 'waiting' && qrCodeUrl ? (
-                        <>
-                          <img className="qr-image" src={qrCodeUrl} alt="微信登录二维码" />
-                          <p className="qr-hint">请使用微信扫描二维码</p>
-                        </>
-                      ) : qrStatus === 'scanned' ? (
-                        <div className="qr-status scanned">
-                          <AppIcon name="check" size={48} />
-                          <p>已扫描，请在手机上确认</p>
-                        </div>
-                      ) : qrStatus === 'confirmed' ? (
-                        <div className="qr-status confirmed">
-                          <AppIcon name="check" size={48} />
-                          <p>登录成功</p>
-                        </div>
-                      ) : (
-                        <div className="qr-status error">
-                          <p>二维码获取失败，请重试</p>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              ) : null}
-            </div>
-          ) : null}
-
-          {tab === 'shortcuts' ? (
-            <div className="shortcut-list">
-              <div className="shortcut-config-card">
-                <strong>发送消息方式</strong>
-                <div className="shortcut-choice-row">
-                  <button
-                    type="button"
-                    className={`shortcut-choice ${generalSettings.submitShortcut === 'enter' ? 'active' : ''}`}
-                    onClick={() =>
-                      setGeneralSettings((previous) => ({
-                        ...previous,
-                        submitShortcut: 'enter',
-                      }))
-                    }
-                  >
-                    <span>Enter 发送</span>
-                    <code>Shift + Enter 换行</code>
-                  </button>
-                  <button
-                    type="button"
-                    className={`shortcut-choice ${generalSettings.submitShortcut === 'mod_enter' ? 'active' : ''}`}
-                    onClick={() =>
-                      setGeneralSettings((previous) => ({
-                        ...previous,
-                        submitShortcut: 'mod_enter',
-                      }))
-                    }
-                  >
-                    <span>Ctrl / Cmd + Enter 发送</span>
-                    <code>Enter 换行</code>
-                  </button>
-                </div>
-              </div>
-              <div className="shortcut-row">
-                <span>发送消息</span>
-                <code>{getSubmitShortcutLabel(generalSettings.submitShortcut)}</code>
-              </div>
-              <div className="shortcut-row">
-                <span>打开设置</span>
-                <code>Cmd + ,</code>
-              </div>
-              <div className="shortcut-row">
-                <span>切换技能页</span>
-                <code>Cmd + 2</code>
-              </div>
-              <div className="shortcut-row">
-                <span>停止当前生成</span>
-                <code>Esc</code>
-              </div>
-            </div>
-          ) : null}
-
-          <div className="settings-footer">
-            <button type="button" className="outline-button settings-footer-button" onClick={onClose}>
-              关闭
-            </button>
-            <button type="button" className="primary-dark-button settings-footer-button" onClick={onClose}>
-              完成
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-      {providerDeleteConfirmId && pendingDeleteLabel ? (
-        <div
-          className="confirm-dialog-overlay"
-          role="presentation"
-          onClick={() => setProviderDeleteConfirmId(null)}
-        >
-          <div
-            className="confirm-dialog"
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby="provider-delete-confirm-title"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <h3 id="provider-delete-confirm-title">删除 Provider</h3>
-            <p>
-              确定要移除「{pendingDeleteLabel}」吗？移除后需重新添加才能再次使用，请确认后再操作。
-            </p>
-            <div className="confirm-dialog-actions">
-              <button type="button" className="outline-button" onClick={() => setProviderDeleteConfirmId(null)}>
-                取消
-              </button>
-              <button
-                type="button"
-                className="outline-button confirm-dialog-delete"
-                onClick={() => {
-                  handleRemoveProvider(providerDeleteConfirmId)
-                  setProviderDeleteConfirmId(null)
-                }}
-              >
-                删除
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
-    </>
-  )
-}
-
-type SettingsTabButtonProps = {
-  active: boolean
-  icon: IconName
-  label: string
-  onClick: () => void
-}
-
-function SettingsTabButton({ active, icon, label, onClick }: SettingsTabButtonProps) {
-  return (
-    <button type="button" className={`settings-tab-button ${active ? 'active' : ''}`} onClick={onClick}>
-      <AppIcon name={icon} size={20} />
-      <span>{label}</span>
-    </button>
-  )
-}
-
-type SettingSwitchProps = {
-  checked: boolean
-  description: string
-  label: string
-  onChange: () => void
-}
-
-function SettingSwitch({ checked, description, label, onChange }: SettingSwitchProps) {
-  return (
-    <div className="settings-row switch">
-      <div>
-        <strong>{label}</strong>
-        <p>{description}</p>
-      </div>
-      <Toggle checked={checked} onChange={onChange} />
-    </div>
-  )
-}
-
-type ToggleProps = {
-  checked: boolean
-  onChange: () => void
-}
-
-function Toggle({ checked, onChange }: ToggleProps) {
-  return (
-    <button type="button" className={`toggle ${checked ? 'checked' : ''}`} onClick={onChange} aria-pressed={checked}>
-      <span />
-    </button>
-  )
-}
-
-type IconName =
-  | 'attachment'
-  | 'bag'
-  | 'book'
-  | 'bot'
-  | 'broadcast'
-  | 'chevron-down'
-  | 'clock'
-  | 'close'
-  | 'folder'
-  | 'keyboard'
-  | 'message'
-  | 'more'
-  | 'network'
-  | 'panel'
-  | 'plus'
-  | 'plus-circle'
-  | 'provider'
-  | 'puzzle'
-  | 'refresh'
-  | 'search'
-  | 'send'
-  | 'settings'
-  | 'spark'
-  | 'sparkles'
-  | 'stop'
-  | 'trash'
-  | 'wrench'
-  | 'upload'
-  | 'qr'
-  | 'check'
-
-function AppIcon({ name, size = 20 }: { name: IconName; size?: number }) {
-  const stroke = 1.8
-
-  return (
-    <svg
-      aria-hidden="true"
-      className="app-icon"
-      fill="none"
-      height={size}
-      viewBox="0 0 24 24"
-      width={size}
-      xmlns="http://www.w3.org/2000/svg"
-    >
-      {name === 'plus' ? <path d="M12 5v14M5 12h14" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} /> : null}
-      {name === 'spark' ? (
-        <path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z" stroke="currentColor" strokeLinejoin="round" strokeWidth={stroke} />
-      ) : null}
-      {name === 'book' ? (
-        <>
-          <path d="M5 5.5C5 4.67 5.67 4 6.5 4H19v15H6.5A1.5 1.5 0 0 1 5 17.5v-12Z" stroke="currentColor" strokeWidth={stroke} />
-          <path d="M9 4v15" stroke="currentColor" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'clock' ? (
-        <>
-          <circle cx="12" cy="12" r="8" stroke="currentColor" strokeWidth={stroke} />
-          <path d="M12 8v4l3 2" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'network' ? (
-        <>
-          <circle cx="6" cy="12" r="2.2" stroke="currentColor" strokeWidth={stroke} />
-          <circle cx="18" cy="7" r="2.2" stroke="currentColor" strokeWidth={stroke} />
-          <circle cx="18" cy="17" r="2.2" stroke="currentColor" strokeWidth={stroke} />
-          <path d="M8 11l7.6-3M8 13l7.6 3" stroke="currentColor" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'settings' ? (
-        <>
-          <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth={stroke} />
-          <path
-            d="M19.4 15a1 1 0 0 0 .2 1.1l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1 1 0 0 0-1.1-.2 1 1 0 0 0-.6.9V20a2 2 0 1 1-4 0v-.2a1 1 0 0 0-.6-.9 1 1 0 0 0-1.1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1 1 0 0 0 .2-1.1 1 1 0 0 0-.9-.6H4a2 2 0 1 1 0-4h.2a1 1 0 0 0 .9-.6 1 1 0 0 0-.2-1.1l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1 1 0 0 0 1.1.2h.1a1 1 0 0 0 .6-.9V4a2 2 0 1 1 4 0v.2a1 1 0 0 0 .6.9 1 1 0 0 0 1.1-.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1 1 0 0 0-.2 1.1v.1a1 1 0 0 0 .9.6H20a2 2 0 1 1 0 4h-.2a1 1 0 0 0-.9.6Z"
-            stroke="currentColor"
-            strokeLinejoin="round"
-            strokeWidth={1.4}
-          />
-        </>
-      ) : null}
-      {name === 'panel' ? (
-        <>
-          <rect x="4" y="4" width="16" height="16" rx="2" stroke="currentColor" strokeWidth={stroke} />
-          <path d="M11 4v16M15 10l-2 2 2 2" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'more' ? (
-        <>
-          <circle cx="6" cy="12" r="1.5" fill="currentColor" />
-          <circle cx="12" cy="12" r="1.5" fill="currentColor" />
-          <circle cx="18" cy="12" r="1.5" fill="currentColor" />
-        </>
-      ) : null}
-      {name === 'chevron-down' ? <path d="m6 9 6 6 6-6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} /> : null}
-      {name === 'bot' ? (
-        <>
-          <rect x="6" y="8" width="12" height="10" rx="3" stroke="currentColor" strokeWidth={stroke} />
-          <path d="M12 4v4M9.5 13h.01M14.5 13h.01M8 18v2M16 18v2" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'attachment' ? <path d="M8.5 12.5 14 7a3 3 0 1 1 4.2 4.2l-6.8 6.8a5 5 0 1 1-7.1-7.1l7.1-7.1" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} /> : null}
-      {name === 'send' ? <path d="m5 12 14-7-3 14-4.2-5.2L5 12Z" fill="currentColor" /> : null}
-      {name === 'stop' ? <rect x="7" y="7" width="10" height="10" rx="2.4" fill="currentColor" /> : null}
-      {name === 'search' ? (
-        <>
-          <circle cx="11" cy="11" r="5.5" stroke="currentColor" strokeWidth={stroke} />
-          <path d="m16 16 3.5 3.5" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'refresh' ? (
-        <path d="M20 11a8 8 0 1 0 2 5.3M20 4v5h-5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
-      ) : null}
-      {name === 'bag' ? (
-        <>
-          <path d="M6 8h12l-1 11H7L6 8Z" stroke="currentColor" strokeLinejoin="round" strokeWidth={stroke} />
-          <path d="M9 8a3 3 0 1 1 6 0" stroke="currentColor" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'plus-circle' ? (
-        <>
-          <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth={stroke} />
-          <path d="M12 8v8M8 12h8" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'upload' ? (
-        <>
-          <path d="M12 16V6M8 10l4-4 4 4" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
-          <path d="M5 18h14" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'folder' ? (
-        <>
-          <path d="M4 8h5l2 2h9v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8Z" stroke="currentColor" strokeLinejoin="round" strokeWidth={stroke} />
-          <path d="M4 10h16" stroke="currentColor" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'puzzle' ? (
-        <path d="M10 4h4v3a1.5 1.5 0 1 0 3 0V4h3v4a2 2 0 0 1-2 2h-3v3a1.5 1.5 0 1 1-3 0v-3H8a2 2 0 0 1-2-2V4h3a1.5 1.5 0 1 0 1 0Z" stroke="currentColor" strokeLinejoin="round" strokeWidth={stroke} />
-      ) : null}
-      {name === 'trash' ? (
-        <>
-          <path d="M5 7h14M9 7V5h6v2M8 10v7M12 10v7M16 10v7M7 7l1 12h8l1-12" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'close' ? <path d="m6 6 12 12M18 6 6 18" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} /> : null}
-      {name === 'sparkles' ? (
-        <>
-          <path d="M6 4 7.4 7.6 11 9l-3.6 1.4L6 14l-1.4-3.6L1 9l3.6-1.4L6 4ZM18 9l1.1 2.9L22 13l-2.9 1.1L18 17l-1.1-2.9L14 13l2.9-1.1L18 9ZM16 2l.7 1.8L18.5 4.5l-1.8.7L16 7l-.7-1.8-1.8-.7 1.8-.7L16 2Z" stroke="currentColor" strokeLinejoin="round" strokeWidth={1.4} />
-        </>
-      ) : null}
-      {name === 'message' ? (
-        <path d="M5 6.5A2.5 2.5 0 0 1 7.5 4H18a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H11l-4.5 4v-4H7.5A2.5 2.5 0 0 1 5 12.5v-6Z" stroke="currentColor" strokeLinejoin="round" strokeWidth={stroke} />
-      ) : null}
-      {name === 'keyboard' ? (
-        <>
-          <rect x="3" y="6" width="18" height="12" rx="2.5" stroke="currentColor" strokeWidth={stroke} />
-          <path d="M6.5 10h.01M10 10h.01M13.5 10h.01M17 10h.01M7 14h10" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'provider' ? (
-        <>
-          <rect x="4" y="5" width="16" height="5" rx="1.5" stroke="currentColor" strokeWidth={stroke} />
-          <rect x="4" y="14" width="16" height="5" rx="1.5" stroke="currentColor" strokeWidth={stroke} />
-          <path d="M8 10v4M16 10v4" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'broadcast' ? (
-        <>
-          <path d="M12 18a6 6 0 0 0 0-12M12 14a2 2 0 0 0 0-4M5 12a9 9 0 0 1 3-6.7M19 12a9 9 0 0 0-3-6.7" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} />
-          <circle cx="12" cy="12" r="1.6" fill="currentColor" />
-        </>
-      ) : null}
-      {name === 'wrench' ? (
-        <path
-          d="M14.5 6.5a4 4 0 0 0 2.8 5.6l-6.9 6.9a2 2 0 1 1-2.8-2.8l6.9-6.9a4 4 0 0 1-5.6-2.8l2.4-2.4 2.6.6.6 2.6 2.4 2.4-.4.4"
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth={stroke}
-        />
-      ) : null}
-      {name === 'qr' ? (
-        <>
-          <rect x="5" y="5" width="5" height="5" rx="1" stroke="currentColor" strokeWidth={stroke} />
-          <rect x="14" y="5" width="5" height="5" rx="1" stroke="currentColor" strokeWidth={stroke} />
-          <rect x="5" y="14" width="5" height="5" rx="1" stroke="currentColor" strokeWidth={stroke} />
-          <rect x="14" y="14" width="3" height="3" rx="0.5" stroke="currentColor" strokeWidth={stroke} />
-          <path d="M17 14v-1M17 19h-1" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} />
-        </>
-      ) : null}
-      {name === 'check' ? (
-        <path d="M5 13 9 17 19 7" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
-      ) : null}
-    </svg>
   )
 }
 

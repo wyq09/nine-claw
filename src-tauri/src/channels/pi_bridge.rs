@@ -14,16 +14,24 @@ pub struct PiBridge {
     #[allow(dead_code)]
     sessions: Mutex<HashMap<String, ()>>,
     provider_id: String,
+    api_format: String,
     base_url: String,
     api_key: String,
     model: String,
 }
 
 impl PiBridge {
-    pub fn new(provider_id: &str, base_url: &str, api_key: &str, model: &str) -> Self {
+    pub fn new(
+        provider_id: &str,
+        api_format: &str,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+    ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             provider_id: provider_id.to_string(),
+            api_format: api_format.to_string(),
             base_url: base_url.to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
@@ -60,22 +68,86 @@ impl PiBridge {
         value.trim().trim_end_matches('/')
     }
 
+    fn normalize_anthropic_base_url(value: &str) -> String {
+        Self::normalize_provider_base_url(value)
+            .trim_end_matches("/v1/messages")
+            .trim_end_matches("/messages")
+            .trim_end_matches("/v1")
+            .trim_end_matches('/')
+            .to_string()
+    }
+
+    fn default_provider_api_format(provider_id: &str) -> &'static str {
+        match provider_id {
+            "anthropic" => "anthropic",
+            _ => "openai",
+        }
+    }
+
+    fn normalize_provider_api_format(value: &str, provider_id: &str) -> &'static str {
+        match value.trim() {
+            "anthropic" => "anthropic",
+            "openai" => "openai",
+            _ => Self::default_provider_api_format(provider_id),
+        }
+    }
+
+    fn normalized_runtime_base_url(&self) -> String {
+        match Self::normalize_provider_api_format(&self.api_format, self.provider_id.trim()) {
+            "anthropic" => Self::normalize_anthropic_base_url(&self.base_url),
+            _ => Self::normalize_provider_base_url(&self.base_url).to_string(),
+        }
+    }
+
+    fn scrub_anthropic_process_env(command: &mut Command) {
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_OAUTH_TOKEN",
+        ] {
+            command.env_remove(key);
+        }
+    }
+
+    fn extract_text_content_from_message(value: Option<&serde_json::Value>) -> Option<String> {
+        let Some(content) = value
+            .and_then(|item| item.get("content"))
+            .and_then(|item| item.as_array())
+        else {
+            return None;
+        };
+
+        let joined = content
+            .iter()
+            .filter_map(|entry| entry.get("text").and_then(|text| text.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
+    }
+
     fn build_provider_models_config(&self) -> Option<serde_json::Value> {
         let provider_id = self.provider_id.trim();
-        let base_url = Self::normalize_provider_base_url(&self.base_url);
+        let base_url = self.normalized_runtime_base_url();
         let model = self.model.trim();
+        let api_format = Self::normalize_provider_api_format(&self.api_format, provider_id);
 
         if provider_id.is_empty() || base_url.is_empty() || model.is_empty() {
             return None;
         }
 
-        match provider_id {
-            "openai" => {
+        match (provider_id, api_format) {
+            ("openai", "openai") => {
                 let Some(default_base_url) = Self::default_provider_base_url(provider_id) else {
                     return None;
                 };
 
-                if base_url == default_base_url {
+                if base_url == Self::normalize_provider_base_url(default_base_url) {
                     return None;
                 }
 
@@ -97,30 +169,26 @@ impl PiBridge {
                         "supportsReasoningEffort": false
                     }),
                 );
-                provider.insert("models".to_string(), json!([{ "id": model }]));
+                provider.insert(
+                    "models".to_string(),
+                    json!([{ "id": model, "api": "openai-completions" }]),
+                );
                 let mut providers = serde_json::Map::new();
                 providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
                 Some(json!({ "providers": providers }))
             }
-            "anthropic" => {
+            ("anthropic", "anthropic") => {
                 let Some(default_base_url) = Self::default_provider_base_url(provider_id) else {
                     return None;
                 };
 
-                if base_url == default_base_url {
+                if base_url == Self::normalize_anthropic_base_url(default_base_url) {
                     return None;
                 }
 
                 let mut provider = serde_json::Map::new();
                 provider.insert("baseUrl".to_string(), json!(base_url));
-                let mut providers = serde_json::Map::new();
-                providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
-                Some(json!({ "providers": providers }))
-            }
-            "deepseek" | "doubao" | "siliconflow" | _ => {
-                let mut provider = serde_json::Map::new();
-                provider.insert("baseUrl".to_string(), json!(base_url));
-                provider.insert("api".to_string(), json!("openai-completions"));
+                provider.insert("api".to_string(), json!("anthropic-messages"));
                 provider.insert(
                     "apiKey".to_string(),
                     json!(if self.api_key.trim().is_empty() {
@@ -130,13 +198,55 @@ impl PiBridge {
                     }),
                 );
                 provider.insert(
-                    "compat".to_string(),
-                    json!({
-                        "supportsDeveloperRole": false,
-                        "supportsReasoningEffort": false
-                    }),
+                    "models".to_string(),
+                    json!([{ "id": model, "api": "anthropic-messages" }]),
                 );
-                provider.insert("models".to_string(), json!([{ "id": model }]));
+                let mut providers = serde_json::Map::new();
+                providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
+                Some(json!({ "providers": providers }))
+            }
+            _ => {
+                let mut provider = serde_json::Map::new();
+                provider.insert("baseUrl".to_string(), json!(base_url));
+                match api_format {
+                    "anthropic" => {
+                        provider.insert("api".to_string(), json!("anthropic-messages"));
+                        provider.insert(
+                            "apiKey".to_string(),
+                            json!(if self.api_key.trim().is_empty() {
+                                "DUMMY_KEY"
+                            } else {
+                                self.api_key.trim()
+                            }),
+                        );
+                        provider.insert(
+                            "models".to_string(),
+                            json!([{ "id": model, "api": "anthropic-messages" }]),
+                        );
+                    }
+                    _ => {
+                        provider.insert("api".to_string(), json!("openai-completions"));
+                        provider.insert(
+                            "apiKey".to_string(),
+                            json!(if self.api_key.trim().is_empty() {
+                                "DUMMY_KEY"
+                            } else {
+                                self.api_key.trim()
+                            }),
+                        );
+                        provider.insert(
+                            "compat".to_string(),
+                            json!({
+                                "supportsDeveloperRole": false,
+                                "supportsReasoningEffort": false
+                            }),
+                        );
+                        provider.insert(
+                            "models".to_string(),
+                            json!([{ "id": model, "api": "openai-completions" }]),
+                        );
+                    }
+                }
                 let mut providers = serde_json::Map::new();
                 providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
                 Some(json!({ "providers": providers }))
@@ -232,6 +342,12 @@ impl PiBridge {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("PI_CODING_AGENT_DIR", &runtime_dir);
+
+        if Self::normalize_provider_api_format(&self.api_format, self.provider_id.trim())
+            == "anthropic"
+        {
+            Self::scrub_anthropic_process_env(&mut cmd);
+        }
 
         if !self.provider_id.is_empty() {
             cmd.args(["--provider", &self.provider_id]);
@@ -332,6 +448,24 @@ impl PiBridge {
                 }
 
                 if delta_type == "done" {
+                    if let Some(final_text) = Self::extract_text_content_from_message(
+                        event.and_then(|v| v.get("message")),
+                    ) {
+                        let missing_text = if full_text.is_empty() {
+                            final_text
+                        } else if let Some(suffix) = final_text.strip_prefix(&full_text) {
+                            suffix.to_string()
+                        } else if final_text != full_text {
+                            final_text
+                        } else {
+                            String::new()
+                        };
+
+                        if !missing_text.is_empty() {
+                            full_text.push_str(&missing_text);
+                            chunk_buffer.push_str(&missing_text);
+                        }
+                    }
                     saw_done = true;
                     break;
                 }
@@ -396,9 +530,21 @@ impl PiBridge {
                 {
                     "pi 已接收消息，但当前微信 Bot 没有关联完整的 Provider 配置，因此没有返回 assistant 回复。请在设置中补全 Base URL、API Key 和模型后重新连接。".to_string()
                 } else {
+                    let provider_label = if self.api_format.trim().is_empty() {
+                        self.provider_id.trim().to_string()
+                    } else {
+                        format!(
+                            "{} ({})",
+                            self.provider_id.trim(),
+                            Self::normalize_provider_api_format(
+                                &self.api_format,
+                                self.provider_id.trim()
+                            )
+                        )
+                    };
                     format!(
                         "pi 已接收消息，但没有返回 assistant 回复（provider={}，model={}）。请检查 Provider 配置或确认当前 pi 版本是否变更了 RPC 输出行为。",
-                        self.provider_id.trim(),
+                        provider_label,
                         self.model.trim()
                     )
                 }
