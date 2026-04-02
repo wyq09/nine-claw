@@ -1,0 +1,218 @@
+[
+  {
+    "pattern": "/v1/chat/completions",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/v1/chat/completions",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/chat/completions",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/chat/completions",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/completion",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/v1/completion",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/generate",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/v1/generate",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/complete",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/v1/complete",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/complete",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/llm",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/llm",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/model",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/model",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/v1/completions",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/v1/chat",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/chat",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/predict",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/predict",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/infer",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/infer",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/v1",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/v1/chat/completions/stream",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/api/stream",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  },
+  {
+    "pattern": "/stream",
+    "get_status": 200,
+    "get_content_type": "text/html",
+    "post_status": 405,
+    "post_content_type": "text/html",
+    "post_body": "<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></cente"
+  }
+]

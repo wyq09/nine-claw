@@ -1,0 +1,356 @@
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::constants;
+use crate::crypto;
+use crate::{auth, fs_util};
+
+// ---------------------------------------------------------------------------
+// Request
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GetMcpConfigRequest {
+    pub bot_id: String,
+    pub time: u64,
+    pub nonce: String,
+    pub signature: String,
+}
+
+impl GetMcpConfigRequest {
+    /// Build a signed request from stored bot credentials
+    pub fn build() -> Result<Self> {
+        let bot = auth::get_bot_info().ok_or_else(|| {
+            anyhow::anyhow!(
+                "未找到企业微信机器人信息，请先运行 `{} init`",
+                env!("CARGO_BIN_NAME")
+            )
+        })?;
+
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let nonce = super::gen_req_id("mcp");
+        let signature = sign(&bot.secret, &bot.id, time, &nonce);
+
+        Ok(Self {
+            bot_id: bot.id,
+            time,
+            nonce,
+            signature,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetMcpConfigResponse {
+    pub errcode: i32,
+    pub errmsg: String,
+    #[serde(default)]
+    pub list: Vec<McpConfigItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConfigItem {
+    pub url: String,
+    #[serde(rename = "type")]
+    pub transport_type: String,
+    pub is_authed: bool,
+    pub biz_type: String,
+}
+
+// ---------------------------------------------------------------------------
+// Signature
+// ---------------------------------------------------------------------------
+
+/// Compute the request signature.
+///
+/// Algorithm: `sha256_hex(secret + bot_id + time + nonce)`
+/// where `sha256_hex` uses the standard zero-padded lowercase hex format (`%02x`).
+pub fn sign(secret: &str, bot_id: &str, time: u64, nonce: &str) -> String {
+    let input = format!("{secret}{bot_id}{time}{nonce}");
+    sha256_hex(&input)
+}
+
+/// Compute the SHA-256 hash of `input` and return it as a lowercase hex string.
+fn sha256_hex(input: &str) -> String {
+    let hash = Sha256::digest(input.as_bytes());
+    let mut result = String::with_capacity(64);
+    for byte in hash.iter() {
+        result.push_str(&format!("{:02x}", byte));
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------------
+
+/// Return the file path for the encrypted MCP config cache.
+fn mcp_config_path() -> std::path::PathBuf {
+    crate::constants::config_dir().join("mcp_config.enc")
+}
+
+/// Read cached MCP config list from the encrypted file.
+pub fn load_mcp_config() -> Option<Vec<McpConfigItem>> {
+    let data = fs::read(mcp_config_path()).ok()?;
+    crypto::try_decrypt_data(&data).ok()
+}
+
+/// Encrypt and persist the MCP config list to disk.
+pub fn save_mcp_config(items: &[McpConfigItem]) -> Result<()> {
+    let key = crypto::load_existing_key().unwrap_or_else(|| {
+        let k = crypto::generate_random_key();
+        tracing::info!("Generated new encryption key for MCP config");
+        k
+    });
+
+    crypto::save_key(&key)?;
+
+    let encrypted = crypto::encrypt_data(items, &key)?;
+    let path = mcp_config_path();
+    fs_util::atomic_write(&path, &encrypted, Some(0o600))?;
+
+    tracing::info!("MCP config saved to {}", path.display());
+    Ok(())
+}
+
+/// Remove the cached MCP config file from disk.
+pub fn clear_mcp_config() {
+    let path = mcp_config_path();
+    if path.exists() {
+        let _ = fs::remove_file(&path);
+        tracing::info!("MCP config cache removed: {}", path.display());
+    }
+}
+
+#[cfg(test)]
+/// Encrypt and write the config list to a specific path with a given key (test helper).
+fn save_mcp_config_to_path(
+    items: &[McpConfigItem],
+    path: &std::path::Path,
+    key: &[u8; 32],
+) -> Result<()> {
+    let encrypted = crypto::encrypt_data(items, key)?;
+    fs_util::atomic_write(path, &encrypted, Some(0o600))
+}
+
+#[cfg(test)]
+/// Read and decrypt the config list from a specific path with a given key (test helper).
+fn load_mcp_config_from_path(path: &std::path::Path, key: &[u8; 32]) -> Option<Vec<McpConfigItem>> {
+    let data = fs::read(path).ok()?;
+    crypto::decrypt_data(&data, key).ok()
+}
+
+// ---------------------------------------------------------------------------
+// API Call
+// ---------------------------------------------------------------------------
+
+/// Return the MCP config list, reading from local cache first; fall back to a network fetch.
+///
+/// On a cache miss the remote result is automatically persisted to disk.
+pub async fn get_mcp_config() -> Result<GetMcpConfigResponse> {
+    if let Some(list) = load_mcp_config() {
+        tracing::debug!("Loaded MCP config from local cache");
+        return Ok(GetMcpConfigResponse {
+            errcode: 0,
+            errmsg: "ok (cached)".into(),
+            list,
+        });
+    }
+
+    fetch_mcp_config().await
+}
+
+/// Always fetch the MCP config from the server, bypassing local cache, and persist the result.
+pub async fn fetch_mcp_config() -> Result<GetMcpConfigResponse> {
+    let resp = fetch_mcp_config_from_server().await?;
+    save_mcp_config(&resp.list)?;
+    Ok(resp)
+}
+
+/// Send the actual HTTP request to the MCP config endpoint.
+async fn fetch_mcp_config_from_server() -> Result<GetMcpConfigResponse> {
+    let request = GetMcpConfigRequest::build()?;
+
+    let response = reqwest::Client::builder()
+        .build()?
+        .post(&constants::mcp_config_endpoint())
+        .json(&request)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let mut body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<Failed to read response body>".to_string());
+        if body.is_empty() {
+            body = "<Empty response body>".to_string();
+        }
+        anyhow::bail!("get_mcp_config failed with status {status}: {body}");
+    }
+
+    let resp = response.json::<GetMcpConfigResponse>().await?;
+
+    if resp.errcode != 0 {
+        anyhow::bail!("获取 MCP 配置失败：[{}] {}", resp.errcode, resp.errmsg);
+    }
+
+    Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto;
+
+    fn sample_items() -> Vec<McpConfigItem> {
+        vec![
+            McpConfigItem {
+                url: "https://example.com/mcp/contact".into(),
+                transport_type: "streamable-http".into(),
+                is_authed: true,
+                biz_type: "contact".into(),
+            },
+            McpConfigItem {
+                url: "https://example.com/mcp/msg".into(),
+                transport_type: "streamable-http".into(),
+                is_authed: false,
+                biz_type: "msg".into(),
+            },
+        ]
+    }
+
+    // -----------------------------------------------------------------------
+    // Signature tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sha256_hex_matches_cpp_format() {
+        let result = sha256_hex("test");
+        // {:02x} format: standard lowercase hex, two digits per byte, zero-padded
+        assert_eq!(
+            result,
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
+    }
+
+    #[test]
+    fn sign_produces_non_empty_signature() {
+        let sig = sign("my_secret", "bot_123", 1774772074, "abc123");
+        assert!(!sig.is_empty());
+    }
+
+    #[test]
+    fn sign_is_deterministic() {
+        let a = sign("sec", "id", 100, "nonce");
+        let b = sign("sec", "id", 100, "nonce");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn sign_changes_with_different_inputs() {
+        let a = sign("sec", "id", 100, "nonce1");
+        let b = sign("sec", "id", 100, "nonce2");
+        assert_ne!(a, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistence tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_config.enc");
+        let key = crypto::generate_random_key();
+        let items = sample_items();
+
+        save_mcp_config_to_path(&items, &path, &key).unwrap();
+
+        let loaded = load_mcp_config_from_path(&path, &key).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].biz_type, "contact");
+        assert_eq!(loaded[0].url, "https://example.com/mcp/contact");
+        assert_eq!(loaded[1].biz_type, "msg");
+        assert!(!loaded[1].is_authed);
+    }
+
+    #[test]
+    fn load_returns_none_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.enc");
+        let key = crypto::generate_random_key();
+
+        assert!(load_mcp_config_from_path(&path, &key).is_none());
+    }
+
+    #[test]
+    fn load_returns_none_with_wrong_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_config.enc");
+        let key = crypto::generate_random_key();
+        let wrong_key = crypto::generate_random_key();
+        let items = sample_items();
+
+        save_mcp_config_to_path(&items, &path, &key).unwrap();
+
+        assert!(load_mcp_config_from_path(&path, &wrong_key).is_none());
+    }
+
+    #[test]
+    fn load_returns_none_with_corrupted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_config.enc");
+        let key = crypto::generate_random_key();
+
+        std::fs::write(&path, b"garbage data").unwrap();
+
+        assert!(load_mcp_config_from_path(&path, &key).is_none());
+    }
+
+    #[test]
+    fn save_overwrites_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_config.enc");
+        let key = crypto::generate_random_key();
+
+        let items_v1 = vec![McpConfigItem {
+            url: "https://v1.example.com".into(),
+            transport_type: "streamable-http".into(),
+            is_authed: true,
+            biz_type: "v1".into(),
+        }];
+        save_mcp_config_to_path(&items_v1, &path, &key).unwrap();
+
+        let items_v2 = sample_items();
+        save_mcp_config_to_path(&items_v2, &path, &key).unwrap();
+
+        let loaded = load_mcp_config_from_path(&path, &key).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].biz_type, "contact");
+    }
+
+    #[test]
+    fn save_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp_config.enc");
+        let key = crypto::generate_random_key();
+
+        save_mcp_config_to_path(&[], &path, &key).unwrap();
+
+        let loaded = load_mcp_config_from_path(&path, &key).unwrap();
+        assert!(loaded.is_empty());
+    }
+}

@@ -1,0 +1,11 @@
+{
+  "tasks": [
+    {
+      "id": "9560c00d",
+      "cron": "17 9 */3 * *",
+      "prompt": "运行 `export PATH=\"$HOME/bin:$PATH\" && lark-cli auth status` 刷新飞书 token 保活。只需执行命令，不需要额外操作。",
+      "createdAt": 1774693056705,
+      "recurring": true
+    }
+  ]
+}

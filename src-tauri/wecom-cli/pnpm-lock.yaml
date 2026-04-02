@@ -1,0 +1,17 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {}
+
+  packages/darwin-arm64: {}
+
+  packages/darwin-x64: {}
+
+  packages/linux-x64: {}
+
+  packages/win32-x64: {}

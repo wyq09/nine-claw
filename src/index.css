@@ -1,0 +1,62 @@
+@import 'tailwindcss';
+@source '../node_modules/streamdown/dist/*.js';
+
+/* Streamdown 使用 shadcn/Tailwind 语义色；未配置时 border / sidebar 等工具类不生效 */
+@theme inline {
+  --color-border: #dbe1ec;
+  --color-sidebar: #f5f7fb;
+  --color-sidebar-border: #dbe1ec;
+}
+
+:root {
+  font-family:
+    'SF Pro Display',
+    'SF Pro Text',
+    'PingFang SC',
+    'Hiragino Sans GB',
+    'Microsoft YaHei',
+    sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #171c28;
+  background: #ffffff;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --background: #ffffff;
+  --foreground: #171c28;
+  --card: #ffffff;
+  --card-foreground: #171c28;
+  --muted: #f5f7fb;
+  --muted-foreground: #6f7b91;
+  --border: #dbe1ec;
+  --sidebar: #f5f7fb;
+  --sidebar-border: #dbe1ec;
+  --input: #dbe1ec;
+  --primary: #171c28;
+  --primary-foreground: #ffffff;
+  --radius: 0.875rem;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: #ffffff;
+}
+
+#root {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+a {
+  color: inherit;
+}

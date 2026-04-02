@@ -1,0 +1,235 @@
+import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+import type {
+  AgentInput,
+  AgentRecord,
+  AgentWorkspaceBundle,
+  ConversationAgentSnapshot,
+  InstalledSkillItem,
+  PiStreamPayload,
+  ProviderRuntimeConfig,
+  SystemSkillCatalog,
+} from '../types'
+
+export type PiStreamUnsubscribe = () => void
+
+export async function streamPiPrompt(
+  prompt: string,
+  options?: {
+    sessionId?: string | null
+    providerConfig?: ProviderRuntimeConfig | null
+    agentConfig?: ConversationAgentSnapshot | null
+  },
+): Promise<void> {
+  await invoke('stream_pi_prompt', {
+    prompt,
+    sessionId: options?.sessionId ?? null,
+    providerConfig: options?.providerConfig ?? null,
+    agentConfig: options?.agentConfig ?? null,
+  })
+}
+
+export async function abortPiStream(sessionId?: string | null): Promise<void> {
+  await invoke('abort_pi_stream', { sessionId: sessionId ?? null })
+}
+
+export async function clearPiSession(): Promise<void> {
+  await invoke('clear_pi_session')
+}
+
+export async function clearPiSessionForId(sessionId: string): Promise<void> {
+  await invoke('clear_pi_session_for_id', { sessionId })
+}
+
+export async function testLlmProviderConnection(payload: {
+  baseUrl: string
+  apiKey: string
+  model: string
+}): Promise<string> {
+  return invoke<string>('test_llm_provider_connection', {
+    baseUrl: payload.baseUrl,
+    apiKey: payload.apiKey,
+    model: payload.model,
+  })
+}
+
+export async function loadHistoryState(): Promise<string | null> {
+  return invoke<string | null>('load_history_state')
+}
+
+export async function saveHistoryState(payload: string): Promise<void> {
+  await invoke('save_history_state', { payload })
+}
+
+export async function clearHistoryState(): Promise<void> {
+  await invoke('clear_history_state')
+}
+
+export async function listInstalledSkills(): Promise<InstalledSkillItem[]> {
+  return invoke<InstalledSkillItem[]>('list_installed_skills')
+}
+
+export async function listSystemSkillCatalog(): Promise<SystemSkillCatalog> {
+  return invoke<SystemSkillCatalog>('list_system_skill_catalog')
+}
+
+export async function installSystemSkill(skillId: string): Promise<InstalledSkillItem> {
+  return invoke<InstalledSkillItem>('install_system_skill', { skillId })
+}
+
+export async function listAgents(): Promise<AgentRecord[]> {
+  return invoke<AgentRecord[]>('list_agents')
+}
+
+export async function getDefaultAgent(): Promise<AgentRecord | null> {
+  return invoke<AgentRecord | null>('get_default_agent')
+}
+
+export async function createAgent(payload: AgentInput): Promise<AgentRecord> {
+  return invoke<AgentRecord>('create_agent', { payload })
+}
+
+export async function updateAgent(agentId: string, payload: AgentInput): Promise<AgentRecord> {
+  return invoke<AgentRecord>('update_agent', { agentId, payload })
+}
+
+export async function archiveAgent(agentId: string): Promise<void> {
+  await invoke('archive_agent', { agentId })
+}
+
+export async function setDefaultAgent(agentId: string): Promise<AgentRecord | null> {
+  return invoke<AgentRecord | null>('set_default_agent', { agentId })
+}
+
+export async function readAgentWorkspaceBundle(agentId: string): Promise<AgentWorkspaceBundle> {
+  return invoke<AgentWorkspaceBundle>('read_agent_workspace_bundle', { agentId })
+}
+
+export async function writeAgentWorkspaceFile(payload: {
+  agentId: string
+  relativePath: string
+  content: string
+}): Promise<AgentWorkspaceBundle> {
+  return invoke<AgentWorkspaceBundle>('write_agent_workspace_file', payload)
+}
+
+export async function subscribePiStream(
+  onMessage: (payload: PiStreamPayload) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<PiStreamPayload>('pi://stream', (event) => {
+    onMessage(event.payload)
+  })
+}
+
+// ── Bot Channel Commands ──
+
+export type QrCodeEvent = {
+  channelId: string
+  qrcodeUrl?: string
+  status: 'waiting' | 'scanned' | 'confirmed' | 'refreshed'
+}
+
+export type WechatLoginResult = {
+  connected: boolean
+  bot_token?: string
+  account_id?: string
+  base_url?: string
+  user_id?: string
+  message: string
+}
+
+export type BotStatus = 'Disconnected' | 'Connecting' | 'Connected' | 'Error'
+
+export async function botLoginWechat(): Promise<WechatLoginResult> {
+  return invoke<WechatLoginResult>('bot_login_wechat')
+}
+
+export async function botStartWechat(
+  token: string,
+  options?: {
+    baseUrl?: string
+    routeTag?: string
+    providerId?: string
+    model?: string
+    apiKey?: string
+    providerBaseUrl?: string
+  },
+): Promise<void> {
+  await invoke('bot_start_wechat', {
+    token,
+    baseUrl: options?.baseUrl ?? null,
+    routeTag: options?.routeTag ?? null,
+    providerId: options?.providerId ?? null,
+    model: options?.model ?? null,
+    apiKey: options?.apiKey ?? null,
+    providerBaseUrl: options?.providerBaseUrl ?? null,
+  })
+}
+
+export async function botStopWechat(): Promise<void> {
+  await invoke('bot_stop_wechat')
+}
+
+export async function botGetStatus(channelId: string): Promise<string> {
+  return invoke<string>('bot_get_status', { channelId })
+}
+
+export async function botSendMessage(channelId: string, userId: string, content: string): Promise<void> {
+  await invoke('bot_send_message', { channelId, userId, content })
+}
+
+export async function subscribeQrCode(
+  onEvent: (payload: QrCodeEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<QrCodeEvent>('bot://qr-code', (event) => {
+    onEvent(event.payload)
+  })
+}
+
+// ── Bot Message Events (history integration) ──
+
+export type BotMessageEvent = {
+  channel_id: string
+  user_id: string
+  direction: string
+  content: string
+  timestamp: number
+}
+
+export async function subscribeBotMessage(
+  onMessage: (payload: BotMessageEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<BotMessageEvent>('bot://message', (event) => {
+    onMessage(event.payload)
+  })
+}
+
+export type BotStatusEvent = {
+  channelId: string
+  userId: string
+  level: 'processing' | 'done' | 'warn' | 'error'
+  message: string
+  timestamp: number
+}
+
+export async function subscribeBotStatus(
+  onEvent: (payload: BotStatusEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<BotStatusEvent>('bot://status', (event) => {
+    onEvent(event.payload)
+  })
+}
+
+export async function botSendMedia(
+  channelId: string,
+  userId: string,
+  mediaType: 'image' | 'file' | 'video',
+  filePath: string,
+): Promise<void> {
+  await invoke('bot_send_media', {
+    channelId,
+    userId,
+    mediaType,
+    filePath,
+  })
+}

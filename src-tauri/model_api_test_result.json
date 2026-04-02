@@ -1,0 +1,9 @@
+{
+  "api_url": "https://chenyu.pro/api/v1/llm",
+  "model": "Jackrong/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-v2",
+  "status": "http_error_404",
+  "response_time": 0.12444114685058594,
+  "error": "HTTP 404: {\"code\":404,\"message\":\"Not found\"}",
+  "raw_response": "{\"code\":404,\"message\":\"Not found\"}",
+  "test_message": "你好，请简单介绍一下自己。如果看到这条消息，请回复'API测试成功！我能正常运行。'"
+}
