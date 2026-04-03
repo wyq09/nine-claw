@@ -376,6 +376,11 @@ fn archive_agent(app: tauri::AppHandle, agent_id: String) -> Result<(), String> 
 }
 
 #[tauri::command]
+fn delete_agent(app: tauri::AppHandle, agent_id: String) -> Result<(), String> {
+    agents::delete_agent(&app, agent_id)
+}
+
+#[tauri::command]
 fn set_default_agent(
     app: tauri::AppHandle,
     agent_id: String,
@@ -1689,12 +1694,13 @@ async fn ensure_runtime_dependencies() -> Result<RuntimeDependencyStatus, String
 #[tauri::command]
 async fn bot_login_wechat(
     app: AppHandle,
+    channel_id: String,
 ) -> Result<channels::wechat::types::WechatLoginResult, String> {
     let app_clone = app.clone();
     // login_with_qr uses block_on_async (dedicated runtime) internally,
     // so we must run it on a blocking-capable thread.
     let handle = tauri::async_runtime::spawn_blocking(move || {
-        let channel = WeChatChannel::new("", "", None);
+        let channel = WeChatChannel::new(&channel_id, "", "", None);
         channel.login_with_qr(&app_clone)
     });
     handle.await.map_err(|e| format!("登录任务执行失败: {e}"))?
@@ -1703,6 +1709,8 @@ async fn bot_login_wechat(
 #[tauri::command]
 async fn bot_start_wechat(
     app: AppHandle,
+    channel_id: String,
+    agent_id: String,
     token: String,
     base_url: Option<String>,
     route_tag: Option<String>,
@@ -1712,12 +1720,45 @@ async fn bot_start_wechat(
     api_key: Option<String>,
     provider_base_url: Option<String>,
 ) -> Result<(), String> {
+    start_wechat_channel(
+        app,
+        channel_id,
+        agent_id,
+        token,
+        base_url,
+        route_tag,
+        provider_id,
+        provider_api_format,
+        model,
+        api_key,
+        provider_base_url,
+    )
+}
+
+fn start_wechat_channel(
+    app: AppHandle,
+    channel_id: String,
+    agent_id: String,
+    token: String,
+    base_url: Option<String>,
+    route_tag: Option<String>,
+    provider_id: Option<String>,
+    provider_api_format: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    provider_base_url: Option<String>,
+) -> Result<(), String> {
+    let agent_config = agents::get_conversation_agent_config(&app, &agent_id)?
+        .ok_or_else(|| "绑定的智能体不存在，无法启动 IM 机器人".to_string())?;
+
     let mut mgr = channel_manager()
         .lock()
         .map_err(|e| format!("锁失败: {e}"))?;
 
     // Register WeChat channel via factory
     mgr.register_channel(ChannelConfig::WeChat {
+        channel_id: channel_id.clone(),
+        agent_config: Some(agent_config),
         token,
         base_url: base_url.unwrap_or_default(),
         route_tag,
@@ -1727,17 +1768,85 @@ async fn bot_start_wechat(
         ai_api_key: api_key.unwrap_or_default(),
         ai_model: model.unwrap_or_default(),
     })?;
-    mgr.start_channel("wechat", app)?;
+    mgr.start_channel(&channel_id, app)?;
 
     Ok(())
 }
 
 #[tauri::command]
-async fn bot_stop_wechat() -> Result<(), String> {
+async fn bot_stop_wechat(channel_id: String) -> Result<(), String> {
     let mut mgr = channel_manager()
         .lock()
         .map_err(|e| format!("锁失败: {e}"))?;
-    mgr.stop_channel("wechat")
+    mgr.stop_channel(&channel_id)
+}
+
+fn auto_start_bound_im_services(app: &AppHandle) -> Result<(), String> {
+    let agent_records = agents::list_agents(app)?;
+
+    for agent in agent_records {
+        let Some(config) = agent.bot_configs.get("wechat") else {
+            continue;
+        };
+
+        if !config.enabled {
+            continue;
+        }
+
+        let Some(token) = config.token.as_ref().filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+
+        let provider_id = config
+            .ai_provider_id
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| agent.default_provider_id.clone());
+        let model = config
+            .ai_model
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| agent.default_model.clone());
+        let provider_api_format = config
+            .ai_api_format
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .or_else(|| Some(default_provider_api_format(&provider_id).to_string()));
+        let provider_base_url = config.ai_base_url.clone();
+        let api_key = config.ai_api_key.clone();
+        let base_url = config
+            .base_url
+            .clone()
+            .or_else(|| Some(config.client_secret.clone()).filter(|value| !value.trim().is_empty()));
+
+        if provider_id.trim().is_empty() || model.trim().is_empty() {
+            log::warn!("跳过自动启动微信机器人: 智能体 {} 缺少模型配置", agent.id);
+            continue;
+        }
+
+        if let Err(error) = start_wechat_channel(
+            app.clone(),
+            format!("wechat:{}", agent.id),
+            agent.id.clone(),
+            token.clone(),
+            base_url,
+            config.route_tag.clone(),
+            Some(provider_id),
+            provider_api_format,
+            Some(model),
+            api_key,
+            provider_base_url,
+        ) {
+            log::warn!("自动启动智能体 {} 的微信机器人失败: {}", agent.id, error);
+        } else {
+            log::info!("已自动启动智能体 {} 的微信机器人", agent.id);
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -1909,6 +2018,9 @@ pub fn run() {
             if !status.pi_available {
                 log::warn!("runtime dependency check: {}", status.messages.join(" | "));
             }
+            if let Err(error) = auto_start_bound_im_services(&app.handle()) {
+                log::warn!("应用启动时自动检测 IM 机器人绑定失败: {}", error);
+            }
 
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -1931,6 +2043,7 @@ pub fn run() {
             create_agent,
             update_agent,
             archive_agent,
+            delete_agent,
             set_default_agent,
             read_agent_workspace_bundle,
             write_agent_workspace_file,

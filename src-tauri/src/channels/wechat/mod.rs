@@ -1,6 +1,8 @@
 pub mod api;
 pub mod types;
 
+use crate::agents::ConversationAgentConfig;
+use crate::agent_workspace;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -55,6 +57,7 @@ struct WorkItem {
 /// (AI via pi subprocess), and reply delivery (sendMessage with
 /// context_token + all required iLink ghost fields).
 pub struct WeChatChannel {
+    channel_id: String,
     token: String,
     base_url: String,
     route_tag: Option<String>,
@@ -69,16 +72,18 @@ pub struct WeChatChannel {
     ai_base_url: String,
     ai_api_key: String,
     ai_model: String,
+    agent_config: Option<ConversationAgentConfig>,
 }
 
 impl WeChatChannel {
-    pub fn new(token: &str, base_url: &str, route_tag: Option<&str>) -> Self {
+    pub fn new(channel_id: &str, token: &str, base_url: &str, route_tag: Option<&str>) -> Self {
         let url = if base_url.is_empty() {
             "https://ilinkai.weixin.qq.com".to_string()
         } else {
             base_url.to_string()
         };
         Self {
+            channel_id: channel_id.to_string(),
             token: token.to_string(),
             base_url: url,
             route_tag: route_tag.map(|s| s.to_string()),
@@ -91,6 +96,7 @@ impl WeChatChannel {
             ai_base_url: String::new(),
             ai_api_key: String::new(),
             ai_model: String::new(),
+            agent_config: None,
         }
     }
 
@@ -102,17 +108,20 @@ impl WeChatChannel {
         base_url: &str,
         api_key: &str,
         model: &str,
+        agent_config: Option<ConversationAgentConfig>,
     ) {
         self.ai_provider_id = provider_id.to_string();
         self.ai_api_format = api_format.to_string();
         self.ai_base_url = base_url.to_string();
         self.ai_api_key = api_key.to_string();
         self.ai_model = model.to_string();
+        self.agent_config = agent_config;
     }
 
     /// QR code login: fetch QR and poll until confirmed.
     pub fn login_with_qr(&self, app: &AppHandle) -> Result<WechatLoginResult, String> {
         let base_url = self.base_url.clone();
+        let channel_id = self.channel_id.clone();
 
         let qr_resp = block_on_async(WeChatApi::get_bot_qrcode(&base_url, DEFAULT_BOT_TYPE))?;
         let qrcode = qr_resp
@@ -128,7 +137,7 @@ impl WeChatChannel {
         let _ = app.emit(
             "bot://qr-code",
             serde_json::json!({
-                "channelId": "wechat", "qrcodeUrl": &qr_data_uri, "status": "waiting"
+                "channelId": &channel_id, "qrcodeUrl": &qr_data_uri, "status": "waiting"
             }),
         );
 
@@ -143,7 +152,7 @@ impl WeChatChannel {
                         let _ = app.emit(
                             "bot://qr-code",
                             serde_json::json!({
-                                "channelId": "wechat", "status": "scanned"
+                                "channelId": &channel_id, "status": "scanned"
                             }),
                         );
                     }
@@ -163,7 +172,7 @@ impl WeChatChannel {
                         let _ = app.emit(
                             "bot://qr-code",
                             serde_json::json!({
-                                "channelId": "wechat", "qrcodeUrl": &nd, "status": "refreshed"
+                                "channelId": &channel_id, "qrcodeUrl": &nd, "status": "refreshed"
                             }),
                         );
                     }
@@ -179,7 +188,7 @@ impl WeChatChannel {
                         let _ = app.emit(
                             "bot://qr-code",
                             serde_json::json!({
-                                "channelId": "wechat", "status": "confirmed"
+                                "channelId": &channel_id, "status": "confirmed"
                             }),
                         );
                         return Ok(WechatLoginResult {
@@ -234,6 +243,7 @@ impl Channel for WeChatChannel {
             let status = self.status.clone();
             let context_tokens = self.context_tokens.clone();
             let app_handle = app.clone();
+            let channel_id = self.channel_id.clone();
 
             thread::spawn(move || {
                 let rt = match tokio::runtime::Runtime::new() {
@@ -290,7 +300,7 @@ impl Channel for WeChatChannel {
                                     );
 
                                     // Emit inbound event to frontend (history integration)
-                                    emit_bot_message(&app_handle, &from_user, "inbound", &text);
+                                    emit_bot_message(&app_handle, &channel_id, &from_user, "inbound", &text);
 
                                     let ct = msg.context_token.clone().unwrap_or_default();
                                     if work_tx
@@ -337,7 +347,9 @@ impl Channel for WeChatChannel {
             let ai_base = self.ai_base_url.clone();
             let ai_key = self.ai_api_key.clone();
             let ai_mdl = self.ai_model.clone();
+            let agent_config = self.agent_config.clone();
             let app_handle = app.clone();
+            let channel_id = self.channel_id.clone();
 
             thread::spawn(move || {
                 let rt = match tokio::runtime::Runtime::new() {
@@ -349,7 +361,7 @@ impl Channel for WeChatChannel {
                     }
                 };
                 let api = WeChatApi::new(&base_url, &token, route_tag.as_deref());
-                let bridge = PiBridge::new(&ai_pid, &ai_fmt, &ai_base, &ai_key, &ai_mdl);
+                let bridge = PiBridge::new(&ai_pid, &ai_fmt, &ai_base, &ai_key, &ai_mdl, agent_config.clone());
 
                 while running.load(Ordering::SeqCst) {
                     let item = match work_rx.recv_timeout(Duration::from_secs(1)) {
@@ -365,6 +377,7 @@ impl Channel for WeChatChannel {
                     );
                     emit_bot_status(
                         &app_handle,
+                        &channel_id,
                         &item.user_id,
                         "processing",
                         &format!("正在处理: {}", truncate_chars(&item.text, 30)),
@@ -395,13 +408,13 @@ impl Channel for WeChatChannel {
                     let app_for_cb = app_handle.clone();
 
                     let result = bridge.process_message(
-                        "wechat",
+                        &channel_id,
                         &item.user_id,
                         &item.text,
                         STREAM_CHUNK_SIZE,
                         |chunk: &str| {
                             // Emit streaming chunk to frontend for live display
-                            emit_bot_message(&app_for_cb, user_id_ref, "outbound_chunk", chunk);
+                            emit_bot_message(&app_for_cb, &channel_id, user_id_ref, "outbound_chunk", chunk);
                         },
                     );
 
@@ -411,11 +424,12 @@ impl Channel for WeChatChannel {
                                 log::warn!("pi 返回空回复");
                                 emit_bot_status(
                                     &app_handle,
+                                    &channel_id,
                                     &item.user_id,
                                     "warn",
                                     "pi 返回了空回复，请检查 provider 配置",
                                 );
-                                emit_bot_message(&app_handle, &item.user_id, "outbound_done", "");
+                                emit_bot_message(&app_handle, &channel_id, &item.user_id, "outbound_done", "");
                                 continue;
                             }
                             log::info!(
@@ -425,15 +439,25 @@ impl Channel for WeChatChannel {
                             );
                             emit_bot_status(
                                 &app_handle,
+                                &channel_id,
                                 &item.user_id,
                                 "done",
                                 &format!("回复 {} 字符完成", full_text.len()),
                             );
+                            if let Some(agent_id) = agent_config.as_ref().map(|config| config.id.as_str()) {
+                                let _ = agent_workspace::append_agent_memory_entry(
+                                    agent_id,
+                                    &item.user_id,
+                                    &item.text,
+                                    &full_text,
+                                );
+                            }
                             // Send complete reply to WeChat (split into ≤3900-char chunks)
                             send_reply_chunks(&rt, &api, &item.user_id, &full_text, ct_opt);
                             // Emit completion to frontend
                             emit_bot_message(
                                 &app_handle,
+                                &channel_id,
                                 &item.user_id,
                                 "outbound_done",
                                 &full_text,
@@ -443,13 +467,14 @@ impl Channel for WeChatChannel {
                             log::error!("pi 处理失败: {e}");
                             emit_bot_status(
                                 &app_handle,
+                                &channel_id,
                                 &item.user_id,
                                 "error",
                                 &format!("pi 失败: {e}"),
                             );
                             let error_msg = format!("[处理失败: {e}]");
                             send_reply_chunks(&rt, &api, &item.user_id, &error_msg, ct_opt);
-                            emit_bot_message(&app_handle, &item.user_id, "error", &error_msg);
+                            emit_bot_message(&app_handle, &channel_id, &item.user_id, "error", &error_msg);
                         }
                     }
                 }
@@ -566,11 +591,11 @@ fn send_reply_chunks(
 }
 
 /// Emit a `bot://status` event to the frontend for diagnostic display.
-fn emit_bot_status(app: &AppHandle, user_id: &str, level: &str, message: &str) {
+fn emit_bot_status(app: &AppHandle, channel_id: &str, user_id: &str, level: &str, message: &str) {
     let _ = app.emit(
         "bot://status",
         serde_json::json!({
-            "channelId": "wechat",
+            "channelId": channel_id,
             "userId": user_id,
             "level": level,   // "processing" | "done" | "warn" | "error"
             "message": message,
@@ -580,9 +605,9 @@ fn emit_bot_status(app: &AppHandle, user_id: &str, level: &str, message: &str) {
 }
 
 /// Emit a `bot://message` event to the frontend for history tracking.
-fn emit_bot_message(app: &AppHandle, user_id: &str, direction: &str, content: &str) {
+fn emit_bot_message(app: &AppHandle, channel_id: &str, user_id: &str, direction: &str, content: &str) {
     let payload = BotMessage {
-        channel_id: "wechat".to_string(),
+        channel_id: channel_id.to_string(),
         user_id: user_id.to_string(),
         direction: direction.to_string(),
         content: content.to_string(),

@@ -202,6 +202,7 @@ export type AgentRecord = {
   executionMode: AgentExecutionMode
   collaborationConfig?: AgentCollaborationConfig
   accentColor?: string
+  botConfigs: AgentBotBindings
   createdAt: number
   updatedAt: number
 }
@@ -217,6 +218,7 @@ export type AgentInput = {
   executionMode: AgentExecutionMode
   collaborationConfig?: AgentCollaborationConfig
   accentColor?: string
+  botConfigs: AgentBotBindings
 }
 
 export type AgentBuilderDraft = {
@@ -230,6 +232,7 @@ export type AgentBuilderDraft = {
   executionMode: AgentExecutionMode
   collaborationConfig?: AgentCollaborationConfig
   accentColor?: string
+  botConfigs?: AgentBotBindings
   workspaceNotes?: string
 }
 
@@ -285,9 +288,16 @@ export type BotConfig = {
   baseUrl?: string
   /** iLink route tag */
   routeTag?: string
+  aiProviderId?: ProviderId
+  aiApiFormat?: ProviderApiFormat
+  aiBaseUrl?: string
+  aiApiKey?: string
+  aiModel?: string
   /** Error message when status === '错误' */
   errorMessage?: string
 }
+
+export type AgentBotBindings = Record<string, BotConfig>
 
 export type CustomProviderMeta = {
   id: string

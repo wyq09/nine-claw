@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -185,6 +186,18 @@ pub fn sync_agent_registry(entries: &[AgentWorkspaceSeed<'_>]) -> Result<(), Str
     Ok(())
 }
 
+pub fn delete_agent_workspace(agent_id: &str) -> Result<(), String> {
+    let root = resolve_workspace_root()?;
+    let agent_home = root.join("agents").join(agent_id);
+    if !agent_home.exists() {
+        return Ok(());
+    }
+
+    fs::remove_dir_all(&agent_home)
+        .map_err(|error| format!("删除智能体工作区失败: {error}"))?;
+    Ok(())
+}
+
 pub fn build_workspace_system_prompt(agent_id: &str) -> Result<String, String> {
     let root = resolve_workspace_root()?;
     let agent_home = root.join("agents").join(agent_id);
@@ -283,6 +296,60 @@ pub fn write_agent_workspace_file(
     fs::write(&target, content).map_err(|error| format!("写入 workspace 文件失败: {error}"))?;
 
     read_agent_workspace_bundle(agent_id)
+}
+
+pub fn append_agent_memory_entry(
+    agent_id: &str,
+    user_id: &str,
+    user_message: &str,
+    assistant_message: &str,
+) -> Result<(), String> {
+    let root = resolve_workspace_root()?;
+    ensure_root_scaffold(&root)?;
+
+    let agent_home = root.join("agents").join(agent_id);
+    fs::create_dir_all(agent_home.join("memory"))
+        .map_err(|error| format!("创建 agent memory 目录失败: {error}"))?;
+
+    let timestamp = current_timestamp_label();
+    let summary = summarize_memory_entry(user_message, assistant_message);
+
+    let working_path = agent_home.join("WORKING.md");
+    let working_existing = fs::read_to_string(&working_path)
+        .unwrap_or_else(|_| fallback_template("WORKING.md").to_string());
+    fs::write(
+        &working_path,
+        upsert_working_memory(&working_existing, user_id, &timestamp, &summary),
+    )
+    .map_err(|error| format!("写入 WORKING.md 失败: {error}"))?;
+
+    let memory_path = agent_home.join("MEMORY.md");
+    let memory_existing = fs::read_to_string(&memory_path)
+        .unwrap_or_else(|_| fallback_template("MEMORY.md").to_string());
+    fs::write(
+        &memory_path,
+        append_memory_summary(&memory_existing, user_id, &timestamp, &summary),
+    )
+    .map_err(|error| format!("写入 MEMORY.md 失败: {error}"))?;
+
+    let daily_log_path = agent_home
+        .join("memory")
+        .join(format!("{}.md", current_date_label()));
+    let daily_log_existing = fs::read_to_string(&daily_log_path)
+        .unwrap_or_else(|_| format!("# {}\n\n", current_date_label()));
+    fs::write(
+        &daily_log_path,
+        append_daily_log_entry(
+            &daily_log_existing,
+            user_id,
+            &timestamp,
+            user_message,
+            assistant_message,
+        ),
+    )
+    .map_err(|error| format!("写入 daily log 失败: {error}"))?;
+
+    Ok(())
 }
 
 fn ensure_root_scaffold(root: &Path) -> Result<(), String> {
@@ -540,6 +607,96 @@ fn apply_placeholders(mut template: String, seed: AgentWorkspaceSeed<'_>) -> Str
     }
 
     template
+}
+
+fn current_date_label() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    format_timestamp(seconds, "%Y-%m-%d")
+}
+
+fn current_timestamp_label() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    format_timestamp(seconds, "%Y-%m-%d %H:%M:%S")
+}
+
+fn format_timestamp(timestamp_secs: i64, pattern: &str) -> String {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_opt(timestamp_secs, 0)
+        .single()
+        .map(|value| value.format(pattern).to_string())
+        .unwrap_or_else(|| "1970-01-01 00:00:00".to_string())
+}
+
+fn summarize_memory_entry(user_message: &str, assistant_message: &str) -> String {
+    let user_compact = user_message.replace('\n', " ").trim().to_string();
+    let assistant_compact = assistant_message.replace('\n', " ").trim().to_string();
+    let user_summary = truncate_for_memory(&user_compact, 80);
+    let assistant_summary = truncate_for_memory(&assistant_compact, 100);
+    format!("用户提到：{}；智能体回复：{}", user_summary, assistant_summary)
+}
+
+fn truncate_for_memory(value: &str, limit: usize) -> String {
+    let mut truncated = String::new();
+    for char in value.chars().take(limit) {
+        truncated.push(char);
+    }
+    if value.chars().count() > limit {
+        truncated.push('…');
+    }
+    truncated
+}
+
+fn upsert_working_memory(existing: &str, user_id: &str, timestamp: &str, summary: &str) -> String {
+    let marker = "## IM Latest Context";
+    let replacement = format!(
+        "{marker}\n\n- Last user: `{}`\n- Updated at: {}\n- Summary: {}\n",
+        user_id, timestamp, summary
+    );
+
+    if let Some(index) = existing.find(marker) {
+        let prefix = existing[..index].trim_end();
+        format!("{prefix}\n\n{replacement}\n")
+    } else {
+        let base = existing.trim_end();
+        format!("{base}\n\n{replacement}\n")
+    }
+}
+
+fn append_memory_summary(existing: &str, user_id: &str, timestamp: &str, summary: &str) -> String {
+    let mut next = existing.trim_end().to_string();
+    if !next.contains("## IM Persistent Memory") {
+        next.push_str("\n\n## IM Persistent Memory\n");
+    }
+    let _ = writeln!(next, "- {} | `{}` | {}", timestamp, user_id, summary);
+    next.push('\n');
+    next
+}
+
+fn append_daily_log_entry(
+    existing: &str,
+    user_id: &str,
+    timestamp: &str,
+    user_message: &str,
+    assistant_message: &str,
+) -> String {
+    let mut next = existing.trim_end().to_string();
+    if !next.ends_with('\n') {
+        next.push('\n');
+    }
+    let _ = writeln!(next, "\n## {} · {}", timestamp, user_id);
+    let _ = writeln!(next, "\n### User\n\n{}", user_message.trim());
+    let _ = writeln!(next, "\n### Agent\n\n{}", assistant_message.trim());
+    next.push('\n');
+    next
 }
 
 fn fallback_template(file_name: &str) -> &'static str {

@@ -2191,6 +2191,8 @@ button {
 .agent-row-action {
   background: rgba(79, 124, 255, 0.12);
   color: var(--blue);
+  border: none;
+  cursor: pointer;
 }
 
 .agent-detail {

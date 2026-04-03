@@ -104,6 +104,10 @@ export async function archiveAgent(agentId: string): Promise<void> {
   await invoke('archive_agent', { agentId })
 }
 
+export async function deleteAgent(agentId: string): Promise<void> {
+  await invoke('delete_agent', { agentId })
+}
+
 export async function setDefaultAgent(agentId: string): Promise<AgentRecord | null> {
   return invoke<AgentRecord | null>('set_default_agent', { agentId })
 }
@@ -147,11 +151,13 @@ export type WechatLoginResult = {
 
 export type BotStatus = 'Disconnected' | 'Connecting' | 'Connected' | 'Error'
 
-export async function botLoginWechat(): Promise<WechatLoginResult> {
-  return invoke<WechatLoginResult>('bot_login_wechat')
+export async function botLoginWechat(channelId: string): Promise<WechatLoginResult> {
+  return invoke<WechatLoginResult>('bot_login_wechat', { channelId })
 }
 
 export async function botStartWechat(
+  channelId: string,
+  agentId: string,
   token: string,
   options?: {
     baseUrl?: string
@@ -164,6 +170,8 @@ export async function botStartWechat(
   },
 ): Promise<void> {
   await invoke('bot_start_wechat', {
+    channelId,
+    agentId,
     token,
     baseUrl: options?.baseUrl ?? null,
     routeTag: options?.routeTag ?? null,
@@ -175,8 +183,8 @@ export async function botStartWechat(
   })
 }
 
-export async function botStopWechat(): Promise<void> {
-  await invoke('bot_stop_wechat')
+export async function botStopWechat(channelId: string): Promise<void> {
+  await invoke('bot_stop_wechat', { channelId })
 }
 
 export async function botGetStatus(channelId: string): Promise<string> {

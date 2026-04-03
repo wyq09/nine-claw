@@ -49,7 +49,7 @@ import type {
 } from './types'
 import type { KeyboardEvent, MouseEvent } from 'react'
 import {
-  archiveAgent,
+  deleteAgent,
   botLoginWechat,
   botStartWechat,
   botStopWechat,
@@ -83,12 +83,10 @@ const GENERAL_SETTINGS_STORAGE_KEY = 'nineclaw.general-settings.v1'
 const APPEARANCE_SETTINGS_STORAGE_KEY = 'nineclaw.appearance-settings.v1'
 const PROVIDER_CONFIGS_STORAGE_KEY = 'nineclaw.provider-configs.v1'
 const CUSTOM_PROVIDERS_META_KEY = 'nineclaw.custom-providers-meta.v1'
-const BOT_CONFIGS_STORAGE_KEY = 'nineclaw.bot-configs.v1'
 const LEGACY_GENERAL_SETTINGS_STORAGE_KEYS = ['yqagent.general-settings.v1']
 const LEGACY_APPEARANCE_SETTINGS_STORAGE_KEYS = ['yqagent.appearance-settings.v1']
 const LEGACY_PROVIDER_CONFIGS_STORAGE_KEYS = ['yqagent.provider-configs.v1']
 const LEGACY_CUSTOM_PROVIDERS_META_KEYS = ['yqagent.custom-providers-meta.v1']
-const LEGACY_BOT_CONFIGS_STORAGE_KEYS = ['yqagent.bot-configs.v1']
 const MarkdownRenderer = lazy(() => import('./components/MarkdownRenderer'))
 
 function readStoredStorageValue(storageKey: string, legacyKeys: string[] = []): string | null {
@@ -130,36 +128,6 @@ function loadStoredState<T extends object>(storageKey: string, defaults: T, lega
     }
 
     return { ...defaults, ...parsed }
-  } catch {
-    return defaults
-  }
-}
-
-function loadStoredRecord<T extends Record<string, object>>(storageKey: string, defaults: T, legacyKeys: string[] = []): T {
-  try {
-    const raw = readStoredStorageValue(storageKey, legacyKeys)
-    if (!raw) {
-      return defaults
-    }
-
-    const parsed: unknown = JSON.parse(raw)
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-      return defaults
-    }
-
-    const result = { ...defaults } as T
-
-    for (const key of Object.keys(defaults) as Array<keyof T>) {
-      const defaultValue = defaults[key]
-      const storedValue = (parsed as Record<string, unknown>)[String(key)]
-
-      result[key] =
-        typeof storedValue === 'object' && storedValue !== null && !Array.isArray(storedValue)
-          ? { ...defaultValue, ...storedValue }
-          : defaultValue
-    }
-
-    return result
   } catch {
     return defaults
   }
@@ -246,10 +214,6 @@ function createInitialProviderState() {
   return loadProviderConfigs()
 }
 
-function createInitialBotState() {
-  return loadStoredRecord(BOT_CONFIGS_STORAGE_KEY, createInitialBotConfigs(), LEGACY_BOT_CONFIGS_STORAGE_KEYS)
-}
-
 function summarizePrompt(prompt: string, maxLength = 26): string {
   const compact = prompt.replace(/\s+/g, ' ').trim()
   if (!compact) {
@@ -290,6 +254,36 @@ function getAgentColor(agent: { accentColor?: string; id: string; name: string }
   return palette[hash % palette.length] ?? palette[0]
 }
 
+function createAgentBotConfigState(configs?: Record<string, BotConfig>): Record<string, BotConfig> {
+  const defaults = createInitialBotConfigs()
+  if (!configs) {
+    return defaults
+  }
+
+  const next = { ...defaults }
+  for (const key of Object.keys(defaults)) {
+    const current = configs[key]
+    if (current) {
+      next[key] = { ...defaults[key], ...current }
+    }
+  }
+  return next
+}
+
+function getBotChannelRuntimeId(agentId: string, channelId: BotChannelId): string {
+  return `${channelId}:${agentId}`
+}
+
+function buildBotRuntimeBindingConfig(runtime: ProviderRuntimeConfig): Partial<BotConfig> {
+  return {
+    aiProviderId: runtime.providerId,
+    aiApiFormat: runtime.apiFormat,
+    aiBaseUrl: runtime.baseUrl,
+    aiApiKey: runtime.apiKey,
+    aiModel: runtime.model,
+  }
+}
+
 function buildConversationAgentSnapshot(agent: AgentRecord): ConversationAgentSnapshot {
   return {
     id: agent.id,
@@ -321,6 +315,7 @@ function createEmptyAgentDraft(
     defaultModel: model,
     executionMode: 'single',
     accentColor,
+    botConfigs: createAgentBotConfigState(),
   }
 }
 
@@ -334,6 +329,7 @@ function createAgentDraftFromRecord(agent: AgentRecord): AgentInput {
     defaultProviderId: agent.defaultProviderId,
     defaultModel: agent.defaultModel,
     executionMode: agent.executionMode,
+    botConfigs: createAgentBotConfigState(agent.botConfigs),
     ...(agent.collaborationConfig ? { collaborationConfig: agent.collaborationConfig } : {}),
     ...(agent.accentColor ? { accentColor: agent.accentColor } : {}),
   }
@@ -349,6 +345,7 @@ function normalizeAgentDraft(input: AgentInput): AgentInput {
     defaultProviderId: input.defaultProviderId.trim(),
     defaultModel: input.defaultModel.trim(),
     skillIds: Array.from(new Set(input.skillIds.map((item) => item.trim()).filter(Boolean))),
+    botConfigs: createAgentBotConfigState(input.botConfigs),
   }
 }
 
@@ -918,6 +915,9 @@ function App() {
   const [agentSaving, setAgentSaving] = useState(false)
   const [agentFormError, setAgentFormError] = useState('')
   const [agentFormNotice, setAgentFormNotice] = useState('')
+  const [agentBotBindingDialogOpen, setAgentBotBindingDialogOpen] = useState(false)
+  const [agentDeleteConfirmOpen, setAgentDeleteConfirmOpen] = useState(false)
+  const [agentDeleteConfirmText, setAgentDeleteConfirmText] = useState('')
   const [agentBuilderActionBusyId, setAgentBuilderActionBusyId] = useState('')
   const [agentBuilderActionTargetId, setAgentBuilderActionTargetId] = useState('')
   const [agentBuilderActionNotice, setAgentBuilderActionNotice] = useState('')
@@ -951,7 +951,6 @@ function App() {
   const [selectedBotId, setSelectedBotId] = useState<BotChannelId>('dingtalk')
   const [providerConfigs, setProviderConfigs] = useState<Record<string, ProviderConfig>>(createInitialProviderState)
   const [customProviderMeta, setCustomProviderMeta] = useState<CustomProviderMeta[]>(() => loadCustomProviderMeta())
-  const [botConfigs, setBotConfigs] = useState<Record<string, BotConfig>>(createInitialBotState)
   const [qrDialogOpen, setQrDialogOpen] = useState(false)
   const [qrCodeUrl, setQrCodeUrl] = useState<string>('')
   const [qrStatus, setQrStatus] = useState<'waiting' | 'scanned' | 'confirmed' | 'error'>('waiting')
@@ -990,7 +989,6 @@ function App() {
     ? mergedProviderDefinitions.find((item) => item.id === activeProviderConfig.providerId) ?? null
     : null
   const selectedBotDefinition = botDefinitions.find((item) => item.id === selectedBotId) ?? botDefinitions[0]
-  const selectedBotConfig = botConfigs[selectedBotId]
   const defaultAgent = useMemo(
     () => agents.find((item) => item.id === defaultAgentId) ?? agents[0] ?? null,
     [agents, defaultAgentId],
@@ -1000,6 +998,11 @@ function App() {
     () => editableAgents.find((item) => item.id === managedAgentId) ?? null,
     [editableAgents, managedAgentId],
   )
+  const selectedManagedBotConfigs = useMemo(
+    () => createAgentBotConfigState(agentEditorDraft?.botConfigs),
+    [agentEditorDraft?.botConfigs],
+  )
+  const selectedManagedBotConfig = selectedManagedBotConfigs[selectedBotId] ?? createInitialBotConfigs()[selectedBotId]
   const preferredComposerAgent = useMemo(
     () => composerAgent ?? (defaultAgent ? buildConversationAgentSnapshot(defaultAgent) : null),
     [composerAgent, defaultAgent],
@@ -1278,14 +1281,6 @@ function App() {
     )
   }, [customProviderMeta])
 
-  useEffect(() => {
-    persistStoredStorageValue(
-      BOT_CONFIGS_STORAGE_KEY,
-      JSON.stringify(botConfigs),
-      LEGACY_BOT_CONFIGS_STORAGE_KEYS,
-    )
-  }, [botConfigs])
-
   // ── Bot status log (diagnostics) ──
   useEffect(() => {
     let unsub: (() => void) | undefined
@@ -1402,6 +1397,7 @@ function App() {
       defaultProviderId: fallbackProviderId,
       defaultModel: fallbackModel,
       executionMode: draft.executionMode,
+      botConfigs: createAgentBotConfigState(draft.botConfigs),
       ...(draft.collaborationConfig ? { collaborationConfig: draft.collaborationConfig } : {}),
       ...(draft.accentColor ? { accentColor: draft.accentColor } : {}),
     })
@@ -1618,10 +1614,31 @@ function App() {
     setManagedAgentId(id)
     setAgentEditorMode('edit')
     setAgentEditorDraft(createAgentDraftFromRecord(targetAgent))
-    setAgentEditorOpen(true)
     setAgentFormError('')
     setAgentFormNotice('')
+    setAgentBotBindingDialogOpen(false)
+    setAgentDeleteConfirmOpen(false)
+    setAgentDeleteConfirmText('')
     handleCloseAgentSkillPicker()
+  }
+
+  const handleOpenAgentEditor = (agentId: string) => {
+    const targetAgent = editableAgents.find((item) => item.id === agentId)
+    if (!targetAgent) {
+      return
+    }
+    handleManagedAgentSelect(agentId)
+    setAgentEditorOpen(true)
+  }
+
+  const handleOpenAgentBotBinding = (agentId: string) => {
+    const targetAgent = editableAgents.find((item) => item.id === agentId)
+    if (!targetAgent) {
+      return
+    }
+    handleManagedAgentSelect(agentId)
+    setAgentEditorOpen(false)
+    setAgentBotBindingDialogOpen(true)
   }
 
   const handleCreateAgentDraft = () => {
@@ -1637,6 +1654,8 @@ function App() {
     setAgentEditorMode('create')
     setAgentFormError('')
     setAgentFormNotice('')
+    setAgentDeleteConfirmOpen(false)
+    setAgentDeleteConfirmText('')
     setAgentSkillSearch('')
     setAgentSkillPickerOpen(false)
     setAgentEditorOpen(true)
@@ -1689,6 +1708,8 @@ function App() {
 
   const handleCloseAgentEditor = () => {
     setAgentEditorOpen(false)
+    setAgentDeleteConfirmOpen(false)
+    setAgentDeleteConfirmText('')
     setAgentWorkspaceDialogOpen(false)
     setAgentWorkspaceDraftContent('')
     setAgentWorkspaceSaving(false)
@@ -1697,6 +1718,11 @@ function App() {
     handleCloseAgentSkillPicker()
     setAgentFormError('')
     setAgentFormNotice('')
+  }
+
+  const handleCloseAgentBotBindingDialog = () => {
+    setAgentBotBindingDialogOpen(false)
+    setQrDialogOpen(false)
   }
 
   const loadAgentWorkspaceBundle = useCallback(async (agent: AgentRecord) => {
@@ -1835,13 +1861,28 @@ function App() {
     }
   }
 
-  const handleArchiveCurrentAgent = async () => {
+  const handleRequestDeleteCurrentAgent = () => {
     if (!selectedManagedAgent || agentSaving) {
       return
     }
+    setAgentDeleteConfirmText('')
+    setAgentDeleteConfirmOpen(true)
+  }
 
-    const shouldArchive = window.confirm(`确认归档智能体「${selectedManagedAgent.name}」吗？`)
-    if (!shouldArchive) {
+  const handleCloseDeleteAgentDialog = () => {
+    if (agentSaving) {
+      return
+    }
+    setAgentDeleteConfirmOpen(false)
+    setAgentDeleteConfirmText('')
+  }
+
+  const handleConfirmDeleteCurrentAgent = async () => {
+    if (!selectedManagedAgent || agentSaving) {
+      return
+    }
+    if (agentDeleteConfirmText.trim() !== '确认删除') {
+      setAgentFormError('请输入“确认删除”后再删除智能体。')
       return
     }
 
@@ -1850,14 +1891,16 @@ function App() {
     setAgentFormNotice('')
 
     try {
-      await archiveAgent(selectedManagedAgent.id)
+      await deleteAgent(selectedManagedAgent.id)
+      setAgentDeleteConfirmOpen(false)
+      setAgentDeleteConfirmText('')
       setAgentEditorMode('edit')
       setAgentEditorDraft(null)
       setAgentEditorOpen(false)
       handleCloseAgentSkillPicker()
       await refreshAgents()
-    } catch (archiveError) {
-      const message = archiveError instanceof Error ? archiveError.message : String(archiveError)
+    } catch (deleteError) {
+      const message = deleteError instanceof Error ? deleteError.message : String(deleteError)
       setAgentFormError(message)
     } finally {
       setAgentSaving(false)
@@ -1918,14 +1961,29 @@ function App() {
     handleViewChange('chat')
   }
 
-  const updateBotConfig = (channelId: BotChannelId, updates: Partial<BotConfig>) => {
-    setBotConfigs((previous) => ({
-      ...previous,
-      [channelId]: {
-        ...previous[channelId],
-        ...updates,
-      },
-    }))
+  const updateAgentBotConfig = (channelId: BotChannelId, updates: Partial<BotConfig>) => {
+    setAgentEditorDraft((current) => {
+      if (!current) {
+        return current
+      }
+      const currentConfigs = createAgentBotConfigState(current.botConfigs)
+      return {
+        ...current,
+        botConfigs: {
+          ...currentConfigs,
+          [channelId]: {
+            ...currentConfigs[channelId],
+            ...updates,
+          },
+        },
+      }
+    })
+    if (agentFormError) {
+      setAgentFormError('')
+    }
+    if (agentFormNotice) {
+      setAgentFormNotice('')
+    }
   }
 
   const updateProviderConfig = (providerId: ProviderId, updates: Partial<ProviderConfig>) => {
@@ -1985,14 +2043,25 @@ function App() {
   // ── Bot Channel Actions ──
 
   const handleWechatLogin = async () => {
+    if (!selectedManagedAgent) {
+      setAgentFormError('请先保存当前智能体，再绑定微信 Bot。')
+      return
+    }
     setBotLoading(true)
     setQrStatus('waiting')
     setQrCodeUrl('')
     setQrDialogOpen(true)
 
+    const runtimeChannelId = selectedManagedAgent
+      ? getBotChannelRuntimeId(selectedManagedAgent.id, 'wechat')
+      : ''
+
     try {
       // Subscribe to QR events before calling login
       const unsub = await subscribeQrCode((event: QrCodeEvent) => {
+        if (runtimeChannelId && event.channelId !== runtimeChannelId) {
+          return
+        }
         if (event.qrcodeUrl) {
           setQrCodeUrl(event.qrcodeUrl)
         }
@@ -2005,29 +2074,34 @@ function App() {
         }
       })
 
-      const result = await botLoginWechat()
+      const result = await botLoginWechat(runtimeChannelId)
       unsub()
 
       if (result.connected) {
         const loginToken = result.bot_token ?? ''
         const loginBaseUrl = result.base_url ?? 'https://ilinkai.weixin.qq.com'
 
-        updateBotConfig('wechat', {
+        const botRuntime = resolveBotRuntimeConfig(selectedProviderId, providerConfigs, allProviderIds)
+        if (!botRuntime) {
+          throw new Error('请先在 Provider 设置中补全 Base URL、API Key 和模型，再启动微信 Bot。')
+        }
+
+        updateAgentBotConfig('wechat', {
           status: '已连接',
           clientId: result.account_id ?? '',
           clientSecret: loginBaseUrl,
           token: loginToken,
+          ...buildBotRuntimeBindingConfig(botRuntime),
           errorMessage: undefined,
         })
         setQrDialogOpen(false)
 
         // Auto-start the bot polling immediately after login
         try {
-          const botRuntime = resolveBotRuntimeConfig(selectedProviderId, providerConfigs, allProviderIds)
-          if (!botRuntime) {
-            throw new Error('请先在 Provider 设置中补全 Base URL、API Key 和模型，再启动微信 Bot。')
+          if (!selectedManagedAgent) {
+            throw new Error('请先保存当前智能体，再启动微信 Bot。')
           }
-          await botStartWechat(loginToken, {
+          await botStartWechat(getBotChannelRuntimeId(selectedManagedAgent.id, 'wechat'), selectedManagedAgent.id, loginToken, {
             baseUrl: loginBaseUrl || undefined,
             providerId: botRuntime.providerId,
             providerApiFormat: botRuntime.apiFormat,
@@ -2035,22 +2109,22 @@ function App() {
             apiKey: botRuntime.apiKey,
             providerBaseUrl: botRuntime.baseUrl,
           })
-          updateBotConfig('wechat', { enabled: true })
+          updateAgentBotConfig('wechat', { enabled: true })
         } catch (startError) {
-          updateBotConfig('wechat', {
+          updateAgentBotConfig('wechat', {
             status: '错误',
             errorMessage: `登录成功但启动失败: ${String(startError)}`,
           })
         }
       } else {
-        updateBotConfig('wechat', {
+        updateAgentBotConfig('wechat', {
           status: '错误',
           errorMessage: result.message,
         })
         setQrDialogOpen(false)
       }
     } catch (error) {
-      updateBotConfig('wechat', {
+      updateAgentBotConfig('wechat', {
         status: '错误',
         errorMessage: String(error),
       })
@@ -2061,9 +2135,14 @@ function App() {
   }
 
   const handleWechatStart = async () => {
-    const config = botConfigs.wechat
+    if (!selectedManagedAgent) {
+      setAgentFormError('请先保存当前智能体，再启动微信 Bot。')
+      return
+    }
+
+    const config = selectedManagedBotConfigs.wechat
     if (!config.token) {
-      updateBotConfig('wechat', { status: '错误', errorMessage: '请先扫码登录获取 token' })
+      updateAgentBotConfig('wechat', { status: '错误', errorMessage: '请先扫码登录获取 token' })
       return
     }
     setBotLoading(true)
@@ -2072,7 +2151,8 @@ function App() {
       if (!botRuntime) {
         throw new Error('请先在 Provider 设置中补全 Base URL、API Key 和模型，再启动微信 Bot。')
       }
-      await botStartWechat(config.token, {
+      updateAgentBotConfig('wechat', buildBotRuntimeBindingConfig(botRuntime))
+      await botStartWechat(getBotChannelRuntimeId(selectedManagedAgent.id, 'wechat'), selectedManagedAgent.id, config.token, {
         baseUrl: config.clientSecret || undefined,
         routeTag: config.routeTag || undefined,
         providerId: botRuntime.providerId,
@@ -2081,21 +2161,24 @@ function App() {
         apiKey: botRuntime.apiKey,
         providerBaseUrl: botRuntime.baseUrl,
       })
-      updateBotConfig('wechat', { status: '已连接', enabled: true, errorMessage: undefined })
+      updateAgentBotConfig('wechat', { status: '已连接', enabled: true, errorMessage: undefined })
     } catch (error) {
-      updateBotConfig('wechat', { status: '错误', errorMessage: String(error) })
+      updateAgentBotConfig('wechat', { status: '错误', errorMessage: String(error) })
     } finally {
       setBotLoading(false)
     }
   }
 
   const handleWechatStop = async () => {
+    if (!selectedManagedAgent) {
+      return
+    }
     setBotLoading(true)
     try {
-      await botStopWechat()
-      updateBotConfig('wechat', { status: '未连接', enabled: false })
+      await botStopWechat(getBotChannelRuntimeId(selectedManagedAgent.id, 'wechat'))
+      updateAgentBotConfig('wechat', { status: '未连接', enabled: false })
     } catch (error) {
-      updateBotConfig('wechat', { status: '错误', errorMessage: String(error) })
+      updateAgentBotConfig('wechat', { status: '错误', errorMessage: String(error) })
     } finally {
       setBotLoading(false)
     }
@@ -2171,10 +2254,18 @@ function App() {
     return (
       <AgentsView
         agentDraft={agentEditorDraft}
+        agentBotBindingDialogOpen={agentBotBindingDialogOpen}
+        agentDeleteConfirmOpen={agentDeleteConfirmOpen}
+        agentDeleteConfirmText={agentDeleteConfirmText}
         agentEditorOpen={agentEditorOpen}
         agentFormError={agentFormError}
         agentFormNotice={agentFormNotice}
         agentSaving={agentSaving}
+        botConfigs={selectedManagedBotConfigs}
+        botLoading={botLoading}
+        botStatusLog={botStatusLog.filter((entry) =>
+          selectedManagedAgent ? entry.channelId === getBotChannelRuntimeId(selectedManagedAgent.id, 'wechat') : false,
+        )}
         agentWorkspaceBundle={agentWorkspaceBundle}
         agentWorkspaceDialogError={agentWorkspaceDialogError}
         agentWorkspaceDialogLoading={agentWorkspaceDialogLoading}
@@ -2188,27 +2279,46 @@ function App() {
         allSkills={installedSkills}
         defaultAgentId={defaultAgentId}
         onCreateAgent={handleCreateAgentDraft}
-        onArchiveAgent={handleArchiveCurrentAgent}
+        onBotConfigChange={updateAgentBotConfig}
         onCloseEditor={handleCloseAgentEditor}
+        onCloseBotBindingDialog={handleCloseAgentBotBindingDialog}
+        onCloseDeleteAgentDialog={handleCloseDeleteAgentDialog}
         onCloseWorkspaceDialog={handleCloseAgentWorkspaceDialog}
+        onConfirmDeleteAgent={handleConfirmDeleteCurrentAgent}
         onDraftWorkspaceContentChange={setAgentWorkspaceDraftContent}
         onDraftChange={handleAgentDraftChange}
+        onDeleteConfirmTextChange={setAgentDeleteConfirmText}
+        onOpenEditor={handleOpenAgentEditor}
+        onOpenBotBinding={handleOpenAgentBotBinding}
         onOpenWorkspace={handleOpenAgentWorkspace}
         onOpenSkillPicker={handleOpenAgentSkillPicker}
         onRefreshWorkspace={handleRefreshAgentWorkspace}
+        onRequestDeleteAgent={handleRequestDeleteCurrentAgent}
         onSaveAgent={handleSaveAgent}
         onSaveWorkspaceFile={handleSaveAgentWorkspaceFile}
         onSearch={setAgentSearch}
         onSelectAgent={handleManagedAgentSelect}
+        onSelectBot={setSelectedBotId}
         onSelectWorkspaceFile={handleSelectAgentWorkspaceFile}
         onSetDefaultAgent={handleSetCurrentDefaultAgent}
         onToggleSkill={handleAgentSkillToggle}
+        onWechatLogin={handleWechatLogin}
+        onWechatStart={handleWechatStart}
+        onWechatStop={handleWechatStop}
         searchValue={agentSearch}
         selectedAgent={selectedManagedAgent}
+        selectedBotConfig={selectedManagedBotConfig}
+        selectedBotDefinition={selectedBotDefinition}
+        selectedBotId={selectedBotId}
         loading={agentsLoading}
         error={agentsError}
         mode={agentEditorMode}
         modelOptions={sessionLlmSelectOptionsWithFallback}
+        qrCodeUrl={qrCodeUrl}
+        qrDialogOpen={qrDialogOpen}
+        qrStatus={qrStatus}
+        setBotLoading={setBotLoading}
+        setQrDialogOpen={setQrDialogOpen}
       />
     )
   }
@@ -2501,35 +2611,19 @@ function App() {
           activeProviderBadge={activeProviderBadge}
           allProviderDefinitions={mergedProviderDefinitions}
           appearanceSettings={appearanceSettings}
-          botConfigs={botConfigs}
-          botLoading={botLoading}
           generalSettings={generalSettings}
           onAddCustomProvider={addCustomProvider}
           onProviderConfigChange={updateProviderConfig}
-          onBotConfigChange={updateBotConfig}
           onClose={() => setSettingsOpen(false)}
           onRemoveCustomProvider={removeCustomProvider}
-          botStatusLog={botStatusLog}
-          onWechatLogin={handleWechatLogin}
-          onWechatStart={handleWechatStart}
-          onWechatStop={handleWechatStop}
           onSelectProvider={setSelectedProviderId}
-          onSelectBot={setSelectedBotId}
           onSelectTab={setSettingsTab}
           providerConfigs={providerConfigs}
-          qrCodeUrl={qrCodeUrl}
-          qrDialogOpen={qrDialogOpen}
-          qrStatus={qrStatus}
-          setBotLoading={setBotLoading}
           selectedProviderConfig={selectedProviderConfig}
           selectedProviderDefinition={selectedProviderDefinition}
           selectedProviderId={selectedProviderId}
-          selectedBotConfig={selectedBotConfig}
-          selectedBotDefinition={selectedBotDefinition}
-          selectedBotId={selectedBotId}
           setAppearanceSettings={setAppearanceSettings}
           setGeneralSettings={setGeneralSettings}
-          setQrDialogOpen={setQrDialogOpen}
           tab={settingsTab}
         />
       ) : null}
@@ -3701,6 +3795,8 @@ function AgentSkillPickerDialog({
 
 type AgentEditorDialogProps = {
   agentDraft: AgentInput | null
+  agentDeleteConfirmOpen: boolean
+  agentDeleteConfirmText: string
   agentFormError: string
   agentFormNotice: string
   agentSaving: boolean
@@ -3708,12 +3804,15 @@ type AgentEditorDialogProps = {
   defaultAgentId: string
   mode: 'create' | 'edit'
   modelOptions: { value: string; label: string }[]
-  onArchiveAgent: () => void
   onClose: () => void
+  onCloseDeleteAgentDialog: () => void
+  onConfirmDeleteAgent: () => void
   onCreateAgent: () => void
   onDraftChange: (updates: Partial<AgentInput>) => void
+  onDeleteConfirmTextChange: (value: string) => void
   onOpenWorkspace: () => void
   onOpenSkillPicker: () => void
+  onRequestDeleteAgent: () => void
   onSaveAgent: () => void
   onSetDefaultAgent: () => void
   onToggleSkill: (skillId: string) => void
@@ -3722,6 +3821,8 @@ type AgentEditorDialogProps = {
 
 function AgentEditorDialog({
   agentDraft,
+  agentDeleteConfirmOpen,
+  agentDeleteConfirmText,
   agentFormError,
   agentFormNotice,
   agentSaving,
@@ -3729,12 +3830,15 @@ function AgentEditorDialog({
   defaultAgentId,
   mode,
   modelOptions,
-  onArchiveAgent,
   onClose,
+  onCloseDeleteAgentDialog,
+  onConfirmDeleteAgent,
   onCreateAgent,
   onDraftChange,
+  onDeleteConfirmTextChange,
   onOpenWorkspace,
   onOpenSkillPicker,
+  onRequestDeleteAgent,
   onSaveAgent,
   onSetDefaultAgent,
   onToggleSkill,
@@ -4052,14 +4156,300 @@ function AgentEditorDialog({
             </button>
           ) : null}
           {selectedAgent && mode === 'edit' ? (
-            <button type="button" className="outline-button danger" onClick={onArchiveAgent} disabled={agentSaving}>
-              归档
+            <button type="button" className="outline-button danger" onClick={onRequestDeleteAgent} disabled={agentSaving}>
+              删除
             </button>
           ) : null}
           <button type="button" className="outline-button primary" onClick={onSaveAgent} disabled={agentSaving}>
             {agentSaving ? '保存中…' : mode === 'create' ? '创建智能体' : '保存修改'}
           </button>
         </div>
+
+        {agentDeleteConfirmOpen && selectedAgent ? (
+          <div className="confirm-dialog-overlay" role="presentation" onClick={onCloseDeleteAgentDialog}>
+            <div className="confirm-dialog" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+              <h3>删除智能体</h3>
+              <p>删除后会一并清除这个智能体的数据库记录、绑定机器人数据和 md 工作区。</p>
+              <p>请输入 `确认删除` 以删除「{selectedAgent.name}」。</p>
+              <label className="input-field">
+                <span>确认口令</span>
+                <input
+                  value={agentDeleteConfirmText}
+                  onChange={(event) => onDeleteConfirmTextChange(event.target.value)}
+                  placeholder="确认删除"
+                />
+              </label>
+              <div className="confirm-dialog-actions">
+                <button type="button" className="outline-button" onClick={onCloseDeleteAgentDialog} disabled={agentSaving}>
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="outline-button confirm-dialog-delete"
+                  onClick={onConfirmDeleteAgent}
+                  disabled={agentSaving || agentDeleteConfirmText.trim() !== '确认删除'}
+                >
+                  {agentSaving ? '删除中…' : '确认删除'}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+      </div>
+    </div>
+  )
+}
+
+type AgentBotBindingDialogProps = {
+  agentName: string
+  botConfigs: Record<string, BotConfig>
+  botLoading: boolean
+  botStatusLog: BotStatusEvent[]
+  formError: string
+  formNotice: string
+  onBotConfigChange: (channelId: BotChannelId, updates: Partial<BotConfig>) => void
+  onClose: () => void
+  onSave: () => void
+  onSelectBot: (id: BotChannelId) => void
+  onWechatLogin: () => void
+  onWechatStart: () => void
+  onWechatStop: () => void
+  qrCodeUrl: string
+  qrDialogOpen: boolean
+  qrStatus: 'waiting' | 'scanned' | 'confirmed' | 'error'
+  selectedBotConfig: BotConfig
+  selectedBotDefinition: (typeof botDefinitions)[number]
+  selectedBotId: BotChannelId
+  setBotLoading: (loading: boolean) => void
+  setQrDialogOpen: (open: boolean) => void
+  saving: boolean
+}
+
+function AgentBotBindingDialog({
+  agentName,
+  botConfigs,
+  botLoading,
+  botStatusLog,
+  formError,
+  formNotice,
+  onBotConfigChange,
+  onClose,
+  onSave,
+  onSelectBot,
+  onWechatLogin,
+  onWechatStart,
+  onWechatStop,
+  qrCodeUrl,
+  qrDialogOpen,
+  qrStatus,
+  selectedBotConfig,
+  selectedBotDefinition,
+  selectedBotId,
+  setBotLoading,
+  setQrDialogOpen,
+  saving,
+}: AgentBotBindingDialogProps) {
+  return (
+    <div className="confirm-dialog-overlay" role="presentation" onClick={onClose}>
+      <div
+        className="agent-editor-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="agent-bot-binding-title"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="agent-editor-dialog-header">
+          <div className="agent-editor-header-copy">
+            <span className="agent-page-kicker">IM Bot Binding</span>
+            <strong id="agent-bot-binding-title">{agentName} 的 IM 机器人绑定</strong>
+            <span>独立维护当前智能体的机器人渠道配置，保存后写入数据库。</span>
+          </div>
+
+          <button type="button" className="icon-button subtle" onClick={onClose} aria-label="关闭机器人绑定弹窗">
+            <AppIcon name="close" size={18} />
+          </button>
+        </div>
+
+        <div className="agent-editor-dialog-scroll">
+          <div className="agent-detail-card agent-editor-card">
+            {formError ? (
+              <div className="skills-feedback error agent-feedback inline">
+                <strong>保存失败</strong>
+                <span>{formError}</span>
+              </div>
+            ) : null}
+
+            {formNotice ? (
+              <div className="skills-feedback success agent-feedback inline">
+                <strong>已更新</strong>
+                <span>{formNotice}</span>
+              </div>
+            ) : null}
+
+            <div className="bot-settings-layout">
+              <div className="bot-channel-list">
+                {botDefinitions.map((channel) => {
+                  const config = botConfigs[channel.id]
+                  return (
+                    <button
+                      key={channel.id}
+                      type="button"
+                      className={`bot-channel-card ${selectedBotId === channel.id ? 'active' : ''}`}
+                      onClick={() => onSelectBot(channel.id)}
+                    >
+                      <span className="bot-channel-copy">
+                        <strong>{channel.name}</strong>
+                        <span
+                          className={`bot-status-text ${
+                            config.status === '已连接' ? 'connected' : config.status === '错误' ? 'error' : ''
+                          }`}
+                        >
+                          {config.status}
+                        </span>
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+
+              <div className="bot-detail-panel">
+                <div className="bot-detail-head">
+                  <div className="bot-detail-title">
+                    <strong className="bot-detail-heading">{selectedBotDefinition.name}</strong>
+                    <span
+                      className={`bot-status-tag ${
+                        selectedBotConfig.status === '已连接'
+                          ? 'connected'
+                          : selectedBotConfig.status === '错误'
+                            ? 'error'
+                            : ''
+                      }`}
+                    >
+                      {selectedBotConfig.status}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="agent-form-grid">
+                  <label className="input-field">
+                    <span>{selectedBotDefinition.keyLabel}</span>
+                    <input
+                      value={selectedBotConfig.clientId}
+                      onChange={(event) => onBotConfigChange(selectedBotId, { clientId: event.target.value })}
+                      placeholder={selectedBotDefinition.keyPlaceholder}
+                    />
+                  </label>
+
+                  <label className="input-field">
+                    <span>{selectedBotDefinition.secretLabel}</span>
+                    <input
+                      value={selectedBotConfig.clientSecret}
+                      onChange={(event) => onBotConfigChange(selectedBotId, { clientSecret: event.target.value })}
+                      placeholder={selectedBotDefinition.secretPlaceholder}
+                    />
+                  </label>
+                </div>
+
+                {selectedBotId === 'wechat' ? (
+                  <>
+                    <label className="input-field agent-field-full">
+                      <span>路由标识（可选）</span>
+                      <input
+                        value={selectedBotConfig.routeTag ?? ''}
+                        onChange={(event) => onBotConfigChange('wechat', { routeTag: event.target.value })}
+                        placeholder="例如：agent-lawyer"
+                      />
+                    </label>
+
+                    <div className="bot-action-row">
+                      <button type="button" className="outline-button" onClick={onWechatLogin} disabled={botLoading || saving}>
+                        <span>{botLoading ? '请稍候...' : '扫码绑定微信'}</span>
+                      </button>
+                      <button type="button" className="outline-button" onClick={onWechatStart} disabled={botLoading || saving}>
+                        <span>{botLoading ? '启动中...' : '启动 Bot'}</span>
+                      </button>
+                      <button type="button" className="outline-button" onClick={onWechatStop} disabled={botLoading || saving}>
+                        <span>{botLoading ? '处理中...' : '断开 Bot'}</span>
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="agent-workspace-hint">
+                    <span>该渠道当前先支持独立保存绑定信息，运行接入稍后补齐。</span>
+                  </div>
+                )}
+
+                {selectedBotConfig.errorMessage ? (
+                  <div className="skills-feedback error agent-feedback inline">
+                    <strong>机器人状态异常</strong>
+                    <span>{selectedBotConfig.errorMessage}</span>
+                  </div>
+                ) : null}
+
+                {botStatusLog.length > 0 ? (
+                  <div className="bot-status-log">
+                    <strong>最近运行状态</strong>
+                    <div className="bot-status-entries">
+                      {botStatusLog.slice(0, 6).map((entry, index) => (
+                        <div key={`${entry.timestamp}-${index}`} className={`bot-status-entry ${entry.level}`}>
+                          <span className="bot-status-level">{entry.level}</span>
+                          <span className="bot-status-msg">{entry.message}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="agent-editor-dialog-footer">
+          <button type="button" className="outline-button" onClick={onClose} disabled={saving}>
+            关闭
+          </button>
+          <button type="button" className="outline-button primary" onClick={onSave} disabled={saving}>
+            {saving ? '保存中…' : '保存绑定'}
+          </button>
+        </div>
+
+        {selectedBotId === 'wechat' && qrDialogOpen ? (
+          <div className="qr-dialog-overlay" onClick={() => { setQrDialogOpen(false); setBotLoading(false) }}>
+            <div className="qr-dialog" onClick={(event) => event.stopPropagation()}>
+              <div className="qr-dialog-header">
+                <strong>微信扫码绑定</strong>
+                <button type="button" className="qr-dialog-close" onClick={() => { setQrDialogOpen(false); setBotLoading(false) }}>
+                  &times;
+                </button>
+              </div>
+              <div className="qr-dialog-body">
+                {qrStatus === 'waiting' && !qrCodeUrl ? (
+                  <div className="qr-loading">正在获取二维码...</div>
+                ) : qrStatus === 'waiting' && qrCodeUrl ? (
+                  <>
+                    <img className="qr-image" src={qrCodeUrl} alt="微信登录二维码" />
+                    <p className="qr-hint">请使用微信扫描二维码</p>
+                  </>
+                ) : qrStatus === 'scanned' ? (
+                  <div className="qr-status scanned">
+                    <AppIcon name="check" size={48} />
+                    <p>已扫描，请在手机上确认</p>
+                  </div>
+                ) : qrStatus === 'confirmed' ? (
+                  <div className="qr-status confirmed">
+                    <AppIcon name="check" size={48} />
+                    <p>绑定成功</p>
+                  </div>
+                ) : (
+                  <div className="qr-status error">
+                    <p>二维码获取失败，请重试</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
     </div>
   )
@@ -4287,10 +4677,16 @@ function AgentWorkspaceDialog({
 
 type AgentsViewProps = {
   agentDraft: AgentInput | null
+  agentBotBindingDialogOpen: boolean
+  agentDeleteConfirmOpen: boolean
+  agentDeleteConfirmText: string
   agentEditorOpen: boolean
   agentFormError: string
   agentFormNotice: string
   agentSaving: boolean
+  botConfigs: Record<string, BotConfig>
+  botLoading: boolean
+  botStatusLog: BotStatusEvent[]
   agentWorkspaceBundle: AgentWorkspaceBundle | null
   agentWorkspaceDialogError: string
   agentWorkspaceDialogLoading: boolean
@@ -4307,32 +4703,57 @@ type AgentsViewProps = {
   loading: boolean
   mode: 'create' | 'edit'
   modelOptions: { value: string; label: string }[]
-  onArchiveAgent: () => void
+  qrCodeUrl: string
+  qrDialogOpen: boolean
+  qrStatus: 'waiting' | 'scanned' | 'confirmed' | 'error'
+  onBotConfigChange: (channelId: BotChannelId, updates: Partial<BotConfig>) => void
   onCloseEditor: () => void
+  onCloseBotBindingDialog: () => void
+  onCloseDeleteAgentDialog: () => void
   onCloseWorkspaceDialog: () => void
+  onConfirmDeleteAgent: () => void
   onCreateAgent: () => void
   onDraftChange: (updates: Partial<AgentInput>) => void
+  onDeleteConfirmTextChange: (value: string) => void
   onDraftWorkspaceContentChange: (value: string) => void
   onOpenWorkspace: () => void
   onOpenSkillPicker: () => void
+  onOpenBotBinding: (id: string) => void
+  onOpenEditor: (id: string) => void
+  onRequestDeleteAgent: () => void
   onRefreshWorkspace: () => void
   onSaveAgent: () => void
   onSaveWorkspaceFile: (file: AgentWorkspaceFile, content: string) => void | Promise<void>
   onSearch: (value: string) => void
   onSelectAgent: (id: string) => void
+  onSelectBot: (id: BotChannelId) => void
   onSelectWorkspaceFile: (key: string) => void
+  setBotLoading: (loading: boolean) => void
   onSetDefaultAgent: () => void
   onToggleSkill: (skillId: string) => void
+  onWechatLogin: () => void
+  onWechatStart: () => void
+  onWechatStop: () => void
+  setQrDialogOpen: (open: boolean) => void
   searchValue: string
   selectedAgent: AgentRecord | null
+  selectedBotConfig: BotConfig
+  selectedBotDefinition: (typeof botDefinitions)[number]
+  selectedBotId: BotChannelId
 }
 
 function AgentsView({
   agentDraft,
+  agentBotBindingDialogOpen,
+  agentDeleteConfirmOpen,
+  agentDeleteConfirmText,
   agentEditorOpen,
   agentFormError,
   agentFormNotice,
   agentSaving,
+  botConfigs,
+  botLoading,
+  botStatusLog,
   agentWorkspaceBundle,
   agentWorkspaceDialogError,
   agentWorkspaceDialogLoading,
@@ -4349,24 +4770,43 @@ function AgentsView({
   loading,
   mode,
   modelOptions,
-  onArchiveAgent,
+  qrCodeUrl,
+  qrDialogOpen,
+  qrStatus,
+  onBotConfigChange,
   onCloseEditor,
+  onCloseBotBindingDialog,
+  onCloseDeleteAgentDialog,
   onCloseWorkspaceDialog,
+  onConfirmDeleteAgent,
   onCreateAgent,
   onDraftChange,
+  onDeleteConfirmTextChange,
   onDraftWorkspaceContentChange,
   onOpenWorkspace,
   onOpenSkillPicker,
+  onOpenBotBinding,
+  onOpenEditor,
+  onRequestDeleteAgent,
   onRefreshWorkspace,
   onSaveAgent,
   onSaveWorkspaceFile,
   onSearch,
   onSelectAgent,
+  onSelectBot,
   onSelectWorkspaceFile,
+  setBotLoading,
   onSetDefaultAgent,
   onToggleSkill,
+  onWechatLogin,
+  onWechatStart,
+  onWechatStop,
+  setQrDialogOpen,
   searchValue,
   selectedAgent,
+  selectedBotConfig,
+  selectedBotDefinition,
+  selectedBotId,
 }: AgentsViewProps) {
   const studioCountLabel = loading ? '正在同步智能体…' : '已保存智能体'
 
@@ -4411,11 +4851,18 @@ function AgentsView({
             <div className="agent-list">
               {agents.length > 0 ? (
                 agents.map((agent) => (
-                  <button
+                  <div
                     key={agent.id}
-                    type="button"
+                    role="button"
+                    tabIndex={0}
                     className={`agent-row list ${selectedAgent?.id === agent.id ? 'active' : ''}`}
                     onClick={() => onSelectAgent(agent.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        onSelectAgent(agent.id)
+                      }
+                    }}
                   >
                     <span className="agent-row-tone" style={{ backgroundColor: getAgentColor(agent) }} />
                     <span className="agent-badge" style={{ backgroundColor: getAgentColor(agent) }}>
@@ -4434,9 +4881,28 @@ function AgentsView({
                         {agent.defaultProviderId} · {agent.defaultModel}
                       </span>
                       <span className="agent-list-meta-pill">{agent.skillIds.length} 个技能</span>
-                      <span className="agent-row-action">编辑配置</span>
+                      <button
+                        type="button"
+                        className="agent-row-action"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          onOpenBotBinding(agent.id)
+                        }}
+                      >
+                        绑定 IM
+                      </button>
+                      <button
+                        type="button"
+                        className="agent-row-action"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          onOpenEditor(agent.id)
+                        }}
+                      >
+                        编辑配置
+                      </button>
                     </span>
-                  </button>
+                  </div>
                 ))
               ) : (
                 <div className="empty-history-card compact agent-list-empty">
@@ -4452,6 +4918,8 @@ function AgentsView({
       {agentEditorOpen && agentDraft ? (
         <AgentEditorDialog
           agentDraft={agentDraft}
+          agentDeleteConfirmOpen={agentDeleteConfirmOpen}
+          agentDeleteConfirmText={agentDeleteConfirmText}
           agentFormError={agentFormError}
           agentFormNotice={agentFormNotice}
           agentSaving={agentSaving}
@@ -4459,16 +4927,46 @@ function AgentsView({
           defaultAgentId={defaultAgentId}
           mode={mode}
           modelOptions={modelOptions}
-          onArchiveAgent={onArchiveAgent}
           onClose={onCloseEditor}
+          onCloseDeleteAgentDialog={onCloseDeleteAgentDialog}
+          onConfirmDeleteAgent={onConfirmDeleteAgent}
           onCreateAgent={onCreateAgent}
           onDraftChange={onDraftChange}
+          onDeleteConfirmTextChange={onDeleteConfirmTextChange}
           onOpenWorkspace={onOpenWorkspace}
           onOpenSkillPicker={onOpenSkillPicker}
+          onRequestDeleteAgent={onRequestDeleteAgent}
           onSaveAgent={onSaveAgent}
           onSetDefaultAgent={onSetDefaultAgent}
           onToggleSkill={onToggleSkill}
           selectedAgent={selectedAgent}
+        />
+      ) : null}
+
+      {agentBotBindingDialogOpen && selectedAgent ? (
+        <AgentBotBindingDialog
+          agentName={selectedAgent.name}
+          botConfigs={botConfigs}
+          botLoading={botLoading}
+          botStatusLog={botStatusLog}
+          formError={agentFormError}
+          formNotice={agentFormNotice}
+          onBotConfigChange={onBotConfigChange}
+          onClose={onCloseBotBindingDialog}
+          onSave={onSaveAgent}
+          onSelectBot={onSelectBot}
+          onWechatLogin={onWechatLogin}
+          onWechatStart={onWechatStart}
+          onWechatStop={onWechatStop}
+          qrCodeUrl={qrCodeUrl}
+          qrDialogOpen={qrDialogOpen}
+          qrStatus={qrStatus}
+          selectedBotConfig={selectedBotConfig}
+          selectedBotDefinition={selectedBotDefinition}
+          selectedBotId={selectedBotId}
+          setBotLoading={setBotLoading}
+          setQrDialogOpen={setQrDialogOpen}
+          saving={agentSaving}
         />
       ) : null}
 

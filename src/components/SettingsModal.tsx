@@ -1,11 +1,7 @@
 import { useEffect, useState } from 'react'
-import { botDefinitions } from '../mockData'
-import { testLlmProviderConnection, type BotStatusEvent } from '../lib/piClient'
+import { testLlmProviderConnection } from '../lib/piClient'
 import type {
   AppearanceSettings,
-  BotChannelId,
-  BotConfig,
-  BotDefinition,
   GeneralSettings,
   ProviderApiFormat,
   ProviderConfig,
@@ -19,35 +15,19 @@ type SettingsModalProps = {
   activeProviderBadge: string
   allProviderDefinitions: ProviderDefinition[]
   appearanceSettings: AppearanceSettings
-  botConfigs: Record<string, BotConfig>
-  botLoading: boolean
-  botStatusLog: BotStatusEvent[]
   generalSettings: GeneralSettings
   onAddCustomProvider: (name: string, description: string, apiFormat: ProviderApiFormat) => void
   onProviderConfigChange: (providerId: ProviderId, updates: Partial<ProviderConfig>) => void
-  onBotConfigChange: (channelId: BotChannelId, updates: Partial<BotConfig>) => void
   onClose: () => void
   onRemoveCustomProvider: (providerId: ProviderId) => void
-  onWechatLogin: () => void
-  onWechatStart: () => void
-  onWechatStop: () => void
   onSelectProvider: (id: ProviderId) => void
-  onSelectBot: (id: BotChannelId) => void
   onSelectTab: (tab: SettingsTab) => void
   providerConfigs: Record<string, ProviderConfig>
-  qrCodeUrl: string
-  qrDialogOpen: boolean
-  qrStatus: 'waiting' | 'scanned' | 'confirmed' | 'error'
   selectedProviderConfig: ProviderConfig
   selectedProviderDefinition: ProviderDefinition
   selectedProviderId: ProviderId
-  selectedBotConfig: BotConfig
-  selectedBotDefinition: BotDefinition
-  selectedBotId: BotChannelId
   setAppearanceSettings: (value: AppearanceSettings | ((previous: AppearanceSettings) => AppearanceSettings)) => void
   setGeneralSettings: (value: GeneralSettings | ((previous: GeneralSettings) => GeneralSettings)) => void
-  setBotLoading: (loading: boolean) => void
-  setQrDialogOpen: (open: boolean) => void
   tab: SettingsTab
 }
 
@@ -137,35 +117,19 @@ export function SettingsModal({
   activeProviderBadge,
   allProviderDefinitions,
   appearanceSettings,
-  botConfigs,
-  botLoading,
-  botStatusLog,
   generalSettings,
   onAddCustomProvider,
   onProviderConfigChange,
-  onBotConfigChange,
   onClose,
   onRemoveCustomProvider,
-  onWechatLogin,
-  onWechatStart,
-  onWechatStop,
   onSelectProvider,
-  onSelectBot,
   onSelectTab,
   providerConfigs,
-  qrCodeUrl,
-  qrDialogOpen,
-  qrStatus,
   selectedProviderConfig,
   selectedProviderDefinition,
   selectedProviderId,
-  selectedBotConfig,
-  selectedBotDefinition,
-  selectedBotId,
   setAppearanceSettings,
-  setBotLoading,
   setGeneralSettings,
-  setQrDialogOpen,
   tab,
 }: SettingsModalProps) {
   const [providerAddMode, setProviderAddMode] = useState(false)
@@ -628,210 +592,16 @@ export function SettingsModal({
             ) : null}
 
             {tab === 'bots' ? (
-              <div className="bot-settings-layout">
-                <div className="bot-channel-list">
-                  {botDefinitions.map((channel) => {
-                    const config = botConfigs[channel.id]
-                    return (
-                      <div
-                        key={channel.id}
-                        className={`bot-channel-card ${selectedBotId === channel.id ? 'active' : ''}`}
-                        role="button"
-                        tabIndex={0}
-                        onClick={() => onSelectBot(channel.id)}
-                        onKeyDown={(event) => {
-                          if (event.key === 'Enter' || event.key === ' ') {
-                            event.preventDefault()
-                            onSelectBot(channel.id)
-                          }
-                        }}
-                      >
-                        <span className="bot-channel-copy">
-                          <strong>{channel.name}</strong>
-                          <span className={`bot-status-text ${config.status === '已连接' ? 'connected' : config.status === '错误' ? 'error' : ''}`}>{config.status}</span>
-                        </span>
-                        {channel.id === 'wechat' ? null : (
-                          <Toggle checked={config.enabled} onChange={() => onBotConfigChange(channel.id, { enabled: !config.enabled })} />
-                        )}
-                      </div>
-                    )
-                  })}
-                </div>
-
-                <div className="bot-detail-panel">
-                  {selectedBotId === 'wechat' ? (
-                    <>
-                      <div className="bot-detail-head">
-                        <div className="bot-detail-title">
-                          <AppIcon name="message" size={18} />
-                          <strong>微信 Bot 设置</strong>
-                          <span className={`bot-status-tag ${selectedBotConfig.status === '已连接' ? 'connected' : selectedBotConfig.status === '错误' ? 'error' : ''}`}>
-                            {selectedBotConfig.status}
-                          </span>
-                        </div>
-                      </div>
-
-                      {selectedBotConfig.status === '已连接' ? (
-                        <div className="bot-connected-info">
-                          <p>微信 Bot 正在运行，每 3 秒轮询一次新消息并自动 AI 回复。</p>
-                          <button
-                            type="button"
-                            className="outline-button danger"
-                            onClick={onWechatStop}
-                            disabled={botLoading}
-                          >
-                            <AppIcon name="stop" size={18} />
-                            <span>{botLoading ? '断开中...' : '断开连接'}</span>
-                          </button>
-                          {botStatusLog.length > 0 ? (
-                            <div className="bot-status-log">
-                              <strong>Bot 运行日志</strong>
-                              <div className="bot-status-entries">
-                                {botStatusLog.slice(0, 8).map((entry, index) => (
-                                  <div key={index} className={`bot-status-entry ${entry.level}`}>
-                                    <span className="bot-status-level">{entry.level}</span>
-                                    <span className="bot-status-msg">{entry.message}</span>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          ) : null}
-                        </div>
-                      ) : (
-                        <>
-                          <label className="input-field">
-                            <span>iLink 服务地址</span>
-                            <input
-                              value={selectedBotConfig.clientSecret}
-                              onChange={(event) => onBotConfigChange(selectedBotId, { clientSecret: event.target.value })}
-                              placeholder="https://ilinkai.weixin.qq.com"
-                            />
-                          </label>
-
-                          <label className="input-field">
-                            <span>Bot Token (扫码后自动填入)</span>
-                            <input
-                              value={selectedBotConfig.clientId}
-                              onChange={(event) => onBotConfigChange(selectedBotId, { clientId: event.target.value })}
-                              placeholder="扫码登录后自动获取"
-                              readOnly
-                            />
-                          </label>
-
-                          <div className="bot-action-row">
-                            <button
-                              type="button"
-                              className="outline-button primary"
-                              onClick={onWechatLogin}
-                              disabled={botLoading}
-                            >
-                              <AppIcon name="qr" size={18} />
-                              <span>{botLoading ? '请稍候...' : '扫码登录'}</span>
-                            </button>
-
-                            {selectedBotConfig.clientId ? (
-                              <button
-                                type="button"
-                                className="outline-button"
-                                onClick={onWechatStart}
-                                disabled={botLoading}
-                              >
-                                <AppIcon name="broadcast" size={18} />
-                                <span>{botLoading ? '启动中...' : '启动 Bot'}</span>
-                              </button>
-                            ) : null}
-                          </div>
-
-                          {selectedBotConfig.errorMessage ? (
-                            <p className="settings-note error">{selectedBotConfig.errorMessage}</p>
-                          ) : null}
-
-                          <p className="settings-note">微信 Bot 使用 iLink 协议，扫码登录后即可接收消息并自动 AI 回复。</p>
-                        </>
-                      )}
-                    </>
-                  ) : (
-                    <>
-                      <div className="bot-detail-head">
-                        <div className="bot-detail-title">
-                          <AppIcon name="message" size={18} />
-                          <strong>{selectedBotDefinition.name} 设置</strong>
-                          <span className="bot-status-tag">{selectedBotConfig.status}</span>
-                        </div>
-                        <button type="button" className="outline-button">
-                          <AppIcon name="book" size={18} />
-                          <span>{selectedBotDefinition.guideLabel}</span>
-                        </button>
-                      </div>
-
-                      <label className="input-field">
-                        <span>{selectedBotDefinition.keyLabel}</span>
-                        <input
-                          value={selectedBotConfig.clientId}
-                          onChange={(event) => onBotConfigChange(selectedBotId, { clientId: event.target.value })}
-                          placeholder={selectedBotDefinition.keyPlaceholder}
-                        />
-                      </label>
-                      <label className="input-field">
-                        <span>{selectedBotDefinition.secretLabel}</span>
-                        <input
-                          type="password"
-                          value={selectedBotConfig.clientSecret}
-                          onChange={(event) => onBotConfigChange(selectedBotId, { clientSecret: event.target.value })}
-                          placeholder={selectedBotDefinition.secretPlaceholder}
-                        />
-                      </label>
-
-                      <button
-                        type="button"
-                        className="outline-button"
-                        onClick={() => onBotConfigChange(selectedBotId, { status: '待接入' })}
-                      >
-                        <AppIcon name="broadcast" size={18} />
-                        <span>测试连通性</span>
-                      </button>
-
-                      <p className="settings-note">该通道暂未接入真实后端，仅保留配置界面。</p>
-                    </>
-                  )}
-                </div>
-
-                {qrDialogOpen && selectedBotId === 'wechat' ? (
-                  <div className="qr-dialog-overlay" onClick={() => { setQrDialogOpen(false); setBotLoading(false) }}>
-                    <div className="qr-dialog" onClick={(event) => event.stopPropagation()}>
-                      <div className="qr-dialog-header">
-                        <strong>微信扫码登录</strong>
-                        <button type="button" className="qr-dialog-close" onClick={() => { setQrDialogOpen(false); setBotLoading(false) }}>
-                          &times;
-                        </button>
-                      </div>
-                      <div className="qr-dialog-body">
-                        {qrStatus === 'waiting' && !qrCodeUrl ? (
-                          <div className="qr-loading">正在获取二维码...</div>
-                        ) : qrStatus === 'waiting' && qrCodeUrl ? (
-                          <>
-                            <img className="qr-image" src={qrCodeUrl} alt="微信登录二维码" />
-                            <p className="qr-hint">请使用微信扫描二维码</p>
-                          </>
-                        ) : qrStatus === 'scanned' ? (
-                          <div className="qr-status scanned">
-                            <AppIcon name="check" size={48} />
-                            <p>已扫描，请在手机上确认</p>
-                          </div>
-                        ) : qrStatus === 'confirmed' ? (
-                          <div className="qr-status confirmed">
-                            <AppIcon name="check" size={48} />
-                            <p>登录成功</p>
-                          </div>
-                        ) : (
-                          <div className="qr-status error">
-                            <p>二维码获取失败，请重试</p>
-                          </div>
-                        )}
-                      </div>
-                    </div>
+              <div className="bot-detail-panel">
+                <div className="bot-detail-head">
+                  <div className="bot-detail-title">
+                    <AppIcon name="message" size={18} />
+                    <strong>IM 机器人已迁移</strong>
                   </div>
-                ) : null}
+                </div>
+                <p className="settings-note">
+                  每个智能体现在独立维护自己的 IM 机器人绑定。请前往「智能体管理」打开对应智能体，在编辑弹窗里配置渠道、扫码绑定和启动 Bot。
+                </p>
               </div>
             ) : null}
 

@@ -1,3 +1,5 @@
+use crate::agents::{self, ConversationAgentConfig};
+use crate::skills;
 use md5::{Digest, Md5};
 use serde_json::json;
 use std::collections::HashMap;
@@ -18,6 +20,7 @@ pub struct PiBridge {
     base_url: String,
     api_key: String,
     model: String,
+    agent_config: Option<ConversationAgentConfig>,
 }
 
 impl PiBridge {
@@ -27,6 +30,7 @@ impl PiBridge {
         base_url: &str,
         api_key: &str,
         model: &str,
+        agent_config: Option<ConversationAgentConfig>,
     ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
@@ -35,6 +39,7 @@ impl PiBridge {
             base_url: base_url.to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
+            agent_config,
         }
     }
 
@@ -357,6 +362,17 @@ impl PiBridge {
         }
         if !self.api_key.is_empty() {
             cmd.args(["--api-key", &self.api_key]);
+        }
+
+        if let Some(agent_config) = self.agent_config.as_ref() {
+            if let Some(system_prompt) = agents::build_agent_system_prompt(agent_config) {
+                cmd.args(["--append-system-prompt", &system_prompt]);
+            }
+
+            for skill_path in skills::resolve_skill_directories(&agent_config.skill_ids)? {
+                let skill_path = skill_path.to_string_lossy().to_string();
+                cmd.args(["--skill", &skill_path]);
+            }
         }
 
         let mut child = cmd

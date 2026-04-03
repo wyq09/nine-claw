@@ -1,7 +1,7 @@
 use crate::agent_workspace::{self, AgentWorkspaceSeed};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tauri::AppHandle;
 use uuid::Uuid;
 
@@ -34,6 +34,8 @@ pub struct AgentRecord {
     pub execution_mode: String,
     pub collaboration_config: Option<AgentCollaborationConfig>,
     pub accent_color: Option<String>,
+    #[serde(default)]
+    pub bot_configs: HashMap<String, AgentBotConfig>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -56,6 +58,35 @@ pub struct AgentInput {
     pub collaboration_config: Option<AgentCollaborationConfig>,
     #[serde(default)]
     pub accent_color: Option<String>,
+    #[serde(default)]
+    pub bot_configs: HashMap<String, AgentBotConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentBotConfig {
+    pub enabled: bool,
+    pub client_id: String,
+    pub client_secret: String,
+    pub status: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub route_tag: Option<String>,
+    #[serde(default)]
+    pub ai_provider_id: Option<String>,
+    #[serde(default)]
+    pub ai_api_format: Option<String>,
+    #[serde(default)]
+    pub ai_base_url: Option<String>,
+    #[serde(default)]
+    pub ai_api_key: Option<String>,
+    #[serde(default)]
+    pub ai_model: Option<String>,
+    #[serde(default)]
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,9 +153,39 @@ pub fn archive_agent(app: &AppHandle, agent_id: String) -> Result<(), String> {
     archive_agent_with_connection(&mut connection, &agent_id)
 }
 
+pub fn delete_agent(app: &AppHandle, agent_id: String) -> Result<(), String> {
+    let mut connection = crate::open_history_db(app)?;
+    delete_agent_with_connection(&mut connection, &agent_id)
+}
+
 pub fn set_default_agent(app: &AppHandle, agent_id: String) -> Result<Option<AgentRecord>, String> {
     let connection = crate::open_history_db(app)?;
     set_default_agent_with_connection(&connection, &agent_id)
+}
+
+pub fn get_conversation_agent_config(
+    app: &AppHandle,
+    agent_id: &str,
+) -> Result<Option<ConversationAgentConfig>, String> {
+    let connection = crate::open_history_db(app)?;
+    ensure_agents_ready(&connection)?;
+    let Some(record) = get_active_agent_by_id(&connection, agent_id)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(ConversationAgentConfig {
+        id: record.id,
+        name: record.name,
+        summary: record.summary,
+        description: record.description,
+        system_prompt: record.system_prompt,
+        skill_ids: record.skill_ids,
+        default_provider_id: record.default_provider_id,
+        default_model: record.default_model,
+        execution_mode: record.execution_mode,
+        collaboration_config: record.collaboration_config,
+        accent_color: record.accent_color,
+    }))
 }
 
 pub fn read_agent_workspace_bundle(
@@ -253,6 +314,17 @@ fn ensure_agents_schema(connection: &Connection) -> Result<(), String> {
                 FOREIGN KEY(agent_id) REFERENCES agents(id)
             );
             CREATE INDEX IF NOT EXISTS idx_agent_skills_agent_id ON agent_skills(agent_id);
+            CREATE TABLE IF NOT EXISTS agent_bot_bindings (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                config_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(agent_id, channel_id),
+                FOREIGN KEY(agent_id) REFERENCES agents(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_bot_bindings_agent_id ON agent_bot_bindings(agent_id);
             CREATE INDEX IF NOT EXISTS idx_agents_active_name ON agents(is_archived, name);",
         )
         .map_err(|error| format!("初始化智能体数据表失败: {error}"))?;
@@ -422,6 +494,7 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
                 execution_mode: row.get(9)?,
                 collaboration_config: deserialize_collaboration_config(row.get(10)?),
                 accent_color: row.get(11)?,
+                bot_configs: HashMap::new(),
                 created_at: row.get(12)?,
                 updated_at: row.get(13)?,
             })
@@ -432,6 +505,7 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
     for row in rows {
         let mut agent = row.map_err(|error| format!("读取智能体数据失败: {error}"))?;
         agent.skill_ids = load_skill_ids_for_agent(connection, &agent.id)?;
+        agent.bot_configs = load_bot_configs_for_agent(connection, &agent.id)?;
         agents.push(agent);
     }
 
@@ -518,6 +592,7 @@ fn get_active_agent_by_id(
                 execution_mode: row.get(9)?,
                 collaboration_config: deserialize_collaboration_config(row.get(10)?),
                 accent_color: row.get(11)?,
+                bot_configs: HashMap::new(),
                 created_at: row.get(12)?,
                 updated_at: row.get(13)?,
             })
@@ -527,6 +602,7 @@ fn get_active_agent_by_id(
 
     if let Some(ref mut record) = agent {
         record.skill_ids = load_skill_ids_for_agent(connection, &record.id)?;
+        record.bot_configs = load_bot_configs_for_agent(connection, &record.id)?;
     }
 
     Ok(agent)
@@ -554,6 +630,34 @@ fn load_skill_ids_for_agent(
         skill_ids.push(row.map_err(|error| format!("读取技能绑定失败: {error}"))?);
     }
     Ok(skill_ids)
+}
+
+fn load_bot_configs_for_agent(
+    connection: &Connection,
+    agent_id: &str,
+) -> Result<HashMap<String, AgentBotConfig>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT channel_id, config_json
+            FROM agent_bot_bindings
+            WHERE agent_id = ?1
+            ORDER BY channel_id ASC",
+        )
+        .map_err(|error| format!("读取智能体机器人绑定失败: {error}"))?;
+
+    let rows = statement
+        .query_map(params![agent_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("解析智能体机器人绑定失败: {error}"))?;
+
+    let mut configs = HashMap::new();
+    for row in rows {
+        let (channel_id, raw) = row.map_err(|error| format!("读取机器人绑定数据失败: {error}"))?;
+        let config = deserialize_bot_config(&raw)?;
+        configs.insert(channel_id, config);
+    }
+    Ok(configs)
 }
 
 fn create_agent_with_connection(
@@ -595,6 +699,7 @@ fn create_agent_with_connection(
         .map_err(|error| format!("写入智能体失败: {error}"))?;
 
     replace_agent_skills(&transaction, &agent_id, &normalized.skill_ids, now)?;
+    replace_agent_bot_bindings(&transaction, &agent_id, &normalized.bot_configs, now)?;
     transaction
         .commit()
         .map_err(|error| format!("提交智能体事务失败: {error}"))?;
@@ -657,6 +762,7 @@ fn update_agent_with_connection(
         .map_err(|error| format!("更新智能体失败: {error}"))?;
 
     replace_agent_skills(&transaction, agent_id, &normalized.skill_ids, now)?;
+    replace_agent_bot_bindings(&transaction, agent_id, &normalized.bot_configs, now)?;
     transaction
         .commit()
         .map_err(|error| format!("提交智能体更新失败: {error}"))?;
@@ -705,6 +811,66 @@ fn archive_agent_with_connection(
 
     try_sync_active_agent_workspaces(connection, "归档后同步智能体工作区");
 
+    Ok(())
+}
+
+fn delete_agent_with_connection(
+    connection: &mut Connection,
+    agent_id: &str,
+) -> Result<(), String> {
+    ensure_agents_ready(connection)?;
+    let Some(agent) = get_active_agent_by_id(connection, agent_id)? else {
+        return Err("要删除的智能体不存在".to_string());
+    };
+    if agent.is_builtin {
+        return Err("内置智能体不允许删除".to_string());
+    }
+
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("删除智能体事务失败: {error}"))?;
+
+    transaction
+        .execute(
+            "DELETE FROM agent_bot_bindings WHERE agent_id = ?1",
+            params![agent_id],
+        )
+        .map_err(|error| format!("删除机器人绑定失败: {error}"))?;
+    transaction
+        .execute("DELETE FROM agent_skills WHERE agent_id = ?1", params![agent_id])
+        .map_err(|error| format!("删除智能体技能绑定失败: {error}"))?;
+    transaction
+        .execute("DELETE FROM agents WHERE id = ?1", params![agent_id])
+        .map_err(|error| format!("删除智能体失败: {error}"))?;
+
+    let current_default = transaction
+        .query_row(
+            "SELECT value FROM app_state WHERE key = ?1",
+            params![DEFAULT_AGENT_STATE_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取默认智能体失败: {error}"))?;
+
+    if current_default.as_deref() == Some(agent_id) {
+        if let Some(next_default) = find_fallback_default_agent(&transaction)? {
+            persist_default_agent_id(&transaction, &next_default.id)?;
+        } else {
+            transaction
+                .execute(
+                    "DELETE FROM app_state WHERE key = ?1",
+                    params![DEFAULT_AGENT_STATE_KEY],
+                )
+                .map_err(|error| format!("清理默认智能体失败: {error}"))?;
+        }
+    }
+
+    transaction
+        .commit()
+        .map_err(|error| format!("提交删除智能体事务失败: {error}"))?;
+
+    let _ = agent_workspace::delete_agent_workspace(agent_id);
+    try_sync_active_agent_workspaces(connection, "删除后同步智能体工作区");
     Ok(())
 }
 
@@ -766,6 +932,39 @@ fn replace_agent_skills(
     Ok(())
 }
 
+fn replace_agent_bot_bindings(
+    connection: &Connection,
+    agent_id: &str,
+    bot_configs: &HashMap<String, AgentBotConfig>,
+    updated_at: i64,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "DELETE FROM agent_bot_bindings WHERE agent_id = ?1",
+            params![agent_id],
+        )
+        .map_err(|error| format!("清理智能体机器人绑定失败: {error}"))?;
+
+    for (channel_id, config) in bot_configs {
+        let config_json = serialize_bot_config(config)?;
+        connection
+            .execute(
+                "INSERT INTO agent_bot_bindings (id, agent_id, channel_id, config_json, created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![
+                    format!("agent_bot_binding_{}", Uuid::new_v4().simple()),
+                    agent_id,
+                    channel_id,
+                    config_json,
+                    updated_at,
+                ],
+            )
+            .map_err(|error| format!("写入智能体机器人绑定失败: {error}"))?;
+    }
+
+    Ok(())
+}
+
 fn normalize_agent_input(payload: AgentInput) -> Result<NormalizedAgentInput, String> {
     let name = trim_required(payload.name, "智能体名称")?;
     let summary = trim_required(payload.summary, "智能体简介")?;
@@ -789,6 +988,7 @@ fn normalize_agent_input(payload: AgentInput) -> Result<NormalizedAgentInput, St
             .accent_color
             .map(|color| color.trim().to_string())
             .filter(|color| !color.is_empty()),
+        bot_configs: normalize_bot_configs(payload.bot_configs)?,
     })
 }
 
@@ -878,6 +1078,85 @@ fn deserialize_collaboration_config(raw: Option<String>) -> Option<AgentCollabor
     raw.and_then(|value| serde_json::from_str::<AgentCollaborationConfig>(&value).ok())
 }
 
+fn normalize_bot_configs(
+    bot_configs: HashMap<String, AgentBotConfig>,
+) -> Result<HashMap<String, AgentBotConfig>, String> {
+    let mut normalized = HashMap::new();
+    for (channel_id, config) in bot_configs {
+        let trimmed_channel_id = channel_id.trim().to_string();
+        if trimmed_channel_id.is_empty() {
+            continue;
+        }
+        normalized.insert(trimmed_channel_id, normalize_bot_config(config));
+    }
+    Ok(normalized)
+}
+
+fn normalize_bot_config(config: AgentBotConfig) -> AgentBotConfig {
+    AgentBotConfig {
+        enabled: config.enabled,
+        client_id: config.client_id.trim().to_string(),
+        client_secret: config.client_secret.trim().to_string(),
+        status: normalize_bot_status(&config.status),
+        token: config
+            .token
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        base_url: config
+            .base_url
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        route_tag: config
+            .route_tag
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        ai_provider_id: config
+            .ai_provider_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        ai_api_format: config
+            .ai_api_format
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        ai_base_url: config
+            .ai_base_url
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        ai_api_key: config
+            .ai_api_key
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        ai_model: config
+            .ai_model
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        error_message: config
+            .error_message
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    }
+}
+
+fn normalize_bot_status(status: &str) -> String {
+    match status.trim() {
+        "待接入" => "待接入".to_string(),
+        "已连接" => "已连接".to_string(),
+        "登录中" => "登录中".to_string(),
+        "错误" => "错误".to_string(),
+        _ => "未连接".to_string(),
+    }
+}
+
+fn serialize_bot_config(config: &AgentBotConfig) -> Result<String, String> {
+    serde_json::to_string(config).map_err(|error| format!("序列化机器人绑定配置失败: {error}"))
+}
+
+fn deserialize_bot_config(raw: &str) -> Result<AgentBotConfig, String> {
+    serde_json::from_str::<AgentBotConfig>(raw)
+        .map(normalize_bot_config)
+        .map_err(|error| format!("解析机器人绑定配置失败: {error}"))
+}
+
 struct NormalizedAgentInput {
     name: String,
     summary: String,
@@ -889,6 +1168,7 @@ struct NormalizedAgentInput {
     execution_mode: String,
     collaboration_config: Option<AgentCollaborationConfig>,
     accent_color: Option<String>,
+    bot_configs: HashMap<String, AgentBotConfig>,
 }
 
 fn sync_active_agent_workspaces(connection: &Connection) -> Result<(), String> {
@@ -995,6 +1275,7 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
                 execution_mode: row.get(9)?,
                 collaboration_config: deserialize_collaboration_config(row.get(10)?),
                 accent_color: row.get(11)?,
+                bot_configs: HashMap::new(),
                 created_at: row.get(12)?,
                 updated_at: row.get(13)?,
             })
