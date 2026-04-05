@@ -1,9 +1,11 @@
 pub mod api;
 pub mod types;
 
-use crate::agents::ConversationAgentConfig;
 use crate::agent_workspace;
+use crate::agents::ConversationAgentConfig;
+use crate::dev_trace::dev_trace;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -16,7 +18,7 @@ use tauri::{AppHandle, Emitter};
 
 use self::api::WeChatApi;
 use self::types::*;
-use crate::channels::pi_bridge::PiBridge;
+use crate::channels::pi_bridge::{PiBridge, PiProcessOutcome, PiRunHandle};
 use crate::channels::types::{BotMessage, ChannelStatus, MediaPayload, MediaType};
 use crate::channels::Channel;
 
@@ -36,6 +38,439 @@ fn now_timestamp_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn merge_pending_user_messages(messages: &[String]) -> String {
+    if messages.len() <= 1 {
+        return messages.first().cloned().unwrap_or_default();
+    }
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            if index == 0 {
+                message.clone()
+            } else {
+                format!("【用户追加消息 {}】\n{}", index, message)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn cleanup_idle_user_state(
+    user_states: &Arc<Mutex<HashMap<String, UserTurnState>>>,
+    user_id: &str,
+) {
+    let mut guard = match user_states.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+
+    let should_remove = guard
+        .get(user_id)
+        .map(|state| !state.running && !state.queued && state.pending_texts.is_empty())
+        .unwrap_or(false);
+
+    if should_remove {
+        guard.remove(user_id);
+    }
+}
+
+fn is_image_path(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg")
+    )
+}
+
+fn is_video_path(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v")
+    )
+}
+
+fn is_audio_path(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp3" | "wav" | "ogg" | "opus" | "m4a" | "aac" | "amr" | "silk")
+    )
+}
+
+fn parse_media_directive(line: &str) -> Option<ParsedMediaItem> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("::nc-media{") || !trimmed.ends_with('}') {
+        return None;
+    }
+
+    let body = &trimmed["::nc-media{".len()..trimmed.len() - 1];
+    let mut media_type = None;
+    let mut path = None;
+
+    for pair in body.split_whitespace() {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let normalized = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        match key {
+            "type" => media_type = Some(normalized),
+            "path" => path = Some(normalized),
+            _ => {}
+        }
+    }
+
+    let path = path?;
+    if !Path::new(&path).is_absolute() {
+        return None;
+    }
+
+    let media_type = match media_type.as_deref() {
+        Some("image") => MediaType::Image,
+        Some("video") => MediaType::Video,
+        Some("audio") | Some("voice") => MediaType::Audio,
+        Some("file") => MediaType::File,
+        _ => {
+            if is_image_path(&path) {
+                MediaType::Image
+            } else if is_video_path(&path) {
+                MediaType::Video
+            } else if is_audio_path(&path) {
+                MediaType::Audio
+            } else {
+                MediaType::File
+            }
+        }
+    };
+
+    let file_name = Path::new(&path)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "attachment".to_string());
+
+    Some(ParsedMediaItem {
+        media_type,
+        file_name,
+        file_path: path,
+    })
+}
+
+fn parse_markdown_media(line: &str) -> Option<ParsedMediaItem> {
+    let trimmed = line.trim();
+    let start = trimmed.find('(')?;
+    let end = trimmed.rfind(')')?;
+    if end <= start + 1 {
+        return None;
+    }
+
+    let path = trimmed[start + 1..end].trim();
+    if !Path::new(path).is_absolute() {
+        return None;
+    }
+
+    let media_type = if trimmed.starts_with("![") || is_image_path(path) {
+        MediaType::Image
+    } else if is_video_path(path) {
+        MediaType::Video
+    } else if is_audio_path(path) {
+        MediaType::Audio
+    } else {
+        MediaType::File
+    };
+
+    let file_name = Path::new(path)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "attachment".to_string());
+
+    Some(ParsedMediaItem {
+        media_type,
+        file_name,
+        file_path: path.to_string(),
+    })
+}
+
+fn split_text_and_media(content: &str) -> (String, Vec<ParsedMediaItem>) {
+    let mut text_lines = Vec::new();
+    let mut media_items = Vec::new();
+
+    for line in content.lines() {
+        if let Some(item) = parse_media_directive(line).or_else(|| parse_markdown_media(line)) {
+            media_items.push(item);
+        } else {
+            text_lines.push(line);
+        }
+    }
+
+    (text_lines.join("\n").trim().to_string(), media_items)
+}
+
+fn inbound_media_label(media_type: &MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "图片",
+        MediaType::Video => "视频",
+        MediaType::Audio => "语音",
+        MediaType::File => "文件",
+    }
+}
+
+fn default_extension(media_type: &MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "png",
+        MediaType::Video => "mp4",
+        MediaType::Audio => "mp3",
+        MediaType::File => "bin",
+    }
+}
+
+fn attachment_display_line(attachment: &InboundAttachment) -> String {
+    let mut line = if attachment.saved_path.is_empty() {
+        format!("[收到{}]", inbound_media_label(&attachment.media_type))
+    } else {
+        format!(
+            "[收到{}] {}",
+            inbound_media_label(&attachment.media_type),
+            attachment.saved_path
+        )
+    };
+    if let Some(transcript) = attachment.transcript.as_deref() {
+        if !transcript.trim().is_empty() {
+            line.push_str(" | 转写: ");
+            line.push_str(transcript.trim());
+        }
+    }
+    line
+}
+
+fn build_inbound_prompt(text: &str, attachments: &[InboundAttachment]) -> InboundMessagePayload {
+    let normalized_text = text.trim();
+    let mut display_lines = Vec::new();
+    if !normalized_text.is_empty() {
+        display_lines.push(normalized_text.to_string());
+    }
+    for attachment in attachments {
+        display_lines.push(attachment_display_line(attachment));
+    }
+    let display_text = display_lines.join("\n").trim().to_string();
+
+    let mut prompt_parts = Vec::new();
+    if !normalized_text.is_empty() {
+        prompt_parts.push(normalized_text.to_string());
+    }
+    if !attachments.is_empty() {
+        let mut section = String::from("用户还发送了以下附件，请按当前智能体能力处理：");
+        for attachment in attachments {
+            section.push_str("\n- ");
+            section.push_str(inbound_media_label(&attachment.media_type));
+            if attachment.saved_path.is_empty() {
+                section.push_str(" 已接收，但当前没有可用文件路径");
+            } else {
+                section.push_str(" 文件路径: ");
+                section.push_str(&attachment.saved_path);
+            }
+            if let Some(transcript) = attachment.transcript.as_deref() {
+                if !transcript.trim().is_empty() {
+                    section.push_str("\n  语音转写: ");
+                    section.push_str(transcript.trim());
+                }
+            }
+        }
+        prompt_parts.push(section);
+    }
+
+    InboundMessagePayload {
+        prompt_text: prompt_parts.join("\n\n").trim().to_string(),
+        display_text,
+    }
+}
+
+fn download_url_bytes(rt: &tokio::runtime::Runtime, url: &str) -> Result<Vec<u8>, String> {
+    rt.block_on(async {
+        let response = reqwest::get(url)
+            .await
+            .map_err(|error| format!("下载附件失败: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("下载附件失败: HTTP {}", response.status()));
+        }
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| format!("读取附件失败: {error}"))
+    })
+}
+
+fn persist_wechat_attachment(
+    rt: &tokio::runtime::Runtime,
+    agent_id: &str,
+    user_id: &str,
+    media_type: MediaType,
+    file_name_hint: Option<&str>,
+    base64_data: Option<&str>,
+    url_data: Option<&str>,
+    transcript: Option<&str>,
+) -> Result<Option<InboundAttachment>, String> {
+    let data = if let Some(raw) = base64_data.filter(|value| !value.trim().is_empty()) {
+        Some(
+            BASE64_ENGINE
+                .decode(raw.trim())
+                .map_err(|error| format!("解析附件 Base64 失败: {error}"))?,
+        )
+    } else if let Some(url) = url_data.filter(|value| !value.trim().is_empty()) {
+        Some(download_url_bytes(rt, url.trim())?)
+    } else {
+        None
+    };
+
+    if data.is_none() && transcript.unwrap_or_default().trim().is_empty() {
+        return Ok(None);
+    }
+
+    let file_name = file_name_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "{}.{}",
+                match media_type {
+                    MediaType::Image => "image",
+                    MediaType::Video => "video",
+                    MediaType::Audio => "voice",
+                    MediaType::File => "file",
+                },
+                default_extension(&media_type)
+            )
+        });
+
+    let saved_path = if let Some(bytes) = data {
+        agent_workspace::persist_agent_inbound_artifact(agent_id, user_id, &file_name, &bytes)?
+            .to_string_lossy()
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    Ok(Some(InboundAttachment {
+        media_type,
+        saved_path,
+        transcript: transcript
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+    }))
+}
+
+fn extract_inbound_message(
+    rt: &tokio::runtime::Runtime,
+    items: &Option<Vec<MessageItem>>,
+    agent_id: Option<&str>,
+    user_id: &str,
+) -> Result<Option<InboundMessagePayload>, String> {
+    let Some(items) = items else {
+        return Ok(None);
+    };
+
+    let mut text = String::new();
+    let mut attachments = Vec::new();
+
+    for item in items {
+        if item.item_type == Some(MSG_ITEM_TYPE_TEXT) || item.text_item.is_some() {
+            if let Some(ref ti) = item.text_item {
+                if let Some(ref t) = ti.text {
+                    text.push_str(t);
+                }
+            }
+        }
+
+        if let Some(agent_id) = agent_id {
+            if let Some(ref image_item) = item.image_item {
+                if let Some(attachment) = persist_wechat_attachment(
+                    rt,
+                    agent_id,
+                    user_id,
+                    MediaType::Image,
+                    Some("image.png"),
+                    image_item.image_base64.as_deref(),
+                    image_item.image_url.as_deref(),
+                    None,
+                )? {
+                    attachments.push(attachment);
+                }
+            }
+
+            if let Some(ref file_item) = item.file_item {
+                if let Some(attachment) = persist_wechat_attachment(
+                    rt,
+                    agent_id,
+                    user_id,
+                    MediaType::File,
+                    file_item.file_name.as_deref(),
+                    file_item.file_base64.as_deref(),
+                    file_item.file_url.as_deref(),
+                    None,
+                )? {
+                    attachments.push(attachment);
+                }
+            }
+
+            if let Some(ref video_item) = item.video_item {
+                if let Some(attachment) = persist_wechat_attachment(
+                    rt,
+                    agent_id,
+                    user_id,
+                    MediaType::Video,
+                    Some("video.mp4"),
+                    video_item.video_base64.as_deref(),
+                    video_item.video_url.as_deref(),
+                    None,
+                )? {
+                    attachments.push(attachment);
+                }
+            }
+
+            if item.item_type == Some(MSG_ITEM_TYPE_VOICE) || item.voice_item.is_some() {
+                let Some(ref voice_item) = item.voice_item else {
+                    continue;
+                };
+                if let Some(attachment) = persist_wechat_attachment(
+                    rt,
+                    agent_id,
+                    user_id,
+                    MediaType::Audio,
+                    voice_item.file_name.as_deref().or(Some("voice.mp3")),
+                    voice_item.voice_base64.as_deref(),
+                    voice_item.voice_url.as_deref(),
+                    voice_item.text.as_deref(),
+                )? {
+                    attachments.push(attachment);
+                }
+            }
+        }
+    }
+
+    let payload = build_inbound_prompt(&text, &attachments);
+    if payload.prompt_text.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(payload))
+}
+
 const DEFAULT_BOT_TYPE: &str = "3";
 const MAX_QR_REFRESH: u32 = 3;
 const CHUNK_SIZE: usize = 3900;
@@ -43,12 +478,41 @@ const CHUNK_SIZE: usize = 3900;
 const POLL_INTERVAL_SECS: u64 = 3;
 /// Chunk size for on_chunk frontend streaming (characters).
 const STREAM_CHUNK_SIZE: usize = 500;
+const MESSAGE_COLLECT_WINDOW_MS: u64 = 800;
 
 /// Internal message routed from monitor thread to worker thread.
 struct WorkItem {
     user_id: String,
-    text: String,
-    context_token: String,
+}
+
+#[derive(Clone)]
+struct UserTurnState {
+    pending_texts: Vec<String>,
+    latest_context_token: String,
+    last_inbound_at: i64,
+    queued: bool,
+    running: bool,
+    active_run: Option<Arc<PiRunHandle>>,
+}
+
+#[derive(Clone, Debug)]
+struct InboundAttachment {
+    media_type: MediaType,
+    saved_path: String,
+    transcript: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct InboundMessagePayload {
+    prompt_text: String,
+    display_text: String,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedMediaItem {
+    media_type: MediaType,
+    file_name: String,
+    file_path: String,
 }
 
 /// WeChat Channel — fully self-contained.
@@ -214,6 +678,13 @@ impl WeChatChannel {
             ..Default::default()
         })
     }
+
+    fn bound_agent_debug_label(&self) -> String {
+        self.agent_config
+            .as_ref()
+            .map(|agent| format!("{} ({})", agent.name, agent.id))
+            .unwrap_or_else(|| "未绑定智能体".to_string())
+    }
 }
 
 // ── Channel trait implementation ──
@@ -226,12 +697,26 @@ impl Channel for WeChatChannel {
         if self.token.is_empty() {
             return Err("微信 token 未配置，请先登录".to_string());
         }
+        let pi_executable = crate::pi_runtime::require_pi_executable(&app)?;
 
         *self.status.lock().unwrap() = ChannelStatus::Connected;
         self.running.store(true, Ordering::SeqCst);
 
+        emit_bot_status(
+            &app,
+            &self.channel_id,
+            "",
+            "done",
+            &format!(
+                "微信机器人已启动，当前绑定智能体: {}",
+                self.bound_agent_debug_label()
+            ),
+        );
+
         // Local channel: monitor → worker
         let (work_tx, work_rx) = mpsc::channel::<WorkItem>();
+        let user_states: Arc<Mutex<HashMap<String, UserTurnState>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // ── Thread 1: Monitor (getUpdates long-poll) ──
         {
@@ -242,8 +727,10 @@ impl Channel for WeChatChannel {
             let sync_buf = self.sync_buf.clone();
             let status = self.status.clone();
             let context_tokens = self.context_tokens.clone();
+            let agent_config = self.agent_config.clone();
             let app_handle = app.clone();
             let channel_id = self.channel_id.clone();
+            let user_states = user_states.clone();
 
             thread::spawn(move || {
                 let rt = match tokio::runtime::Runtime::new() {
@@ -289,27 +776,94 @@ impl Channel for WeChatChannel {
                                         }
                                     }
 
-                                    let text = extract_text_from_items(&msg.item_list);
-                                    if text.is_empty() {
-                                        continue;
-                                    }
+                                    let inbound = match extract_inbound_message(
+                                        &rt,
+                                        &msg.item_list,
+                                        agent_config.as_ref().map(|config| config.id.as_str()),
+                                        &from_user,
+                                    ) {
+                                        Ok(Some(payload)) => payload,
+                                        Ok(None) => continue,
+                                        Err(error) => {
+                                            emit_bot_status(
+                                                &app_handle,
+                                                &channel_id,
+                                                &from_user,
+                                                "warn",
+                                                &format!("解析微信入站附件失败: {error}"),
+                                            );
+                                            continue;
+                                        }
+                                    };
 
                                     log::info!(
                                         "微信收到消息: 用户={from_user} 内容={}",
-                                        truncate_chars(&text, 50)
+                                        truncate_chars(&inbound.display_text, 50)
+                                    );
+                                    dev_trace(
+                                        "wechat",
+                                        format!(
+                                            "收到消息: user={} chars={} text={}",
+                                            from_user,
+                                            inbound.display_text.chars().count(),
+                                            truncate_chars(&inbound.display_text, 80)
+                                        ),
                                     );
 
                                     // Emit inbound event to frontend (history integration)
-                                    emit_bot_message(&app_handle, &channel_id, &from_user, "inbound", &text);
+                                    emit_bot_message(
+                                        &app_handle,
+                                        &channel_id,
+                                        &from_user,
+                                        "inbound",
+                                        &inbound.display_text,
+                                        agent_config.as_ref(),
+                                    );
 
                                     let ct = msg.context_token.clone().unwrap_or_default();
-                                    if work_tx
-                                        .send(WorkItem {
-                                            user_id: from_user,
-                                            text,
-                                            context_token: ct,
-                                        })
-                                        .is_err()
+                                    let control_update = {
+                                        let mut guard = match user_states.lock() {
+                                            Ok(guard) => guard,
+                                            Err(_) => {
+                                                running.store(false, Ordering::SeqCst);
+                                                break;
+                                            }
+                                        };
+
+                                        let state =
+                                            guard.entry(from_user.clone()).or_insert_with(|| {
+                                                UserTurnState {
+                                                    pending_texts: Vec::new(),
+                                                    latest_context_token: ct.clone(),
+                                                    last_inbound_at: now_timestamp_ms(),
+                                                    queued: false,
+                                                    running: false,
+                                                    active_run: None,
+                                                }
+                                            });
+
+                                        state.pending_texts.push(inbound.prompt_text);
+                                        state.latest_context_token = ct.clone();
+                                        state.last_inbound_at = now_timestamp_ms();
+
+                                        let should_queue = !state.running && !state.queued;
+                                        if should_queue {
+                                            state.queued = true;
+                                        }
+                                        let active_run = if state.running {
+                                            state.active_run.clone()
+                                        } else {
+                                            None
+                                        };
+                                        (should_queue, active_run)
+                                    };
+
+                                    if let Some(run_handle) = control_update.1 {
+                                        let _ = run_handle.abort();
+                                    }
+
+                                    if control_update.0
+                                        && work_tx.send(WorkItem { user_id: from_user }).is_err()
                                     {
                                         log::warn!("Worker 已关闭，停止微信监控");
                                         running.store(false, Ordering::SeqCst);
@@ -350,6 +904,7 @@ impl Channel for WeChatChannel {
             let agent_config = self.agent_config.clone();
             let app_handle = app.clone();
             let channel_id = self.channel_id.clone();
+            let user_states = user_states.clone();
 
             thread::spawn(move || {
                 let rt = match tokio::runtime::Runtime::new() {
@@ -361,7 +916,15 @@ impl Channel for WeChatChannel {
                     }
                 };
                 let api = WeChatApi::new(&base_url, &token, route_tag.as_deref());
-                let bridge = PiBridge::new(&ai_pid, &ai_fmt, &ai_base, &ai_key, &ai_mdl, agent_config.clone());
+                let bridge = PiBridge::new(
+                    pi_executable,
+                    &ai_pid,
+                    &ai_fmt,
+                    &ai_base,
+                    &ai_key,
+                    &ai_mdl,
+                    agent_config.clone(),
+                );
 
                 while running.load(Ordering::SeqCst) {
                     let item = match work_rx.recv_timeout(Duration::from_secs(1)) {
@@ -370,111 +933,291 @@ impl Channel for WeChatChannel {
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     };
 
-                    log::info!(
-                        "Worker 开始处理: 用户={} 内容={}",
-                        item.user_id,
-                        truncate_chars(&item.text, 50)
-                    );
-                    emit_bot_status(
-                        &app_handle,
-                        &channel_id,
-                        &item.user_id,
-                        "processing",
-                        &format!("正在处理: {}", truncate_chars(&item.text, 30)),
-                    );
+                    let user_id = item.user_id;
 
-                    // Use context_token from message, fallback to stored
-                    let ct = if item.context_token.is_empty() {
-                        context_tokens
-                            .lock()
-                            .unwrap()
-                            .get(&item.user_id)
-                            .cloned()
-                            .unwrap_or_default()
-                    } else {
-                        item.context_token
-                    };
-                    let ct_opt = if ct.is_empty() {
-                        None
-                    } else {
-                        Some(ct.as_str())
-                    };
+                    while running.load(Ordering::SeqCst) {
+                        let wait_more_ms = {
+                            let guard = match user_states.lock() {
+                                Ok(guard) => guard,
+                                Err(_) => break,
+                            };
+                            let Some(state) = guard.get(&user_id) else {
+                                break;
+                            };
+                            if state.pending_texts.is_empty() {
+                                None
+                            } else {
+                                let elapsed = now_timestamp_ms() - state.last_inbound_at;
+                                if elapsed >= MESSAGE_COLLECT_WINDOW_MS as i64 {
+                                    None
+                                } else {
+                                    Some((MESSAGE_COLLECT_WINDOW_MS as i64 - elapsed) as u64)
+                                }
+                            }
+                        };
 
-                    // Streaming callback:
-                    // - Only emit chunks to frontend for live in-app display.
-                    // - Do NOT send partial messages to WeChat here; WeChat gets one
-                    //   complete message at the end to avoid protocol issues.
-                    let user_id_ref = &item.user_id;
-                    let app_for_cb = app_handle.clone();
+                        if let Some(wait_ms) = wait_more_ms {
+                            thread::sleep(Duration::from_millis(wait_ms));
+                            continue;
+                        }
 
-                    let result = bridge.process_message(
-                        &channel_id,
-                        &item.user_id,
-                        &item.text,
-                        STREAM_CHUNK_SIZE,
-                        |chunk: &str| {
-                            // Emit streaming chunk to frontend for live display
-                            emit_bot_message(&app_for_cb, &channel_id, user_id_ref, "outbound_chunk", chunk);
-                        },
-                    );
+                        let (prompt_text, context_token) = {
+                            let mut guard = match user_states.lock() {
+                                Ok(guard) => guard,
+                                Err(_) => break,
+                            };
+                            let Some(state) = guard.get_mut(&user_id) else {
+                                break;
+                            };
+                            if state.pending_texts.is_empty() {
+                                state.queued = false;
+                                state.running = false;
+                                state.active_run = None;
+                                break;
+                            }
 
-                    match result {
-                        Ok(full_text) => {
-                            if full_text.is_empty() {
-                                log::warn!("pi 返回空回复");
+                            state.queued = false;
+                            state.running = true;
+                            state.active_run = None;
+
+                            (
+                                merge_pending_user_messages(&std::mem::take(
+                                    &mut state.pending_texts,
+                                )),
+                                state.latest_context_token.clone(),
+                            )
+                        };
+
+                        log::info!(
+                            "Worker 开始处理: 用户={} 内容={}",
+                            user_id,
+                            truncate_chars(&prompt_text, 50)
+                        );
+                        dev_trace(
+                            "wechat",
+                            format!(
+                                "开始处理: user={} prompt_chars={} merged_count={}",
+                                user_id,
+                                prompt_text.chars().count(),
+                                prompt_text.matches("【用户追加消息").count() + 1
+                            ),
+                        );
+                        emit_bot_status(
+                            &app_handle,
+                            &channel_id,
+                            &user_id,
+                            "processing",
+                            &format!(
+                                "正在按智能体 {} 处理: {}",
+                                agent_config
+                                    .as_ref()
+                                    .map(|agent| format!("{} ({})", agent.name, agent.id))
+                                    .unwrap_or_else(|| "未绑定智能体".to_string()),
+                                truncate_chars(&prompt_text, 30)
+                            ),
+                        );
+
+                        let ct = if context_token.is_empty() {
+                            context_tokens
+                                .lock()
+                                .unwrap()
+                                .get(&user_id)
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            context_token
+                        };
+                        let ct_opt = if ct.is_empty() {
+                            None
+                        } else {
+                            Some(ct.as_str())
+                        };
+
+                        let user_id_for_chunk = user_id.clone();
+                        let user_id_for_state = user_id.clone();
+                        let app_for_cb = app_handle.clone();
+                        let state_for_run = user_states.clone();
+
+                        let result = bridge.process_message_interruptible(
+                            &channel_id,
+                            &user_id,
+                            &prompt_text,
+                            STREAM_CHUNK_SIZE,
+                            |chunk: &str| {
+                                emit_bot_message(
+                                    &app_for_cb,
+                                    &channel_id,
+                                    &user_id_for_chunk,
+                                    "outbound_chunk",
+                                    chunk,
+                                    agent_config.as_ref(),
+                                );
+                            },
+                            move |run_handle| {
+                                if let Ok(mut guard) = state_for_run.lock() {
+                                    if let Some(state) = guard.get_mut(&user_id_for_state) {
+                                        state.active_run = Some(run_handle);
+                                    }
+                                }
+                            },
+                        );
+
+                        let has_pending_followup = {
+                            let mut guard = match user_states.lock() {
+                                Ok(guard) => guard,
+                                Err(_) => break,
+                            };
+                            let state = match guard.get_mut(&user_id) {
+                                Some(state) => state,
+                                None => break,
+                            };
+                            state.running = false;
+                            state.active_run = None;
+                            !state.pending_texts.is_empty()
+                        };
+
+                        match result {
+                            Ok(PiProcessOutcome::Completed(full_text)) => {
+                                if has_pending_followup {
+                                    emit_bot_status(
+                                        &app_handle,
+                                        &channel_id,
+                                        &user_id,
+                                        "processing",
+                                        "检测到用户追加消息，正在合并后重新处理",
+                                    );
+                                    continue;
+                                }
+
+                                let (text_reply, media_items) = split_text_and_media(&full_text);
+
+                                if text_reply.is_empty() && media_items.is_empty() {
+                                    log::warn!("pi 返回空回复");
+                                    emit_bot_status(
+                                        &app_handle,
+                                        &channel_id,
+                                        &user_id,
+                                        "warn",
+                                        "pi 返回了空回复，请检查 provider 配置",
+                                    );
+                                    emit_bot_message(
+                                        &app_handle,
+                                        &channel_id,
+                                        &user_id,
+                                        "outbound_done",
+                                        "",
+                                        agent_config.as_ref(),
+                                    );
+                                    cleanup_idle_user_state(&user_states, &user_id);
+                                    break;
+                                }
+                                log::info!(
+                                    "Worker 完成: 用户={} 回复 {} 字符",
+                                    user_id,
+                                    full_text.len()
+                                );
+                                dev_trace(
+                                    "wechat",
+                                    format!(
+                                        "处理完成: user={} chars={} media_items={}",
+                                        user_id,
+                                        full_text.chars().count(),
+                                        media_items.len()
+                                    ),
+                                );
                                 emit_bot_status(
                                     &app_handle,
                                     &channel_id,
-                                    &item.user_id,
-                                    "warn",
-                                    "pi 返回了空回复，请检查 provider 配置",
+                                    &user_id,
+                                    "done",
+                                    &format!("回复 {} 字符完成", full_text.len()),
                                 );
-                                emit_bot_message(&app_handle, &channel_id, &item.user_id, "outbound_done", "");
-                                continue;
-                            }
-                            log::info!(
-                                "Worker 完成: 用户={} 回复 {} 字符",
-                                item.user_id,
-                                full_text.len()
-                            );
-                            emit_bot_status(
-                                &app_handle,
-                                &channel_id,
-                                &item.user_id,
-                                "done",
-                                &format!("回复 {} 字符完成", full_text.len()),
-                            );
-                            if let Some(agent_id) = agent_config.as_ref().map(|config| config.id.as_str()) {
-                                let _ = agent_workspace::append_agent_memory_entry(
-                                    agent_id,
-                                    &item.user_id,
-                                    &item.text,
+                                if let Some(agent_id) =
+                                    agent_config.as_ref().map(|config| config.id.as_str())
+                                {
+                                    let _ = agent_workspace::append_agent_memory_entry(
+                                        agent_id,
+                                        &user_id,
+                                        &prompt_text,
+                                        if text_reply.is_empty() {
+                                            &full_text
+                                        } else {
+                                            &text_reply
+                                        },
+                                    );
+                                }
+                                if !text_reply.is_empty() {
+                                    send_reply_chunks(&rt, &api, &user_id, &text_reply, ct_opt);
+                                }
+                                for media in media_items {
+                                    if let Err(error) =
+                                        send_media_item(&rt, &api, &user_id, &media, ct_opt)
+                                    {
+                                        log::error!("发送媒体消息失败: {error}");
+                                    }
+                                }
+                                emit_bot_message(
+                                    &app_handle,
+                                    &channel_id,
+                                    &user_id,
+                                    "outbound_done",
                                     &full_text,
+                                    agent_config.as_ref(),
                                 );
+                                cleanup_idle_user_state(&user_states, &user_id);
+                                break;
                             }
-                            // Send complete reply to WeChat (split into ≤3900-char chunks)
-                            send_reply_chunks(&rt, &api, &item.user_id, &full_text, ct_opt);
-                            // Emit completion to frontend
-                            emit_bot_message(
-                                &app_handle,
-                                &channel_id,
-                                &item.user_id,
-                                "outbound_done",
-                                &full_text,
-                            );
-                        }
-                        Err(e) => {
-                            log::error!("pi 处理失败: {e}");
-                            emit_bot_status(
-                                &app_handle,
-                                &channel_id,
-                                &item.user_id,
-                                "error",
-                                &format!("pi 失败: {e}"),
-                            );
-                            let error_msg = format!("[处理失败: {e}]");
-                            send_reply_chunks(&rt, &api, &item.user_id, &error_msg, ct_opt);
-                            emit_bot_message(&app_handle, &channel_id, &item.user_id, "error", &error_msg);
+                            Ok(PiProcessOutcome::Aborted) => {
+                                if has_pending_followup {
+                                    emit_bot_status(
+                                        &app_handle,
+                                        &channel_id,
+                                        &user_id,
+                                        "processing",
+                                        "收到用户新消息，正在中断上一轮并重新处理",
+                                    );
+                                    continue;
+                                }
+                                cleanup_idle_user_state(&user_states, &user_id);
+                                break;
+                            }
+                            Err(e) => {
+                                if has_pending_followup {
+                                    emit_bot_status(
+                                        &app_handle,
+                                        &channel_id,
+                                        &user_id,
+                                        "warn",
+                                        &format!("上一轮处理失败，已切换到用户最新消息: {e}"),
+                                    );
+                                    continue;
+                                }
+
+                                log::error!("pi 处理失败: {e}");
+                                dev_trace(
+                                    "wechat",
+                                    format!("处理失败: user={} error={}", user_id, e),
+                                );
+                                emit_bot_status(
+                                    &app_handle,
+                                    &channel_id,
+                                    &user_id,
+                                    "error",
+                                    &format!("pi 失败: {e}"),
+                                );
+                                let error_msg = format!("[处理失败: {e}]");
+                                send_reply_chunks(&rt, &api, &user_id, &error_msg, ct_opt);
+                                emit_bot_message(
+                                    &app_handle,
+                                    &channel_id,
+                                    &user_id,
+                                    "error",
+                                    &error_msg,
+                                    agent_config.as_ref(),
+                                );
+                                cleanup_idle_user_state(&user_states, &user_id);
+                                break;
+                            }
                         }
                     }
                 }
@@ -520,6 +1263,10 @@ impl Channel for WeChatChannel {
             MediaType::Image => (
                 MSG_ITEM_TYPE_IMAGE,
                 json!({ "image_item": { "image_base64": b64 } }),
+            ),
+            MediaType::Audio => (
+                MSG_ITEM_TYPE_FILE,
+                json!({ "file_item": { "file_base64": b64, "file_name": media.file_name } }),
             ),
             MediaType::File => (
                 MSG_ITEM_TYPE_FILE,
@@ -590,6 +1337,39 @@ fn send_reply_chunks(
     }
 }
 
+fn send_media_item(
+    rt: &tokio::runtime::Runtime,
+    api: &WeChatApi,
+    user_id: &str,
+    media: &ParsedMediaItem,
+    context_token: Option<&str>,
+) -> Result<(), String> {
+    let data = std::fs::read(&media.file_path)
+        .map_err(|error| format!("读取媒体文件失败 {}: {error}", media.file_path))?;
+    let b64 = BASE64_ENGINE.encode(&data);
+
+    let (item_type, item_json) = match media.media_type {
+        MediaType::Image => (
+            MSG_ITEM_TYPE_IMAGE,
+            json!({ "image_item": { "image_base64": b64 } }),
+        ),
+        MediaType::Audio => (
+            MSG_ITEM_TYPE_FILE,
+            json!({ "file_item": { "file_base64": b64, "file_name": media.file_name } }),
+        ),
+        MediaType::Video => (
+            MSG_ITEM_TYPE_VIDEO,
+            json!({ "video_item": { "video_base64": b64 } }),
+        ),
+        MediaType::File => (
+            MSG_ITEM_TYPE_FILE,
+            json!({ "file_item": { "file_base64": b64, "file_name": media.file_name } }),
+        ),
+    };
+
+    rt.block_on(api.send_media_message(user_id, item_type, item_json, context_token))
+}
+
 /// Emit a `bot://status` event to the frontend for diagnostic display.
 fn emit_bot_status(app: &AppHandle, channel_id: &str, user_id: &str, level: &str, message: &str) {
     let _ = app.emit(
@@ -605,32 +1385,23 @@ fn emit_bot_status(app: &AppHandle, channel_id: &str, user_id: &str, level: &str
 }
 
 /// Emit a `bot://message` event to the frontend for history tracking.
-fn emit_bot_message(app: &AppHandle, channel_id: &str, user_id: &str, direction: &str, content: &str) {
+fn emit_bot_message(
+    app: &AppHandle,
+    channel_id: &str,
+    user_id: &str,
+    direction: &str,
+    content: &str,
+    agent: Option<&ConversationAgentConfig>,
+) {
     let payload = BotMessage {
         channel_id: channel_id.to_string(),
         user_id: user_id.to_string(),
         direction: direction.to_string(),
         content: content.to_string(),
         timestamp: now_timestamp_ms(),
+        agent: agent.cloned(),
     };
     if let Err(e) = app.emit("bot://message", &payload) {
         log::error!("emit bot://message 失败: {e}");
     }
-}
-
-fn extract_text_from_items(items: &Option<Vec<MessageItem>>) -> String {
-    let Some(items) = items else {
-        return String::new();
-    };
-    let mut result = String::new();
-    for item in items {
-        if item.item_type == Some(MSG_ITEM_TYPE_TEXT) {
-            if let Some(ref ti) = item.text_item {
-                if let Some(ref t) = ti.text {
-                    result.push_str(t);
-                }
-            }
-        }
-    }
-    result
 }

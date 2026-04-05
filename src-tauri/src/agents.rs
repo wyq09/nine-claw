@@ -36,6 +36,8 @@ pub struct AgentRecord {
     pub accent_color: Option<String>,
     #[serde(default)]
     pub bot_configs: HashMap<String, AgentBotConfig>,
+    #[serde(default)]
+    pub heartbeat_config: AgentHeartbeatConfig,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -60,6 +62,8 @@ pub struct AgentInput {
     pub accent_color: Option<String>,
     #[serde(default)]
     pub bot_configs: HashMap<String, AgentBotConfig>,
+    #[serde(default)]
+    pub heartbeat_config: AgentHeartbeatConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +91,73 @@ pub struct AgentBotConfig {
     pub ai_model: Option<String>,
     #[serde(default)]
     pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentHeartbeatTask {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_heartbeat_task_type")]
+    pub task_type: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub message_template: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub working_directory: String,
+    #[serde(default = "default_heartbeat_timeout_sec")]
+    pub timeout_sec: i64,
+    #[serde(default = "default_true")]
+    pub notify_on_success: bool,
+    #[serde(default = "default_true")]
+    pub notify_on_failure: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentHeartbeatSchedule {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default = "default_heartbeat_schedule_type")]
+    pub schedule_type: String,
+    #[serde(default)]
+    pub times: Vec<String>,
+    #[serde(default = "default_heartbeat_channel_id")]
+    pub channel_id: String,
+    #[serde(default)]
+    pub target_user_id: String,
+    #[serde(default)]
+    pub target_label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentHeartbeatConfig {
+    #[serde(default = "default_heartbeat_timezone")]
+    pub timezone: String,
+    #[serde(default)]
+    pub tasks: Vec<AgentHeartbeatTask>,
+    #[serde(default)]
+    pub schedules: Vec<AgentHeartbeatSchedule>,
+}
+
+impl Default for AgentHeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            timezone: default_heartbeat_timezone(),
+            tasks: Vec::new(),
+            schedules: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -220,60 +291,77 @@ pub fn write_agent_workspace_file(
     agent_workspace::write_agent_workspace_file(&agent_id, &relative_path, &content)
 }
 
+#[allow(dead_code)]
 pub fn build_agent_system_prompt(agent: &ConversationAgentConfig) -> Option<String> {
+    build_agent_system_prompt_for_prompt(agent, None)
+}
+
+fn trim_prompt_snippet(value: &str, limit: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || limit == 0 {
+        return String::new();
+    }
+
+    let snippet: String = trimmed.chars().take(limit).collect();
+    if trimmed.chars().count() > limit {
+        format!("{snippet}…")
+    } else {
+        snippet
+    }
+}
+
+pub fn build_agent_system_prompt_for_prompt(
+    agent: &ConversationAgentConfig,
+    current_prompt: Option<&str>,
+) -> Option<String> {
     let mut sections = Vec::new();
 
     let name = agent.name.trim();
     if !name.is_empty() {
-        sections.push(format!("你当前以“{}”智能体身份工作。", name));
+        sections.push(format!("身份：{}", trim_prompt_snippet(name, 80)));
     }
 
     let summary = agent.summary.trim();
     if !summary.is_empty() {
-        sections.push(format!("智能体简介：{}", summary));
+        sections.push(format!("简介：{}", trim_prompt_snippet(summary, 160)));
+    } else {
+        let description = agent.description.trim();
+        if !description.is_empty() {
+            sections.push(format!("简介：{}", trim_prompt_snippet(description, 160)));
+        }
     }
-
-    let description = agent.description.trim();
-    if !description.is_empty() {
-        sections.push(format!("能力介绍：{}", description));
-    }
-
-    let execution_mode = normalize_execution_mode(Some(agent.execution_mode.as_str()));
-    sections.push(format!(
-        "当前执行模式：{}。当前聊天窗口仅接入单智能体执行链路，如需协作请先规划，再明确说明哪些部分仍需人工确认。",
-        execution_mode_label(&execution_mode)
-    ));
 
     if !agent.skill_ids.is_empty() {
+        let listed = agent
+            .skill_ids
+            .iter()
+            .take(4)
+            .map(|item| item.as_str())
+            .collect::<Vec<_>>()
+            .join("、");
+        let suffix = if agent.skill_ids.len() > 4 {
+            format!(" 等{}个", agent.skill_ids.len())
+        } else {
+            String::new()
+        };
         sections.push(format!(
-            "已挂载技能：{}。优先使用这些技能完成任务；若技能缺失或不可用，要明确说明。",
-            agent.skill_ids.join("、")
+            "已挂载技能：{}{}",
+            listed, suffix
         ));
     }
 
     let system_prompt = agent.system_prompt.trim();
     if !system_prompt.is_empty() {
-        sections.push(format!("附加执行约束：{}", system_prompt));
-    }
-
-    if let Some(config) = agent.collaboration_config.as_ref() {
-        if !config.allowed_delegate_agent_ids.is_empty() {
-            sections.push(format!(
-                "未来允许协作的智能体：{}。",
-                config.allowed_delegate_agent_ids.join("、")
-            ));
-        }
-        if !config.handoff_prompt.trim().is_empty() {
-            sections.push(format!("协作交接偏好：{}", config.handoff_prompt.trim()));
-        }
         sections.push(format!(
-            "共享上下文策略：{}。",
-            shared_context_policy_label(&config.shared_context_policy)
+            "附加执行约束：{}",
+            trim_prompt_snippet(system_prompt, 320)
         ));
     }
 
     if agent_workspace::runtime_sync_enabled() {
-        if let Ok(workspace_prompt) = agent_workspace::build_workspace_system_prompt(&agent.id) {
+        if let Ok(workspace_prompt) =
+            agent_workspace::build_workspace_system_prompt_for_query(&agent.id, current_prompt)
+        {
             sections.push(workspace_prompt);
         }
     }
@@ -281,7 +369,7 @@ pub fn build_agent_system_prompt(agent: &ConversationAgentConfig) -> Option<Stri
     if sections.is_empty() {
         None
     } else {
-        Some(sections.join("\n\n"))
+        Some(sections.join("\n"))
     }
 }
 
@@ -300,6 +388,7 @@ fn ensure_agents_schema(connection: &Connection) -> Result<(), String> {
                 is_archived INTEGER NOT NULL DEFAULT 0,
                 execution_mode TEXT NOT NULL DEFAULT 'single',
                 collaboration_config_json TEXT,
+                heartbeat_config_json TEXT,
                 accent_color TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -329,6 +418,38 @@ fn ensure_agents_schema(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("初始化智能体数据表失败: {error}"))?;
 
+    add_agents_column_if_missing(connection, "heartbeat_config_json", "TEXT")?;
+    crate::heartbeat::ensure_heartbeat_schema(connection)?;
+
+    Ok(())
+}
+
+fn add_agents_column_if_missing(
+    connection: &Connection,
+    column_name: &str,
+    column_definition: &str,
+) -> Result<(), String> {
+    let pragma = format!("PRAGMA table_info(agents)");
+    let mut statement = connection
+        .prepare(&pragma)
+        .map_err(|error| format!("读取 agents 表结构失败: {error}"))?;
+    let existing = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("解析 agents 表结构失败: {error}"))?
+        .filter_map(Result::ok)
+        .any(|name| name == column_name);
+
+    if existing {
+        return Ok(());
+    }
+
+    connection
+        .execute(
+            &format!("ALTER TABLE agents ADD COLUMN {column_name} {column_definition}"),
+            [],
+        )
+        .map_err(|error| format!("补充 agents.{column_name} 失败: {error}"))?;
+
     Ok(())
 }
 
@@ -345,10 +466,10 @@ fn seed_builtin_agents(connection: &Connection) -> Result<(), String> {
         connection
             .execute(
                 "INSERT OR IGNORE INTO agents (
-                    id, name, summary, description, system_prompt, default_provider_id,
-                    default_model, is_builtin, is_archived, execution_mode,
-                    collaboration_config_json, accent_color, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, 'single', NULL, ?8, ?9, ?9)",
+                id, name, summary, description, system_prompt, default_provider_id,
+                default_model, is_builtin, is_archived, execution_mode,
+                collaboration_config_json, heartbeat_config_json, accent_color, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, 'single', NULL, NULL, ?8, ?9, ?9)",
                 params![
                     seed.id,
                     seed.name,
@@ -465,6 +586,7 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
                 is_archived,
                 execution_mode,
                 collaboration_config_json,
+                heartbeat_config_json,
                 accent_color,
                 created_at,
                 updated_at
@@ -493,10 +615,11 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
                 is_archived: row.get::<_, i64>(8)? != 0,
                 execution_mode: row.get(9)?,
                 collaboration_config: deserialize_collaboration_config(row.get(10)?),
-                accent_color: row.get(11)?,
+                heartbeat_config: deserialize_heartbeat_config(row.get(11)?),
+                accent_color: row.get(12)?,
                 bot_configs: HashMap::new(),
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
             })
         })
         .map_err(|error| format!("解析智能体列表失败: {error}"))?;
@@ -568,6 +691,7 @@ fn get_active_agent_by_id(
                 is_archived,
                 execution_mode,
                 collaboration_config_json,
+                heartbeat_config_json,
                 accent_color,
                 created_at,
                 updated_at
@@ -591,10 +715,11 @@ fn get_active_agent_by_id(
                 is_archived: row.get::<_, i64>(8)? != 0,
                 execution_mode: row.get(9)?,
                 collaboration_config: deserialize_collaboration_config(row.get(10)?),
-                accent_color: row.get(11)?,
+                heartbeat_config: deserialize_heartbeat_config(row.get(11)?),
+                accent_color: row.get(12)?,
                 bot_configs: HashMap::new(),
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
             })
         })
         .optional()
@@ -667,9 +792,18 @@ fn create_agent_with_connection(
     ensure_agents_ready(connection)?;
     let normalized = normalize_agent_input(payload)?;
     let agent_id = format!("agent_{}", Uuid::new_v4().simple());
+    let workspace_seed = AgentWorkspaceSeed {
+        id: agent_id.as_str(),
+        name: normalized.name.as_str(),
+        summary: normalized.summary.as_str(),
+        description: normalized.description.as_str(),
+        accent_color: normalized.accent_color.as_deref(),
+        is_builtin: false,
+    };
     let now = crate::chrono_like_timestamp();
     let collaboration_json =
         serialize_collaboration_config(normalized.collaboration_config.as_ref())?;
+    let heartbeat_json = serialize_heartbeat_config(&normalized.heartbeat_config)?;
 
     let transaction = connection
         .transaction()
@@ -680,19 +814,20 @@ fn create_agent_with_connection(
             "INSERT INTO agents (
                 id, name, summary, description, system_prompt, default_provider_id,
                 default_model, is_builtin, is_archived, execution_mode,
-                collaboration_config_json, accent_color, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, ?10, ?11, ?11)",
+                collaboration_config_json, heartbeat_config_json, accent_color, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, ?10, ?11, ?12, ?12)",
             params![
-                agent_id,
-                normalized.name,
-                normalized.summary,
-                normalized.description,
-                normalized.system_prompt,
-                normalized.default_provider_id,
-                normalized.default_model,
-                normalized.execution_mode,
+                agent_id.as_str(),
+                normalized.name.as_str(),
+                normalized.summary.as_str(),
+                normalized.description.as_str(),
+                normalized.system_prompt.as_str(),
+                normalized.default_provider_id.as_str(),
+                normalized.default_model.as_str(),
+                normalized.execution_mode.as_str(),
                 collaboration_json,
-                normalized.accent_color,
+                heartbeat_json,
+                normalized.accent_color.as_deref(),
                 now,
             ],
         )
@@ -700,13 +835,16 @@ fn create_agent_with_connection(
 
     replace_agent_skills(&transaction, &agent_id, &normalized.skill_ids, now)?;
     replace_agent_bot_bindings(&transaction, &agent_id, &normalized.bot_configs, now)?;
+    if agent_workspace::runtime_sync_enabled() {
+        agent_workspace::ensure_agent_workspace(workspace_seed, true)
+            .map_err(|error| format!("创建智能体工作区失败: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("提交智能体事务失败: {error}"))?;
 
     let record = get_active_agent_by_id(connection, &agent_id)?
         .ok_or_else(|| "创建智能体后读取结果失败".to_string())?;
-    try_ensure_workspace_for_record(&record, true, "创建智能体工作区");
     try_sync_active_agent_workspaces(connection, "创建后同步智能体工作区");
     Ok(record)
 }
@@ -725,6 +863,7 @@ fn update_agent_with_connection(
     let now = crate::chrono_like_timestamp();
     let collaboration_json =
         serialize_collaboration_config(normalized.collaboration_config.as_ref())?;
+    let heartbeat_json = serialize_heartbeat_config(&normalized.heartbeat_config)?;
 
     let transaction = connection
         .transaction()
@@ -742,8 +881,9 @@ fn update_agent_with_connection(
                 default_model = ?7,
                 execution_mode = ?8,
                 collaboration_config_json = ?9,
-                accent_color = ?10,
-                updated_at = ?11
+                heartbeat_config_json = ?10,
+                accent_color = ?11,
+                updated_at = ?12
             WHERE id = ?1 AND is_archived = 0",
             params![
                 agent_id,
@@ -755,6 +895,7 @@ fn update_agent_with_connection(
                 normalized.default_model,
                 normalized.execution_mode,
                 collaboration_json,
+                heartbeat_json,
                 normalized.accent_color,
                 now,
             ],
@@ -814,10 +955,7 @@ fn archive_agent_with_connection(
     Ok(())
 }
 
-fn delete_agent_with_connection(
-    connection: &mut Connection,
-    agent_id: &str,
-) -> Result<(), String> {
+fn delete_agent_with_connection(connection: &mut Connection, agent_id: &str) -> Result<(), String> {
     ensure_agents_ready(connection)?;
     let Some(agent) = get_active_agent_by_id(connection, agent_id)? else {
         return Err("要删除的智能体不存在".to_string());
@@ -837,7 +975,16 @@ fn delete_agent_with_connection(
         )
         .map_err(|error| format!("删除机器人绑定失败: {error}"))?;
     transaction
-        .execute("DELETE FROM agent_skills WHERE agent_id = ?1", params![agent_id])
+        .execute(
+            "DELETE FROM agent_heartbeat_runs WHERE agent_id = ?1",
+            params![agent_id],
+        )
+        .map_err(|error| format!("删除心跳任务运行记录失败: {error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM agent_skills WHERE agent_id = ?1",
+            params![agent_id],
+        )
         .map_err(|error| format!("删除智能体技能绑定失败: {error}"))?;
     transaction
         .execute("DELETE FROM agents WHERE id = ?1", params![agent_id])
@@ -989,6 +1136,7 @@ fn normalize_agent_input(payload: AgentInput) -> Result<NormalizedAgentInput, St
             .map(|color| color.trim().to_string())
             .filter(|color| !color.is_empty()),
         bot_configs: normalize_bot_configs(payload.bot_configs)?,
+        heartbeat_config: normalize_heartbeat_config(payload.heartbeat_config)?,
     })
 }
 
@@ -1019,6 +1167,30 @@ fn default_execution_mode() -> String {
     "single".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_heartbeat_task_type() -> String {
+    "notify".to_string()
+}
+
+fn default_heartbeat_schedule_type() -> String {
+    "daily".to_string()
+}
+
+fn default_heartbeat_channel_id() -> String {
+    "wechat".to_string()
+}
+
+fn default_heartbeat_timeout_sec() -> i64 {
+    180
+}
+
+fn default_heartbeat_timezone() -> String {
+    "Asia/Shanghai".to_string()
+}
+
 fn normalize_execution_mode(value: Option<&str>) -> String {
     match value.unwrap_or_default().trim() {
         "supervisor" => "supervisor".to_string(),
@@ -1027,6 +1199,7 @@ fn normalize_execution_mode(value: Option<&str>) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn execution_mode_label(value: &str) -> &'static str {
     match value {
         "supervisor" => "多智能体协调者",
@@ -1055,6 +1228,7 @@ fn normalize_shared_context_policy(value: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn shared_context_policy_label(value: &str) -> &'static str {
     match value {
         "summary" => "摘要共享",
@@ -1076,6 +1250,209 @@ fn serialize_collaboration_config(
 
 fn deserialize_collaboration_config(raw: Option<String>) -> Option<AgentCollaborationConfig> {
     raw.and_then(|value| serde_json::from_str::<AgentCollaborationConfig>(&value).ok())
+}
+
+fn serialize_heartbeat_config(config: &AgentHeartbeatConfig) -> Result<Option<String>, String> {
+    let normalized = normalize_heartbeat_config(config.clone())?;
+    if normalized.timezone == default_heartbeat_timezone()
+        && normalized.tasks.is_empty()
+        && normalized.schedules.is_empty()
+    {
+        return Ok(None);
+    }
+
+    serde_json::to_string(&normalized)
+        .map(Some)
+        .map_err(|error| format!("序列化心跳任务配置失败: {error}"))
+}
+
+fn deserialize_heartbeat_config(raw: Option<String>) -> AgentHeartbeatConfig {
+    raw.and_then(|value| serde_json::from_str::<AgentHeartbeatConfig>(&value).ok())
+        .and_then(|config| normalize_heartbeat_config(config).ok())
+        .unwrap_or_default()
+}
+
+fn normalize_heartbeat_config(
+    config: AgentHeartbeatConfig,
+) -> Result<AgentHeartbeatConfig, String> {
+    let timezone = normalize_heartbeat_timezone(&config.timezone);
+    let tasks = normalize_heartbeat_tasks(config.tasks)?;
+    let task_ids: HashSet<_> = tasks.iter().map(|task| task.id.as_str()).collect();
+    let schedules = normalize_heartbeat_schedules(config.schedules, &task_ids)?;
+
+    Ok(AgentHeartbeatConfig {
+        timezone,
+        tasks,
+        schedules,
+    })
+}
+
+fn normalize_heartbeat_timezone(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        default_heartbeat_timezone()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_heartbeat_tasks(
+    tasks: Vec<AgentHeartbeatTask>,
+) -> Result<Vec<AgentHeartbeatTask>, String> {
+    let mut normalized = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    for (index, task) in tasks.into_iter().enumerate() {
+        let id = normalize_stable_item_id(&task.id, "task");
+        if !seen_ids.insert(id.clone()) {
+            continue;
+        }
+
+        let task_type = match task.task_type.trim() {
+            "shell" => "shell".to_string(),
+            _ => "notify".to_string(),
+        };
+        let name = fallback_name(task.name, "任务", index + 1);
+        let description = task.description.trim().to_string();
+        let message_template = task.message_template.trim().to_string();
+        let command = task.command.trim().to_string();
+        let working_directory = task.working_directory.trim().to_string();
+        let timeout_sec = task.timeout_sec.clamp(10, 7200);
+
+        if task.enabled && task_type == "shell" && command.is_empty() {
+            return Err(format!("心跳任务“{name}”缺少执行命令"));
+        }
+
+        normalized.push(AgentHeartbeatTask {
+            id,
+            name,
+            description,
+            task_type,
+            enabled: task.enabled,
+            message_template,
+            command,
+            working_directory,
+            timeout_sec,
+            notify_on_success: task.notify_on_success,
+            notify_on_failure: task.notify_on_failure,
+        });
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_heartbeat_schedules(
+    schedules: Vec<AgentHeartbeatSchedule>,
+    task_ids: &HashSet<&str>,
+) -> Result<Vec<AgentHeartbeatSchedule>, String> {
+    let mut normalized = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    for (index, schedule) in schedules.into_iter().enumerate() {
+        let id = normalize_stable_item_id(&schedule.id, "schedule");
+        if !seen_ids.insert(id.clone()) {
+            continue;
+        }
+
+        let name = fallback_name(schedule.name, "规则", index + 1);
+        let task_id = schedule.task_id.trim().to_string();
+        let times = normalize_schedule_times(schedule.times)?;
+        let channel_id = schedule.channel_id.trim();
+        let channel_id = if channel_id.is_empty() {
+            default_heartbeat_channel_id()
+        } else {
+            channel_id.to_string()
+        };
+        let target_user_id = schedule.target_user_id.trim().to_string();
+        let target_label = schedule.target_label.trim().to_string();
+
+        if !task_id.is_empty() && !task_ids.contains(task_id.as_str()) {
+            return Err(format!("心跳规则“{name}”引用了不存在的任务"));
+        }
+        if schedule.enabled && task_id.is_empty() {
+            return Err(format!("启用中的心跳规则“{name}”必须绑定一个任务"));
+        }
+        if schedule.enabled && times.is_empty() {
+            return Err(format!("启用中的心跳规则“{name}”至少需要一个触发时间"));
+        }
+        if schedule.enabled && target_user_id.is_empty() {
+            return Err(format!("启用中的心跳规则“{name}”缺少接收用户 ID"));
+        }
+
+        normalized.push(AgentHeartbeatSchedule {
+            id,
+            name,
+            enabled: schedule.enabled,
+            task_id,
+            schedule_type: default_heartbeat_schedule_type(),
+            times,
+            channel_id,
+            target_user_id,
+            target_label,
+        });
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_schedule_times(times: Vec<String>) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+
+    for raw in times {
+        for part in raw.split(',') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let normalized_time = normalize_schedule_time(trimmed)?;
+            if seen.insert(normalized_time.clone()) {
+                normalized.push(normalized_time);
+            }
+        }
+    }
+
+    normalized.sort();
+    Ok(normalized)
+}
+
+fn normalize_schedule_time(value: &str) -> Result<String, String> {
+    let Some((hour_raw, minute_raw)) = value.split_once(':') else {
+        return Err(format!("无效的时间格式：{value}，请使用 HH:MM"));
+    };
+
+    let hour: u32 = hour_raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("无效的小时：{value}"))?;
+    let minute: u32 = minute_raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("无效的分钟：{value}"))?;
+
+    if hour > 23 || minute > 59 {
+        return Err(format!("无效的时间：{value}"));
+    }
+
+    Ok(format!("{hour:02}:{minute:02}"))
+}
+
+fn normalize_stable_item_id(raw: &str, prefix: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        format!("{prefix}_{}", Uuid::new_v4().simple())
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn fallback_name(name: String, prefix: &str, index: usize) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        format!("{prefix} {index}")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn normalize_bot_configs(
@@ -1169,6 +1546,7 @@ struct NormalizedAgentInput {
     collaboration_config: Option<AgentCollaborationConfig>,
     accent_color: Option<String>,
     bot_configs: HashMap<String, AgentBotConfig>,
+    heartbeat_config: AgentHeartbeatConfig,
 }
 
 fn sync_active_agent_workspaces(connection: &Connection) -> Result<(), String> {
@@ -1250,6 +1628,7 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
                 is_archived,
                 execution_mode,
                 collaboration_config_json,
+                heartbeat_config_json,
                 accent_color,
                 created_at,
                 updated_at
@@ -1274,10 +1653,11 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
                 is_archived: row.get::<_, i64>(8)? != 0,
                 execution_mode: row.get(9)?,
                 collaboration_config: deserialize_collaboration_config(row.get(10)?),
-                accent_color: row.get(11)?,
+                heartbeat_config: deserialize_heartbeat_config(row.get(11)?),
+                accent_color: row.get(12)?,
                 bot_configs: HashMap::new(),
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
             })
         })
         .map_err(|error| format!("读取同步用 agent 数据失败: {error}"))?;
@@ -1325,6 +1705,8 @@ mod tests {
                 execution_mode: Some("single".to_string()),
                 collaboration_config: None,
                 accent_color: Some("#112233".to_string()),
+                bot_configs: HashMap::new(),
+                heartbeat_config: AgentHeartbeatConfig::default(),
             },
         )
         .expect("create agent");
@@ -1353,6 +1735,8 @@ mod tests {
                     shared_context_policy: "summary".to_string(),
                 }),
                 accent_color: None,
+                bot_configs: HashMap::new(),
+                heartbeat_config: AgentHeartbeatConfig::default(),
             },
         )
         .expect("update agent");
@@ -1393,6 +1777,8 @@ mod tests {
                 execution_mode: Some("single".to_string()),
                 collaboration_config: None,
                 accent_color: None,
+                bot_configs: HashMap::new(),
+                heartbeat_config: AgentHeartbeatConfig::default(),
             },
         )
         .expect("create custom");
@@ -1437,5 +1823,66 @@ mod tests {
         assert!(prompt.contains("负责项目推进"));
         assert!(prompt.contains("已挂载技能"));
         assert!(prompt.contains("避免省略关键确认步骤"));
+    }
+
+    #[test]
+    fn create_agent_persists_heartbeat_config() {
+        let mut connection = connection();
+
+        let created = create_agent_with_connection(
+            &mut connection,
+            AgentInput {
+                name: "提醒助理".to_string(),
+                summary: "会定时提醒".to_string(),
+                description: "负责晨会提醒和日报抓取".to_string(),
+                system_prompt: "".to_string(),
+                skill_ids: vec![],
+                default_provider_id: "openai".to_string(),
+                default_model: "gpt-4.1".to_string(),
+                execution_mode: Some("single".to_string()),
+                collaboration_config: None,
+                accent_color: None,
+                bot_configs: HashMap::new(),
+                heartbeat_config: AgentHeartbeatConfig {
+                    timezone: "Asia/Shanghai".to_string(),
+                    tasks: vec![AgentHeartbeatTask {
+                        id: "task_report".to_string(),
+                        name: "日报抓取".to_string(),
+                        description: "抓取日报后发给用户".to_string(),
+                        task_type: "shell".to_string(),
+                        enabled: true,
+                        message_template: "今日结果：{{stdout}}".to_string(),
+                        command: "python3 scripts/daily.py".to_string(),
+                        working_directory: "".to_string(),
+                        timeout_sec: 90,
+                        notify_on_success: true,
+                        notify_on_failure: true,
+                    }],
+                    schedules: vec![AgentHeartbeatSchedule {
+                        id: "schedule_morning".to_string(),
+                        name: "早间播报".to_string(),
+                        enabled: true,
+                        task_id: "task_report".to_string(),
+                        schedule_type: "daily".to_string(),
+                        times: vec!["8:00".to_string(), "17:30".to_string()],
+                        channel_id: "wechat".to_string(),
+                        target_user_id: "wxid_demo".to_string(),
+                        target_label: "自己".to_string(),
+                    }],
+                },
+            },
+        )
+        .expect("create agent");
+
+        assert_eq!(created.heartbeat_config.tasks.len(), 1);
+        assert_eq!(created.heartbeat_config.schedules.len(), 1);
+        assert_eq!(
+            created.heartbeat_config.schedules[0].times,
+            vec!["08:00".to_string(), "17:30".to_string()]
+        );
+        assert_eq!(
+            created.heartbeat_config.schedules[0].target_user_id,
+            "wxid_demo"
+        );
     }
 }

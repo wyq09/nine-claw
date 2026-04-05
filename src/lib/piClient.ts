@@ -5,7 +5,9 @@ import type {
   AgentRecord,
   AgentWorkspaceBundle,
   ConversationAgentSnapshot,
+  ChatAttachmentUpload,
   InstalledSkillItem,
+  PersistedChatAttachment,
   PiStreamPayload,
   ProviderRuntimeConfig,
   RuntimeDependencyStatus,
@@ -42,6 +44,18 @@ export async function clearPiSessionForId(sessionId: string): Promise<void> {
   await invoke('clear_pi_session_for_id', { sessionId })
 }
 
+export async function persistChatAttachments(payload: {
+  agentId: string
+  sessionId?: string | null
+  attachments: ChatAttachmentUpload[]
+}): Promise<PersistedChatAttachment[]> {
+  return invoke<PersistedChatAttachment[]>('persist_chat_attachments', {
+    agentId: payload.agentId,
+    sessionId: payload.sessionId ?? null,
+    attachments: payload.attachments,
+  })
+}
+
 export async function testLlmProviderConnection(payload: {
   apiFormat: 'openai' | 'anthropic'
   baseUrl: string
@@ -66,6 +80,22 @@ export async function saveHistoryState(payload: string): Promise<void> {
 
 export async function clearHistoryState(): Promise<void> {
   await invoke('clear_history_state')
+}
+
+export type ProviderPreferencesPayload = {
+  providerConfigs?: string | null
+  customProviderMeta?: string | null
+}
+
+export async function loadProviderPreferences(): Promise<ProviderPreferencesPayload> {
+  return invoke<ProviderPreferencesPayload>('load_provider_preferences')
+}
+
+export async function saveProviderPreferences(payload: {
+  providerConfigsPayload: string
+  customProviderMetaPayload: string
+}): Promise<void> {
+  await invoke('save_provider_preferences', payload)
 }
 
 export async function ensureRuntimeDependencies(): Promise<RuntimeDependencyStatus> {
@@ -183,8 +213,38 @@ export async function botStartWechat(
   })
 }
 
+export async function botStartLark(
+  channelId: string,
+  agentId: string,
+  appId: string,
+  appSecret: string,
+  options?: {
+    providerId?: string
+    providerApiFormat?: 'openai' | 'anthropic'
+    model?: string
+    apiKey?: string
+    providerBaseUrl?: string
+  },
+): Promise<void> {
+  await invoke('bot_start_lark', {
+    channelId,
+    agentId,
+    appId,
+    appSecret,
+    providerId: options?.providerId ?? null,
+    providerApiFormat: options?.providerApiFormat ?? null,
+    model: options?.model ?? null,
+    apiKey: options?.apiKey ?? null,
+    providerBaseUrl: options?.providerBaseUrl ?? null,
+  })
+}
+
 export async function botStopWechat(channelId: string): Promise<void> {
   await invoke('bot_stop_wechat', { channelId })
+}
+
+export async function botStopLark(channelId: string): Promise<void> {
+  await invoke('bot_stop_lark', { channelId })
 }
 
 export async function botGetStatus(channelId: string): Promise<string> {
@@ -211,6 +271,7 @@ export type BotMessageEvent = {
   direction: string
   content: string
   timestamp: number
+  agent?: ConversationAgentSnapshot
 }
 
 export async function subscribeBotMessage(

@@ -1,6 +1,10 @@
 mod agent_workspace;
 mod agents;
 mod channels;
+mod chat_attachments;
+mod dev_trace;
+mod heartbeat;
+mod pi_runtime;
 mod skills;
 
 use md5::{Digest, Md5};
@@ -8,12 +12,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,6 +29,9 @@ use channels::factory::ChannelConfig;
 use channels::manager::ChannelManager;
 use channels::types::{MediaPayload, MediaType};
 use channels::wechat::WeChatChannel;
+use chat_attachments::{ChatAttachmentUpload, PersistedChatAttachment};
+use dev_trace::{dev_trace, dev_trace_block};
+use pi_runtime::RuntimeDependencyStatus;
 use skills::{InstalledSkill, SystemSkillCatalog};
 
 #[derive(Clone)]
@@ -41,6 +48,8 @@ const PI_SESSION_FILE_PREFIX: &str = "nineclaw-pi-session-";
 const LEGACY_PI_SESSION_FILE_PREFIXES: &[&str] = &["yqagent-pi-session-"];
 const PI_RUNTIME_DIR_NAME: &str = "nineclaw-pi-runtime";
 const HISTORY_STATE_KEY: &str = "history_v1";
+const PROVIDER_CONFIGS_STATE_KEY: &str = "provider_configs_v1";
+const CUSTOM_PROVIDER_META_STATE_KEY: &str = "custom_provider_meta_v1";
 
 #[derive(Clone, Serialize)]
 struct PiTokenUsagePayload {
@@ -68,18 +77,6 @@ struct PiStreamPayload {
     usage: Option<PiTokenUsagePayload>,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeDependencyStatus {
-    platform: String,
-    node_available: bool,
-    npm_available: bool,
-    pi_available: bool,
-    auto_install_attempted: bool,
-    auto_install_succeeded: bool,
-    messages: Vec<String>,
-}
-
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderRuntimeConfig {
@@ -90,9 +87,80 @@ struct ProviderRuntimeConfig {
     model: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderPreferencesPayload {
+    provider_configs: Option<String>,
+    custom_provider_meta: Option<String>,
+}
+
 struct ChildExitOutcome {
-    status: ExitStatus,
+    status: Option<ExitStatus>,
     timed_out: bool,
+}
+
+const PI_FIRST_OUTPUT_TIMEOUT: Duration = Duration::from_secs(60);
+const PI_IDLE_OUTPUT_TIMEOUT: Duration = Duration::from_secs(60);
+const PI_TOTAL_RUNTIME_TIMEOUT: Duration = Duration::from_secs(180);
+const CHILD_KILL_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn spawn_pi_stdout_logger<R>(
+    reader: R,
+    scope: &'static str,
+    tx: mpsc::Sender<Result<String, String>>,
+) where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        dev_trace(scope, trimmed);
+                    }
+                    let _ = tx.send(Ok(line));
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    dev_trace(scope, format!("读取失败: {message}"));
+                    let _ = tx.send(Err(message));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_pi_stderr_logger<R>(reader: R, scope: &'static str, buffer: Arc<Mutex<String>>)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        dev_trace(scope, trimmed);
+                    }
+                    if let Ok(mut stderr) = buffer.lock() {
+                        stderr.push_str(&line);
+                        stderr.push('\n');
+                    }
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    dev_trace(scope, format!("读取失败: {message}"));
+                    if let Ok(mut stderr) = buffer.lock() {
+                        stderr.push_str(&message);
+                        stderr.push('\n');
+                    }
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn runtime_handle_store() -> &'static Mutex<HashMap<String, PiRuntimeHandle>> {
@@ -131,20 +199,28 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<ChildExit
             .map_err(|error| format!("等待 pi 进程状态失败: {error}"))?
         {
             return Ok(ChildExitOutcome {
-                status,
+                status: Some(status),
                 timed_out: false,
             });
         }
 
         if started_at.elapsed() >= timeout {
-            child
-                .kill()
-                .map_err(|error| format!("终止未退出的 pi 进程失败: {error}"))?;
-            let status = child
-                .wait()
-                .map_err(|error| format!("等待被终止的 pi 进程失败: {error}"))?;
+            let _ = child.kill();
+            let kill_started_at = Instant::now();
+            while kill_started_at.elapsed() < CHILD_KILL_GRACE_TIMEOUT {
+                if let Some(status) = child
+                    .try_wait()
+                    .map_err(|error| format!("等待被终止的 pi 进程失败: {error}"))?
+                {
+                    return Ok(ChildExitOutcome {
+                        status: Some(status),
+                        timed_out: true,
+                    });
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
             return Ok(ChildExitOutcome {
-                status,
+                status: None,
                 timed_out: true,
             });
         }
@@ -332,6 +408,72 @@ fn clear_history_state(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn load_provider_preferences(app: tauri::AppHandle) -> Result<ProviderPreferencesPayload, String> {
+    let connection = open_history_db(&app)?;
+
+    let provider_configs = connection
+        .query_row(
+            "SELECT value FROM app_state WHERE key = ?1",
+            params![PROVIDER_CONFIGS_STATE_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 Provider 配置失败: {error}"))?;
+
+    let custom_provider_meta = connection
+        .query_row(
+            "SELECT value FROM app_state WHERE key = ?1",
+            params![CUSTOM_PROVIDER_META_STATE_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取自定义 Provider 元数据失败: {error}"))?;
+
+    Ok(ProviderPreferencesPayload {
+        provider_configs,
+        custom_provider_meta,
+    })
+}
+
+#[tauri::command]
+fn save_provider_preferences(
+    app: tauri::AppHandle,
+    provider_configs_payload: String,
+    custom_provider_meta_payload: String,
+) -> Result<(), String> {
+    let connection = open_history_db(&app)?;
+    let updated_at = chrono_like_timestamp();
+
+    connection
+        .execute(
+            "INSERT INTO app_state (key, value, updated_at)
+       VALUES (?1, ?2, ?3)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![
+                PROVIDER_CONFIGS_STATE_KEY,
+                provider_configs_payload,
+                updated_at
+            ],
+        )
+        .map_err(|error| format!("保存 Provider 配置失败: {error}"))?;
+
+    connection
+        .execute(
+            "INSERT INTO app_state (key, value, updated_at)
+       VALUES (?1, ?2, ?3)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![
+                CUSTOM_PROVIDER_META_STATE_KEY,
+                custom_provider_meta_payload,
+                updated_at
+            ],
+        )
+        .map_err(|error| format!("保存自定义 Provider 元数据失败: {error}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
 fn list_installed_skills() -> Result<Vec<InstalledSkill>, String> {
     skills::list_installed_skills()
 }
@@ -419,17 +561,6 @@ fn pi_runtime_dir() -> PathBuf {
     std::env::temp_dir().join(PI_RUNTIME_DIR_NAME)
 }
 
-fn default_provider_base_url(provider_id: &str) -> Option<&'static str> {
-    match provider_id {
-        "openai" => Some("https://api.openai.com/v1"),
-        "anthropic" => Some("https://api.anthropic.com"),
-        "deepseek" => Some("https://api.deepseek.com"),
-        "doubao" => Some("https://ark.cn-beijing.volces.com/api/v3"),
-        "siliconflow" => Some("https://api.siliconflow.cn/v1"),
-        _ => None,
-    }
-}
-
 fn default_provider_api_format(provider_id: &str) -> &'static str {
     match provider_id {
         "anthropic" => "anthropic",
@@ -477,6 +608,16 @@ fn normalized_provider_runtime_base_url(
     }
 }
 
+fn runtime_provider_id(provider_id: &str) -> String {
+    let trimmed = provider_id.trim();
+    if trimmed.is_empty() {
+        return "nineclaw-runtime-provider".to_string();
+    }
+
+    let digest = format!("{:x}", Md5::digest(trimmed.as_bytes()));
+    format!("nineclaw-runtime-{}", &digest[..12])
+}
+
 fn scrub_anthropic_process_env(command: &mut Command) {
     for key in [
         "ANTHROPIC_API_KEY",
@@ -514,6 +655,9 @@ fn custom_provider_object(
     match api_format {
         "anthropic" => {
             provider.insert("api".to_string(), json!("anthropic-messages"));
+            // Some Anthropic-compatible gateways require both the standard
+            // Anthropic headers and `Authorization: Bearer <key>`.
+            provider.insert("authHeader".to_string(), json!(true));
             provider.insert(
                 "models".to_string(),
                 json!([
@@ -557,51 +701,21 @@ fn build_provider_models_config(
         provider_id,
     );
     let model = provider_config.model.trim();
-    let api_format = normalize_provider_api_format(&provider_config.api_format, provider_id);
 
     if provider_id.is_empty() || base_url.is_empty() || model.is_empty() {
         return None;
     }
 
-    match (provider_id, api_format) {
-        ("openai", "openai") => {
-            let Some(default_base_url) = default_provider_base_url(provider_id) else {
-                return None;
-            };
-
-            if base_url == normalize_provider_base_url(default_base_url) {
-                return None;
-            }
-
-            let provider = custom_provider_object(provider_config);
-            let mut providers = serde_json::Map::new();
-            providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
-
-            Some(json!({ "providers": providers }))
-        }
-        ("anthropic", "anthropic") => {
-            let Some(default_base_url) = default_provider_base_url(provider_id) else {
-                return None;
-            };
-
-            if base_url == normalize_anthropic_base_url(default_base_url) {
-                return None;
-            }
-
-            let provider = custom_provider_object(provider_config);
-
-            let mut providers = serde_json::Map::new();
-            providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
-
-            Some(json!({ "providers": providers }))
-        }
-        _ => {
-            let provider = custom_provider_object(provider_config);
-            let mut providers = serde_json::Map::new();
-            providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
-            Some(json!({ "providers": providers }))
-        }
-    }
+    // Always materialize the selected provider into `models.json` so runtime
+    // behavior matches the user's explicit UI configuration, even for built-in
+    // providers on their default base URL.
+    let provider = custom_provider_object(provider_config);
+    let mut providers = serde_json::Map::new();
+    providers.insert(
+        runtime_provider_id(provider_id),
+        serde_json::Value::Object(provider),
+    );
+    Some(json!({ "providers": providers }))
 }
 
 fn prepare_pi_runtime_dir(provider_config: &ProviderRuntimeConfig) -> Result<PathBuf, String> {
@@ -777,6 +891,27 @@ fn resize_main_window_to_screen(app: &tauri::AppHandle) {
     }
 }
 
+fn extract_message_terminal_error(value: Option<&serde_json::Value>) -> Option<String> {
+    let message = value?;
+    let stop_reason = message
+        .get("stopReason")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+
+    let error_text = message
+        .get("errorMessage")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+
+    if stop_reason == "error" {
+        return Some(error_text.unwrap_or_else(|| "pi 返回了空错误响应".to_string()));
+    }
+
+    error_text
+}
+
 #[tauri::command]
 async fn abort_pi_stream(session_id: Option<String>) -> Result<(), String> {
     let Some(session_id) = session_id
@@ -866,6 +1001,19 @@ async fn clear_pi_session_for_id(session_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn persist_chat_attachments(
+    agent_id: String,
+    session_id: Option<String>,
+    attachments: Vec<ChatAttachmentUpload>,
+) -> Result<Vec<PersistedChatAttachment>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        chat_attachments::persist_chat_attachments(&agent_id, session_id.as_deref(), attachments)
+    })
+    .await
+    .map_err(|error| format!("持久化聊天附件失败: {error}"))?
+}
+
+#[tauri::command]
 async fn stream_pi_prompt(
     app: tauri::AppHandle,
     prompt: String,
@@ -904,7 +1052,10 @@ async fn stream_pi_prompt(
 
         let session_path = session_file_path(Some(normalized_session_id.as_str()));
         let session_path_string = session_path.to_string_lossy().to_string();
-        let mut command = Command::new("pi");
+        let resolved_pi_path = pi_runtime::resolve_pi_executable(&app)
+            .map(|location| location.executable.display().to_string())
+            .unwrap_or_else(|| "(unresolved)".to_string());
+        let mut command = pi_runtime::create_pi_command(&app)?;
         command
             .args(["--mode", "rpc", "--session", &session_path_string])
             .stdin(Stdio::piped())
@@ -923,8 +1074,9 @@ async fn stream_pi_prompt(
                 scrub_anthropic_process_env(&mut command);
             }
 
-            if !provider_config.provider_id.trim().is_empty() {
-                command.args(["--provider", provider_config.provider_id.trim()]);
+            let runtime_provider_id = runtime_provider_id(provider_config.provider_id.trim());
+            if !runtime_provider_id.is_empty() {
+                command.args(["--provider", &runtime_provider_id]);
             }
 
             if !provider_config.model.trim().is_empty() {
@@ -936,20 +1088,102 @@ async fn stream_pi_prompt(
             }
         }
 
+        let mut system_prompt_chars = 0usize;
+        let mut system_prompt_sections: Vec<(String, String)> = Vec::new();
+        let mut skill_count = 0usize;
         if let Some(agent_config) = agent_config.as_ref() {
-            if let Some(system_prompt) = agents::build_agent_system_prompt(agent_config) {
+            if let Ok(workspace_root) = agent_workspace::resolve_workspace_root() {
+                let agent_home = workspace_root.join("agents").join(&agent_config.id);
+                command
+                    .current_dir(&agent_home)
+                    .env("NINECLAW_AGENT_ID", &agent_config.id)
+                    .env("NINECLAW_AGENT_NAME", &agent_config.name)
+                    .env("NINECLAW_WORKSPACE_ROOT", workspace_root.as_os_str())
+                    .env("NINECLAW_AGENT_HOME", agent_home.as_os_str());
+            }
+
+            if let Some(system_prompt) = agents::build_agent_system_prompt_for_prompt(
+                agent_config,
+                Some(trimmed_prompt.as_str()),
+            ) {
+                system_prompt_chars += system_prompt.chars().count();
+                system_prompt_sections.push((
+                    "agent_system_prompt".to_string(),
+                    system_prompt.clone(),
+                ));
                 command.args(["--append-system-prompt", &system_prompt]);
             }
 
+            let memory_isolation_prompt = "记忆隔离规则：当前智能体只能使用自己的私有工作区记忆。禁止读取、引用、总结或迁移其他智能体 `agents/<other-agent-id>/` 下的任何 markdown 记忆文件。";
+            system_prompt_chars += memory_isolation_prompt.chars().count();
+            system_prompt_sections.push((
+                "memory_isolation".to_string(),
+                memory_isolation_prompt.to_string(),
+            ));
+            command.args([
+                "--append-system-prompt",
+                memory_isolation_prompt,
+            ]);
+
             for skill_path in skills::resolve_skill_directories(&agent_config.skill_ids)? {
+                skill_count += 1;
                 let skill_path = skill_path.to_string_lossy().to_string();
                 command.args(["--skill", &skill_path]);
             }
         }
 
+        dev_trace(
+            "desktop.stream",
+            format!(
+                "准备启动 pi: session={} prompt_chars={} system_prompt_chars={} skill_count={} provider={} model={} agent={} pi_path={}",
+                normalized_session_id,
+                trimmed_prompt.chars().count(),
+                system_prompt_chars,
+                skill_count,
+                provider_config
+                    .as_ref()
+                    .map(|item| item.provider_id.as_str())
+                    .unwrap_or("(default)"),
+                provider_config
+                    .as_ref()
+                    .map(|item| item.model.as_str())
+                    .unwrap_or("(default)"),
+                agent_config
+                    .as_ref()
+                    .map(|item| item.id.as_str())
+                    .unwrap_or("(none)"),
+                resolved_pi_path,
+            ),
+        );
+        for (label, content) in &system_prompt_sections {
+            dev_trace(
+                "desktop.stream",
+                format!(
+                    "system_prompt_part: session={} label={} chars={}",
+                    normalized_session_id,
+                    label,
+                    content.chars().count()
+                ),
+            );
+            dev_trace_block(
+                "desktop.stream",
+                format!(
+                    "system_prompt_part session={} label={} chars={}",
+                    normalized_session_id,
+                    label,
+                    content.chars().count()
+                ),
+                content,
+            );
+        }
+
         let mut child = command
             .spawn()
             .map_err(|error| format!("调用 pi 失败，请确认已安装并在 PATH 中: {error}"))?;
+        dev_trace(
+            "desktop.stream",
+            format!("pi 已启动: session={} pid={}", normalized_session_id, child.id()),
+        );
 
         let abort_requested = Arc::new(AtomicBool::new(false));
 
@@ -992,21 +1226,66 @@ async fn stream_pi_prompt(
             .stdout
             .take()
             .ok_or_else(|| "无法读取 pi 输出".to_string())?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or_else(|| "无法读取 pi 错误输出".to_string())?;
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let stderr_buffer = Arc::new(Mutex::new(String::new()));
+        spawn_pi_stdout_logger(stdout, "desktop.stream.raw", stdout_tx);
+        spawn_pi_stderr_logger(stderr, "desktop.stream.stderr", stderr_buffer.clone());
 
         let mut saw_agent_end = false;
         let mut saw_message_done = false;
         let mut saw_model_abort_event = false;
+        let mut done_emitted = false;
         let mut final_usage: Option<PiTokenUsagePayload> = None;
         let mut emitted_assistant_text = String::new();
+        let mut assistant_terminal_error: Option<String> = None;
+        let mut saw_any_output = false;
+        let started_at = Instant::now();
 
-        for line_result in BufReader::new(stdout).lines() {
-            let line = match line_result {
-                Ok(current_line) => current_line,
-                Err(error) => {
+        loop {
+            if started_at.elapsed() >= PI_TOTAL_RUNTIME_TIMEOUT {
+                let timeout_error =
+                    format!("pi 总运行超时（>{} 秒）", PI_TOTAL_RUNTIME_TIMEOUT.as_secs());
+                dev_trace(
+                    "desktop.stream",
+                    format!("pi 超时: session={} error={}", normalized_session_id, timeout_error),
+                );
+                let _ = child.kill();
+                let _ = wait_for_child_exit(&mut child, CHILD_KILL_GRACE_TIMEOUT);
+                remove_runtime_handle(&normalized_session_id)?;
+                emit_stream_event(
+                    &app,
+                    "error",
+                    Some(normalized_session_id.clone()),
+                    None,
+                    Some(timeout_error.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+                return Err(timeout_error);
+            }
+
+            let base_timeout = if saw_any_output {
+                PI_IDLE_OUTPUT_TIMEOUT
+            } else {
+                PI_FIRST_OUTPUT_TIMEOUT
+            };
+            let remaining_total = PI_TOTAL_RUNTIME_TIMEOUT
+                .checked_sub(started_at.elapsed())
+                .unwrap_or(Duration::from_secs(0));
+            let timeout = base_timeout.min(remaining_total);
+            let line = match stdout_rx.recv_timeout(timeout) {
+                Ok(Ok(current_line)) => current_line,
+                Ok(Err(error)) => {
                     remove_runtime_handle(&normalized_session_id)?;
                     if abort_requested.load(Ordering::SeqCst) {
                         emit_stream_event(
@@ -1028,7 +1307,43 @@ async fn stream_pi_prompt(
                     }
                     return Err(format!("读取 pi 输出失败: {error}"));
                 }
+                Err(RecvTimeoutError::Timeout) => {
+                    let timeout_error = if timeout == remaining_total {
+                        format!("pi 总运行超时（>{} 秒）", PI_TOTAL_RUNTIME_TIMEOUT.as_secs())
+                    } else if saw_any_output {
+                        format!("等待 pi 后续输出超时（>{} 秒）", PI_IDLE_OUTPUT_TIMEOUT.as_secs())
+                    } else {
+                        format!("等待 pi 首包输出超时（>{} 秒）", PI_FIRST_OUTPUT_TIMEOUT.as_secs())
+                    };
+                    dev_trace(
+                        "desktop.stream",
+                        format!("pi 超时: session={} error={}", normalized_session_id, timeout_error),
+                    );
+                    let _ = child.kill();
+                    let _ = wait_for_child_exit(&mut child, CHILD_KILL_GRACE_TIMEOUT);
+                    remove_runtime_handle(&normalized_session_id)?;
+                    emit_stream_event(
+                        &app,
+                        "error",
+                        Some(normalized_session_id.clone()),
+                        None,
+                        Some(timeout_error.clone()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?;
+                    return Err(timeout_error);
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             };
+            if !line.trim().is_empty() {
+                saw_any_output = true;
+            }
 
             let value: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(parsed) => parsed,
@@ -1248,6 +1563,56 @@ async fn stream_pi_prompt(
                 }
             }
 
+            if matches!(line_type, "message_start" | "message_end" | "turn_end") {
+                let message = value.get("message");
+                let is_assistant = message
+                    .and_then(|item| item.get("role"))
+                    .and_then(|item| item.as_str())
+                    == Some("assistant");
+
+                if is_assistant {
+                    if let Some(final_text) = extract_text_content(message) {
+                        let missing_text = if emitted_assistant_text.is_empty() {
+                            final_text
+                        } else if let Some(suffix) = final_text.strip_prefix(&emitted_assistant_text)
+                        {
+                            suffix.to_string()
+                        } else if final_text != emitted_assistant_text {
+                            final_text
+                        } else {
+                            String::new()
+                        };
+
+                        if !missing_text.is_empty() {
+                            emitted_assistant_text.push_str(&missing_text);
+                            emit_stream_event(
+                                &app,
+                                "delta",
+                                Some(normalized_session_id.clone()),
+                                Some(missing_text),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )?;
+                        }
+                    }
+
+                    if assistant_terminal_error.is_none() {
+                        assistant_terminal_error = extract_message_terminal_error(message);
+                    }
+
+                    final_usage = final_usage.or_else(|| {
+                        extract_usage_payload(message.and_then(|item| item.get("usage")))
+                    });
+                }
+            }
+
             if line_type == "tool_execution_start" {
                 let tool_call_id = value
                     .get("toolCallId")
@@ -1336,7 +1701,73 @@ async fn stream_pi_prompt(
             }
 
             if line_type == "agent_end" {
+                if let Some(messages) = value.get("messages").and_then(|item| item.as_array()) {
+                    if let Some(last_assistant) = messages.iter().rev().find(|message| {
+                        message.get("role").and_then(|item| item.as_str()) == Some("assistant")
+                    }) {
+                        if let Some(final_text) = extract_text_content(Some(last_assistant)) {
+                            let missing_text = if emitted_assistant_text.is_empty() {
+                                final_text
+                            } else if let Some(suffix) =
+                                final_text.strip_prefix(&emitted_assistant_text)
+                            {
+                                suffix.to_string()
+                            } else if final_text != emitted_assistant_text {
+                                final_text
+                            } else {
+                                String::new()
+                            };
+
+                            if !missing_text.is_empty() {
+                                emitted_assistant_text.push_str(&missing_text);
+                                emit_stream_event(
+                                    &app,
+                                    "delta",
+                                    Some(normalized_session_id.clone()),
+                                    Some(missing_text),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                )?;
+                            }
+                        }
+
+                        if assistant_terminal_error.is_none() {
+                            assistant_terminal_error =
+                                extract_message_terminal_error(Some(last_assistant));
+                        }
+
+                        final_usage = final_usage.or_else(|| {
+                            extract_usage_payload(last_assistant.get("usage"))
+                        });
+                    }
+                }
+
                 saw_agent_end = true;
+                if assistant_terminal_error.is_none() {
+                    emit_stream_event(
+                        &app,
+                        "done",
+                        Some(normalized_session_id.clone()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        final_usage.clone(),
+                    )?;
+                    done_emitted = true;
+                }
                 break;
             }
         }
@@ -1346,10 +1777,10 @@ async fn stream_pi_prompt(
 
         remove_runtime_handle(&normalized_session_id)?;
 
-        let mut stderr_text = String::new();
-        stderr
-            .read_to_string(&mut stderr_text)
-            .map_err(|error| format!("读取 pi 错误输出失败: {error}"))?;
+        let stderr_text = stderr_buffer
+            .lock()
+            .map(|stderr| stderr.clone())
+            .unwrap_or_else(|_| String::new());
 
         if abort_requested.load(Ordering::SeqCst) {
             emit_stream_event(
@@ -1389,12 +1820,53 @@ async fn stream_pi_prompt(
             return Ok(());
         }
 
+        if let Some(error_text) = assistant_terminal_error {
+            dev_trace(
+                "desktop.stream",
+                format!("assistant error: session={} error={}", normalized_session_id, error_text),
+            );
+            emit_stream_event(
+                &app,
+                "error",
+                Some(normalized_session_id.clone()),
+                None,
+                Some(error_text.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                final_usage,
+            )?;
+            return Err(error_text);
+        }
+
+        if let Some(agent_config) = agent_config.as_ref() {
+            if (saw_agent_end || saw_message_done) && !emitted_assistant_text.trim().is_empty() {
+                // 桌面聊天也需要沉淀进统一的 agent wiki，避免记忆只在 Bot 通道生效。
+                if let Err(error) = agent_workspace::append_agent_memory_entry(
+                    &agent_config.id,
+                    "desktop-local",
+                    &trimmed_prompt,
+                    &emitted_assistant_text,
+                ) {
+                    eprintln!("NineClaw: 写入桌面聊天记忆失败: {error}");
+                }
+            }
+        }
+
         if !saw_agent_end && !saw_message_done {
             let fallback_error = if !stderr_text.trim().is_empty() {
                 stderr_text.trim().to_string()
             } else {
                 "pi 未返回 agent_end 事件".to_string()
             };
+            dev_trace(
+                "desktop.stream",
+                format!("pi 未正常结束: session={} error={}", normalized_session_id, fallback_error),
+            );
             emit_stream_event(
                 &app,
                 "error",
@@ -1413,26 +1885,32 @@ async fn stream_pi_prompt(
             return Err(fallback_error);
         }
 
-        if !status.success() {
+        if status.map(|value| !value.success()).unwrap_or(true) {
+            if done_emitted && (saw_agent_end || saw_message_done) {
+                return Ok(());
+            }
+
             if exit_outcome.timed_out
                 && (saw_agent_end || saw_message_done)
                 && stderr_text.trim().is_empty()
             {
-                emit_stream_event(
-                    &app,
-                    "done",
-                    Some(normalized_session_id.clone()),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    final_usage,
-                )?;
+                if !done_emitted {
+                    emit_stream_event(
+                        &app,
+                        "done",
+                        Some(normalized_session_id.clone()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        final_usage,
+                    )?;
+                }
                 return Ok(());
             }
 
@@ -1440,9 +1918,18 @@ async fn stream_pi_prompt(
                 stderr_text.trim().to_string()
             } else if exit_outcome.timed_out && (saw_agent_end || saw_message_done) {
                 "pi 在返回完整结果后退出过慢，运行时已强制回收进程。".to_string()
+            } else if exit_outcome.timed_out {
+                "pi 已被请求终止，但回收超时，运行时已主动脱离该卡死进程。".to_string()
             } else {
-                format!("pi 退出码异常: {status}")
+                match status {
+                    Some(status) => format!("pi 退出码异常: {status}"),
+                    None => "pi 已被请求终止，但进程仍未退出".to_string(),
+                }
             };
+            dev_trace(
+                "desktop.stream",
+                format!("pi 异常退出: session={} error={}", normalized_session_id, fallback_error),
+            );
             emit_stream_event(
                 &app,
                 "error",
@@ -1461,21 +1948,31 @@ async fn stream_pi_prompt(
             return Err(fallback_error);
         }
 
-        emit_stream_event(
-            &app,
-            "done",
-            Some(normalized_session_id.clone()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            final_usage,
-        )?;
+        if !done_emitted {
+            emit_stream_event(
+                &app,
+                "done",
+                Some(normalized_session_id.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                final_usage,
+            )?;
+        }
+        dev_trace(
+            "desktop.stream",
+            format!(
+                "pi 完成: session={} chars={}",
+                normalized_session_id,
+                emitted_assistant_text.chars().count()
+            ),
+        );
         Ok(())
     })
     .await
@@ -1486,209 +1983,15 @@ async fn stream_pi_prompt(
 
 static CHANNEL_MANAGER: OnceLock<Mutex<ChannelManager>> = OnceLock::new();
 
-fn channel_manager() -> &'static Mutex<ChannelManager> {
+pub(crate) fn channel_manager() -> &'static Mutex<ChannelManager> {
     CHANNEL_MANAGER.get_or_init(|| Mutex::new(ChannelManager::new()))
 }
 
-fn resolve_command_path(candidates: &[&str]) -> Option<PathBuf> {
-    let resolver = if cfg!(target_os = "windows") {
-        ("where", "/")
-    } else {
-        ("which", "")
-    };
-
-    for candidate in candidates {
-        let output = Command::new(resolver.0).arg(candidate).output().ok()?;
-        if !output.status.success() {
-            continue;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(first_line) = stdout.lines().map(str::trim).find(|line| !line.is_empty()) {
-            return Some(PathBuf::from(first_line));
-        }
-    }
-
-    None
-}
-
-fn prepend_to_path(path: &Path) {
-    let Some(path_str) = path.to_str() else {
-        return;
-    };
-
-    let current = env::var_os("PATH").unwrap_or_default();
-    let already_present = env::split_paths(&current).any(|entry| entry == path);
-    if already_present {
-        return;
-    }
-
-    let mut updated = vec![path.to_path_buf()];
-    updated.extend(env::split_paths(&current));
-    if let Ok(joined) = env::join_paths(updated) {
-        env::set_var("PATH", joined);
-    } else {
-        let mut fallback = path_str.to_string();
-        if !current.is_empty() {
-            fallback.push(if cfg!(target_os = "windows") {
-                ';'
-            } else {
-                ':'
-            });
-            fallback.push_str(&current.to_string_lossy());
-        }
-        env::set_var("PATH", fallback);
-    }
-}
-
-fn windows_common_bin_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    if let Some(app_data) = env::var_os("APPDATA") {
-        dirs.push(PathBuf::from(app_data).join("npm"));
-    }
-    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-        dirs.push(
-            PathBuf::from(local_app_data)
-                .join("Microsoft")
-                .join("WinGet")
-                .join("Links"),
-        );
-    }
-    dirs.push(PathBuf::from(r"C:\Program Files\nodejs"));
-    dirs.push(PathBuf::from(r"C:\Program Files (x86)\nodejs"));
-
-    dirs
-}
-
-fn prime_runtime_path_for_platform() {
-    if cfg!(target_os = "windows") {
-        for dir in windows_common_bin_dirs() {
-            if dir.exists() {
-                prepend_to_path(&dir);
-            }
-        }
-    }
-}
-
-fn install_nodejs_with_winget(messages: &mut Vec<String>) -> bool {
-    let winget = resolve_command_path(&["winget"]);
-    let Some(winget_path) = winget else {
-        messages.push("未找到 winget，无法自动安装 Node.js。".to_string());
-        return false;
-    };
-
-    messages.push("检测到缺少 npm，尝试通过 winget 安装 Node.js LTS。".to_string());
-    match Command::new(winget_path)
-        .args([
-            "install",
-            "--id",
-            "OpenJS.NodeJS.LTS",
-            "-e",
-            "--silent",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-        ])
-        .status()
-    {
-        Ok(status) if status.success() => {
-            messages.push("Node.js LTS 安装完成，正在刷新 PATH。".to_string());
-            prime_runtime_path_for_platform();
-            true
-        }
-        Ok(status) => {
-            messages.push(format!("winget 安装 Node.js 失败，退出码: {status}"));
-            false
-        }
-        Err(error) => {
-            messages.push(format!("执行 winget 安装 Node.js 失败: {error}"));
-            false
-        }
-    }
-}
-
-fn install_pi_with_npm(messages: &mut Vec<String>) -> bool {
-    let npm = resolve_command_path(&["npm.cmd", "npm"]);
-    let Some(npm_path) = npm else {
-        messages.push("未找到 npm，无法自动安装 pi。".to_string());
-        return false;
-    };
-
-    messages.push("尝试通过 npm 全局安装 pi 运行时。".to_string());
-    match Command::new(npm_path)
-        .args(["install", "-g", "@mariozechner/pi-coding-agent"])
-        .status()
-    {
-        Ok(status) if status.success() => {
-            prime_runtime_path_for_platform();
-            true
-        }
-        Ok(status) => {
-            messages.push(format!("npm 安装 pi 失败，退出码: {status}"));
-            false
-        }
-        Err(error) => {
-            messages.push(format!("执行 npm 安装 pi 失败: {error}"));
-            false
-        }
-    }
-}
-
-fn ensure_runtime_dependencies_impl() -> RuntimeDependencyStatus {
-    prime_runtime_path_for_platform();
-
-    let platform = env::consts::OS.to_string();
-    let mut messages = Vec::new();
-    let mut node_available = resolve_command_path(&["node.exe", "node"]).is_some();
-    let mut npm_available = resolve_command_path(&["npm.cmd", "npm"]).is_some();
-    let mut pi_available = resolve_command_path(&["pi.cmd", "pi.exe", "pi"]).is_some();
-    let mut auto_install_attempted = false;
-    let mut auto_install_succeeded = false;
-
-    if cfg!(target_os = "windows") && !pi_available {
-        auto_install_attempted = true;
-
-        if !npm_available && !install_nodejs_with_winget(&mut messages) {
-            messages.push("自动安装中止：Node.js/npm 仍不可用。".to_string());
-        }
-
-        node_available = resolve_command_path(&["node.exe", "node"]).is_some();
-        npm_available = resolve_command_path(&["npm.cmd", "npm"]).is_some();
-
-        if npm_available {
-            let _ = install_pi_with_npm(&mut messages);
-        }
-
-        prime_runtime_path_for_platform();
-        pi_available = resolve_command_path(&["pi.cmd", "pi.exe", "pi"]).is_some();
-        auto_install_succeeded = pi_available;
-
-        if pi_available {
-            messages.push("pi 运行时已就绪。".to_string());
-        } else {
-            messages
-                .push("pi 仍不可用。请确认系统允许执行 winget / npm，并重新启动应用。".to_string());
-        }
-    } else if pi_available {
-        messages.push("pi 运行时已就绪。".to_string());
-    } else {
-        messages.push("当前平台未检测到 pi。".to_string());
-    }
-
-    RuntimeDependencyStatus {
-        platform,
-        node_available,
-        npm_available,
-        pi_available,
-        auto_install_attempted,
-        auto_install_succeeded,
-        messages,
-    }
-}
-
 #[tauri::command]
-async fn ensure_runtime_dependencies() -> Result<RuntimeDependencyStatus, String> {
-    Ok(ensure_runtime_dependencies_impl())
+async fn ensure_runtime_dependencies(
+    app: tauri::AppHandle,
+) -> Result<RuntimeDependencyStatus, String> {
+    Ok(pi_runtime::ensure_runtime_dependencies_impl(&app))
 }
 
 #[tauri::command]
@@ -1735,6 +2038,33 @@ async fn bot_start_wechat(
     )
 }
 
+#[tauri::command]
+async fn bot_start_lark(
+    app: AppHandle,
+    channel_id: String,
+    agent_id: String,
+    app_id: String,
+    app_secret: String,
+    provider_id: Option<String>,
+    provider_api_format: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    provider_base_url: Option<String>,
+) -> Result<(), String> {
+    start_lark_channel(
+        app,
+        channel_id,
+        agent_id,
+        app_id,
+        app_secret,
+        provider_id,
+        provider_api_format,
+        model,
+        api_key,
+        provider_base_url,
+    )
+}
+
 fn start_wechat_channel(
     app: AppHandle,
     channel_id: String,
@@ -1756,7 +2086,7 @@ fn start_wechat_channel(
         .map_err(|e| format!("锁失败: {e}"))?;
 
     // Register WeChat channel via factory
-    mgr.register_channel(ChannelConfig::WeChat {
+    let old = mgr.register_channel(ChannelConfig::WeChat {
         channel_id: channel_id.clone(),
         agent_config: Some(agent_config),
         token,
@@ -1768,6 +2098,55 @@ fn start_wechat_channel(
         ai_api_key: api_key.unwrap_or_default(),
         ai_model: model.unwrap_or_default(),
     })?;
+    drop(mgr);
+    if let Some(mut channel) = old {
+        let _ = channel.stop();
+    }
+    let mut mgr = channel_manager()
+        .lock()
+        .map_err(|e| format!("锁失败: {e}"))?;
+    mgr.start_channel(&channel_id, app)?;
+
+    Ok(())
+}
+
+fn start_lark_channel(
+    app: AppHandle,
+    channel_id: String,
+    agent_id: String,
+    app_id: String,
+    app_secret: String,
+    provider_id: Option<String>,
+    provider_api_format: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    provider_base_url: Option<String>,
+) -> Result<(), String> {
+    let agent_config = agents::get_conversation_agent_config(&app, &agent_id)?
+        .ok_or_else(|| "绑定的智能体不存在，无法启动 IM 机器人".to_string())?;
+
+    let mut mgr = channel_manager()
+        .lock()
+        .map_err(|e| format!("锁失败: {e}"))?;
+
+    let old = mgr.register_channel(ChannelConfig::Lark {
+        channel_id: channel_id.clone(),
+        agent_config: Some(agent_config),
+        app_id,
+        app_secret,
+        ai_provider_id: provider_id.unwrap_or_default(),
+        ai_api_format: provider_api_format.unwrap_or_else(|| "openai".to_string()),
+        ai_base_url: provider_base_url.unwrap_or_default(),
+        ai_api_key: api_key.unwrap_or_default(),
+        ai_model: model.unwrap_or_default(),
+    })?;
+    drop(mgr);
+    if let Some(mut channel) = old {
+        let _ = channel.stop();
+    }
+    let mut mgr = channel_manager()
+        .lock()
+        .map_err(|e| format!("锁失败: {e}"))?;
     mgr.start_channel(&channel_id, app)?;
 
     Ok(())
@@ -1781,68 +2160,111 @@ async fn bot_stop_wechat(channel_id: String) -> Result<(), String> {
     mgr.stop_channel(&channel_id)
 }
 
+#[tauri::command]
+async fn bot_stop_lark(channel_id: String) -> Result<(), String> {
+    let mut mgr = channel_manager()
+        .lock()
+        .map_err(|e| format!("锁失败: {e}"))?;
+    mgr.stop_channel(&channel_id)
+}
+
 fn auto_start_bound_im_services(app: &AppHandle) -> Result<(), String> {
     let agent_records = agents::list_agents(app)?;
 
     for agent in agent_records {
-        let Some(config) = agent.bot_configs.get("wechat") else {
-            continue;
-        };
+        for (channel_key, config) in &agent.bot_configs {
+            if !config.enabled {
+                continue;
+            }
 
-        if !config.enabled {
-            continue;
-        }
+            let provider_id = config
+                .ai_provider_id
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| agent.default_provider_id.clone());
+            let model = config
+                .ai_model
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| agent.default_model.clone());
+            let provider_api_format = config
+                .ai_api_format
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .or_else(|| Some(default_provider_api_format(&provider_id).to_string()));
+            let provider_base_url = config.ai_base_url.clone();
+            let api_key = config.ai_api_key.clone();
 
-        let Some(token) = config.token.as_ref().filter(|value| !value.trim().is_empty()) else {
-            continue;
-        };
+            if provider_id.trim().is_empty() || model.trim().is_empty() {
+                log::warn!(
+                    "跳过自动启动 {} 机器人: 智能体 {} 缺少模型配置",
+                    channel_key,
+                    agent.id
+                );
+                continue;
+            }
 
-        let provider_id = config
-            .ai_provider_id
-            .as_ref()
-            .filter(|value| !value.trim().is_empty())
-            .cloned()
-            .unwrap_or_else(|| agent.default_provider_id.clone());
-        let model = config
-            .ai_model
-            .as_ref()
-            .filter(|value| !value.trim().is_empty())
-            .cloned()
-            .unwrap_or_else(|| agent.default_model.clone());
-        let provider_api_format = config
-            .ai_api_format
-            .as_ref()
-            .filter(|value| !value.trim().is_empty())
-            .cloned()
-            .or_else(|| Some(default_provider_api_format(&provider_id).to_string()));
-        let provider_base_url = config.ai_base_url.clone();
-        let api_key = config.ai_api_key.clone();
-        let base_url = config
-            .base_url
-            .clone()
-            .or_else(|| Some(config.client_secret.clone()).filter(|value| !value.trim().is_empty()));
+            match channel_key.as_str() {
+                "wechat" => {
+                    let Some(token) = config
+                        .token
+                        .as_ref()
+                        .filter(|value| !value.trim().is_empty())
+                    else {
+                        continue;
+                    };
 
-        if provider_id.trim().is_empty() || model.trim().is_empty() {
-            log::warn!("跳过自动启动微信机器人: 智能体 {} 缺少模型配置", agent.id);
-            continue;
-        }
+                    let base_url = config.base_url.clone().or_else(|| {
+                        Some(config.client_secret.clone()).filter(|value| !value.trim().is_empty())
+                    });
 
-        if let Err(error) = start_wechat_channel(
-            app.clone(),
-            format!("wechat:{}", agent.id),
-            agent.id.clone(),
-            token.clone(),
-            base_url,
-            config.route_tag.clone(),
-            Some(provider_id),
-            provider_api_format,
-            Some(model),
-            api_key,
-            provider_base_url,
-        ) {
-            log::warn!("自动启动智能体 {} 的微信机器人失败: {}", agent.id, error);
-        } else {
-            log::info!("已自动启动智能体 {} 的微信机器人", agent.id);
+                    if let Err(error) = start_wechat_channel(
+                        app.clone(),
+                        format!("wechat:{}", agent.id),
+                        agent.id.clone(),
+                        token.clone(),
+                        base_url,
+                        config.route_tag.clone(),
+                        Some(provider_id),
+                        provider_api_format,
+                        Some(model),
+                        api_key,
+                        provider_base_url,
+                    ) {
+                        log::warn!("自动启动智能体 {} 的微信机器人失败: {}", agent.id, error);
+                    } else {
+                        log::info!("已自动启动智能体 {} 的微信机器人", agent.id);
+                    }
+                }
+                "lark" => {
+                    let app_id = config.client_id.trim();
+                    let app_secret = config.client_secret.trim();
+                    if app_id.is_empty() || app_secret.is_empty() {
+                        continue;
+                    }
+
+                    if let Err(error) = start_lark_channel(
+                        app.clone(),
+                        format!("lark:{}", agent.id),
+                        agent.id.clone(),
+                        app_id.to_string(),
+                        app_secret.to_string(),
+                        Some(provider_id),
+                        provider_api_format,
+                        Some(model),
+                        api_key,
+                        provider_base_url,
+                    ) {
+                        log::warn!("自动启动智能体 {} 的飞书机器人失败: {}", agent.id, error);
+                    } else {
+                        log::info!("已自动启动智能体 {} 的飞书机器人", agent.id);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1909,7 +2331,11 @@ async fn test_llm_provider_connection(
                 .header("anthropic-version", "2023-06-01")
                 .json(&body);
             if !api_key.trim().is_empty() {
-                request = request.header("x-api-key", api_key.trim());
+                // Some Anthropic-compatible gateways require Bearer auth even when
+                // they expose the Messages API surface.
+                request = request
+                    .header("x-api-key", api_key.trim())
+                    .header("Authorization", format!("Bearer {}", api_key.trim()));
             }
             (endpoint, request)
         }
@@ -1994,6 +2420,7 @@ async fn bot_send_media(
     let mt = match media_type.as_str() {
         "image" => MediaType::Image,
         "video" => MediaType::Video,
+        "audio" | "voice" => MediaType::Audio,
         "file" | _ => MediaType::File,
     };
 
@@ -2013,14 +2440,16 @@ async fn bot_send_media(
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
+            dev_trace("app", "NineClaw 启动");
             resize_main_window_to_screen(&app.handle());
-            let status = ensure_runtime_dependencies_impl();
+            let status = pi_runtime::ensure_runtime_dependencies_impl(&app.handle());
             if !status.pi_available {
                 log::warn!("runtime dependency check: {}", status.messages.join(" | "));
             }
             if let Err(error) = auto_start_bound_im_services(&app.handle()) {
                 log::warn!("应用启动时自动检测 IM 机器人绑定失败: {}", error);
             }
+            heartbeat::start_heartbeat_scheduler(app.handle().clone());
 
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -2035,6 +2464,8 @@ pub fn run() {
             load_history_state,
             save_history_state,
             clear_history_state,
+            load_provider_preferences,
+            save_provider_preferences,
             list_installed_skills,
             list_system_skill_catalog,
             install_system_skill,
@@ -2049,11 +2480,14 @@ pub fn run() {
             write_agent_workspace_file,
             stream_pi_prompt,
             abort_pi_stream,
+            persist_chat_attachments,
             clear_pi_session,
             clear_pi_session_for_id,
             bot_login_wechat,
             bot_start_wechat,
+            bot_start_lark,
             bot_stop_wechat,
+            bot_stop_lark,
             bot_get_status,
             bot_send_message,
             bot_send_media,

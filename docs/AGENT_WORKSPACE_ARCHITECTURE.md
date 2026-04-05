@@ -42,6 +42,16 @@
       PUBLIC_CONTEXT.md
       memory/
         YYYY-MM-DD.md
+        WIKI_INDEX.md
+        SOURCE_INDEX.md
+        LOG.md
+        LINT.md
+        raw/
+          YYYY-MM-DD/
+            <timestamp>-<source>.md
+      inbox/
+        YYYY-MM-DD/
+          <timestamp>-<scope>-<file>
 ```
 
 ## Memory Layers
@@ -70,6 +80,27 @@
 - `DECISIONS.md`: 决策日志
 - `PUBLIC_CONTEXT.md`: 外部安全上下文
 - `memory/YYYY-MM-DD.md`: 每日日志
+- `memory/WIKI_INDEX.md`: 当前 agent wiki 的总索引，运行时先读它再决定看哪些页
+- `memory/SOURCE_INDEX.md`: raw source / 附件来源注册表，不直接改源文件
+- `memory/LOG.md`: append-only 的 ingest/query/source 操作日志
+- `memory/LINT.md`: wiki 健康检查标准
+- `memory/raw/YYYY-MM-DD/*.md`: 原始对话/来源快照，作为不可变 source-of-truth
+- `inbox/YYYY-MM-DD/*`: 用户或渠道发来的附件副本，供后续工具读取
+
+## LLM Wiki Layering
+
+这版工作区已经不是“单个 `MEMORY.md`”模式，而是借鉴了 Karpathy 的 LLM Wiki 思路，拆成三层：
+
+1. Raw sources
+   - `memory/raw/` 与 `inbox/`
+   - 只追加，不改写
+   - 保留原始对话、附件和来源路径
+2. Curated wiki
+   - `MEMORY.md`、`WORKING.md`、分类记忆、决策、daily log
+   - LLM 维护这个层，负责总结、交叉引用和沉淀
+3. Schema
+   - `AGENTS.md`、当前 agent 私有 markdown、`LINT.md`
+   - 定义 ingest / query / lint 的规则
 
 ## Runtime Integration
 
@@ -93,6 +124,7 @@ NineClaw 在以下时机自动接入这套结构：
 - 当前 workspace 根目录
 - 当前 agent home 路径
 - 读取顺序
+- `WIKI_INDEX.md` / `SOURCE_INDEX.md` / `LOG.md` / `LINT.md`
 - 共享 / 私有记忆边界
 - 写入规则
 - `BOOTSTRAP.md` 首次引导规则

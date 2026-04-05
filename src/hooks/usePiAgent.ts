@@ -1,4 +1,4 @@
-import { useEffect, useEffectEvent, useRef, useState } from 'react'
+import { useCallback, useEffect, useEffectEvent, useRef, useState } from 'react'
 import {
   abortPiStream,
   clearHistoryState,
@@ -193,6 +193,44 @@ function deriveConversationTitle(prompt: string, existingTitle?: string): string
 
   const title = normalized || titleText || promptText
   return truncateTitle(title || '新会话')
+}
+
+function deriveBotChannelLabel(channelId: string): string {
+  const baseChannelId = channelId.split(':')[0] ?? channelId
+  if (baseChannelId === 'wechat') {
+    return '微信'
+  }
+  if (baseChannelId === 'lark') {
+    return '飞书'
+  }
+  return baseChannelId
+}
+
+function buildBotConversationTitle(message: BotMessageEvent): string {
+  const channelLabel = deriveBotChannelLabel(message.channel_id)
+  const title = deriveConversationTitle(message.content)
+  if (message.agent?.name) {
+    return `[${channelLabel} · ${message.agent.name}] ${title}`
+  }
+  return `[${channelLabel}] ${title}`
+}
+
+function withBotAgentMetadata(item: HistoryItem, message: BotMessageEvent): HistoryItem {
+  if (!message.agent) {
+    return item
+  }
+
+  const channelLabel = deriveBotChannelLabel(message.channel_id)
+  const nextTitle =
+    item.title.startsWith(`[${channelLabel}] `) && !item.title.startsWith(`[${channelLabel} · `)
+      ? `[${channelLabel} · ${message.agent.name}] ${item.title.slice(`[${channelLabel}] `.length)}`
+      : item.title
+
+  return {
+    ...item,
+    title: nextTitle,
+    agent: message.agent,
+  }
 }
 
 function parseOptionalNumber(value: unknown): number | undefined {
@@ -911,12 +949,15 @@ export function usePiAgent() {
         setHistory((prev) => {
           const updated = prev.map((item): HistoryItem =>
             item.id === historyId
-              ? {
-                  ...item,
-                  status: 'running',
-                  updatedAt: now,
-                  turns: [...item.turns, turn],
-                }
+              ? withBotAgentMetadata(
+                  {
+                    ...item,
+                    status: 'running',
+                    updatedAt: now,
+                    turns: [...item.turns, turn],
+                  },
+                  msg,
+                )
               : item,
           )
           const current = updated.find((item) => item.id === historyId)
@@ -927,14 +968,14 @@ export function usePiAgent() {
         // First message from this channel:user — create new history item
         const historyId = createId()
         botSessionMapRef.current.set(sessionKey, { historyId, turnId: turn.id })
-        const channelLabel = msg.channel_id === 'wechat' ? '微信' : msg.channel_id
         const newSession: HistoryItem = {
           id: historyId,
-          title: `[${channelLabel}] ${deriveConversationTitle(msg.content)}`,
+          title: buildBotConversationTitle(msg),
           status: 'running',
           createdAt: now,
           updatedAt: now,
           turns: [turn],
+          ...(msg.agent ? { agent: msg.agent } : {}),
         }
         setHistory((prev) => [newSession, ...prev].slice(0, MAX_HISTORY_ITEMS))
       }
@@ -949,6 +990,7 @@ export function usePiAgent() {
 
     if (msg.direction === 'outbound_chunk') {
       // Streaming chunk from AI → append to answer
+      updateHistoryItem(historyId, (item) => withBotAgentMetadata(item, msg))
       updateTurn(historyId, turnId, (turn) => ({
         ...turn,
         answer: turn.answer + msg.content,
@@ -961,6 +1003,7 @@ export function usePiAgent() {
 
     if (msg.direction === 'outbound_done') {
       // Final complete reply → set answer to full text, mark done
+      updateHistoryItem(historyId, (item) => withBotAgentMetadata(item, msg))
       updateTurn(historyId, turnId, (turn) => ({
         ...turn,
         answer: msg.content,
@@ -973,6 +1016,7 @@ export function usePiAgent() {
     }
 
     if (msg.direction === 'error') {
+      updateHistoryItem(historyId, (item) => withBotAgentMetadata(item, msg))
       updateTurn(historyId, turnId, (turn) => ({
         ...turn,
         answer: turn.answer || msg.content,
@@ -1158,6 +1202,30 @@ export function usePiAgent() {
     }))
   }
 
+  const sanitizeSessionLlmReferences = useCallback((isValidRef: (providerId: ProviderId, model: string) => boolean) => {
+    setHistory((previous) => {
+      let changed = false
+      const next = previous.map((item) => {
+        const providerId = item.sessionLlmProviderId?.trim()
+        const model = item.sessionLlmModel?.trim() ?? ''
+        if (!providerId || !model) {
+          return item
+        }
+        if (isValidRef(providerId, model)) {
+          return item
+        }
+        changed = true
+        return {
+          ...item,
+          updatedAt: Date.now(),
+          sessionLlmProviderId: undefined,
+          sessionLlmModel: undefined,
+        }
+      })
+      return changed ? next : previous
+    })
+  }, [])
+
   const selectHistoryItem = (id: string) => {
     setActiveHistoryId(id)
     setError('')
@@ -1232,5 +1300,6 @@ export function usePiAgent() {
     deleteHistoryItem,
     clearSession,
     updateSessionLlm,
+    sanitizeSessionLlmReferences,
   }
 }

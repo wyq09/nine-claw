@@ -22,13 +22,23 @@
 
 1. 安装 Rust 与 Tauri 依赖环境
 2. 安装 Node.js 与 npm
-3. 安装 pi CLI：
+3. 安装项目依赖（现在默认把 `pi-mono` 核心包作为项目级 devDependencies 管理）
+4. 准备 pi 运行时资源：
 
 ```bash
-npm install -g @mariozechner/pi-coding-agent
+npm install
+npm run prepare:pi-runtime
 ```
 
-并确保 `pi --version` 可用。
+`prepare:pi-runtime` 会优先从当前项目 `node_modules` 里取 `@mariozechner/pi-coding-agent`
+及其相关 `pi-mono` 核心包，并把它们一起打进 `src-tauri/resources/pi-runtime/`。
+如果还想把本地 `pi-mono` 仓库快照一并打进去，可额外设置：
+
+```bash
+PI_MONO_REPO_DIR=/path/to/pi-mono npm run prepare:pi-runtime -- macos
+```
+
+开发环境下仍然允许回退到系统 `pi`，但正式打包不再依赖全局安装。
 
 另外需要你本地可用的模型认证（任选其一）：
 - 设置 API Key 环境变量（如 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`）
@@ -49,6 +59,7 @@ npm run tauri dev
   - `abort_pi_stream`（中止当前生成）
   - `clear_pi_session`（清理会话文件）
 - `src-tauri/tauri.conf.json`：Tauri 2.0 配置
+- `src-tauri/src/pi_runtime.rs`：统一的 `pi` 运行时解析与打包入口
 
 ## Agent Workspace
 
@@ -64,6 +75,8 @@ NineClaw 现在把智能体拆成两层：
 
 ## 注意
 
-- 当前实现依赖系统 PATH 中存在 `pi` 命令
+- 当前实现会优先使用应用包内置的 `pi`，找不到时再回退到系统 PATH
 - 当前方案是“每次请求启动一个 RPC 子进程”，但共享同一个 session 文件以保留上下文
 - 当前展示流式文本输出（`text_delta`），后续可扩展工具调用事件与更细粒度状态
+
+更多说明见 [docs/PI_RUNTIME_BUNDLING.md](docs/PI_RUNTIME_BUNDLING.md)。

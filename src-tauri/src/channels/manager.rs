@@ -22,11 +22,19 @@ impl ChannelManager {
     ///
     /// The `ChannelConfig` variant determines which concrete channel type gets
     /// created.  Callers never need to know about concrete types.
-    pub fn register_channel(&mut self, config: ChannelConfig) -> Result<(), String> {
+    ///
+    /// Returns the previous channel (if any). Callers should [`Channel::stop`] it **after**
+    /// releasing the manager mutex so `stop` never runs while the lock is held (avoids
+    /// deadlocks when the child process needs other commands to make progress).
+    pub fn register_channel(
+        &mut self,
+        config: ChannelConfig,
+    ) -> Result<Option<Box<dyn Channel>>, String> {
         let id = config.channel_id().to_string();
+        let existing = self.channels.remove(&id);
         let channel = factory::create_channel(config)?;
         self.channels.insert(id, channel);
-        Ok(())
+        Ok(existing)
     }
 
     /// Start a specific channel by ID.

@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NineClaw - 你的桌面 AI 智能体平台</title>
+    <meta name="description" content="NineClaw — 多模型·多渠道的 AI 智能体桌面客户端，本地运行，多模型协同工作， 让你通过一个窗口中管理和 AI 智能体， 多渠道接入 微信、 鯉钉、 企业微信, 钉钉等, 还能通过自然语言对话创建每一个 Agent.">
+    <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+    <style>
+        :root {
+            --bg-deep: #0a0f1a;
+            --bg-mid: #0e0e8, #111820 0);
+            --bg-light: #e8ece6;
+            --accent-jade: #2dd4a8;
+            --accent-red: #c4384a;
+            --text-primary: #f0f0f0;
+            --text-muted: #7a8a2a200;
+            --glass-bg: linear-gradient(135deg, 155deg, 5% 0);
+            --glass-surface: rgba(255,255,255,0.03);
+            --glass-border: 1px solid rgba(255,255,255,0.12);
+            --glass-shadow: 0 8px 4px var(--accent), rgba(45,221,12,0.8,0);
+            --glass-card {
+                backdrop-filter: blur(8px);
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.1);
+                border-radius: 12px;
+                padding: 1.5rem 1.25rem;
+                transition: border-color 0.3s, box-shadow: 0.3s;
+            }
+            .glass-card:hover {
+ border-color: var(--accent); box-shadow: 0 0 8px var(--accent-glow);
+ }
+            .feature-item {
+                padding: 1.25rem;
+                border-left: 3px solid var(--glass-border);
+ background: rgba(255,255,255,0.05);
+                transition: background 0.3s;
+            }
+            .feature-item:hover { border-color: var(--accent); }
+            .feature-title { font-size: 1rem;
+                margin-bottom: 2px;
+                letter-spacing: 0.1em;
+                color: var(--text-secondary);
+            }
+            .feature-desc {
+ font-size: 0.9rem;
+                color: var(--text-muted);
+                line-height: 1.6;
+            }
+            .section { padding: 4rem 0;
+            text-align: center;
+            }
+            .section-title { font-size: clamp(2rem, 2.5vw, 3.5rem);
+                font-weight: 300;
+                letter-spacing: 0.05em;
+                color: var(--text-secondary);
+                text-transform: uppercase;
+                margin-bottom: 0.5em;
+            }
+            .section-desc { font-size: 1rem;
+                color: var(--text-muted);
+                max-width: 560px;
+            }
+            .philosophy-block { max-width: 720px; margin: 0 auto; padding: 2rem 1rem; }
+            .philosophy-blockquote {
+ font-size: 1.4rem; line-height: 1.7; font-style: italic; color: var(--accent); border-left: 3px solid var(--accent); padding-left: 1rem; margin-bottom: 1rem; }
+            .philosophy-text { font-size: 1rem; color: var(--text-muted); max-width: 600px; margin-top: 0.5rem; }
+            .nav-inner { display: flex; align-items: center; gap: 1rem; max-width: 1000px; margin: 0 auto; }
+            .nav-inner a { color: var(--text-primary); text-decoration: none; font-size: 0.85rem; transition: color 0.3s; }
+            .nav-inner a:hover { color: var(--accent); }
+            .nav-brand { font-weight: 600; }
+            .stat-number { font-size: clamp(2.5rem, 4.5rem); font-weight: 300; color: var(--accent); }
+            .stat-label { font-size: 0.9rem; color: var(--text-secondary); }
+            .hero-badge { display: inline-block; padding: 0.35rem 0.75rem; background: rgba(45,212,168,0.1); border-radius: 20px; font-size: 0.75rem; color: var(--accent); letter-spacing: 0.1em; margin-bottom: 1.25rem; }
+            .hero-title { font-size: clamp(2.2rem, 5vw, 3.75rem); font-weight: 500; line-height: 1.1; margin-bottom: 0.75rem; }
+            .hero-subtitle { font-size: clamp(1rem, 2vw, 1.5rem); color: var(--text-secondary); margin-bottom: 1rem; }
+            .hero-btn-group { display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center; margin-top: 2rem; }
+            .cta-btn { display: inline-block; padding: 0.75rem 1.5rem; background: transparent; color: white; border: 1px solid var(--accent); border-radius: 4px; font-size: 0.9rem; cursor: pointer; transition: all 0.3s; text-decoration: none; }
+            .cta-btn:hover { box-shadow: 0 0 12px var(--accent); transform: scale(1.05); }
+            .cta-btn-outline { background: none; border: 1px solid rgba(45,212,168,0.3); color: var(--accent); }
+            .cta-secondary { display: inline-block; margin-top: 1rem; font-size: 0.85rem; color: var(--text-muted); text-decoration: none; }
+            .cta-secondary:hover { text-decoration: underline; }
+            .glass-panel { background: var(--glass-surface); backdrop-filter: blur(8px); border: 1px solid var(--glass-border); border-radius: 12px; }
+            .features-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr); gap: 1rem; }
+            .feature-item { padding: 1.25rem; border-radius: 12px; background: rgba(255,255,255,0.02); transition: background 0.3s; }
+            .feature-item:hover { background: rgba(255,255,255,0.04); }
+            .feature-icon { width: 32px; height: 32px; margin-bottom: 0.75rem; }
+            .feature-name { font-size: 1rem; font-weight: 500; margin-bottom: 0.5rem; }
+            .feature-desc { font-size: 0.85rem; color: var(--text-muted); line-height: 1.5; }
+            .stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; text-align: center; }
+            .stat-card { padding: 1.5rem; background: rgba(255,255,255,0.02); border-radius: 8px; text-align: center; }
+            .stat-card:hover { background: rgba(255,255,255,0.04); }
+            .step-line { display: flex; align-items: center; gap: 1.5rem; }
+            .step { display: flex; flex-direction: column; align-items: center; gap: 0.5rem; flex: 1; }
+            .step-number { width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: white; font-size: 0.85rem; display: flex; align-items: center; justify-content: center; font-weight: 600; flex-shrink: 0; }
+            .step-title { font-size: 0.95rem; font-weight: 500; margin-bottom: 0.25rem; }
+            .step-desc { font-size: 0.8rem; color: var(--text-muted); }
+            .channel-badge { display: inline-block; padding: 0.3rem 0.6rem; background: rgba(45,212,168,0.08); border-radius: 20px; font-size: 0.85rem; color: var(--accent); margin-bottom: 0.25rem; }
+            .channels-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; text-align: center; }
+            .channel-card { padding: 1.25rem; background: rgba(255,255,255,0.02); border-radius: 12px; text-align: center; transition: background 0.3s; }
+            .channel-card:hover { border-color: rgba(45,212,168,0.1); }
+            .channel-name { font-size: 0.95rem; font-weight: 500; margin-bottom: 0.25rem; }
+            .channel-desc { font-size: 0.8rem; color: var(--text-muted); }
+            .model-card { padding: 1.25rem; background: rgba(255,255,255,0.02); border-radius: 12px; text-align: center; transition: background 0.3s; }
+            .model-card:hover { border-color: rgba(45,212,168,0.08); }
+            .model-name { font-size: 0.9rem; font-weight: 500; margin-bottom: 0.25rem; }
+            .model-desc { font-size: 0.8rem; color: var(--text-muted); }
+            footer { text-align: center; padding: 2rem 1.5rem; color: var(--text-muted); font-size: 0.8rem; }
+            footer a { color: var(--text-muted); text-decoration: none; }
+        </style>
+    </head>
+    <body>
+        <!-- Navigation -->
+        <nav class="floating-nav" id="nav">
+            <div class="nav-inner">
+                <a href="#home" class="nav-brand">NineClaw</a>
+                <a href="#features" class="nav-link active">功能详情</a>
+                <a href="https://github.com/nine-claw-server/NineClaw" target="_blank" rel="noopener" class="nav-link">GitHub</a>
+            </div>
+        </nav>
+
+        <!-- Hero -->
+        <section id="hero" class="hero-section">
+            <div class="hero-glow"></div>
+            <div class="glass-panel hero-panel">
+                <div class="hero-content">
+                    <div class="hero-badge">AI 智能体平台</div>
+                    <h1 class="hero-title">你的桌面 AI 智能体平台</h1>
+                    <p class="hero-subtitle">多模型 · 多渠道、 AI 智能体桌面客户端， 本地运行，多模型协同工作</ 让你通过一个窗口中管理和 AI 智能体。</brbr>
+                    <p class="hero-subtitle-detail">通过自然语言对话创建每个 Agent — 诽表表且而非表表</配置文件</p>
+                    <div class="hero-btn-group">
+                        <a href="#features" class="cta-btn">功能详情</a>
+                        <a href="#download" class="cta-btn">下载 NineClaw</a>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Features -->
+        <section id="features" class="section fade-in">
+            <div class="section-header">
+                <h2 class="section-title">自定义智能体，对话式创建，而非表单.<br6p class="section-desc">每个智能体拥有独立的身份、记忆忆和技能， — 而表表而不是并非                    <p class="philosophy-text">对话式创建， 而非冷冰冰的配置表。 它应该很快出生、很快能干活。</</p>
+                    <div class="features-grid">
+                    <div class="feature-item glass">
+                        <div class="feature-icon">⚡</div>
+                        <h3 class="feature-name">多智能体</h3>
+                        <p class="feature-desc">对话式创建， 而非冷冰冰的配置表。 对话式创建，而非表单</p>
+                    </div>
+                    <div class="feature-item glass">
+                        <div class="feature-icon">🛰</div>
+                        <h3 class="feature-name">多渠道接入</h3>
+                        <p class="feature-desc">将 AI 能力延伸到日常使用的通讯工具</p>
+                    </div>
+                    <div class="feature-item glass">
+                        <div class="feature-icon">⚙</div>
+                        <h3 class="feature-name">智能对话</h3>
+                        <p class="feature-desc">多模型协同工作， 多轮对话更自然</p>
+                    </div>
+                    <div class="feature-item glass">
+                        <div class="feature-icon">⚙</div>
+                        <h3 class="feature-name">AI 模型引擎</h3>
+                        <p class="feature-desc">OpenAI、 Claude、 DeepSeek 等主流大模型</p>
+                    </div>
+                    <div class="feature-item glass">
+                        <div class="feature-icon">⚙</div>
+                        <h3 class="feature-name">技能系统</h3>
+                        <p class="feature-desc">内置 PDF、 DOCX 独立技能处理能力</p>
+                    </div>
+                    <div class="feature-item glass">
+                        <div class="feature-icon">⏰</div>
+                        <h3 class="feature-name">本地运行</h3>
+                        <p class="feature-desc">数据本地处理， 隐私安全， 无需上传服务器</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- How it works -->
+        <section id="how" class="section fade-in">
+            <div class="section-header">
+                <h2 class="section-title">工作流程</h2>
+            <div class="step-line">
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <div class="step-content">
+                        <h3 class="step-title">选择模型</h3>
+                        <p class="step-desc">选择适合你的 AI 模型</p>
+                    </div>
+                    <div class="step">
+                        <div class="step-number">2</div>
+                        <div class="step-content">
+                        <h3 class="step-title">创建智能体</h3>
+                        <p class="step-desc">对话式创建 Agent， 自然语言描述创建身份与记忆、技能</p>
+                    </div>
+                    <div class="step">
+                        <div class="step-number">3</div>
+                        <div class="step-content">
+                        <h3 class="step-title">接入渠道</h3>
+                        <p class="step-desc">扫码即用， 将 AI 能力延伸到日常通讯工具</p>
+                    </div>
+                </div>
+        </section>
+
+        <!-- Channels -->
+        <section id="channels" class="section fade-in">
+            <div class="section-header">
+                <h2 class="section-title">多渠道接入</h2>
+            <div class="channels-grid">
+                <div class="channel-card">
+                    <div class="channel-icon">💬</div>
+                    <h3 class="channel-name">微信</h3>
+                    <p class="channel-desc">扫码即用, AI Agent 直接在微信对话</p>
+                </div>
+                <div class="channel-card">
+                    <div class="channel-icon">💬</div>
+                    <h3 class="channel-name">飞书</h3>
+                    <p class="channel-desc">Lark SDK 接入, 多群消息群工作</p>
+                </div>
+                <div class="channel-card">
+                    <div class="channel-icon">💬</div>
+                    <h3 class="channel-name">钉钉</h3>
+                    <p class="channel-desc">钉钉机器人支持</p>
+                </div>
+                <div class="channel-card">
+                    <div class="channel-icon">💬</div>
+                    <h3 class="channel-name">企业微信</h3>
+                    <p class="channel-desc">企业微信 Bot 接收消息</p>
+                </div>
+                <div class="channel-card">
+                    <div class="channel-icon">💬</div>
+                    <h3 class="channel-name">企业微信 Bot</h3>
+                    <p class="channel-desc">Webhook 推送通知</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Models -->
+        <section id="models" class="section fade-in">
+            <div class="section-header">
+                <h2 class="section-title">多模型支持</</h2>
+            <p class="section-desc">主流 AI 模型自由 切换， 本地运行</p>
+            <div class="models-grid">
+                <div class="model-card">
+                    <div class="model-icon">⚡</div>
+                    <h3 class="model-name">OpenAI</h3>
+                    <p class="model-desc">GPT-4.1, 最先进的推理模型</p>
+                </div>
+                <div class="model-card">
+                    <div class="model-icon">⚡</div>
+                    <h3 class="model-name">Anthropic</h3>
+                    <p class="model-desc">Claude 系列， 深度思考</p>
+                </div>
+                <div class="model-card">
+                    <div class="model-icon">⚡</div>
+                    <h3 class="model-name">DeepSeek</h3>
+                    <p class="model-desc">深度求索, 深度思考</p>
+                </div>
+                <div class="model-card">
+                    <div class="model-icon">⚡</div>
+                    <h3 class="model-name">豆包</h3>
+                    <p class="model-desc">字节跳动 Doubao 模型</p>
+                </div>
+                <div class="model-card">
+                    <div class="model-icon">⚡</div>
+                    <h3 class="model-name">SiliconFlow</h3>
+                    <p class="model-desc">聚合多模型, 按需选择</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Philosophy -->
+        <section id="philosophy" class="section fade-in">
+            <div class="philosophy-content glass-panel">
+                <blockquote>智能体不该是冷冰冰的配置表。它应该很快出生，很快能干活。</p>
+                <p class="philosophy-text">NineClaw 让每个智能体拥有身份、 有记忆, 有个性 — 很快出生，很快能干活。</p>
+            </div>
+        </section>
+
+        <!-- CTA -->
+        <section id="cta" class="section fade-in">
+            <div class="cta-content glass-panel">
+                <div class="cta-text">
+                    <h2 class="cta-title">开始使用 NineClaw</h2>
+                    <p class="cta-subtitle">下载桌面客户端, 在本地运行, 免费体验 AI 智能体的全部能力</p>
+                    <div class="cta-btn-group">
+                        <a href="#download" class="cta-btn">下载 NineClaw</a>
+                        <a href="https://github.com/nine-claw-server/NineClaw" target="_blank" rel="noopener" class="cta-btn-secondary">查看文档</a>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <footer>
+            <div class="footer-content">
+                <a href="https://github.com/nine-claw-server/NineClaw" target="_blank" rel="noopener" class="footer-brand">NineClaw</a>
+                <nav class="footer-nav">
+                    <a href="https://github.com/nine-claw-server/NineClaw" target="_blank" rel="noopener"> class="footer-link">GitHub</a>
+                    <span class="footer-copy">&copy; 2024-2026 NineClaw</span>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <!-- Scroll Indicator -->
+    <div class="scroll-indindicator">
+ id="scrollIndicator">
+ aria="scroll indicator" aria-viewport" content="width=device-width, initial-scale=1.0 opacity: 0;"></div>
+
+    <!-- Mobile Menu -->
+    <button class="hamburger" id="hamburger" aria="☰" aria-label="Menu"></button>
+    <div class="mobile-nav">
+        <a href="#home" class="nav-brand">NineClaw</a>
+        <a href="#features" class="nav-link active">功能详情</a>
+        <a href="https://github.com/nine-claw-server/NineClaw" target="_blank" rel="noopener" class="nav-link">GitHub</a>
+    </div>
+
+    <nav>
+
+    <div class="page" id="home">
+      <!-- Hero -->
+      <section id="hero" class="hero-section">
+        <div class="hero-glow"></div>
+        <div class="glass-panel hero-panel">
+          <div class="hero-content">
+            <div class="hero-badge">AI 智能体平台</div>
+            <h1 class="hero-title">你的桌面 AI 智能体平台</h1>
+            <p class="hero-subtitle">多模型 · 多渠道 · AI 智能体桌面客户端， 本地运行, 多模型协同工作</ 让你通过一个窗口中管理和 AI 智能体。"
+brbr}                    <p class="hero-subtitle-detail">通过自然语言对话创建每一个 Agent — 对话式创建，而非表单.<br> 你只需要做的只是告诉他
+
+            <div class="hero-btn-group">
+              <a href="#features" class="cta-btn">功能详情</a>
+              <a href="#download" class="cta-btn">下载 NineClaw</a>
+          </div>
+        </section>
+      </section>
+
+      <!-- Features -->
+      <section id="features" class="section fade-in">
+        <div class="section-header">
+          <h2 class="section-title">自定义智能体</h2>
+          <p class="section-desc">对话式创建， 而非冷冰冰的配置表。</ 每个智能体拥有独立的身份、 记忆和技能。</</p>
+                    <p class="philosophy-text">对话式创建， 而非冷冰冰的配置表。 它应该很快出生，很快能干活。</p>
+                  </div>
+                </div>
+                <div class="features-grid">
+                  <div class="feature-item glass">
+                    <div class="feature-icon">⚡</div>
+                    <h3 class="feature-name">多智能体</h3>
+                    <p class="feature-desc">对话式创建, 而非冷冰冰的配置表</</p>
+                  </div>
+                  <div class="feature-item glass">
+                    <div class="feature-icon">💬</div>
+                    <h3 class="feature-name">多渠道接入</h3>
+                    <p class="feature-desc">将 AI 能力延伸到日常使用的通讯工具</p>
+                  </div>
+                  <div class="feature-item glass">
+                    <div class="feature-icon">💬</div>
+                    <h3 class="feature-name">智能对话</h3>
+                    <p class="feature-desc">多模型协同工作， 多轮对话更自然</p>
+                  </div>
+                  <div class="feature-item glass">
+                    <div class="feature-icon">⚙</div>
+                    <h3 class="feature-name">AI 模型引擎</h3>
+                    <p class="feature-desc">OpenAI、 Claude、 DeepSeek 等主流大模型</p>
+                  </div>
+                  <div class="feature-item glass">
+                    <div class="feature-icon">⚙</div>
+                    <h3 class="feature-name">技能系统</h3>
+                    <p class="feature-desc">内置 PDF、 DOCX 独立技能处理能力</p>
+                  </div>
+                  <div class="feature-item glass"                    <div class="feature-icon">⏰</div>
+                    <h3 class="feature-name">本地运行</h3>
+                    <p class="feature-desc">数据本地处理, 隐私安全, 无需上传服务器</p>
+                  </div>
+                </div>
+            </div>
+          </section>
+
+          <!-- How it works -->
+          <section id="how" class="section fade-in">
+            <div class="section-header">
+              <h2 class="section-title">工作流程</h2>
+            <div class="step-line">
+              <div class="step">
+                <div class="step-number">1</div>
+                <div class="step-content">
+                  <h3 class="step-title">选择模型</h3>
+                  <p class="step-desc">选择适合你的 AI 模型</p>
+              </div>
+              <div class="step">
+                <div class="step-number">2</div>
+                <div class="step-content">
+                  <h3 class="step-title">创建智能体</h3>
+                  <p class="step-desc">对话式创建 Agent; 自然语言描述创建身份、记忆忆、技能</p>
+              </div>
+              <div class="step">
+                <div class="step-number">3</div>
+                <div class="step-content">
+                  <h3 class="step-title">接入渠道</h3>
+                  <p class="step-desc">扫码即用, 将 AI 能力延伸到日常通讯工具</p>
+              </div>
+            </div>
+          </section>
+          </section>
+
+        <!-- Channels -->
+        <section id="channels" class="section fade-in">
+          <div class="section-header">
+            <h2 class="section-title">多渠道接入</h2>
+          <div class="channels-grid">
+            <div class="channel-card">
+              <div class="channel-icon">💬</div>
+              <h3 class="channel-name">微信</h3>
+              <p class="channel-desc">扫码即用, AI Agent 直接在微信对话</p>
+            </div>
+            <div class="channel-card">
+              <div class="channel-icon">💬</div>
+              <h3 class="channel-name">飞书</h3>
+              <p class="channel-desc">Lark SDK 接入, 多群消息群工作</p>
+            </div>
+            <div class="channel-card">
+              <div class="channel-icon">💬</div>
+              <h3 class="channel-name">钉钉</h3>
+              <p class="channel-desc">钉钉机器人支持</p>
+            </div>
+            <div class="channel-card">
+              <div class="channel-icon">💬</div>
+              <h3 class="channel-name">企业微信</h3>
+              <p class="channel-desc">企业微信 Bot 推送通知</p>
+            </div>
+            <div class="channel-card">
+              <div class="channel-icon">💬</div>
+              <h3 class="channel-name">企业微信 Bot</h3>
+              <p class="channel-desc">Webhook 推送通知? 通过 URL 即可</p>
+            </div>
+          </section>
+        </section>
+
+        <!-- Models -->
+        <section id="models" class="section fade-in">
+          <div class="section-header">
+            <h2 class="section-title">多模型支持</h2>
+          <p class="section-desc">主流 AI 模型自由切换. 本地运行</p>
+          <div class="models-grid">
+            <div class="model-card">
+              <div class="model-icon">⚡</div>
+              <h3 class="model-name">OpenAI</h3>
+              <p class="model-desc">GPT-4.1 · 最先进的推理模型</p>
+            </div>
+            <div class="model-card">
+              <div class="model-icon">⚡</div>
+              <h3 class="model-name">Anthropic</h3>
+              <p class="model-desc">Claude 系列, 深度思考</p>
+            </div>
+            <div class="model-card">
+              <div class="model-icon">⚡</div>
+              <h3 class="model-name">DeepSeek</h3>
+              <p class="model-desc">深度求索? 深度思考</p>
+            </div>
+            <div class="model-card">
+              <div class="model-icon">⚡</div>
+              <h3 class="model-name">豆包</h3>
+              <p class="model-desc">字节跳动 Doubao 模型</p>
+            </div>
+            <div class="model-card">
+              <div class="model-icon">⚡</div>
+              <h3 class="model-name">SiliconFlow</h3>
+              <p class="model-desc">聚合多模型. 按需选择</p>
+            </div>
+          </section>
+        </section>
+
+        <!-- Philosophy -->
+        <section id="philosophy" class="section fade-in">
+          <div class="philosophy-content glass-panel">
+            <blockquote>智能体不该是冷冰冰的配置表。让它用户通过对话式创建， 而非冷冰冰的配置表。 每个智能体拥有独立的身份、有记忆, 有个性 — 很快出生，很快能干活。</p>
+              <p class="philosophy-text">九Claw 的理念是：智能体不该是是冷冰冰的配置表</blockquote>
+            <p class="philosophy-text">本地运行， 党上传服务器， 隐私安全， 无需上传服务器。 永远在桌面端。</p>
+          </div>
+        </section>
+
+        <!-- CTA -->
+        <section id="cta" class="section fade-in">
+          <div class="cta-content glass-panel">
+            <div class="cta-text">
+              <h2 class="cta-title">开始使用 NineClaw</h2>
+              <p class="cta-subtitle">下载桌面客户端， 在本地运行, 党费体验 AI 智能体的全部能力</p>
+              <div class="cta-btn-group">
+                <a href="#download" class="cta-btn">下载 NineClaw</a>
+                <a href="https://github.com/nine-claw-server/NineClaw" target="_blank" rel="noopener" class="cta-btn-secondary">查看文档</a>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <footer>
+            <div class="footer-content">
+              <a href="https://github.com/nine-claw-server/NineClaw" target="_blank" rel="noopener" class="footer-brand">NineClaw</a>
+              <nav class="footer-nav">
+                  <a href="https://github.com/nine-claw-server/NineClaw" target="_blank" rel="noopener" class="footer-link">GitHub</a>
+                <span class="footer-copy">&copy; 2024-2026 NineClaw</span>
+              </div>
+            </div>
+        </footer>
+    </div>
+
+    <div class="scroll-indindicator" id="scrollIndicator">
+      <span class="scroll-label" aria="scroll indicator" aria-viewport" content="width=device-width; initial-scale=1.0 opacity: 0;"></span>
+    <button class="hamburger" id="hamburger" aria="☰" aria-label="Menu"></button>
+    <div class="mobile-nav">
+      <a href="#home" class="nav-brand">NineClaw</a>
+      <a href="#features" class="nav-link active">功能详情</a>
+      <a href="https://github.com/nine-claw-server/NineClaw" target="_blank" rel="noopener" class="nav-link">GitHub</a>
+    </div>
+
+    <nav>
+
+    <script>
+        // Mobile menu toggle
+        const hamburger = document.getElementById('hamburger');
+        const const navLinks = document.querySelectorAll('.nav-link');
+          navLinks.classList.toggle('active');
+          hamburger.classList.toggle('active');
+        });
+
+        // Nav link active state
+        const links = document.querySelectorAll('.nav-link');
+        links.forEach(link(link { link.classList.toggle('active'); });
+      });
+
+    }
+
+  </script>
+
+    <!-- Intersection observer for sections -->
+    const observer = new IntersectionObserver({
+ threshold: 0.15, rootMargin: '0px 0px', });
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('fade-in');
+        }
+      });
+    });
+
+  </script>
+</body>
+</html>

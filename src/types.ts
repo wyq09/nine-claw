@@ -87,6 +87,24 @@ export type ResponseSegment =
   | { type: 'text'; text: string }
   | { type: 'tool'; toolCallId: string }
 
+export type ChatAttachmentKind = 'image' | 'video' | 'audio' | 'file'
+
+export type ChatAttachmentUpload = {
+  fileName: string
+  mimeType?: string | null
+  dataBase64?: string | null
+  sourcePath?: string | null
+}
+
+export type PersistedChatAttachment = {
+  id: string
+  fileName: string
+  filePath: string
+  mimeType: string
+  size: number
+  kind: ChatAttachmentKind
+}
+
 export type AgentExecutionMode = 'single' | 'supervisor' | 'worker'
 
 export type AgentSharedContextPolicy = 'session' | 'summary' | 'none'
@@ -95,6 +113,40 @@ export type AgentCollaborationConfig = {
   allowedDelegateAgentIds: string[]
   handoffPrompt: string
   sharedContextPolicy: AgentSharedContextPolicy
+}
+
+export type AgentHeartbeatTaskType = 'notify' | 'shell'
+
+export type AgentHeartbeatTask = {
+  id: string
+  name: string
+  description: string
+  taskType: AgentHeartbeatTaskType
+  enabled: boolean
+  messageTemplate: string
+  command: string
+  workingDirectory: string
+  timeoutSec: number
+  notifyOnSuccess: boolean
+  notifyOnFailure: boolean
+}
+
+export type AgentHeartbeatSchedule = {
+  id: string
+  name: string
+  enabled: boolean
+  taskId: string
+  scheduleType: 'daily'
+  times: string[]
+  channelId: string
+  targetUserId: string
+  targetLabel: string
+}
+
+export type AgentHeartbeatConfig = {
+  timezone: string
+  tasks: AgentHeartbeatTask[]
+  schedules: AgentHeartbeatSchedule[]
 }
 
 export type ConversationAgentSnapshot = {
@@ -203,6 +255,7 @@ export type AgentRecord = {
   collaborationConfig?: AgentCollaborationConfig
   accentColor?: string
   botConfigs: AgentBotBindings
+  heartbeatConfig: AgentHeartbeatConfig
   createdAt: number
   updatedAt: number
 }
@@ -219,6 +272,7 @@ export type AgentInput = {
   collaborationConfig?: AgentCollaborationConfig
   accentColor?: string
   botConfigs: AgentBotBindings
+  heartbeatConfig: AgentHeartbeatConfig
 }
 
 export type AgentBuilderDraft = {
@@ -233,6 +287,7 @@ export type AgentBuilderDraft = {
   collaborationConfig?: AgentCollaborationConfig
   accentColor?: string
   botConfigs?: AgentBotBindings
+  heartbeatConfig?: AgentHeartbeatConfig
   workspaceNotes?: string
 }
 
@@ -262,6 +317,10 @@ export type RuntimeDependencyStatus = {
   nodeAvailable: boolean
   npmAvailable: boolean
   piAvailable: boolean
+  bundledPiAvailable: boolean
+  bundledPiPath?: string | null
+  resolvedPiPath?: string | null
+  piSource?: 'bundled' | 'system_path' | null
   autoInstallAttempted: boolean
   autoInstallSucceeded: boolean
   messages: string[]
@@ -363,4 +422,5 @@ export type BotMessagePayload = {
   direction: string
   content: string
   timestamp: number
+  agent?: ConversationAgentSnapshot
 }

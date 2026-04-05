@@ -47,7 +47,9 @@
       }
     },
     "resources": [
-      "resources/system-skills"
+      "resources/system-skills",
+      "resources/bot-helpers",
+      "resources/pi-runtime"
     ],
     "icon": [
       "icons/32x32.png",

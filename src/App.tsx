@@ -1,8 +1,10 @@
-import { lazy, Suspense, startTransition, useCallback, useDeferredValue, useEffect, useMemo, useState } from 'react'
-import { convertFileSrc } from '@tauri-apps/api/core'
+import { lazy, Suspense, startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { Check, Copy } from 'lucide-react'
 import './App.css'
 import { AppIcon, type IconName } from './components/AppIcon'
+import { ComposerAttachmentStrip } from './components/ComposerAttachmentStrip'
+import { InlineMediaAttachmentList } from './components/InlineMediaAttachmentList'
+import { PromptBubbleContent } from './components/PromptBubbleContent'
 import { SettingsModal } from './components/SettingsModal'
 import {
   botDefinitions,
@@ -14,10 +16,14 @@ import {
   providerDefinitions,
   resourceSeed,
 } from './mockData'
+import { useComposerAttachments } from './hooks/useComposerAttachments'
 import { usePiAgent } from './hooks/usePiAgent'
 import type {
   AgentExecutionMode,
   AgentBuilderDraft,
+  AgentHeartbeatConfig,
+  AgentHeartbeatSchedule,
+  AgentHeartbeatTask,
   AgentInput,
   AgentRecord,
   AgentWorkspaceBundle,
@@ -34,10 +40,11 @@ import type {
   ProviderDefinition,
   ProviderId,
   ProviderRuntimeConfig,
+  PersistedChatAttachment,
   CustomProviderMeta,
   ProviderApiFormat,
   ResourceItem,
-  RuntimeDependencyStatus,
+
   SettingsTab,
   InstalledSkillItem,
   SkillLibraryTab,
@@ -47,20 +54,23 @@ import type {
   ToolCallEntry,
   ViewKey,
 } from './types'
-import type { KeyboardEvent, MouseEvent } from 'react'
+import type { ChangeEvent, ClipboardEvent, KeyboardEvent, MouseEvent, RefObject } from 'react'
 import {
   deleteAgent,
   botLoginWechat,
+  botStartLark,
   botStartWechat,
+  botStopLark,
   botStopWechat,
   createAgent,
-  ensureRuntimeDependencies,
   getDefaultAgent,
   installSystemSkill,
   listInstalledSkills,
   listAgents,
+  loadProviderPreferences,
   listSystemSkillCatalog,
   readAgentWorkspaceBundle,
+  saveProviderPreferences,
   setDefaultAgent,
   subscribeQrCode,
   subscribeBotStatus,
@@ -68,6 +78,8 @@ import {
   writeAgentWorkspaceFile,
 } from './lib/piClient'
 import type { QrCodeEvent, BotStatusEvent } from './lib/piClient'
+import { buildPromptWithAttachments } from './lib/composerAttachments'
+import { extractInlineMediaAttachments, normalizeMarkdownImageSources } from './lib/inlineMedia'
 
 const ABSOLUTE_TIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
   year: 'numeric',
@@ -214,6 +226,62 @@ function createInitialProviderState() {
   return loadProviderConfigs()
 }
 
+function parseStoredProviderConfigs(raw: string | null | undefined): Record<string, ProviderConfig> | null {
+  if (!raw) {
+    return null
+  }
+  try {
+    const defaults = createInitialProviderConfigs()
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return null
+    }
+    const result: Record<string, ProviderConfig> = { ...defaults }
+    for (const key of Object.keys(parsed)) {
+      const value = (parsed as Record<string, unknown>)[key]
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        continue
+      }
+      const base = defaults[key] ?? emptyProviderConfig()
+      result[key] = { ...base, ...(value as Partial<ProviderConfig>) }
+    }
+    return result
+  } catch {
+    return null
+  }
+}
+
+function parseStoredCustomProviderMeta(raw: string | null | undefined): CustomProviderMeta[] | null {
+  if (!raw) {
+    return null
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) {
+      return null
+    }
+    return parsed.flatMap((x) => {
+      if (
+        typeof x !== 'object' ||
+        x === null ||
+        typeof (x as CustomProviderMeta).id !== 'string' ||
+        typeof (x as CustomProviderMeta).name !== 'string'
+      ) {
+        return []
+      }
+
+      return [
+        {
+          ...(x as CustomProviderMeta),
+          apiFormat: normalizeProviderApiFormat((x as Partial<CustomProviderMeta>).apiFormat),
+        },
+      ]
+    })
+  } catch {
+    return null
+  }
+}
+
 function summarizePrompt(prompt: string, maxLength = 26): string {
   const compact = prompt.replace(/\s+/g, ' ').trim()
   if (!compact) {
@@ -274,6 +342,33 @@ function getBotChannelRuntimeId(agentId: string, channelId: BotChannelId): strin
   return `${channelId}:${agentId}`
 }
 
+function resolveBotChannelFromRuntimeId(agentId: string, runtimeChannelId: string): BotChannelId | null {
+  for (const channel of botDefinitions) {
+    if (runtimeChannelId === getBotChannelRuntimeId(agentId, channel.id)) {
+      return channel.id
+    }
+  }
+  return null
+}
+
+function buildBotConfigStatusPatch(event: BotStatusEvent): Partial<BotConfig> | null {
+  switch (event.level) {
+    case 'processing':
+      return { status: '登录中', errorMessage: undefined }
+    case 'done':
+      return { status: '已连接', enabled: true, errorMessage: undefined }
+    case 'error':
+      return { status: '错误', enabled: false, errorMessage: event.message }
+    case 'warn':
+      if (event.message.includes('已关闭') || event.message.includes('已停止') || event.message.includes('已退出')) {
+        return { status: '未连接', enabled: false }
+      }
+      return null
+    default:
+      return null
+  }
+}
+
 function buildBotRuntimeBindingConfig(runtime: ProviderRuntimeConfig): Partial<BotConfig> {
   return {
     aiProviderId: runtime.providerId,
@@ -300,6 +395,94 @@ function buildConversationAgentSnapshot(agent: AgentRecord): ConversationAgentSn
   }
 }
 
+function generateDraftItemId(prefix: string): string {
+  const uuid =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID().replace(/-/g, '')
+      : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
+  return `${prefix}_${uuid}`
+}
+
+function createEmptyHeartbeatConfig(): AgentHeartbeatConfig {
+  return {
+    timezone: 'Asia/Shanghai',
+    tasks: [],
+    schedules: [],
+  }
+}
+
+function createEmptyHeartbeatTask(): AgentHeartbeatTask {
+  return {
+    id: generateDraftItemId('task'),
+    name: '',
+    description: '',
+    taskType: 'notify',
+    enabled: true,
+    messageTemplate: '',
+    command: '',
+    workingDirectory: '',
+    timeoutSec: 180,
+    notifyOnSuccess: true,
+    notifyOnFailure: true,
+  }
+}
+
+function createEmptyHeartbeatSchedule(): AgentHeartbeatSchedule {
+  return {
+    id: generateDraftItemId('schedule'),
+    name: '',
+    enabled: true,
+    taskId: '',
+    scheduleType: 'daily',
+    times: ['08:00'],
+    channelId: 'wechat',
+    targetUserId: '',
+    targetLabel: '',
+  }
+}
+
+function normalizeHeartbeatTimes(times: string[]): string[] {
+  return Array.from(
+    new Set(
+      times
+        .flatMap((value) => value.split(','))
+        .map((value) => value.trim())
+        .filter(Boolean),
+    ),
+  )
+}
+
+function normalizeHeartbeatConfig(config?: AgentHeartbeatConfig | null): AgentHeartbeatConfig {
+  const source = config ?? createEmptyHeartbeatConfig()
+  return {
+    timezone: source.timezone.trim() || 'Asia/Shanghai',
+    tasks: source.tasks.map((task) => ({
+      id: task.id || generateDraftItemId('task'),
+      name: task.name.trim(),
+      description: task.description.trim(),
+      taskType: task.taskType === 'shell' ? 'shell' : 'notify',
+      enabled: task.enabled !== false,
+      messageTemplate: task.messageTemplate.trim(),
+      command: task.command.trim(),
+      workingDirectory: task.workingDirectory.trim(),
+      timeoutSec: Number.isFinite(task.timeoutSec) ? Math.max(10, Math.trunc(task.timeoutSec)) : 180,
+      notifyOnSuccess: task.notifyOnSuccess !== false,
+      notifyOnFailure: task.notifyOnFailure !== false,
+    })),
+    schedules: source.schedules.map((schedule) => ({
+      id: schedule.id || generateDraftItemId('schedule'),
+      name: schedule.name.trim(),
+      enabled: schedule.enabled !== false,
+      taskId: schedule.taskId.trim(),
+      scheduleType: 'daily',
+      times: normalizeHeartbeatTimes(schedule.times),
+      channelId: schedule.channelId.trim() || 'wechat',
+      targetUserId: schedule.targetUserId.trim(),
+      targetLabel: schedule.targetLabel.trim(),
+    })),
+  }
+}
+
 function createEmptyAgentDraft(
   providerId: ProviderId,
   model: string,
@@ -316,6 +499,7 @@ function createEmptyAgentDraft(
     executionMode: 'single',
     accentColor,
     botConfigs: createAgentBotConfigState(),
+    heartbeatConfig: createEmptyHeartbeatConfig(),
   }
 }
 
@@ -330,6 +514,7 @@ function createAgentDraftFromRecord(agent: AgentRecord): AgentInput {
     defaultModel: agent.defaultModel,
     executionMode: agent.executionMode,
     botConfigs: createAgentBotConfigState(agent.botConfigs),
+    heartbeatConfig: normalizeHeartbeatConfig(agent.heartbeatConfig),
     ...(agent.collaborationConfig ? { collaborationConfig: agent.collaborationConfig } : {}),
     ...(agent.accentColor ? { accentColor: agent.accentColor } : {}),
   }
@@ -346,6 +531,7 @@ function normalizeAgentDraft(input: AgentInput): AgentInput {
     defaultModel: input.defaultModel.trim(),
     skillIds: Array.from(new Set(input.skillIds.map((item) => item.trim()).filter(Boolean))),
     botConfigs: createAgentBotConfigState(input.botConfigs),
+    heartbeatConfig: normalizeHeartbeatConfig(input.heartbeatConfig),
   }
 }
 
@@ -361,6 +547,27 @@ function validateAgentDraft(input: AgentInput): string | null {
   }
   if (!input.defaultProviderId.trim() || !input.defaultModel.trim()) {
     return '请为智能体配置默认模型。'
+  }
+  const heartbeatConfig = normalizeHeartbeatConfig(input.heartbeatConfig)
+  const taskIds = new Set(heartbeatConfig.tasks.map((task) => task.id))
+  for (const task of heartbeatConfig.tasks) {
+    if (task.enabled && task.taskType === 'shell' && !task.command.trim()) {
+      return `任务「${task.name || '未命名任务'}」缺少执行命令。`
+    }
+  }
+  for (const schedule of heartbeatConfig.schedules) {
+    if (!schedule.enabled) {
+      continue
+    }
+    if (!schedule.taskId || !taskIds.has(schedule.taskId)) {
+      return `规则「${schedule.name || '未命名规则'}」需要绑定一个有效任务。`
+    }
+    if (schedule.times.length === 0) {
+      return `规则「${schedule.name || '未命名规则'}」至少要配置一个触发时间。`
+    }
+    if (!schedule.targetUserId.trim()) {
+      return `规则「${schedule.name || '未命名规则'}」缺少接收用户 ID。`
+    }
   }
   return null
 }
@@ -612,6 +819,112 @@ function providerDisplayName(definition: ProviderDefinition, config: ProviderCon
   return definition.name
 }
 
+function hasProviderDefinition(providerId: ProviderId, definitions: ProviderDefinition[]): boolean {
+  return definitions.some((item) => item.id === providerId)
+}
+
+function isProviderAvailable(
+  providerId: ProviderId,
+  definitions: ProviderDefinition[],
+  providerConfigs: Record<string, ProviderConfig>,
+): boolean {
+  return hasProviderDefinition(providerId, definitions) && providerConfigs[providerId]?.added === true
+}
+
+function isValidConfiguredModelReference(
+  providerId: ProviderId,
+  model: string,
+  definitions: ProviderDefinition[],
+  providerConfigs: Record<string, ProviderConfig>,
+): boolean {
+  if (!providerId.trim() || !model.trim() || !isProviderAvailable(providerId, definitions, providerConfigs)) {
+    return false
+  }
+  const config = providerConfigs[providerId]
+  return isProviderConfigComplete(config) && config.model.trim() === model.trim()
+}
+
+function pickFallbackSessionLlm(
+  definitions: ProviderDefinition[],
+  providerConfigs: Record<string, ProviderConfig>,
+  preferredProviderId?: ProviderId | null,
+): { providerId: ProviderId; model: string } | null {
+  const orderedDefinitions = preferredProviderId
+    ? [
+        ...definitions.filter((item) => item.id === preferredProviderId),
+        ...definitions.filter((item) => item.id !== preferredProviderId),
+      ]
+    : definitions
+
+  for (const definition of orderedDefinitions) {
+    const config = providerConfigs[definition.id]
+    if (config?.added !== true || !isProviderConfigComplete(config)) {
+      continue
+    }
+    return {
+      providerId: definition.id,
+      model: config.model.trim(),
+    }
+  }
+
+  return null
+}
+
+function pickFallbackAgentModel(
+  definitions: ProviderDefinition[],
+  providerConfigs: Record<string, ProviderConfig>,
+  preferredProviderId?: ProviderId | null,
+): { providerId: ProviderId; model: string } | null {
+  const runtimeFallback = pickFallbackSessionLlm(definitions, providerConfigs, preferredProviderId)
+  if (runtimeFallback) {
+    return runtimeFallback
+  }
+
+  const preferredDefinition =
+    (preferredProviderId &&
+      definitions.find((item) => item.id === preferredProviderId && providerConfigs[item.id]?.added === true)) ??
+    definitions.find((item) => providerConfigs[item.id]?.added === true) ??
+    definitions[0] ??
+    null
+  if (!preferredDefinition) {
+    return null
+  }
+
+  const configuredModel = providerConfigs[preferredDefinition.id]?.model?.trim()
+  return {
+    providerId: preferredDefinition.id,
+    model: configuredModel || preferredDefinition.suggestedModel,
+  }
+}
+
+function sanitizeAgentInputModelReference(
+  draft: AgentInput,
+  definitions: ProviderDefinition[],
+  providerConfigs: Record<string, ProviderConfig>,
+): AgentInput {
+  if (
+    isValidConfiguredModelReference(
+      draft.defaultProviderId,
+      draft.defaultModel,
+      definitions,
+      providerConfigs,
+    )
+  ) {
+    return draft
+  }
+
+  const fallback = pickFallbackAgentModel(definitions, providerConfigs, draft.defaultProviderId)
+  if (!fallback) {
+    return draft
+  }
+
+  return {
+    ...draft,
+    defaultProviderId: fallback.providerId,
+    defaultModel: fallback.model,
+  }
+}
+
 function shouldSubmitWithShortcut(
   event: KeyboardEvent<HTMLTextAreaElement>,
   submitShortcut: SubmitShortcut,
@@ -645,7 +958,7 @@ function resolveActiveProviderConfig(
 
   for (const providerId of orderedProviderIds) {
     const config = providerConfigs[providerId]
-    if (!config?.enabled || !config.model.trim()) {
+    if (!config?.added || !config.enabled || !config.model.trim()) {
       continue
     }
 
@@ -673,7 +986,7 @@ function resolveBotRuntimeConfig(
 
   for (const providerId of orderedProviderIds) {
     const config = providerConfigs[providerId]
-    if (!isProviderConfigComplete(config)) {
+    if (!config?.added || !isProviderConfigComplete(config)) {
       continue
     }
 
@@ -721,7 +1034,7 @@ function buildSessionLlmSelectOptions(
   const out: { value: string; label: string }[] = []
   for (const def of mergedProviderDefinitions) {
     const cfg = providerConfigs[def.id]
-    if (!isProviderConfigComplete(cfg)) {
+    if (!cfg?.added || !isProviderConfigComplete(cfg)) {
       continue
     }
     const m = cfg.model.trim()
@@ -739,6 +1052,17 @@ function buildSessionLlmOptionsWithFallback(
   providerConfigs: Record<string, ProviderConfig>,
   current: { providerId: ProviderId; model: string },
 ): { value: string; label: string }[] {
+  if (
+    !isValidConfiguredModelReference(
+      current.providerId,
+      current.model,
+      mergedProviderDefinitions,
+      providerConfigs,
+    )
+  ) {
+    return options
+  }
+
   const encodedCurrent = sessionLlmEncode(current.providerId, current.model.trim())
   if (options.some((option) => option.value === encodedCurrent)) {
     return options
@@ -760,7 +1084,7 @@ function resolveRuntimeFromSessionFields(
   providerConfigs: Record<string, ProviderConfig>,
 ): ProviderRuntimeConfig | null {
   const cfg = providerConfigs[providerId]
-  if (!isProviderConfigComplete(cfg) || !model.trim()) {
+  if (!cfg?.added || !isProviderConfigComplete(cfg) || !model.trim()) {
     return null
   }
   return {
@@ -770,6 +1094,17 @@ function resolveRuntimeFromSessionFields(
     apiKey: cfg!.apiKey.trim(),
     model: model.trim(),
   }
+}
+
+function resolveRuntimeFromAgentSnapshot(
+  agent: ConversationAgentSnapshot | null,
+  providerConfigs: Record<string, ProviderConfig>,
+): ProviderRuntimeConfig | null {
+  if (!agent) {
+    return null
+  }
+
+  return resolveRuntimeFromSessionFields(agent.defaultProviderId, agent.defaultModel, providerConfigs)
 }
 
 /** 当前聊天输入/本会话实际调用 pi 时使用的模型配置（含每会话覆盖） */
@@ -793,6 +1128,10 @@ function resolveEffectiveChatRuntime(
   }
 
   if (activeHistoryItem) {
+    const resolvedFromAgent = resolveRuntimeFromAgentSnapshot(activeHistoryItem.agent ?? null, providerConfigs)
+    if (resolvedFromAgent) {
+      return resolvedFromAgent
+    }
     return resolveActiveProviderConfig(selectedProviderId, providerConfigs, allProviderIds)
   }
 
@@ -808,61 +1147,13 @@ function resolveEffectiveChatRuntime(
   }
 
   if (!activeHistoryItem && fallbackAgent) {
-    const resolved = resolveRuntimeFromSessionFields(
-      fallbackAgent.defaultProviderId,
-      fallbackAgent.defaultModel,
-      providerConfigs,
-    )
+    const resolved = resolveRuntimeFromAgentSnapshot(fallbackAgent, providerConfigs)
     if (resolved) {
       return resolved
     }
   }
 
   return resolveActiveProviderConfig(selectedProviderId, providerConfigs, allProviderIds)
-}
-
-function isAbsoluteLocalPath(value: string): boolean {
-  return value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value)
-}
-
-function decodeLocalPathSource(source: string): string {
-  try {
-    return decodeURIComponent(source)
-  } catch {
-    return source
-  }
-}
-
-function normalizeMarkdownImageSource(source: string): string {
-  const trimmed = source.trim()
-  if (!trimmed) {
-    return source
-  }
-
-  if (/^(https?:|data:|asset:)/i.test(trimmed)) {
-    return trimmed
-  }
-
-  if (/^file:\/\//i.test(trimmed)) {
-    const filePath = decodeLocalPathSource(trimmed.replace(/^file:\/\//i, ''))
-    return convertFileSrc(filePath)
-  }
-
-  if (isAbsoluteLocalPath(trimmed)) {
-    return convertFileSrc(decodeLocalPathSource(trimmed))
-  }
-
-  return trimmed
-}
-
-function normalizeMarkdownImageSources(content: string): string {
-  return content
-    .replace(/!\[([^\]]*)\]\(([^)\s]+)(\s+"[^"]*")?\)/g, (_match, alt: string, src: string, title = '') => {
-      return `![${alt}](${normalizeMarkdownImageSource(src)}${title})`
-    })
-    .replace(/<img([^>]*?)src=(['"])(.*?)\2([^>]*)>/gi, (_match, before: string, quote: string, src: string, after: string) => {
-      return `<img${before}src=${quote}${normalizeMarkdownImageSource(src)}${quote}${after}>`
-    })
 }
 
 function App() {
@@ -883,6 +1174,7 @@ function App() {
     clearHistory,
     deleteHistoryItem,
     updateSessionLlm,
+    sanitizeSessionLlmReferences,
   } = usePiAgent()
 
   const [view, setView] = useState<ViewKey>('chat')
@@ -913,6 +1205,7 @@ function App() {
   const [agentEditorDraft, setAgentEditorDraft] = useState<AgentInput | null>(null)
   const [agentEditorOpen, setAgentEditorOpen] = useState(false)
   const [agentSaving, setAgentSaving] = useState(false)
+  const [agentRefreshing, setAgentRefreshing] = useState(false)
   const [agentFormError, setAgentFormError] = useState('')
   const [agentFormNotice, setAgentFormNotice] = useState('')
   const [agentBotBindingDialogOpen, setAgentBotBindingDialogOpen] = useState(false)
@@ -956,12 +1249,12 @@ function App() {
   const [qrStatus, setQrStatus] = useState<'waiting' | 'scanned' | 'confirmed' | 'error'>('waiting')
   const [botLoading, setBotLoading] = useState(false)
   const [botStatusLog, setBotStatusLog] = useState<BotStatusEvent[]>([])
-  const [runtimeDependencyStatus, setRuntimeDependencyStatus] = useState<RuntimeDependencyStatus | null>(null)
-  const [runtimeDependencyError, setRuntimeDependencyError] = useState('')
   /** 无选中会话时，输入区上方选择的模型（首条消息写入该会话） */
   const [composerSessionLlm, setComposerSessionLlm] = useState<{ providerId: ProviderId; model: string } | null>(null)
   const [composerAgent, setComposerAgent] = useState<ConversationAgentSnapshot | null>(null)
   const [chatGateError, setChatGateError] = useState('')
+  const providerCleanupInFlightRef = useRef<Set<string>>(new Set())
+  const providerPreferencesHydratedRef = useRef(false)
 
   const deferredSkillSearch = useDeferredValue(skillSearch.trim().toLowerCase())
   const deferredResourceSearch = useDeferredValue(resourceSearch.trim().toLowerCase())
@@ -981,6 +1274,10 @@ function App() {
     return [...providerDefinitions, ...custom]
   }, [customProviderMeta])
   const allProviderIds = useMemo(() => mergedProviderDefinitions.map((p) => p.id), [mergedProviderDefinitions])
+  const firstAddedProviderId = useMemo(
+    () => mergedProviderDefinitions.find((item) => providerConfigs[item.id]?.added)?.id ?? '',
+    [mergedProviderDefinitions, providerConfigs],
+  )
   const selectedProviderDefinition =
     mergedProviderDefinitions.find((item) => item.id === selectedProviderId) ?? providerDefinitions[0]
   const selectedProviderConfig = providerConfigs[selectedProviderId] ?? emptyProviderConfig()
@@ -1008,6 +1305,23 @@ function App() {
     [composerAgent, defaultAgent],
   )
   const activeChatAgent = activeHistoryItem ? activeHistoryItem.agent ?? null : preferredComposerAgent
+  const composerAttachmentScopeKey = `${activeHistoryId || 'composer'}:${activeChatAgent?.id ?? 'no-agent'}`
+  const {
+    attachments: composerAttachments,
+    uploading: composerAttachmentUploading,
+    error: composerAttachmentError,
+    fileInputRef: composerAttachmentInputRef,
+    openFilePicker: openComposerAttachmentPicker,
+    handleFileInputChange: handleComposerAttachmentInputChange,
+    handleComposerPaste,
+    removeAttachment: removeComposerAttachment,
+    clearAttachments: clearComposerAttachments,
+    clearError: clearComposerAttachmentError,
+  } = useComposerAttachments({
+    agentId: activeChatAgent?.id ?? '',
+    sessionId: activeHistoryId || null,
+    scopeKey: composerAttachmentScopeKey,
+  })
   const visibleInstalledSkills = installedSkills.filter((skill) => {
     if (!deferredSkillSearch) return true
     return `${skill.name} ${skill.description} ${skill.path}`.toLowerCase().includes(deferredSkillSearch)
@@ -1090,12 +1404,26 @@ function App() {
       globalRuntime?.model ?? providerConfigs[selectedProviderId]?.model?.trim() ?? ''
 
     if (activeHistoryItem?.sessionLlmProviderId && activeHistoryItem.sessionLlmModel !== undefined) {
-      return {
-        providerId: activeHistoryItem.sessionLlmProviderId,
-        model: activeHistoryItem.sessionLlmModel,
+      const resolved = resolveRuntimeFromSessionFields(
+        activeHistoryItem.sessionLlmProviderId,
+        activeHistoryItem.sessionLlmModel,
+        providerConfigs,
+      )
+      if (resolved) {
+        return {
+          providerId: resolved.providerId,
+          model: resolved.model,
+        }
       }
     }
     if (activeHistoryItem) {
+      const resolvedFromAgent = resolveRuntimeFromAgentSnapshot(activeHistoryItem.agent ?? null, providerConfigs)
+      if (resolvedFromAgent) {
+        return {
+          providerId: resolvedFromAgent.providerId,
+          model: resolvedFromAgent.model,
+        }
+      }
       const global = resolveActiveProviderConfig(selectedProviderId, providerConfigs, allProviderIds)
       if (global) {
         return { providerId: global.providerId, model: global.model }
@@ -1108,12 +1436,18 @@ function App() {
       return { providerId: fallbackPid, model: fallbackModel }
     }
     if (composerSessionLlm) {
-      return composerSessionLlm
+      const resolved = resolveRuntimeFromSessionFields(composerSessionLlm.providerId, composerSessionLlm.model, providerConfigs)
+      if (resolved) {
+        return { providerId: resolved.providerId, model: resolved.model }
+      }
     }
     if (preferredComposerAgent?.defaultProviderId && preferredComposerAgent.defaultModel.trim()) {
-      return {
-        providerId: preferredComposerAgent.defaultProviderId,
-        model: preferredComposerAgent.defaultModel,
+      const resolved = resolveRuntimeFromAgentSnapshot(preferredComposerAgent, providerConfigs)
+      if (resolved) {
+        return {
+          providerId: resolved.providerId,
+          model: resolved.model,
+        }
       }
     }
     const globalForComposer = resolveActiveProviderConfig(selectedProviderId, providerConfigs, allProviderIds)
@@ -1166,7 +1500,10 @@ function App() {
     ? mergedProviderDefinitions.find((item) => item.id === effectiveChatRuntime.providerId) ?? null
     : null
   const requiresConfiguredSessionModel = activeHistoryItem
-    ? Boolean(activeHistoryItem.sessionLlmProviderId && activeHistoryItem.sessionLlmModel?.trim())
+    ? Boolean(
+        (activeHistoryItem.sessionLlmProviderId && activeHistoryItem.sessionLlmModel?.trim()) ||
+          (activeHistoryItem.agent?.defaultProviderId && activeHistoryItem.agent.defaultModel?.trim()),
+      )
     : Boolean(composerSessionLlm || (preferredComposerAgent?.defaultProviderId && preferredComposerAgent.defaultModel.trim()))
   const runtimeResolutionError =
     !effectiveChatRuntime && requiresConfiguredSessionModel
@@ -1188,28 +1525,6 @@ function App() {
         )}`
       : '当前使用 · pi 默认'
 
-  useEffect(() => {
-    let cancelled = false
-
-    ensureRuntimeDependencies()
-      .then((status) => {
-        if (cancelled) {
-          return
-        }
-        setRuntimeDependencyStatus(status)
-        setRuntimeDependencyError('')
-      })
-      .catch((reason) => {
-        if (cancelled) {
-          return
-        }
-        setRuntimeDependencyError(String(reason))
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [])
 
   useEffect(() => {
     if (customProviderMeta.length === 0) {
@@ -1235,6 +1550,129 @@ function App() {
       return changed ? next : previous
     })
   }, [customProviderMeta])
+
+  useEffect(() => {
+    if (mergedProviderDefinitions.length === 0) {
+      return
+    }
+
+    if (
+      !isProviderAvailable(selectedProviderId, mergedProviderDefinitions, providerConfigs) &&
+      firstAddedProviderId &&
+      selectedProviderId !== firstAddedProviderId
+    ) {
+      setSelectedProviderId(firstAddedProviderId)
+      return
+    }
+
+    if (!hasProviderDefinition(selectedProviderId, mergedProviderDefinitions)) {
+      setSelectedProviderId(firstAddedProviderId || mergedProviderDefinitions[0]?.id || 'openai')
+    }
+
+    sanitizeSessionLlmReferences((providerId, model) =>
+      isValidConfiguredModelReference(providerId, model, mergedProviderDefinitions, providerConfigs),
+    )
+
+    setComposerSessionLlm((current) => {
+      if (!current) {
+        return current
+      }
+      if (isValidConfiguredModelReference(current.providerId, current.model, mergedProviderDefinitions, providerConfigs)) {
+        return current
+      }
+      return pickFallbackSessionLlm(mergedProviderDefinitions, providerConfigs, current.providerId)
+    })
+
+    setNewSessionLlm((current) => {
+      if (!current) {
+        return current
+      }
+      if (isValidConfiguredModelReference(current.providerId, current.model, mergedProviderDefinitions, providerConfigs)) {
+        return current
+      }
+      return pickFallbackSessionLlm(mergedProviderDefinitions, providerConfigs, current.providerId)
+    })
+
+    setAgentEditorDraft((current) => {
+      if (!current) {
+        return current
+      }
+      const next = sanitizeAgentInputModelReference(current, mergedProviderDefinitions, providerConfigs)
+      return next.defaultProviderId === current.defaultProviderId && next.defaultModel === current.defaultModel
+        ? current
+        : next
+    })
+
+    setAgents((previous) => {
+      let changed = false
+      const next = previous.map((agent) => {
+        const sanitized = sanitizeAgentInputModelReference(
+          createAgentDraftFromRecord(agent),
+          mergedProviderDefinitions,
+          providerConfigs,
+        )
+        if (
+          sanitized.defaultProviderId === agent.defaultProviderId &&
+          sanitized.defaultModel === agent.defaultModel
+        ) {
+          return agent
+        }
+        changed = true
+        return {
+          ...agent,
+          defaultProviderId: sanitized.defaultProviderId,
+          defaultModel: sanitized.defaultModel,
+        }
+      })
+      return changed ? next : previous
+    })
+
+    for (const agent of agents) {
+      const sanitized = sanitizeAgentInputModelReference(
+        createAgentDraftFromRecord(agent),
+        mergedProviderDefinitions,
+        providerConfigs,
+      )
+      if (
+        sanitized.defaultProviderId === agent.defaultProviderId &&
+        sanitized.defaultModel === agent.defaultModel
+      ) {
+        continue
+      }
+      if (providerCleanupInFlightRef.current.has(agent.id)) {
+        continue
+      }
+
+      providerCleanupInFlightRef.current.add(agent.id)
+      void updateAgent(agent.id, sanitized)
+        .then((savedAgent) => {
+          setAgents((previous) => previous.map((item) => (item.id === savedAgent.id ? savedAgent : item)))
+          setAgentEditorDraft((current) => {
+            if (!current || managedAgentId !== savedAgent.id) {
+              return current
+            }
+            return createAgentDraftFromRecord(savedAgent)
+          })
+        })
+        .catch((cleanupError) => {
+          const message = cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          setAgentFormError((current) =>
+            current || `自动清理已删除 Provider 的智能体模型引用失败：${message}`,
+          )
+        })
+        .finally(() => {
+          providerCleanupInFlightRef.current.delete(agent.id)
+        })
+    }
+  }, [
+    agents,
+    managedAgentId,
+    firstAddedProviderId,
+    mergedProviderDefinitions,
+    providerConfigs,
+    sanitizeSessionLlmReferences,
+    selectedProviderId,
+  ])
 
   useEffect(() => {
     const onResize = () => {
@@ -1266,12 +1704,62 @@ function App() {
   }, [appearanceSettings])
 
   useEffect(() => {
+    let cancelled = false
+
+    void loadProviderPreferences()
+      .then((payload) => {
+        if (cancelled) {
+          return
+        }
+
+        const backendProviderConfigs = parseStoredProviderConfigs(payload.providerConfigs)
+        const backendCustomProviderMeta = parseStoredCustomProviderMeta(payload.customProviderMeta)
+
+        if (backendProviderConfigs) {
+          setProviderConfigs(backendProviderConfigs)
+        }
+        if (backendCustomProviderMeta) {
+          setCustomProviderMeta(backendCustomProviderMeta)
+        }
+
+        const hasBackendState = Boolean(payload.providerConfigs || payload.customProviderMeta)
+        providerPreferencesHydratedRef.current = true
+
+        if (!hasBackendState) {
+          void saveProviderPreferences({
+            providerConfigsPayload: JSON.stringify(providerConfigs),
+            customProviderMetaPayload: JSON.stringify(customProviderMeta),
+          }).catch((error) => {
+            console.warn('NineClaw: migrate provider preferences failed', error)
+          })
+        }
+      })
+      .catch((error) => {
+        providerPreferencesHydratedRef.current = true
+        console.warn('NineClaw: load provider preferences failed', error)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
     persistStoredStorageValue(
       PROVIDER_CONFIGS_STORAGE_KEY,
       JSON.stringify(providerConfigs),
       LEGACY_PROVIDER_CONFIGS_STORAGE_KEYS,
     )
-  }, [providerConfigs])
+    if (!providerPreferencesHydratedRef.current) {
+      return
+    }
+    void saveProviderPreferences({
+      providerConfigsPayload: JSON.stringify(providerConfigs),
+      customProviderMetaPayload: JSON.stringify(customProviderMeta),
+    }).catch((error) => {
+      console.warn('NineClaw: save provider preferences failed', error)
+    })
+  }, [customProviderMeta, providerConfigs])
 
   useEffect(() => {
     persistStoredStorageValue(
@@ -1286,11 +1774,37 @@ function App() {
     let unsub: (() => void) | undefined
     void subscribeBotStatus((event) => {
       setBotStatusLog((prev) => [event, ...prev].slice(0, 20))
+      if (!selectedManagedAgent) {
+        return
+      }
+
+      const channelId = resolveBotChannelFromRuntimeId(selectedManagedAgent.id, event.channelId)
+      const statusPatch = channelId ? buildBotConfigStatusPatch(event) : null
+      if (!channelId || !statusPatch) {
+        return
+      }
+
+      setAgentEditorDraft((current) => {
+        if (!current) {
+          return current
+        }
+        const currentConfigs = createAgentBotConfigState(current.botConfigs)
+        return {
+          ...current,
+          botConfigs: {
+            ...currentConfigs,
+            [channelId]: {
+              ...currentConfigs[channelId],
+              ...statusPatch,
+            },
+          },
+        }
+      })
     }).then((unlisten) => {
       unsub = unlisten
     })
     return () => unsub?.()
-  }, [])
+  }, [selectedManagedAgent])
 
   const refreshSkillLibrary = async () => {
     setSkillsLoading(true)
@@ -1369,9 +1883,11 @@ function App() {
       } else {
         setAgentEditorDraft(null)
       }
+      return true
     } catch (loadError) {
       const message = loadError instanceof Error ? loadError.message : String(loadError)
       setAgentsError(message)
+      return false
     } finally {
       setAgentsLoading(false)
     }
@@ -1398,6 +1914,7 @@ function App() {
       defaultModel: fallbackModel,
       executionMode: draft.executionMode,
       botConfigs: createAgentBotConfigState(draft.botConfigs),
+      heartbeatConfig: normalizeHeartbeatConfig(draft.heartbeatConfig),
       ...(draft.collaborationConfig ? { collaborationConfig: draft.collaborationConfig } : {}),
       ...(draft.accentColor ? { accentColor: draft.accentColor } : {}),
     })
@@ -1422,6 +1939,7 @@ function App() {
       setManagedAgentId(created.id)
       setAgentEditorMode('edit')
       setAgentEditorDraft(createAgentDraftFromRecord(created))
+      setAgentEditorOpen(true)
       setAgentBuilderActionNotice(
         omittedSkillIds.length > 0
           ? `已创建智能体，未挂载未安装技能：${omittedSkillIds.join('、')}`
@@ -1468,10 +1986,19 @@ function App() {
 
     if (seedAgent) {
       setNewSessionAgentId(seedAgent.id)
-      setNewSessionLlm({
-        providerId: seedAgent.defaultProviderId,
-        model: seedAgent.defaultModel,
-      })
+      setNewSessionLlm(
+        isValidConfiguredModelReference(
+          seedAgent.defaultProviderId,
+          seedAgent.defaultModel,
+          mergedProviderDefinitions,
+          providerConfigs,
+        )
+          ? {
+              providerId: seedAgent.defaultProviderId,
+              model: seedAgent.defaultModel,
+            }
+          : pickFallbackSessionLlm(mergedProviderDefinitions, providerConfigs, seedAgent.defaultProviderId),
+      )
     } else {
       setNewSessionAgentId('')
       setNewSessionLlm(null)
@@ -1509,10 +2036,16 @@ function App() {
       setChatGateError(runtimeResolutionError)
       return
     }
+    if (composerAttachmentUploading) {
+      setChatGateError('附件仍在导入中，请稍等片刻再发送。')
+      return
+    }
     if (chatGateError) {
       setChatGateError('')
     }
-    await submitPrompt(draft, {
+    const promptWithAttachments = buildPromptWithAttachments(draft, composerAttachments)
+    clearComposerAttachments()
+    await submitPrompt(promptWithAttachments, {
       providerConfig: effectiveChatRuntime,
       agent: activeHistoryItem ? activeHistoryItem.agent ?? null : preferredComposerAgent,
       sessionLlm: sessionLlmDisplay,
@@ -1861,6 +2394,30 @@ function App() {
     }
   }
 
+  const handleRefreshCurrentAgent = async () => {
+    const preferredAgentId = selectedManagedAgent?.id || managedAgentId || undefined
+
+    setAgentRefreshing(true)
+    setAgentFormError('')
+    if (preferredAgentId) {
+      setAgentFormNotice('正在刷新最新配置…')
+    }
+
+    try {
+      const refreshed = await refreshAgents(preferredAgentId)
+      if (preferredAgentId && refreshed) {
+        setAgentFormNotice('已刷新当前智能体配置。')
+      } else if (!refreshed) {
+        setAgentFormNotice('')
+      }
+    } catch (refreshError) {
+      const message = refreshError instanceof Error ? refreshError.message : String(refreshError)
+      setAgentFormError(message)
+    } finally {
+      setAgentRefreshing(false)
+    }
+  }
+
   const handleRequestDeleteCurrentAgent = () => {
     if (!selectedManagedAgent || agentSaving) {
       return
@@ -1934,10 +2491,19 @@ function App() {
     if (!targetAgent) {
       return
     }
-    setNewSessionLlm({
-      providerId: targetAgent.defaultProviderId,
-      model: targetAgent.defaultModel,
-    })
+    setNewSessionLlm(
+      isValidConfiguredModelReference(
+        targetAgent.defaultProviderId,
+        targetAgent.defaultModel,
+        mergedProviderDefinitions,
+        providerConfigs,
+      )
+        ? {
+            providerId: targetAgent.defaultProviderId,
+            model: targetAgent.defaultModel,
+          }
+        : pickFallbackSessionLlm(mergedProviderDefinitions, providerConfigs, targetAgent.defaultProviderId),
+    )
   }
 
   const handleConfirmNewSession = () => {
@@ -1949,14 +2515,19 @@ function App() {
     if (chatGateError) {
       setChatGateError('')
     }
+    const nextSessionLlm =
+      newSessionLlm &&
+      isValidConfiguredModelReference(
+        newSessionLlm.providerId,
+        newSessionLlm.model,
+        mergedProviderDefinitions,
+        providerConfigs,
+      )
+        ? newSessionLlm
+        : pickFallbackSessionLlm(mergedProviderDefinitions, providerConfigs, targetAgent.defaultProviderId)
     resetSessionDraft()
     setComposerAgent(buildConversationAgentSnapshot(targetAgent))
-    setComposerSessionLlm(
-      newSessionLlm ?? {
-        providerId: targetAgent.defaultProviderId,
-        model: targetAgent.defaultModel,
-      },
-    )
+    setComposerSessionLlm(nextSessionLlm)
     setNewSessionDialogOpen(false)
     handleViewChange('chat')
   }
@@ -2184,6 +2755,70 @@ function App() {
     }
   }
 
+  const handleLarkStart = async () => {
+    if (!selectedManagedAgent) {
+      setAgentFormError('请先保存当前智能体，再启动飞书 Bot。')
+      return
+    }
+
+    const config = selectedManagedBotConfigs.lark
+    if (!config.clientId.trim() || !config.clientSecret.trim()) {
+      updateAgentBotConfig('lark', {
+        status: '错误',
+        errorMessage: '请先填写飞书 App ID 和 App Secret',
+      })
+      return
+    }
+
+    setBotLoading(true)
+    try {
+      const botRuntime = resolveBotRuntimeConfig(selectedProviderId, providerConfigs, allProviderIds)
+      if (!botRuntime) {
+        throw new Error('请先在 Provider 设置中补全 Base URL、API Key 和模型，再启动飞书 Bot。')
+      }
+
+      updateAgentBotConfig('lark', {
+        ...buildBotRuntimeBindingConfig(botRuntime),
+        status: '登录中',
+        errorMessage: undefined,
+      })
+      await botStartLark(
+        getBotChannelRuntimeId(selectedManagedAgent.id, 'lark'),
+        selectedManagedAgent.id,
+        config.clientId.trim(),
+        config.clientSecret.trim(),
+        {
+          providerId: botRuntime.providerId,
+          providerApiFormat: botRuntime.apiFormat,
+          model: botRuntime.model,
+          apiKey: botRuntime.apiKey,
+          providerBaseUrl: botRuntime.baseUrl,
+        },
+      )
+
+      updateAgentBotConfig('lark', { status: '已连接', enabled: true, errorMessage: undefined })
+    } catch (error) {
+      updateAgentBotConfig('lark', { status: '错误', errorMessage: String(error) })
+    } finally {
+      setBotLoading(false)
+    }
+  }
+
+  const handleLarkStop = async () => {
+    if (!selectedManagedAgent) {
+      return
+    }
+    setBotLoading(true)
+    try {
+      await botStopLark(getBotChannelRuntimeId(selectedManagedAgent.id, 'lark'))
+      updateAgentBotConfig('lark', { status: '未连接', enabled: false, errorMessage: undefined })
+    } catch (error) {
+      updateAgentBotConfig('lark', { status: '错误', errorMessage: String(error) })
+    } finally {
+      setBotLoading(false)
+    }
+  }
+
   const renderContent = () => {
     if (view === 'chat') {
       return (
@@ -2201,7 +2836,17 @@ function App() {
           runningHistoryIds={runningHistoryIds}
           activeHistoryId={activeHistoryId}
           onAbort={abortPrompt}
+          attachmentError={composerAttachmentError}
+          attachmentInputRef={composerAttachmentInputRef}
+          attachmentUploading={composerAttachmentUploading}
+          composerAttachments={composerAttachments}
           onCreateAgentDraft={handleCreateAgentFromDraft}
+          onComposerAttachmentInputChange={handleComposerAttachmentInputChange}
+          onComposerClearAttachments={clearComposerAttachments}
+          onComposerPaste={handleComposerPaste}
+          onComposerPickAttachment={openComposerAttachmentPicker}
+          onComposerRemoveAttachment={removeComposerAttachment}
+          onComposerClearAttachmentError={clearComposerAttachmentError}
           onSubmit={handleSubmit}
           selectedAgent={activeChatAgent}
           setDraft={setDraft}
@@ -2260,11 +2905,12 @@ function App() {
         agentEditorOpen={agentEditorOpen}
         agentFormError={agentFormError}
         agentFormNotice={agentFormNotice}
+        agentRefreshing={agentRefreshing}
         agentSaving={agentSaving}
         botConfigs={selectedManagedBotConfigs}
         botLoading={botLoading}
         botStatusLog={botStatusLog.filter((entry) =>
-          selectedManagedAgent ? entry.channelId === getBotChannelRuntimeId(selectedManagedAgent.id, 'wechat') : false,
+          selectedManagedAgent ? entry.channelId === getBotChannelRuntimeId(selectedManagedAgent.id, selectedBotId) : false,
         )}
         agentWorkspaceBundle={agentWorkspaceBundle}
         agentWorkspaceDialogError={agentWorkspaceDialogError}
@@ -2288,6 +2934,7 @@ function App() {
         onDraftWorkspaceContentChange={setAgentWorkspaceDraftContent}
         onDraftChange={handleAgentDraftChange}
         onDeleteConfirmTextChange={setAgentDeleteConfirmText}
+        onRefreshAgents={handleRefreshCurrentAgent}
         onOpenEditor={handleOpenAgentEditor}
         onOpenBotBinding={handleOpenAgentBotBinding}
         onOpenWorkspace={handleOpenAgentWorkspace}
@@ -2302,6 +2949,8 @@ function App() {
         onSelectWorkspaceFile={handleSelectAgentWorkspaceFile}
         onSetDefaultAgent={handleSetCurrentDefaultAgent}
         onToggleSkill={handleAgentSkillToggle}
+        onLarkStart={handleLarkStart}
+        onLarkStop={handleLarkStop}
         onWechatLogin={handleWechatLogin}
         onWechatStart={handleWechatStart}
         onWechatStop={handleWechatStop}
@@ -2336,34 +2985,6 @@ function App() {
           .filter(Boolean)
           .join(' ')}
       >
-        {runtimeDependencyError ? (
-          <div className="runtime-banner warning">
-            <div className="runtime-banner-title">运行环境自检失败</div>
-            <p>{runtimeDependencyError}</p>
-          </div>
-        ) : runtimeDependencyStatus && (!runtimeDependencyStatus.piAvailable || runtimeDependencyStatus.autoInstallAttempted) ? (
-          <div className={`runtime-banner ${runtimeDependencyStatus.piAvailable ? 'success' : 'warning'}`}>
-            <div className="runtime-banner-title">
-              {runtimeDependencyStatus.piAvailable ? '运行环境已准备完成' : '正在处理运行环境依赖'}
-            </div>
-            <p>
-              平台 {runtimeDependencyStatus.platform}
-              {runtimeDependencyStatus.autoInstallAttempted
-                ? runtimeDependencyStatus.autoInstallSucceeded
-                  ? '，已自动补齐缺失依赖。'
-                  : '，已尝试自动安装缺失依赖。'
-                : '。'}
-            </p>
-            {runtimeDependencyStatus.messages.length > 0 ? (
-              <ul className="runtime-banner-list">
-                {runtimeDependencyStatus.messages.map((message, index) => (
-                  <li key={`${message}-${index}`}>{message}</li>
-                ))}
-              </ul>
-            ) : null}
-          </div>
-        ) : null}
-
         {shouldHideSidebar && sidebarOverlayOpen ? (
           <button
             type="button"
@@ -2435,7 +3056,10 @@ function App() {
                       onContextMenu={(event) => handleHistoryContextMenu(event, item)}
                       title={item.title}
                     >
-                      <span className="history-card-title">{summarizePrompt(item.title, 24)}</span>
+                      <span className="history-card-copy">
+                        <span className="history-card-title">{summarizePrompt(item.title, 24)}</span>
+                        {item.agent ? <span className="history-card-agent">{item.agent.name}</span> : null}
+                      </span>
                       <span className={`history-card-time ${getStatusTone(item.status)}`}>
                         {formatHistoryAgeLabel(item.status, item.updatedAt)}
                       </span>
@@ -2655,11 +3279,21 @@ type ChatViewProps = {
   agentBuilderActionError: string
   agentBuilderActionNotice: string
   agentBuilderActionTargetId: string
+  attachmentError: string
+  attachmentInputRef: RefObject<HTMLInputElement | null>
+  attachmentUploading: boolean
+  composerAttachments: PersistedChatAttachment[]
   draft: string
   error: string
   globalBusy: boolean
   runningHistoryIds: string[]
   onAbort: () => void
+  onComposerAttachmentInputChange: (event: ChangeEvent<HTMLInputElement>) => void
+  onComposerClearAttachments: () => void
+  onComposerPaste: (event: ClipboardEvent<HTMLTextAreaElement>) => void
+  onComposerPickAttachment: () => void
+  onComposerRemoveAttachment: (attachmentId: string) => void
+  onComposerClearAttachmentError: () => void
   onCreateAgentDraft: (draft: AgentBuilderDraft, actionId: string) => Promise<void> | void
   onSubmit: () => Promise<void>
   selectedAgent: ConversationAgentSnapshot | null
@@ -2680,11 +3314,21 @@ function ChatView({
   agentBuilderActionError,
   agentBuilderActionNotice,
   agentBuilderActionTargetId,
+  attachmentError,
+  attachmentInputRef,
+  attachmentUploading,
+  composerAttachments,
   draft,
   error,
   globalBusy,
   runningHistoryIds,
   onAbort,
+  onComposerAttachmentInputChange,
+  onComposerClearAttachments,
+  onComposerPaste,
+  onComposerPickAttachment,
+  onComposerRemoveAttachment,
+  onComposerClearAttachmentError,
   onCreateAgentDraft,
   onSubmit,
   selectedAgent,
@@ -2744,39 +3388,12 @@ function ChatView({
     setPreviewImage({ src, alt })
   }
 
-  const composerPlaceholder = activeHistoryItem ? '继续对话…' : "描述您的法律需求，或输入 '/' 唤起技能…"
+  const composerPlaceholder = activeHistoryItem ? '继续对话…' : "描述您的需求，或输入 '/' 唤起技能…"
 
   return (
     <div className="workspace">
       <header className="workspace-topbar">
         <div className="workspace-topbar-left">
-          <div className="session-llm-toolbar" title={activeProviderLabel}>
-            <label className="visually-hidden" htmlFor="session-llm-combined">
-              本会话使用的模型
-            </label>
-            <select
-              id="session-llm-combined"
-              className="session-llm-select"
-              value={
-                sessionLlmSelectOptions.some((o) => o.value === sessionLlmSelectValue)
-                  ? sessionLlmSelectValue
-                  : sessionLlmSelectOptions[0]?.value ?? ''
-              }
-              disabled={sessionStreaming || sessionLlmSelectOptions.length === 0}
-              onChange={(event) => onSessionLlmSelectChange(event.target.value)}
-              aria-label="本会话使用的供应商与模型"
-            >
-              {sessionLlmSelectOptions.length === 0 ? (
-                <option value="">暂无已配置的模型，请先在设置中填写供应商</option>
-              ) : (
-                sessionLlmSelectOptions.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))
-              )}
-            </select>
-          </div>
           {activeHistoryItem ? <h1 title={workspaceTitle}>{workspaceTitle}</h1> : null}
         </div>
       </header>
@@ -2787,6 +3404,12 @@ function ChatView({
             <div className="status-strip">
               <div className="status-strip-head">
                 <span className="status-strip-note">{workspaceStatusNote}</span>
+                {selectedAgent ? (
+                  <div className="agent-chip" title={`当前挂载智能体：${selectedAgent.name}`}>
+                    <span className="agent-chip-dot" style={{ backgroundColor: getAgentColor(selectedAgent) }} />
+                    <span>{selectedAgent.name}</span>
+                  </div>
+                ) : null}
               </div>
             </div>
 
@@ -2798,7 +3421,7 @@ function ChatView({
                   className={`chat-turn ${item.id === activeTurnId ? 'active' : ''}`}
                 >
                   <div className="prompt-block">
-                    <div className="prompt-bubble">{item.prompt}</div>
+                    <PromptBubbleContent content={item.prompt} onImageClick={handleMarkdownImageClick} />
                     <div className="prompt-timestamp">{formatAbsoluteTime(item.createdAt)}</div>
                   </div>
 
@@ -2874,17 +3497,47 @@ function ChatView({
             void onSubmit()
           }}
         >
+          <input
+            ref={attachmentInputRef}
+            type="file"
+            className="composer-file-input"
+            multiple
+            onChange={onComposerAttachmentInputChange}
+          />
           <textarea
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={handleComposerKeyDown}
+            onPaste={(event) => {
+              if (attachmentError) {
+                onComposerClearAttachmentError()
+              }
+              void onComposerPaste(event)
+            }}
             placeholder={composerPlaceholder}
             rows={4}
             disabled={sessionStreaming}
           />
+          <ComposerAttachmentStrip
+            attachments={composerAttachments}
+            uploading={attachmentUploading}
+            onRemove={onComposerRemoveAttachment}
+            onClear={onComposerClearAttachments}
+          />
           <div className="composer-toolbar">
             <div className="composer-toolbar-left">
-              <button type="button" className="ghost-icon-button" aria-label="附件">
+              <button
+                type="button"
+                className="ghost-icon-button"
+                aria-label="附件"
+                onClick={() => {
+                  if (attachmentError) {
+                    onComposerClearAttachmentError()
+                  }
+                  onComposerPickAttachment()
+                }}
+                disabled={sessionStreaming || attachmentUploading || !selectedAgent}
+              >
                 <AppIcon name="attachment" size={18} />
               </button>
               <button type="button" className="ghost-icon-button" aria-label="技能">
@@ -2896,6 +3549,33 @@ function ChatView({
                   <span>{selectedAgent.name}</span>
                 </div>
               ) : null}
+              <div className="session-llm-toolbar composer-session-llm-toolbar" title={activeProviderLabel}>
+                <label className="visually-hidden" htmlFor="session-llm-combined">
+                  本会话使用的模型
+                </label>
+                <select
+                  id="session-llm-combined"
+                  className="session-llm-select"
+                  value={
+                    sessionLlmSelectOptions.some((o) => o.value === sessionLlmSelectValue)
+                      ? sessionLlmSelectValue
+                      : sessionLlmSelectOptions[0]?.value ?? ''
+                  }
+                  disabled={sessionStreaming || sessionLlmSelectOptions.length === 0}
+                  onChange={(event) => onSessionLlmSelectChange(event.target.value)}
+                  aria-label="本会话使用的供应商与模型"
+                >
+                  {sessionLlmSelectOptions.length === 0 ? (
+                    <option value="">暂无已配置的模型，请先在设置中填写供应商</option>
+                  ) : (
+                    sessionLlmSelectOptions.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))
+                  )}
+                </select>
+              </div>
             </div>
             <div className="composer-toolbar-right">
               {sessionStreaming ? (
@@ -2910,6 +3590,7 @@ function ChatView({
             </div>
           </div>
         </form>
+        {attachmentError ? <div className="composer-attachment-error">{attachmentError}</div> : null}
         <div className="composer-footnote">
           {globalBusy && !sessionStreaming
             ? '其他会话也在执行中；当前会话仍可继续发送。'
@@ -2995,7 +3676,7 @@ function TurnResponseBody({
           if (!toolCall) {
             return null
           }
-          return <ToolCallCard key={toolCall.id} toolCall={toolCall} />
+          return <ToolCallCard key={toolCall.id} toolCall={toolCall} onImageClick={onImageClick} />
         })}
       </div>
     )
@@ -3019,14 +3700,18 @@ function TurnResponseBody({
           onImageClick={onImageClick}
         />
       ) : null}
-      {hasLegacyTools ? <ToolCallList toolCalls={legacyTools} /> : null}
+      {hasLegacyTools ? <ToolCallList toolCalls={legacyTools} onImageClick={onImageClick} /> : null}
       {!turn.answer && !hasLegacyTools ? (
         <p className="placeholder-copy">
           {loading && turn.id === activeTurnId
             ? '正在等待 pi 返回首段内容…'
-            : legacyTools.length > 0
-              ? '本轮主要产出了工具调用结果。'
-              : '当前轮次还没有输出内容。'}
+            : turn.status === 'done'
+              ? '本轮已结束，但模型没有返回任何可渲染内容。'
+              : turn.status === 'error'
+                ? '本轮执行失败，未产出可渲染内容。'
+                : legacyTools.length > 0
+                  ? '本轮主要产出了工具调用结果。'
+                  : '当前轮次还没有输出内容。'}
         </p>
       ) : null}
     </>
@@ -3056,7 +3741,14 @@ function MarkdownBlock({
 }) {
   const agentDraft = parseAgentBuilderDraft(content)
   const cleanedContent = stripAgentBuilderBlock(content)
-  const normalizedContent = normalizeMarkdownImageSources(cleanedContent)
+  const { contentWithoutAttachments, attachments } = useMemo(
+    () => extractInlineMediaAttachments(cleanedContent),
+    [cleanedContent],
+  )
+  const normalizedContent = useMemo(
+    () => normalizeMarkdownImageSources(contentWithoutAttachments),
+    [contentWithoutAttachments],
+  )
 
   const handleClick = (event: MouseEvent<HTMLDivElement>) => {
     if (!onImageClick) {
@@ -3086,6 +3778,7 @@ function MarkdownBlock({
           </Suspense>
         </div>
       ) : null}
+      {attachments.length > 0 ? <InlineMediaAttachmentList attachments={attachments} onImageClick={onImageClick} /> : null}
       {agentDraft ? (
         <AgentBuilderDraftCard
           actionError={actionTargetId === actionId && actionBusyId !== actionId ? actionError : ''}
@@ -3166,25 +3859,64 @@ function formatToolCallText(text: string, fallback: string, pretty = true): stri
   }
 }
 
-function ToolCallStreamBlock({
+function ToolCallContentBlock({
   content,
   isStreaming,
+  onImageClick,
 }: {
   content: string
   isStreaming: boolean
+  onImageClick?: (src: string, alt: string) => void
 }) {
+  const { contentWithoutAttachments, attachments } = useMemo(
+    () => extractInlineMediaAttachments(content),
+    [content],
+  )
+  const normalizedContent = useMemo(
+    () => normalizeMarkdownImageSources(contentWithoutAttachments || content),
+    [content, contentWithoutAttachments],
+  )
+
+  const handleClick = (event: MouseEvent<HTMLDivElement>) => {
+    if (!onImageClick) {
+      return
+    }
+
+    const target = event.target
+    if (!(target instanceof HTMLElement)) {
+      return
+    }
+
+    const image = target.closest('img')
+    if (!(image instanceof HTMLImageElement) || !image.src) {
+      return
+    }
+
+    event.preventDefault()
+    onImageClick(image.src, image.alt)
+  }
+
   return (
     <div className="tool-call-code tool-call-code-stream">
-      <div className="markdown-content">
-        <Suspense fallback={<MarkdownFallback content={content || ' '} />}>
-          <MarkdownRenderer content={content || ' '} isStreaming={isStreaming} />
-        </Suspense>
-      </div>
+      {normalizedContent ? (
+        <div className="markdown-content" onClick={handleClick}>
+          <Suspense fallback={<MarkdownFallback content={normalizedContent || ' '} />}>
+            <MarkdownRenderer content={normalizedContent || ' '} isStreaming={isStreaming} />
+          </Suspense>
+        </div>
+      ) : null}
+      {attachments.length > 0 ? <InlineMediaAttachmentList attachments={attachments} onImageClick={onImageClick} /> : null}
     </div>
   )
 }
 
-function ToolCallCard({ toolCall }: { toolCall: ToolCallEntry }) {
+function ToolCallCard({
+  toolCall,
+  onImageClick,
+}: {
+  toolCall: ToolCallEntry
+  onImageClick?: (src: string, alt: string) => void
+}) {
   const isStreaming = toolCall.state === 'running'
   const [detailsOpen, setDetailsOpen] = useState(() => isStreaming)
 
@@ -3218,30 +3950,36 @@ function ToolCallCard({ toolCall }: { toolCall: ToolCallEntry }) {
       <div className="tool-call-grid">
         <div className="tool-call-panel tool-call-panel-args">
           <span className="tool-call-panel-label">调用 / 参数</span>
-          {isStreaming ? (
-            <ToolCallStreamBlock content={argsLive} isStreaming />
-          ) : (
-            <pre className="tool-call-code">{argsPretty}</pre>
-          )}
+          <ToolCallContentBlock
+            content={isStreaming ? argsLive : argsPretty}
+            isStreaming={isStreaming}
+            onImageClick={onImageClick}
+          />
         </div>
         <div className="tool-call-panel tool-call-panel-result">
           <span className="tool-call-panel-label">输出结果</span>
-          {isStreaming ? (
-            <ToolCallStreamBlock content={resultLive} isStreaming />
-          ) : (
-            <pre className="tool-call-code">{resultPretty}</pre>
-          )}
+          <ToolCallContentBlock
+            content={isStreaming ? resultLive : resultPretty}
+            isStreaming={isStreaming}
+            onImageClick={onImageClick}
+          />
         </div>
       </div>
     </details>
   )
 }
 
-function ToolCallList({ toolCalls }: { toolCalls: ToolCallEntry[] }) {
+function ToolCallList({
+  toolCalls,
+  onImageClick,
+}: {
+  toolCalls: ToolCallEntry[]
+  onImageClick?: (src: string, alt: string) => void
+}) {
   return (
     <div className="tool-call-list">
       {toolCalls.map((toolCall) => (
-        <ToolCallCard key={toolCall.id} toolCall={toolCall} />
+        <ToolCallCard key={toolCall.id} toolCall={toolCall} onImageClick={onImageClick} />
       ))}
     </div>
   )
@@ -3564,20 +4302,7 @@ function NewSessionDialog({
   onClose,
   onConfirm,
 }: NewSessionDialogProps) {
-  const selectedAgent = agents.find((item) => item.id === selectedAgentId) ?? null
-  const selectedModel = sessionLlmDecode(selectedModelValue)
-  const modelOptionsWithFallback =
-    selectedModelValue && !modelOptions.some((item) => item.value === selectedModelValue)
-      ? [
-          {
-            value: selectedModelValue,
-            label: `${selectedModel?.providerId ?? selectedAgent?.defaultProviderId ?? '当前'} · ${
-              selectedModel?.model ?? selectedAgent?.defaultModel ?? '模型'
-            }（当前）`,
-          },
-          ...modelOptions,
-        ]
-      : modelOptions
+  const selectedAgent = agents.find((agent) => agent.id === selectedAgentId) ?? null
 
   return (
     <div className="confirm-dialog-overlay" role="presentation" onClick={onClose}>
@@ -3622,12 +4347,12 @@ function NewSessionDialog({
           <select
             value={selectedModelValue}
             onChange={(event) => onChangeModel(event.target.value)}
-            disabled={modelOptionsWithFallback.length === 0}
+            disabled={modelOptions.length === 0}
           >
-            {modelOptionsWithFallback.length === 0 ? (
+            {modelOptions.length === 0 ? (
               <option value="">暂无已配置模型</option>
             ) : (
-              modelOptionsWithFallback.map((option) => (
+              modelOptions.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
                 </option>
@@ -3799,6 +4524,7 @@ type AgentEditorDialogProps = {
   agentDeleteConfirmText: string
   agentFormError: string
   agentFormNotice: string
+  agentRefreshing: boolean
   agentSaving: boolean
   allSkills: InstalledSkillItem[]
   defaultAgentId: string
@@ -3810,6 +4536,7 @@ type AgentEditorDialogProps = {
   onCreateAgent: () => void
   onDraftChange: (updates: Partial<AgentInput>) => void
   onDeleteConfirmTextChange: (value: string) => void
+  onRefreshAgent: () => void
   onOpenWorkspace: () => void
   onOpenSkillPicker: () => void
   onRequestDeleteAgent: () => void
@@ -3825,6 +4552,7 @@ function AgentEditorDialog({
   agentDeleteConfirmText,
   agentFormError,
   agentFormNotice,
+  agentRefreshing,
   agentSaving,
   allSkills,
   defaultAgentId,
@@ -3836,6 +4564,7 @@ function AgentEditorDialog({
   onCreateAgent,
   onDraftChange,
   onDeleteConfirmTextChange,
+  onRefreshAgent,
   onOpenWorkspace,
   onOpenSkillPicker,
   onRequestDeleteAgent,
@@ -3852,21 +4581,62 @@ function AgentEditorDialog({
     agentDraft.defaultProviderId.trim() && agentDraft.defaultModel.trim()
       ? sessionLlmEncode(agentDraft.defaultProviderId, agentDraft.defaultModel)
       : ''
-  const modelOptionsWithFallback =
-    selectedModelValue && !modelOptions.some((item) => item.value === selectedModelValue)
-      ? [
-          {
-            value: selectedModelValue,
-            label: `${agentDraft.defaultProviderId} · ${agentDraft.defaultModel}（当前）`,
-          },
-          ...modelOptions,
-        ]
-      : modelOptions
   const missingSkillIds = agentDraft.skillIds.filter((skillId) => !allSkills.some((skill) => skill.id === skillId))
   const mountedSkills = allSkills.filter((skill) => agentDraft.skillIds.includes(skill.id))
   const editorAccent = getAgentColor(
     selectedAgent ?? { id: 'draft', name: agentDraft.name || '智能体', accentColor: agentDraft.accentColor },
   )
+  const heartbeatConfig = normalizeHeartbeatConfig(agentDraft.heartbeatConfig)
+  const heartbeatTasks = heartbeatConfig.tasks
+  const heartbeatSchedules = heartbeatConfig.schedules
+  const updateHeartbeatConfig = (updater: (current: AgentHeartbeatConfig) => AgentHeartbeatConfig) => {
+    onDraftChange({ heartbeatConfig: updater(normalizeHeartbeatConfig(agentDraft.heartbeatConfig)) })
+  }
+  const updateHeartbeatTask = (taskId: string, updates: Partial<AgentHeartbeatTask>) => {
+    updateHeartbeatConfig((current) => ({
+      ...current,
+      tasks: current.tasks.map((task) => (task.id === taskId ? { ...task, ...updates } : task)),
+    }))
+  }
+  const removeHeartbeatTask = (taskId: string) => {
+    updateHeartbeatConfig((current) => ({
+      ...current,
+      tasks: current.tasks.filter((task) => task.id !== taskId),
+      schedules: current.schedules.map((schedule) =>
+        schedule.taskId === taskId ? { ...schedule, taskId: '' } : schedule,
+      ),
+    }))
+  }
+  const addHeartbeatTask = () => {
+    updateHeartbeatConfig((current) => ({
+      ...current,
+      tasks: [...current.tasks, createEmptyHeartbeatTask()],
+    }))
+  }
+  const updateHeartbeatSchedule = (scheduleId: string, updates: Partial<AgentHeartbeatSchedule>) => {
+    updateHeartbeatConfig((current) => ({
+      ...current,
+      schedules: current.schedules.map((schedule) => (schedule.id === scheduleId ? { ...schedule, ...updates } : schedule)),
+    }))
+  }
+  const removeHeartbeatSchedule = (scheduleId: string) => {
+    updateHeartbeatConfig((current) => ({
+      ...current,
+      schedules: current.schedules.filter((schedule) => schedule.id !== scheduleId),
+    }))
+  }
+  const addHeartbeatSchedule = () => {
+    updateHeartbeatConfig((current) => ({
+      ...current,
+      schedules: [
+        ...current.schedules,
+        {
+          ...createEmptyHeartbeatSchedule(),
+          taskId: current.tasks[0]?.id ?? '',
+        },
+      ],
+    }))
+  }
 
   return (
     <div className="confirm-dialog-overlay" role="presentation" onClick={onClose}>
@@ -3888,9 +4658,21 @@ function AgentEditorDialog({
             </span>
           </div>
 
-          <button type="button" className="icon-button subtle" onClick={onClose} aria-label="关闭智能体编辑器">
-            <AppIcon name="close" size={18} />
-          </button>
+          <div className="agent-editor-header-actions">
+            <button
+              type="button"
+              className="outline-button"
+              onClick={onRefreshAgent}
+              disabled={agentRefreshing || agentSaving || mode !== 'edit' || !selectedAgent}
+            >
+              <AppIcon name="refresh" size={16} />
+              <span>{agentRefreshing ? '刷新中…' : '刷新'}</span>
+            </button>
+
+            <button type="button" className="icon-button subtle" onClick={onClose} aria-label="关闭智能体编辑器">
+              <AppIcon name="close" size={18} />
+            </button>
+          </div>
         </div>
 
         <div className="agent-editor-dialog-scroll">
@@ -3915,6 +4697,7 @@ function AgentEditorDialog({
                 <span className="agent-hero-pill">{mode === 'create' ? '未保存' : '用户智能体'}</span>
                 <span className="agent-hero-pill">{formatAgentExecutionModeLabel(agentDraft.executionMode)}</span>
                 <span className="agent-hero-pill">{agentDraft.skillIds.length} 个挂载技能</span>
+                {selectedAgent ? <span className="agent-hero-pill">ID: {selectedAgent.id}</span> : null}
                 {selectedAgent?.id === defaultAgentId ? <span className="agent-hero-pill accent">当前默认</span> : null}
               </div>
             </div>
@@ -3995,10 +4778,10 @@ function AgentEditorDialog({
                       }
                     }}
                   >
-                    {modelOptionsWithFallback.length === 0 ? (
+                    {modelOptions.length === 0 ? (
                       <option value="">暂无已配置模型</option>
                     ) : (
-                      modelOptionsWithFallback.map((option) => (
+                      modelOptions.map((option) => (
                         <option key={option.value} value={option.value}>
                           {option.label}
                         </option>
@@ -4118,6 +4901,308 @@ function AgentEditorDialog({
             <div className="agent-section">
               <div className="agent-section-header">
                 <div>
+                  <strong>心跳与任务</strong>
+                  <p>给这个智能体配置定时提醒和可执行任务。规则到点后会自动通过绑定的 IM 通道给目标用户发消息，shell 任务会先执行程序，再推送结果。</p>
+                </div>
+
+                <div className="agent-inline-actions">
+                  <button type="button" className="outline-button" onClick={addHeartbeatTask}>
+                    <AppIcon name="plus" size={16} />
+                    <span>添加任务</span>
+                  </button>
+                  <button type="button" className="outline-button" onClick={addHeartbeatSchedule}>
+                    <AppIcon name="clock" size={16} />
+                    <span>添加规则</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="agent-form-grid">
+                <label className="input-field">
+                  <span>时区</span>
+                  <input
+                    value={heartbeatConfig.timezone}
+                    onChange={(event) =>
+                      updateHeartbeatConfig((current) => ({
+                        ...current,
+                        timezone: event.target.value,
+                      }))
+                    }
+                    placeholder="Asia/Shanghai"
+                  />
+                </label>
+              </div>
+
+              <div className="agent-subsection">
+                <div className="agent-subsection-header">
+                  <div>
+                    <strong>任务</strong>
+                    <p>`notify` 只负责提醒，`shell` 会执行命令后把结果发给用户。</p>
+                  </div>
+                </div>
+
+                {heartbeatTasks.length > 0 ? (
+                  <div className="agent-automation-list">
+                    {heartbeatTasks.map((task, index) => (
+                      <div key={task.id} className="agent-automation-card">
+                        <div className="agent-automation-card-header">
+                          <div>
+                            <strong>{task.name || `任务 ${index + 1}`}</strong>
+                            <span>{task.taskType === 'shell' ? '执行程序并回推结果' : '纯文本提醒'}</span>
+                          </div>
+                          <button type="button" className="icon-button subtle" onClick={() => removeHeartbeatTask(task.id)}>
+                            <AppIcon name="trash" size={16} />
+                          </button>
+                        </div>
+
+                        <div className="agent-form-grid">
+                          <label className="input-field">
+                            <span>任务名称</span>
+                            <input
+                              value={task.name}
+                              onChange={(event) => updateHeartbeatTask(task.id, { name: event.target.value })}
+                              placeholder="例如：早间播报"
+                            />
+                          </label>
+
+                          <label className="input-field">
+                            <span>任务类型</span>
+                            <select
+                              value={task.taskType}
+                              onChange={(event) =>
+                                updateHeartbeatTask(task.id, {
+                                  taskType: event.target.value === 'shell' ? 'shell' : 'notify',
+                                })
+                              }
+                            >
+                              <option value="notify">notify · 纯提醒</option>
+                              <option value="shell">shell · 先执行程序</option>
+                            </select>
+                          </label>
+                        </div>
+
+                        <label className="input-field agent-field-full">
+                          <span>任务说明</span>
+                          <textarea
+                            value={task.description}
+                            onChange={(event) => updateHeartbeatTask(task.id, { description: event.target.value })}
+                            rows={3}
+                            placeholder="说明这个任务在做什么，例如：每天 8 点推送昨晚抓取的数据摘要"
+                          />
+                        </label>
+
+                        {task.taskType === 'shell' ? (
+                          <>
+                            <label className="input-field agent-field-full">
+                              <span>执行命令</span>
+                              <input
+                                value={task.command}
+                                onChange={(event) => updateHeartbeatTask(task.id, { command: event.target.value })}
+                                placeholder="例如：python3 scripts/fetch_daily_report.py"
+                              />
+                            </label>
+
+                            <div className="agent-form-grid">
+                              <label className="input-field">
+                                <span>工作目录</span>
+                                <input
+                                  value={task.workingDirectory}
+                                  onChange={(event) => updateHeartbeatTask(task.id, { workingDirectory: event.target.value })}
+                                  placeholder="留空时使用 agents/<agent-id>/"
+                                />
+                              </label>
+
+                              <label className="input-field">
+                                <span>超时秒数</span>
+                                <input
+                                  type="number"
+                                  min={10}
+                                  step={10}
+                                  value={task.timeoutSec}
+                                  onChange={(event) =>
+                                    updateHeartbeatTask(task.id, {
+                                      timeoutSec: Number.parseInt(event.target.value || '180', 10) || 180,
+                                    })
+                                  }
+                                />
+                              </label>
+                            </div>
+                          </>
+                        ) : null}
+
+                        <label className="input-field agent-field-full">
+                          <span>消息模板</span>
+                          <textarea
+                            value={task.messageTemplate}
+                            onChange={(event) => updateHeartbeatTask(task.id, { messageTemplate: event.target.value })}
+                            rows={4}
+                            placeholder={'留空时使用系统默认文案。可用变量：{{agent_name}} {{task_name}} {{schedule_name}} {{now}} {{stdout}} {{stderr}} {{exit_code}}'}
+                          />
+                        </label>
+
+                        <div className="agent-toggle-row">
+                          <label className="agent-check">
+                            <input
+                              type="checkbox"
+                              checked={task.enabled}
+                              onChange={(event) => updateHeartbeatTask(task.id, { enabled: event.target.checked })}
+                            />
+                            <span>启用任务</span>
+                          </label>
+
+                          {task.taskType === 'shell' ? (
+                            <>
+                              <label className="agent-check">
+                                <input
+                                  type="checkbox"
+                                  checked={task.notifyOnSuccess}
+                                  onChange={(event) => updateHeartbeatTask(task.id, { notifyOnSuccess: event.target.checked })}
+                                />
+                                <span>成功后发消息</span>
+                              </label>
+
+                              <label className="agent-check">
+                                <input
+                                  type="checkbox"
+                                  checked={task.notifyOnFailure}
+                                  onChange={(event) => updateHeartbeatTask(task.id, { notifyOnFailure: event.target.checked })}
+                                />
+                                <span>失败后发消息</span>
+                              </label>
+                            </>
+                          ) : null}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="agent-empty-block">
+                    <strong>还没有任务</strong>
+                    <span>先添加一个 `notify` 或 `shell` 任务，再给它配置定时规则。</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="agent-subsection">
+                <div className="agent-subsection-header">
+                  <div>
+                    <strong>规则</strong>
+                    <p>规则决定什么时候触发、触发哪个任务，以及把结果发给谁。当前 MVP 先支持每日固定时刻。</p>
+                  </div>
+                </div>
+
+                {heartbeatSchedules.length > 0 ? (
+                  <div className="agent-automation-list">
+                    {heartbeatSchedules.map((schedule, index) => (
+                      <div key={schedule.id} className="agent-automation-card">
+                        <div className="agent-automation-card-header">
+                          <div>
+                            <strong>{schedule.name || `规则 ${index + 1}`}</strong>
+                            <span>{schedule.times.join('、') || '未设置时间'} · {schedule.channelId || 'wechat'}</span>
+                          </div>
+                          <button type="button" className="icon-button subtle" onClick={() => removeHeartbeatSchedule(schedule.id)}>
+                            <AppIcon name="trash" size={16} />
+                          </button>
+                        </div>
+
+                        <div className="agent-form-grid">
+                          <label className="input-field">
+                            <span>规则名称</span>
+                            <input
+                              value={schedule.name}
+                              onChange={(event) => updateHeartbeatSchedule(schedule.id, { name: event.target.value })}
+                              placeholder="例如：工作日晚间复盘"
+                            />
+                          </label>
+
+                          <label className="input-field">
+                            <span>绑定任务</span>
+                            <select
+                              value={schedule.taskId}
+                              onChange={(event) => updateHeartbeatSchedule(schedule.id, { taskId: event.target.value })}
+                            >
+                              <option value="">请选择任务</option>
+                              {heartbeatTasks.map((task) => (
+                                <option key={task.id} value={task.id}>
+                                  {task.name || task.id}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        </div>
+
+                        <div className="agent-form-grid">
+                          <label className="input-field">
+                            <span>触发时间</span>
+                            <input
+                              value={schedule.times.join(', ')}
+                              onChange={(event) =>
+                                updateHeartbeatSchedule(schedule.id, {
+                                  times: event.target.value
+                                    .split(',')
+                                    .map((value) => value.trim())
+                                    .filter(Boolean),
+                                })
+                              }
+                              placeholder="例如：08:00, 17:00"
+                            />
+                          </label>
+
+                          <label className="input-field">
+                            <span>通道 ID</span>
+                            <input
+                              value={schedule.channelId}
+                              onChange={(event) => updateHeartbeatSchedule(schedule.id, { channelId: event.target.value })}
+                              placeholder="wechat"
+                            />
+                          </label>
+                        </div>
+
+                        <div className="agent-form-grid">
+                          <label className="input-field">
+                            <span>接收用户 ID</span>
+                            <input
+                              value={schedule.targetUserId}
+                              onChange={(event) => updateHeartbeatSchedule(schedule.id, { targetUserId: event.target.value })}
+                              placeholder="例如：wxid_xxx"
+                            />
+                          </label>
+
+                          <label className="input-field">
+                            <span>接收人备注</span>
+                            <input
+                              value={schedule.targetLabel}
+                              onChange={(event) => updateHeartbeatSchedule(schedule.id, { targetLabel: event.target.value })}
+                              placeholder="例如：老板 / 自己 / 数据群"
+                            />
+                          </label>
+                        </div>
+
+                        <div className="agent-toggle-row">
+                          <label className="agent-check">
+                            <input
+                              type="checkbox"
+                              checked={schedule.enabled}
+                              onChange={(event) => updateHeartbeatSchedule(schedule.id, { enabled: event.target.checked })}
+                            />
+                            <span>启用规则</span>
+                          </label>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="agent-empty-block">
+                    <strong>还没有规则</strong>
+                    <span>规则决定执行时机和接收对象。添加后，应用启动时会自动加载并在后台定时检查。</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="agent-section">
+              <div className="agent-section-header">
+                <div>
                   <strong>工作区 Markdown</strong>
                   <p>查看这个智能体对应的 `IDENTITY.md`、`ROLE.md`、`MEMORY.md`、`WORKING.md` 等文件内容。</p>
                 </div>
@@ -4134,6 +5219,7 @@ function AgentEditorDialog({
               </div>
 
               <div className="agent-workspace-hint">
+                <span>智能体 ID：{selectedAgent?.id ?? '保存后生成'}</span>
                 <span>私有目录：{selectedAgent ? `agents/${selectedAgent.id}/` : '尚未创建'}</span>
                 <span>共享文件：`AGENTS.md`、`SOUL.md`、`USER.md`、`MEMORY.md`、`TOOLS.md`</span>
               </div>
@@ -4210,6 +5296,8 @@ type AgentBotBindingDialogProps = {
   formNotice: string
   onBotConfigChange: (channelId: BotChannelId, updates: Partial<BotConfig>) => void
   onClose: () => void
+  onLarkStart: () => void
+  onLarkStop: () => void
   onSave: () => void
   onSelectBot: (id: BotChannelId) => void
   onWechatLogin: () => void
@@ -4235,6 +5323,8 @@ function AgentBotBindingDialog({
   formNotice,
   onBotConfigChange,
   onClose,
+  onLarkStart,
+  onLarkStop,
   onSave,
   onSelectBot,
   onWechatLogin,
@@ -4371,6 +5461,20 @@ function AgentBotBindingDialog({
                       </button>
                       <button type="button" className="outline-button" onClick={onWechatStop} disabled={botLoading || saving}>
                         <span>{botLoading ? '处理中...' : '断开 Bot'}</span>
+                      </button>
+                    </div>
+                  </>
+                ) : selectedBotId === 'lark' ? (
+                  <>
+                    <div className="agent-workspace-hint">
+                      <span>请在飞书开放平台开启机器人能力、长连接事件订阅，并订阅 `im.message.receive_v1`。</span>
+                    </div>
+                    <div className="bot-action-row">
+                      <button type="button" className="outline-button" onClick={onLarkStart} disabled={botLoading || saving}>
+                        <span>{botLoading ? '启动中...' : '启动飞书 Bot'}</span>
+                      </button>
+                      <button type="button" className="outline-button" onClick={onLarkStop} disabled={botLoading || saving}>
+                        <span>{botLoading ? '处理中...' : '断开飞书 Bot'}</span>
                       </button>
                     </div>
                   </>
@@ -4683,6 +5787,7 @@ type AgentsViewProps = {
   agentEditorOpen: boolean
   agentFormError: string
   agentFormNotice: string
+  agentRefreshing: boolean
   agentSaving: boolean
   botConfigs: Record<string, BotConfig>
   botLoading: boolean
@@ -4716,6 +5821,7 @@ type AgentsViewProps = {
   onDraftChange: (updates: Partial<AgentInput>) => void
   onDeleteConfirmTextChange: (value: string) => void
   onDraftWorkspaceContentChange: (value: string) => void
+  onRefreshAgents: () => void
   onOpenWorkspace: () => void
   onOpenSkillPicker: () => void
   onOpenBotBinding: (id: string) => void
@@ -4731,6 +5837,8 @@ type AgentsViewProps = {
   setBotLoading: (loading: boolean) => void
   onSetDefaultAgent: () => void
   onToggleSkill: (skillId: string) => void
+  onLarkStart: () => void
+  onLarkStop: () => void
   onWechatLogin: () => void
   onWechatStart: () => void
   onWechatStop: () => void
@@ -4750,6 +5858,7 @@ function AgentsView({
   agentEditorOpen,
   agentFormError,
   agentFormNotice,
+  agentRefreshing,
   agentSaving,
   botConfigs,
   botLoading,
@@ -4783,6 +5892,7 @@ function AgentsView({
   onDraftChange,
   onDeleteConfirmTextChange,
   onDraftWorkspaceContentChange,
+  onRefreshAgents,
   onOpenWorkspace,
   onOpenSkillPicker,
   onOpenBotBinding,
@@ -4798,6 +5908,8 @@ function AgentsView({
   setBotLoading,
   onSetDefaultAgent,
   onToggleSkill,
+  onLarkStart,
+  onLarkStop,
   onWechatLogin,
   onWechatStart,
   onWechatStop,
@@ -4820,10 +5932,17 @@ function AgentsView({
             <p></p>
           </div>
 
-          <button type="button" className="create-agent-button agent-create-inline" onClick={onCreateAgent}>
-            <AppIcon name="plus" size={20} />
-            <span>新建智能体</span>
-          </button>
+          <div className="agent-page-header-actions">
+            <button type="button" className="outline-button" onClick={() => void onRefreshAgents()} disabled={loading || agentRefreshing}>
+              <AppIcon name="refresh" size={18} />
+              <span>{agentRefreshing ? '刷新中…' : '刷新列表'}</span>
+            </button>
+
+            <button type="button" className="create-agent-button agent-create-inline" onClick={onCreateAgent}>
+              <AppIcon name="plus" size={20} />
+              <span>新建智能体</span>
+            </button>
+          </div>
         </header>
 
         <section className="agent-list-panel">
@@ -4873,6 +5992,7 @@ function AgentsView({
                         {agent.name}
                         {agent.id === defaultAgentId ? <span className="agent-inline-tag">默认</span> : null}
                       </strong>
+                      <span className="agent-inline-id">ID: {agent.id}</span>
                       <span>{agent.summary}</span>
                       <small>{agent.description || '点击进入弹窗，补充介绍、模型和挂载技能。'}</small>
                     </span>
@@ -4922,6 +6042,7 @@ function AgentsView({
           agentDeleteConfirmText={agentDeleteConfirmText}
           agentFormError={agentFormError}
           agentFormNotice={agentFormNotice}
+          agentRefreshing={agentRefreshing}
           agentSaving={agentSaving}
           allSkills={allSkills}
           defaultAgentId={defaultAgentId}
@@ -4933,6 +6054,7 @@ function AgentsView({
           onCreateAgent={onCreateAgent}
           onDraftChange={onDraftChange}
           onDeleteConfirmTextChange={onDeleteConfirmTextChange}
+          onRefreshAgent={onRefreshAgents}
           onOpenWorkspace={onOpenWorkspace}
           onOpenSkillPicker={onOpenSkillPicker}
           onRequestDeleteAgent={onRequestDeleteAgent}
@@ -4953,6 +6075,8 @@ function AgentsView({
           formNotice={agentFormNotice}
           onBotConfigChange={onBotConfigChange}
           onClose={onCloseBotBindingDialog}
+          onLarkStart={onLarkStart}
+          onLarkStop={onLarkStop}
           onSave={onSaveAgent}
           onSelectBot={onSelectBot}
           onWechatLogin={onWechatLogin}

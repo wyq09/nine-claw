@@ -1,4 +1,5 @@
 use crate::agents::{self, ConversationAgentConfig};
+use crate::dev_trace::{dev_trace, dev_trace_block};
 use crate::skills;
 use md5::{Digest, Md5};
 use serde_json::json;
@@ -6,15 +7,151 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
-/// Manages per-user pi sessions for bot channel message processing.
-/// Each (channel_id, user_id) pair gets its own pi subprocess with an independent session file.
+const ABORT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const PI_FIRST_OUTPUT_TIMEOUT: Duration = Duration::from_secs(60);
+const PI_IDLE_OUTPUT_TIMEOUT: Duration = Duration::from_secs(60);
+const PI_TOTAL_RUNTIME_TIMEOUT: Duration = Duration::from_secs(180);
+const CHILD_KILL_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn spawn_pi_stdout_logger<R>(
+    reader: R,
+    scope: &'static str,
+    tx: mpsc::Sender<Result<String, String>>,
+) where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        dev_trace(scope, trimmed);
+                    }
+                    let _ = tx.send(Ok(line));
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    dev_trace(scope, format!("读取失败: {message}"));
+                    let _ = tx.send(Err(message));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_pi_stderr_logger<R>(reader: R, scope: &'static str, buffer: Arc<Mutex<String>>)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        dev_trace(scope, trimmed);
+                    }
+                    if let Ok(mut stderr) = buffer.lock() {
+                        stderr.push_str(&line);
+                        stderr.push('\n');
+                    }
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    dev_trace(scope, format!("读取失败: {message}"));
+                    if let Ok(mut stderr) = buffer.lock() {
+                        stderr.push_str(&message);
+                        stderr.push('\n');
+                    }
+                    break;
+                }
+            }
+        }
+    });
+}
+
+#[derive(Clone)]
+pub struct PiRunHandle {
+    abort_requested: Arc<AtomicBool>,
+    pid: u32,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+}
+
+impl PiRunHandle {
+    pub fn abort(&self) -> Result<(), String> {
+        self.abort_requested.store(true, Ordering::SeqCst);
+
+        let abort_command = json!({
+            "id": format!("abort-{}", self.pid),
+            "type": "abort",
+        })
+        .to_string();
+
+        let write_result = (|| -> Result<(), String> {
+            let mut stdin = self
+                .stdin
+                .lock()
+                .map_err(|error| format!("无法锁定 pi abort stdin: {error}"))?;
+            let stdin = stdin
+                .as_mut()
+                .ok_or_else(|| "pi stdin 已关闭，无法发送 abort 指令".to_string())?;
+            writeln!(stdin, "{abort_command}")
+                .map_err(|error| format!("发送 pi abort 指令失败: {error}"))?;
+            stdin
+                .flush()
+                .map_err(|error| format!("刷新 pi abort 指令失败: {error}"))?;
+            Ok(())
+        })();
+
+        if write_result.is_ok() {
+            return Ok(());
+        }
+
+        let status = Command::new("kill")
+            .args(["-TERM", &self.pid.to_string()])
+            .status()
+            .map_err(|error| format!("中止 pi 进程失败: {error}"))?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("中止 pi 进程失败，退出码: {status}"))
+        }
+    }
+
+    pub fn is_abort_requested(&self) -> bool {
+        self.abort_requested.load(Ordering::SeqCst)
+    }
+}
+
+pub enum PiProcessOutcome {
+    Completed(String),
+    Aborted,
+}
+
+struct ChildExitOutcome {
+    status: Option<ExitStatus>,
+    timed_out: bool,
+}
+
+/// Manages pi sessions for bot channel message processing.
+/// Temporary IM session context stays isolated per (channel_id, user_id) pair.
+/// Long-term memory is still shared at the agent workspace layer because each
+/// turn re-injects the bound agent's md files into the system prompt.
 pub struct PiBridge {
     // sessions field reserved for future persistent-session reuse
     #[allow(dead_code)]
     sessions: Mutex<HashMap<String, ()>>,
+    pi_executable: PathBuf,
     provider_id: String,
     api_format: String,
     base_url: String,
@@ -25,6 +162,7 @@ pub struct PiBridge {
 
 impl PiBridge {
     pub fn new(
+        pi_executable: PathBuf,
         provider_id: &str,
         api_format: &str,
         base_url: &str,
@@ -34,6 +172,7 @@ impl PiBridge {
     ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            pi_executable,
             provider_id: provider_id.to_string(),
             api_format: api_format.to_string(),
             base_url: base_url.to_string(),
@@ -44,7 +183,11 @@ impl PiBridge {
     }
 
     /// Generate a deterministic session key from (channel, user) pair.
-    fn session_key(channel_id: &str, user_id: &str) -> String {
+    ///
+    /// Cross-channel sharing belongs to the persistent workspace memory layer,
+    /// not the transient IM session file. We intentionally keep bot sessions
+    /// isolated so WeChat and Lark can each maintain their own short-term turns.
+    fn session_key(&self, channel_id: &str, user_id: &str) -> String {
         let mut hasher = Md5::new();
         hasher.update(format!("nineclaw:{}:{}", channel_id, user_id).as_bytes());
         format!("{:x}", hasher.finalize())
@@ -56,17 +199,6 @@ impl PiBridge {
 
     fn pi_runtime_dir() -> PathBuf {
         std::env::temp_dir().join("nineclaw-pi-runtime")
-    }
-
-    fn default_provider_base_url(provider_id: &str) -> Option<&'static str> {
-        match provider_id {
-            "openai" => Some("https://api.openai.com/v1"),
-            "anthropic" => Some("https://api.anthropic.com"),
-            "deepseek" => Some("https://api.deepseek.com"),
-            "doubao" => Some("https://ark.cn-beijing.volces.com/api/v3"),
-            "siliconflow" => Some("https://api.siliconflow.cn/v1"),
-            _ => None,
-        }
     }
 
     fn normalize_provider_base_url(value: &str) -> &str {
@@ -102,6 +234,16 @@ impl PiBridge {
             "anthropic" => Self::normalize_anthropic_base_url(&self.base_url),
             _ => Self::normalize_provider_base_url(&self.base_url).to_string(),
         }
+    }
+
+    fn runtime_provider_id(&self) -> String {
+        let trimmed = self.provider_id.trim();
+        if trimmed.is_empty() {
+            return "nineclaw-runtime-provider".to_string();
+        }
+
+        let digest = format!("{:x}", Md5::digest(trimmed.as_bytes()));
+        format!("nineclaw-runtime-{}", &digest[..12])
     }
 
     fn scrub_anthropic_process_env(command: &mut Command) {
@@ -146,27 +288,29 @@ impl PiBridge {
             return None;
         }
 
-        match (provider_id, api_format) {
-            ("openai", "openai") => {
-                let Some(default_base_url) = Self::default_provider_base_url(provider_id) else {
-                    return None;
-                };
-
-                if base_url == Self::normalize_provider_base_url(default_base_url) {
-                    return None;
-                }
-
-                let mut provider = serde_json::Map::new();
-                provider.insert("baseUrl".to_string(), json!(base_url));
-                provider.insert("api".to_string(), json!("openai-completions"));
+        let mut provider = serde_json::Map::new();
+        provider.insert("baseUrl".to_string(), json!(base_url));
+        provider.insert(
+            "apiKey".to_string(),
+            json!(if self.api_key.trim().is_empty() {
+                "DUMMY_KEY"
+            } else {
+                self.api_key.trim()
+            }),
+        );
+        match api_format {
+            "anthropic" => {
+                provider.insert("api".to_string(), json!("anthropic-messages"));
+                // Keep bot/runtime requests aligned with custom Anthropic
+                // gateways that expect `Authorization: Bearer <apiKey>`.
+                provider.insert("authHeader".to_string(), json!(true));
                 provider.insert(
-                    "apiKey".to_string(),
-                    json!(if self.api_key.trim().is_empty() {
-                        "DUMMY_KEY"
-                    } else {
-                        self.api_key.trim()
-                    }),
+                    "models".to_string(),
+                    json!([{ "id": model, "api": "anthropic-messages" }]),
                 );
+            }
+            _ => {
+                provider.insert("api".to_string(), json!("openai-completions"));
                 provider.insert(
                     "compat".to_string(),
                     json!({
@@ -178,85 +322,14 @@ impl PiBridge {
                     "models".to_string(),
                     json!([{ "id": model, "api": "openai-completions" }]),
                 );
-                let mut providers = serde_json::Map::new();
-                providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
-                Some(json!({ "providers": providers }))
-            }
-            ("anthropic", "anthropic") => {
-                let Some(default_base_url) = Self::default_provider_base_url(provider_id) else {
-                    return None;
-                };
-
-                if base_url == Self::normalize_anthropic_base_url(default_base_url) {
-                    return None;
-                }
-
-                let mut provider = serde_json::Map::new();
-                provider.insert("baseUrl".to_string(), json!(base_url));
-                provider.insert("api".to_string(), json!("anthropic-messages"));
-                provider.insert(
-                    "apiKey".to_string(),
-                    json!(if self.api_key.trim().is_empty() {
-                        "DUMMY_KEY"
-                    } else {
-                        self.api_key.trim()
-                    }),
-                );
-                provider.insert(
-                    "models".to_string(),
-                    json!([{ "id": model, "api": "anthropic-messages" }]),
-                );
-                let mut providers = serde_json::Map::new();
-                providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
-                Some(json!({ "providers": providers }))
-            }
-            _ => {
-                let mut provider = serde_json::Map::new();
-                provider.insert("baseUrl".to_string(), json!(base_url));
-                match api_format {
-                    "anthropic" => {
-                        provider.insert("api".to_string(), json!("anthropic-messages"));
-                        provider.insert(
-                            "apiKey".to_string(),
-                            json!(if self.api_key.trim().is_empty() {
-                                "DUMMY_KEY"
-                            } else {
-                                self.api_key.trim()
-                            }),
-                        );
-                        provider.insert(
-                            "models".to_string(),
-                            json!([{ "id": model, "api": "anthropic-messages" }]),
-                        );
-                    }
-                    _ => {
-                        provider.insert("api".to_string(), json!("openai-completions"));
-                        provider.insert(
-                            "apiKey".to_string(),
-                            json!(if self.api_key.trim().is_empty() {
-                                "DUMMY_KEY"
-                            } else {
-                                self.api_key.trim()
-                            }),
-                        );
-                        provider.insert(
-                            "compat".to_string(),
-                            json!({
-                                "supportsDeveloperRole": false,
-                                "supportsReasoningEffort": false
-                            }),
-                        );
-                        provider.insert(
-                            "models".to_string(),
-                            json!([{ "id": model, "api": "openai-completions" }]),
-                        );
-                    }
-                }
-                let mut providers = serde_json::Map::new();
-                providers.insert(provider_id.to_string(), serde_json::Value::Object(provider));
-                Some(json!({ "providers": providers }))
             }
         }
+        let mut providers = serde_json::Map::new();
+        providers.insert(
+            self.runtime_provider_id(),
+            serde_json::Value::Object(provider),
+        );
+        Some(json!({ "providers": providers }))
     }
 
     fn prepare_runtime_dir() -> Result<PathBuf, String> {
@@ -310,6 +383,48 @@ impl PiBridge {
             })
     }
 
+    fn wait_for_child_exit(
+        child: &mut Child,
+        timeout: Duration,
+    ) -> Result<ChildExitOutcome, String> {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| format!("检查 pi 退出状态失败: {error}"))?
+            {
+                return Ok(ChildExitOutcome {
+                    status: Some(status),
+                    timed_out: false,
+                });
+            }
+
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let kill_deadline = Instant::now() + CHILD_KILL_GRACE_TIMEOUT;
+                while Instant::now() < kill_deadline {
+                    if let Some(status) = child
+                        .try_wait()
+                        .map_err(|error| format!("回收超时 pi 进程失败: {error}"))?
+                    {
+                        return Ok(ChildExitOutcome {
+                            status: Some(status),
+                            timed_out: true,
+                        });
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                return Ok(ChildExitOutcome {
+                    status: None,
+                    timed_out: true,
+                });
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Process an incoming message through pi, calling `on_chunk` every `chunk_size` characters.
     pub fn process_message<F>(
         &self,
@@ -317,12 +432,38 @@ impl PiBridge {
         user_id: &str,
         prompt: &str,
         chunk_size: usize,
-        mut on_chunk: F,
+        on_chunk: F,
     ) -> Result<String, String>
     where
         F: FnMut(&str),
     {
-        let key = Self::session_key(channel_id, user_id);
+        match self.process_message_interruptible(
+            channel_id,
+            user_id,
+            prompt,
+            chunk_size,
+            on_chunk,
+            |_| {},
+        )? {
+            PiProcessOutcome::Completed(full_text) => Ok(full_text),
+            PiProcessOutcome::Aborted => Err("pi 处理被中断".to_string()),
+        }
+    }
+
+    pub fn process_message_interruptible<F, S>(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        prompt: &str,
+        chunk_size: usize,
+        mut on_chunk: F,
+        on_run_start: S,
+    ) -> Result<PiProcessOutcome, String>
+    where
+        F: FnMut(&str),
+        S: FnOnce(Arc<PiRunHandle>),
+    {
+        let key = self.session_key(channel_id, user_id);
         let session_path = Self::session_file_path(&key);
         let runtime_dir = Self::prepare_runtime_dir()?;
 
@@ -336,7 +477,7 @@ impl PiBridge {
             fs::remove_file(&models_path).map_err(|e| format!("清理旧的 models.json 失败: {e}"))?;
         }
 
-        let mut cmd = Command::new("pi");
+        let mut cmd = Command::new(&self.pi_executable);
         cmd.args([
             "--mode",
             "rpc",
@@ -354,8 +495,9 @@ impl PiBridge {
             Self::scrub_anthropic_process_env(&mut cmd);
         }
 
-        if !self.provider_id.is_empty() {
-            cmd.args(["--provider", &self.provider_id]);
+        let runtime_provider_id = self.runtime_provider_id();
+        if !runtime_provider_id.is_empty() {
+            cmd.args(["--provider", &runtime_provider_id]);
         }
         if !self.model.is_empty() {
             cmd.args(["--model", &self.model]);
@@ -364,10 +506,46 @@ impl PiBridge {
             cmd.args(["--api-key", &self.api_key]);
         }
 
+        let mut system_prompt_chars = 0usize;
+        let mut system_prompt_sections: Vec<(String, String)> = Vec::new();
         if let Some(agent_config) = self.agent_config.as_ref() {
-            if let Some(system_prompt) = agents::build_agent_system_prompt(agent_config) {
+            if let Ok(workspace_root) = crate::agent_workspace::resolve_workspace_root() {
+                let agent_home = workspace_root.join("agents").join(&agent_config.id);
+                cmd.current_dir(&agent_home)
+                    .env("NINECLAW_AGENT_ID", &agent_config.id)
+                    .env("NINECLAW_AGENT_NAME", &agent_config.name)
+                    .env("NINECLAW_WORKSPACE_ROOT", workspace_root.as_os_str())
+                    .env("NINECLAW_AGENT_HOME", agent_home.as_os_str());
+            }
+
+            if let Some(system_prompt) =
+                agents::build_agent_system_prompt_for_prompt(agent_config, Some(prompt))
+            {
+                system_prompt_chars += system_prompt.chars().count();
+                system_prompt_sections.push((
+                    "agent_system_prompt".to_string(),
+                    system_prompt.clone(),
+                ));
                 cmd.args(["--append-system-prompt", &system_prompt]);
             }
+
+            let media_prompt = "当前回复目标是 IM 用户。如果你需要把本地生成的图片、文件或视频真正发送给用户，请单独输出一行 `::nc-media{type=\"image|file|video\" path=\"/absolute/path/to/file\"}`。该指令行不要附加解释文字；普通文本说明单独写在其他行。";
+            system_prompt_chars += media_prompt.chars().count();
+            system_prompt_sections.push(("im_media".to_string(), media_prompt.to_string()));
+            cmd.args([
+                "--append-system-prompt",
+                media_prompt,
+            ]);
+            let memory_isolation_prompt = "记忆隔离规则：当前智能体只能使用自己的私有工作区记忆。禁止读取、引用、总结或迁移其他智能体 `agents/<other-agent-id>/` 下的任何 markdown 记忆文件。";
+            system_prompt_chars += memory_isolation_prompt.chars().count();
+            system_prompt_sections.push((
+                "memory_isolation".to_string(),
+                memory_isolation_prompt.to_string(),
+            ));
+            cmd.args([
+                "--append-system-prompt",
+                memory_isolation_prompt,
+            ]);
 
             for skill_path in skills::resolve_skill_directories(&agent_config.skill_ids)? {
                 let skill_path = skill_path.to_string_lossy().to_string();
@@ -375,36 +553,93 @@ impl PiBridge {
             }
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("启动 pi 失败（请确认 pi 已安装且在 PATH 中）: {e}"))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            format!(
+                "启动 pi 失败（executable={}）: {e}",
+                self.pi_executable.display()
+            )
+        })?;
+        dev_trace(
+            "bot.pi",
+            format!(
+                "启动 pi: channel={} user={} pid={} provider={} model={} prompt_chars={} system_prompt_chars={}",
+                channel_id,
+                user_id,
+                child.id(),
+                self.provider_id,
+                self.model,
+                prompt.chars().count(),
+                system_prompt_chars
+            ),
+        );
+        for (label, content) in &system_prompt_sections {
+            dev_trace(
+                "bot.pi",
+                format!(
+                    "system_prompt_part: channel={} user={} label={} chars={}",
+                    channel_id,
+                    user_id,
+                    label,
+                    content.chars().count()
+                ),
+            );
+            dev_trace_block(
+                "bot.pi",
+                format!(
+                    "system_prompt_part channel={} user={} label={} chars={}",
+                    channel_id,
+                    user_id,
+                    label,
+                    content.chars().count()
+                ),
+                content,
+            );
+        }
 
         // Write prompt to stdin
-        let mut stdin = child
+        let stdin = child
             .stdin
             .take()
             .ok_or_else(|| "无法获取 pi stdin".to_string())?;
+        let stdin = Arc::new(Mutex::new(Some(stdin)));
+        let run_handle = Arc::new(PiRunHandle {
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            pid: child.id(),
+            stdin: stdin.clone(),
+        });
         {
+            let mut stdin_guard = stdin
+                .lock()
+                .map_err(|e| format!("锁定 pi stdin 失败: {e}"))?;
+            let stdin_writer = stdin_guard
+                .as_mut()
+                .ok_or_else(|| "pi stdin 已关闭，无法写入 prompt".to_string())?;
             let prompt_cmd = json!({
                 "id": "prompt-1",
                 "type": "prompt",
                 "message": prompt,
             })
             .to_string();
-            writeln!(stdin, "{}", prompt_cmd).map_err(|e| format!("写入 prompt 失败: {e}"))?;
-            stdin
+            writeln!(stdin_writer, "{}", prompt_cmd)
+                .map_err(|e| format!("写入 prompt 失败: {e}"))?;
+            stdin_writer
                 .flush()
                 .map_err(|e| format!("flush stdin 失败: {e}"))?;
         }
+        on_run_start(run_handle.clone());
 
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| "无法获取 pi stdout".to_string())?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or_else(|| "无法获取 pi stderr".to_string())?;
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let stderr_buffer = Arc::new(Mutex::new(String::new()));
+        spawn_pi_stdout_logger(stdout, "bot.pi.raw", stdout_tx);
+        spawn_pi_stderr_logger(stderr, "bot.pi.stderr", stderr_buffer.clone());
 
         let mut full_text = String::new();
         let mut chunk_buffer = String::new();
@@ -412,11 +647,81 @@ impl PiBridge {
         let mut saw_done = false;
         let mut saw_any_output = false;
         let mut saw_prompt_response = false;
+        let mut saw_abort_event = false;
+        let mut saw_assistant_activity = false;
+        let started_at = Instant::now();
 
-        for line in BufReader::new(stdout).lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
+        loop {
+            if started_at.elapsed() >= PI_TOTAL_RUNTIME_TIMEOUT {
+                let _ = child.kill();
+                let _ = Self::wait_for_child_exit(&mut child, CHILD_KILL_GRACE_TIMEOUT);
+                if let Ok(mut stdin_guard) = stdin.lock() {
+                    let _ = stdin_guard.take();
+                }
+                let error = format!(
+                    "pi 总运行超时（>{} 秒）",
+                    PI_TOTAL_RUNTIME_TIMEOUT.as_secs()
+                );
+                dev_trace(
+                    "bot.pi",
+                    format!(
+                        "总超时: channel={} user={} error={}",
+                        channel_id, user_id, error
+                    ),
+                );
+                return Err(error);
+            }
+
+            let base_timeout = if saw_any_output {
+                PI_IDLE_OUTPUT_TIMEOUT
+            } else {
+                PI_FIRST_OUTPUT_TIMEOUT
+            };
+            let remaining_total = PI_TOTAL_RUNTIME_TIMEOUT
+                .checked_sub(started_at.elapsed())
+                .unwrap_or(Duration::from_secs(0));
+            let timeout = base_timeout.min(remaining_total);
+            let line = match stdout_rx.recv_timeout(timeout) {
+                Ok(Ok(line)) => line,
+                Ok(Err(_)) => {
+                    if run_handle.is_abort_requested() {
+                        saw_abort_event = true;
+                        break;
+                    }
+                    break;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    let timeout_reason = if timeout == remaining_total {
+                        format!(
+                            "pi 总运行超时（>{} 秒）",
+                            PI_TOTAL_RUNTIME_TIMEOUT.as_secs()
+                        )
+                    } else if saw_any_output {
+                        format!(
+                            "等待 pi 后续输出超时（>{} 秒）",
+                            PI_IDLE_OUTPUT_TIMEOUT.as_secs()
+                        )
+                    } else {
+                        format!(
+                            "等待 pi 首包输出超时（>{} 秒）",
+                            PI_FIRST_OUTPUT_TIMEOUT.as_secs()
+                        )
+                    };
+                    dev_trace(
+                        "bot.pi",
+                        format!(
+                            "超时: channel={} user={} error={}",
+                            channel_id, user_id, timeout_reason
+                        ),
+                    );
+                    let _ = child.kill();
+                    let _ = Self::wait_for_child_exit(&mut child, CHILD_KILL_GRACE_TIMEOUT);
+                    if let Ok(mut stdin_guard) = stdin.lock() {
+                        let _ = stdin_guard.take();
+                    }
+                    return Err(timeout_reason);
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             };
             if !line.trim().is_empty() {
                 saw_any_output = true;
@@ -424,7 +729,13 @@ impl PiBridge {
 
             let value: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(_) => {
+                    if run_handle.is_abort_requested() {
+                        saw_abort_event = true;
+                        break;
+                    }
+                    continue;
+                }
             };
 
             let line_type = value
@@ -437,6 +748,13 @@ impl PiBridge {
                 "message_start" | "message_end" | "turn_end" | "agent_end"
             ) {
                 if let Some(err) = Self::extract_assistant_error(&value) {
+                    dev_trace(
+                        "bot.pi",
+                        format!(
+                            "assistant error: channel={} user={} error={}",
+                            channel_id, user_id, err
+                        ),
+                    );
                     return Err(format!("pi assistant 错误: {err}"));
                 }
             }
@@ -454,6 +772,7 @@ impl PiBridge {
                         .and_then(|v| v.as_str())
                         .unwrap_or_default();
                     if !text.is_empty() {
+                        saw_assistant_activity = true;
                         full_text.push_str(text);
                         chunk_buffer.push_str(text);
                         if chunk_buffer.len() >= chunk_size {
@@ -467,6 +786,7 @@ impl PiBridge {
                     if let Some(final_text) = Self::extract_text_content_from_message(
                         event.and_then(|v| v.get("message")),
                     ) {
+                        saw_assistant_activity = true;
                         let missing_text = if full_text.is_empty() {
                             final_text
                         } else if let Some(suffix) = final_text.strip_prefix(&full_text) {
@@ -491,12 +811,26 @@ impl PiBridge {
                         .and_then(|v| v.get("reason"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown");
+                    if reason == "aborted" {
+                        saw_abort_event = true;
+                        break;
+                    }
+                    dev_trace(
+                        "bot.pi",
+                        format!(
+                            "流错误: channel={} user={} error={}",
+                            channel_id, user_id, reason
+                        ),
+                    );
                     return Err(format!("pi 流错误: {reason}"));
                 }
             }
 
             if line_type == "agent_end" {
                 saw_agent_end = true;
+                if run_handle.is_abort_requested() {
+                    saw_abort_event = true;
+                }
                 break;
             }
 
@@ -518,28 +852,58 @@ impl PiBridge {
                         .get("error")
                         .and_then(|v| v.as_str())
                         .unwrap_or("未知错误");
+                    if run_handle.is_abort_requested() {
+                        saw_abort_event = true;
+                        break;
+                    }
+                    dev_trace(
+                        "bot.pi",
+                        format!(
+                            "RPC 错误: channel={} user={} error={}",
+                            channel_id, user_id, err
+                        ),
+                    );
                     return Err(format!("pi RPC 错误: {err}"));
                 }
             }
         }
 
         // Flush remaining chunk
-        if !chunk_buffer.is_empty() {
+        if !chunk_buffer.is_empty() && !run_handle.is_abort_requested() && !saw_abort_event {
             on_chunk(&chunk_buffer);
         }
+        if let Ok(mut stdin_guard) = stdin.lock() {
+            let _ = stdin_guard.take();
+        }
 
-        drop(stdin);
+        let exit_outcome = Self::wait_for_child_exit(
+            &mut child,
+            if run_handle.is_abort_requested() || saw_abort_event {
+                ABORT_WAIT_TIMEOUT
+            } else {
+                Duration::from_secs(30)
+            },
+        )?;
+        let exit_status = exit_outcome.status;
 
-        let exit_status = child.wait().map_err(|e| format!("等待 pi 退出失败: {e}"))?;
+        let stderr_text = stderr_buffer
+            .lock()
+            .map(|stderr| stderr.clone())
+            .unwrap_or_else(|_| String::new());
 
-        let mut stderr_text = String::new();
-        let _ = stderr.read_to_string(&mut stderr_text);
+        if run_handle.is_abort_requested() || saw_abort_event {
+            dev_trace(
+                "bot.pi",
+                format!("已中止: channel={} user={}", channel_id, user_id),
+            );
+            return Ok(PiProcessOutcome::Aborted);
+        }
 
         // If pi exited without producing any assistant events, surface a more useful reason.
         if full_text.is_empty() && !saw_done && !saw_agent_end {
             let reason = if !stderr_text.trim().is_empty() {
                 stderr_text.trim().to_string()
-            } else if saw_prompt_response || saw_any_output {
+            } else if saw_prompt_response || saw_any_output || saw_assistant_activity {
                 if self.provider_id.trim().is_empty()
                     || self.base_url.trim().is_empty()
                     || self.model.trim().is_empty()
@@ -564,21 +928,54 @@ impl PiBridge {
                         self.model.trim()
                     )
                 }
+            } else if exit_outcome.timed_out {
+                "pi 在回收时超时，运行时已主动脱离该卡死进程。".to_string()
             } else {
-                format!("pi 退出码 {exit_status}，无输出内容")
+                match exit_status {
+                    Some(status) => format!("pi 退出码 {status}，无输出内容"),
+                    None => "pi 已被请求终止，但进程仍未退出且没有输出内容".to_string(),
+                }
             };
+            dev_trace(
+                "bot.pi",
+                format!(
+                    "无回复退出: channel={} user={} error={}",
+                    channel_id, user_id, reason
+                ),
+            );
             return Err(reason);
         }
 
-        if !exit_status.success() {
-            let reason = if !stderr_text.trim().is_empty() {
+        if exit_status.map(|status| !status.success()).unwrap_or(true) {
+            let reason = if exit_outcome.timed_out && stderr_text.trim().is_empty() {
+                "等待 pi 退出超时，运行时已主动脱离该卡死进程。".to_string()
+            } else if !stderr_text.trim().is_empty() {
                 stderr_text.trim().to_string()
             } else {
-                format!("pi 退出码异常: {exit_status}")
+                match exit_status {
+                    Some(status) => format!("pi 退出码异常: {status}"),
+                    None => "pi 已被请求终止，但进程仍未退出".to_string(),
+                }
             };
+            dev_trace(
+                "bot.pi",
+                format!(
+                    "异常退出: channel={} user={} error={}",
+                    channel_id, user_id, reason
+                ),
+            );
             return Err(reason);
         }
 
-        Ok(full_text)
+        dev_trace(
+            "bot.pi",
+            format!(
+                "完成: channel={} user={} chars={}",
+                channel_id,
+                user_id,
+                full_text.chars().count()
+            ),
+        );
+        Ok(PiProcessOutcome::Completed(full_text))
     }
 }

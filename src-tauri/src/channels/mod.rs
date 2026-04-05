@@ -1,4 +1,5 @@
 pub mod factory;
+pub mod lark;
 pub mod manager;
 pub mod pi_bridge;
 pub mod types;

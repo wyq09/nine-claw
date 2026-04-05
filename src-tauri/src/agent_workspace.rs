@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+
+mod memory_wiki;
+
 use serde::Serialize;
 use std::fmt::Write as _;
 use std::fs;
@@ -8,6 +12,8 @@ const LEGACY_WORKSPACE_RELATIVE_PATH: &str = ".openclaw/workspace";
 const PRIMARY_WORKSPACE_ROOT_ENV: &str = "NINECLAW_WORKSPACE_ROOT";
 const LEGACY_WORKSPACE_ROOT_ENVS: &[&str] = &["NINECLAW_AGENT_WORKSPACE_ROOT"];
 const TEMPLATE_DIR: &str = "agents/_templates";
+const CATEGORY_MEMORY_DIR: &str = "memory/categories";
+const WORKSPACE_SYSTEM_PROMPT_CHAR_LIMIT: usize = 1200;
 const ROOT_FILES: &[&str] = &[
     "AGENTS.md",
     "SOUL.md",
@@ -45,6 +51,246 @@ const AGENT_VIEW_FILES: &[&str] = &[
     "PUBLIC_CONTEXT.md",
     "HEARTBEAT.md",
     "BOOTSTRAP.md",
+];
+
+#[derive(Clone, Copy)]
+struct MemoryCategoryDefinition {
+    key: &'static str,
+    title: &'static str,
+    description: &'static str,
+    storage_keywords: &'static [&'static str],
+    query_keywords: &'static [&'static str],
+}
+
+const MEMORY_CATEGORY_DEFINITIONS: &[MemoryCategoryDefinition] = &[
+    MemoryCategoryDefinition {
+        key: "general",
+        title: "GENERAL_MEMORY",
+        description: "兜底的通用稳定记忆，放未命中特定分类但值得长期保留的事实。",
+        storage_keywords: &[],
+        query_keywords: &[],
+    },
+    MemoryCategoryDefinition {
+        key: "user_profile",
+        title: "USER_PROFILE",
+        description: "关于用户身份、背景、角色、公司、所在地、时区等稳定画像。",
+        storage_keywords: &[
+            "我是",
+            "我的职位",
+            "我的角色",
+            "我的公司",
+            "我负责",
+            "我在",
+            "我来自",
+            "我住在",
+            "时区",
+            "背景",
+            "职位",
+            "角色",
+            "公司",
+            "城市",
+            "where i am",
+            "my role",
+            "my company",
+            "background",
+        ],
+        query_keywords: &[
+            "我是谁",
+            "我的信息",
+            "我的背景",
+            "我的职位",
+            "我的角色",
+            "我的公司",
+            "我的时区",
+            "我的城市",
+            "user profile",
+            "background",
+            "who am i",
+            "my role",
+            "my company",
+        ],
+    },
+    MemoryCategoryDefinition {
+        key: "preferences",
+        title: "PREFERENCES",
+        description: "用户偏好、口吻、格式要求、称呼习惯、喜欢或避开的做法。",
+        storage_keywords: &[
+            "偏好",
+            "喜欢",
+            "不喜欢",
+            "习惯",
+            "风格",
+            "口吻",
+            "称呼",
+            "叫我",
+            "输出格式",
+            "尽量",
+            "不要",
+            "prefer",
+            "like",
+            "dislike",
+            "format",
+            "tone",
+        ],
+        query_keywords: &[
+            "我的偏好",
+            "我喜欢什么",
+            "我不喜欢什么",
+            "按我的习惯",
+            "按我的风格",
+            "怎么称呼我",
+            "我的格式要求",
+            "preferences",
+            "my preference",
+            "my style",
+            "call me",
+        ],
+    },
+    MemoryCategoryDefinition {
+        key: "projects",
+        title: "PROJECTS",
+        description: "项目、产品、代码库、需求、架构、发布计划等长期项目上下文。",
+        storage_keywords: &[
+            "项目",
+            "产品",
+            "代码库",
+            "仓库",
+            "repo",
+            "需求",
+            "功能",
+            "版本",
+            "发布",
+            "架构",
+            "roadmap",
+            "milestone",
+            "feature",
+            "project",
+        ],
+        query_keywords: &[
+            "这个项目",
+            "我们的项目",
+            "项目背景",
+            "项目计划",
+            "产品规划",
+            "代码库",
+            "仓库",
+            "需求",
+            "架构",
+            "roadmap",
+            "repo",
+            "project",
+            "feature",
+            "architecture",
+        ],
+    },
+    MemoryCategoryDefinition {
+        key: "commitments",
+        title: "COMMITMENTS",
+        description: "待办、承诺、截止时间、下一步、提醒事项、跟进动作。",
+        storage_keywords: &[
+            "待办",
+            "todo",
+            "提醒",
+            "记得",
+            "跟进",
+            "截止",
+            "ddl",
+            "明天",
+            "下周",
+            "下一步",
+            "交付",
+            "完成",
+            "安排",
+            "计划",
+            "会去做",
+        ],
+        query_keywords: &[
+            "下一步",
+            "待办",
+            "我们要做什么",
+            "后面怎么做",
+            "截止",
+            "提醒",
+            "跟进",
+            "计划",
+            "安排",
+            "todo",
+            "next step",
+            "deadline",
+            "follow up",
+        ],
+    },
+    MemoryCategoryDefinition {
+        key: "decisions",
+        title: "DECISIONS",
+        description: "已经确认的决定、规范、规则、统一约定和禁用项。",
+        storage_keywords: &[
+            "决定",
+            "确认",
+            "定下来",
+            "选用",
+            "约定",
+            "规则",
+            "规范",
+            "统一",
+            "以后都",
+            "必须",
+            "不要再",
+            "confirmed",
+            "decision",
+            "rule",
+            "standard",
+        ],
+        query_keywords: &[
+            "之前的决定",
+            "之前确认",
+            "已经定下来的",
+            "规则",
+            "规范",
+            "约定",
+            "统一方案",
+            "禁用项",
+            "decision",
+            "confirmed",
+            "rule",
+            "standard",
+        ],
+    },
+    MemoryCategoryDefinition {
+        key: "relationships",
+        title: "RELATIONSHIPS",
+        description: "与用户相关的人、团队、客户、合作方、负责人等关系网络。",
+        storage_keywords: &[
+            "同事",
+            "老板",
+            "客户",
+            "团队",
+            "合作方",
+            "朋友",
+            "家人",
+            "负责人",
+            "联系人",
+            "stakeholder",
+            "owner",
+            "manager",
+            "client",
+        ],
+        query_keywords: &[
+            "谁负责",
+            "联系人",
+            "客户是谁",
+            "团队里",
+            "老板",
+            "同事",
+            "合作方",
+            "负责人",
+            "关系人",
+            "owner",
+            "stakeholder",
+            "client",
+            "contact",
+        ],
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -158,10 +404,12 @@ pub fn sync_agent_registry(entries: &[AgentWorkspaceSeed<'_>]) -> Result<(), Str
     );
 
     content.push_str("## Shared Rules\n\n");
-    content.push_str("- Root files are shared across agents\n");
     content.push_str("- `agents/<agent-id>/` is the private home of that agent\n");
-    content.push_str("- Shared facts belong in root `MEMORY.md`\n");
-    content.push_str("- Role-specific facts belong in `agents/<agent-id>/MEMORY.md`\n");
+    content.push_str("- Agent memory is isolated per agent home and must not be copied from other agent directories\n");
+    content.push_str(
+        "- Root files are system policy / operator notes, not cross-agent runtime memory\n",
+    );
+    content.push_str("- Runtime memory loading should only use the current agent home\n");
     content.push_str("- New agents should be scaffolded from `agents/_templates/`\n\n");
 
     content.push_str("## Current Agents\n\n");
@@ -193,45 +441,83 @@ pub fn delete_agent_workspace(agent_id: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    fs::remove_dir_all(&agent_home)
-        .map_err(|error| format!("删除智能体工作区失败: {error}"))?;
+    fs::remove_dir_all(&agent_home).map_err(|error| format!("删除智能体工作区失败: {error}"))?;
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn build_workspace_system_prompt(agent_id: &str) -> Result<String, String> {
+    build_workspace_system_prompt_for_query(agent_id, None)
+}
+
+pub fn build_workspace_system_prompt_for_query(
+    agent_id: &str,
+    current_prompt: Option<&str>,
+) -> Result<String, String> {
     let root = resolve_workspace_root()?;
     let agent_home = root.join("agents").join(agent_id);
-    let relative_agent_home = format!("agents/{agent_id}");
     let bootstrap_exists = agent_home.join("BOOTSTRAP.md").exists();
-    let root_display = display_workspace_root(&root);
 
     let mut sections = Vec::new();
-    sections.push(format!(
-        "NineClaw agent workspace 根目录：{}。",
-        root_display
-    ));
-    sections.push(format!("当前智能体私有 home：{}/。", relative_agent_home));
     sections.push(
-        "进入会话后，先同步本地 markdown 工作区，再开始正常答复；不要假装自己记得，先读文件。"
+        "记忆规则：只使用当前 agent 私有记忆；命中不到就直说；禁止引用其他 agents/<id>/ 内容。"
             .to_string(),
     );
     sections.push(
-        "加载顺序：root `AGENTS.md` -> root `SOUL.md` -> root `USER.md` -> root `TOOLS.md` -> 私有会话可读 root `MEMORY.md` -> 当前 agent 的 `IDENTITY.md`、`ROLE.md`、`TOOLS.md`、`MEMORY.md`、`WORKING.md`、`DECISIONS.md` -> 最近两天 daily log。".to_string(),
-    );
-    sections.push(
-        "共享 / 外部上下文默认只读 `PUBLIC_CONTEXT.md`，不要把 root `MEMORY.md` 或 agent 私有记忆向外复述。"
+        "写回：短期写 WORKING.md；稳定事实写 MEMORY.md；决定写 DECISIONS.md；共享资料写 PUBLIC_CONTEXT.md。"
             .to_string(),
-    );
-    sections.push(
-        "写入规则：原始过程写 daily log，短期上下文写 `WORKING.md`，稳定经验写 agent `MEMORY.md`，只有跨 agent 都该知道的事实才提升到 root `MEMORY.md`。".to_string(),
     );
     if bootstrap_exists {
-        sections.push(
-            "检测到当前 agent home 里存在 `BOOTSTRAP.md`。把它当成首次建档引导，先按引导补齐身份和角色文件，完成后删除它。".to_string(),
-        );
+        sections.push("BOOTSTRAP.md 存在：先按引导补齐身份文件，完成后删除。".to_string());
     }
 
-    Ok(sections.join("\n\n"))
+    if let Some(wiki_snapshot) =
+        memory_wiki::build_memory_wiki_snapshot(&agent_home, current_prompt)?
+    {
+        sections.push(wiki_snapshot);
+    }
+    sections.push(build_legacy_workspace_memory_snapshot(&root, agent_id)?);
+
+    Ok(trim_to_char_limit(
+        &sections.join("\n\n"),
+        WORKSPACE_SYSTEM_PROMPT_CHAR_LIMIT,
+    ))
+}
+
+pub fn read_agent_heartbeat_instructions(agent_id: &str) -> Result<Option<String>, String> {
+    let root = resolve_workspace_root()?;
+    ensure_root_scaffold(&root)?;
+
+    let shared = read_meaningful_heartbeat_file(
+        root.join("HEARTBEAT.md"),
+        root_fallback_template("HEARTBEAT.md"),
+        3_200,
+    )?;
+    let agent_specific = read_meaningful_heartbeat_file(
+        root.join("agents").join(agent_id).join("HEARTBEAT.md"),
+        fallback_template("HEARTBEAT.md"),
+        3_200,
+    )?;
+
+    let mut sections = Vec::new();
+    if !shared.is_empty() {
+        sections.push(format!(
+            "以下是系统级 HEARTBEAT.md，请把它当作全局心跳规则：\n```md\n{}\n```",
+            shared
+        ));
+    }
+    if !agent_specific.is_empty() {
+        sections.push(format!(
+            "以下是当前智能体私有 HEARTBEAT.md，请优先遵守：\n```md\n{}\n```",
+            agent_specific
+        ));
+    }
+
+    if sections.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(sections.join("\n\n")))
+    }
 }
 
 pub fn read_agent_workspace_bundle(agent_id: &str) -> Result<AgentWorkspaceBundle, String> {
@@ -313,13 +599,33 @@ pub fn append_agent_memory_entry(
 
     let timestamp = current_timestamp_label();
     let summary = summarize_memory_entry(user_message, assistant_message);
+    let categories = classify_memory_categories(user_message, assistant_message, &summary);
+    let category_notes =
+        build_category_memory_notes(user_message, assistant_message, &summary, &categories);
+    let core_memory_points = select_core_memory_points(&category_notes);
+    let ingest_summary = build_ingest_summary(&category_notes, &summary);
+    let source_ref = memory_wiki::record_conversation_ingest(
+        &agent_home,
+        user_id,
+        &timestamp,
+        user_message,
+        assistant_message,
+        &ingest_summary,
+        &categories,
+    )?;
 
     let working_path = agent_home.join("WORKING.md");
     let working_existing = fs::read_to_string(&working_path)
         .unwrap_or_else(|_| fallback_template("WORKING.md").to_string());
     fs::write(
         &working_path,
-        upsert_working_memory(&working_existing, user_id, &timestamp, &summary),
+        upsert_working_memory(
+            &working_existing,
+            user_id,
+            &ingest_summary,
+            &source_ref,
+            &categories,
+        ),
     )
     .map_err(|error| format!("写入 WORKING.md 失败: {error}"))?;
 
@@ -328,9 +634,11 @@ pub fn append_agent_memory_entry(
         .unwrap_or_else(|_| fallback_template("MEMORY.md").to_string());
     fs::write(
         &memory_path,
-        append_memory_summary(&memory_existing, user_id, &timestamp, &summary),
+        append_core_memory_points(&memory_existing, &core_memory_points),
     )
     .map_err(|error| format!("写入 MEMORY.md 失败: {error}"))?;
+
+    append_category_memory_entries(&agent_home, &category_notes, &source_ref)?;
 
     let daily_log_path = agent_home
         .join("memory")
@@ -343,13 +651,90 @@ pub fn append_agent_memory_entry(
             &daily_log_existing,
             user_id,
             &timestamp,
-            user_message,
-            assistant_message,
+            &ingest_summary,
+            &source_ref,
+            &categories,
         ),
     )
     .map_err(|error| format!("写入 daily log 失败: {error}"))?;
 
+    memory_wiki::refresh_memory_wiki(&agent_home)?;
+
     Ok(())
+}
+
+pub fn register_agent_attachment_source(
+    agent_id: &str,
+    title: &str,
+    file_path: &Path,
+    mime_type: Option<&str>,
+    note: Option<&str>,
+) -> Result<(), String> {
+    let root = resolve_workspace_root()?;
+    ensure_root_scaffold(&root)?;
+
+    let agent_home = root.join("agents").join(agent_id);
+    fs::create_dir_all(agent_home.join("memory"))
+        .map_err(|error| format!("创建 agent memory 目录失败: {error}"))?;
+    let timestamp = current_timestamp_label();
+    let daily_log_path = agent_home
+        .join("memory")
+        .join(format!("{}.md", current_date_label()));
+    let existing = fs::read_to_string(&daily_log_path)
+        .unwrap_or_else(|_| format!("# {}\n\n", current_date_label()));
+    let attachment_message = match mime_type.filter(|value| !value.trim().is_empty()) {
+        Some(mime) => format!(
+            "收到附件：{}（mime={}，path=`{}`）",
+            title,
+            mime,
+            file_path.display()
+        ),
+        None => format!("收到附件：{}（path=`{}`）", title, file_path.display()),
+    };
+    memory_wiki::record_attachment_source(&agent_home, &timestamp, title, file_path, mime_type, note)?;
+    fs::write(
+        &daily_log_path,
+        append_daily_log_entry(
+            &existing,
+            "attachment",
+            &timestamp,
+            &attachment_message,
+            &file_path.display().to_string(),
+            &[],
+        ),
+    )
+    .map_err(|error| format!("写入附件 daily log 失败: {error}"))?;
+    memory_wiki::refresh_memory_wiki(&agent_home)?;
+    Ok(())
+}
+
+pub fn persist_agent_inbound_artifact(
+    agent_id: &str,
+    user_id: &str,
+    file_name: &str,
+    data: &[u8],
+) -> Result<PathBuf, String> {
+    let root = resolve_workspace_root()?;
+    ensure_root_scaffold(&root)?;
+
+    let inbox_dir = root
+        .join("agents")
+        .join(agent_id)
+        .join("inbox")
+        .join(current_date_label());
+    fs::create_dir_all(&inbox_dir).map_err(|error| format!("创建智能体收件目录失败: {error}"))?;
+
+    let safe_user = sanitize_workspace_segment(user_id, "user");
+    let safe_name = sanitize_workspace_file_name(file_name, "attachment.bin");
+    let path = inbox_dir.join(format!(
+        "{}-{}-{}",
+        current_timestamp_file_label(),
+        safe_user,
+        safe_name
+    ));
+
+    fs::write(&path, data).map_err(|error| format!("写入智能体收件文件失败: {error}"))?;
+    Ok(path)
 }
 
 fn ensure_root_scaffold(root: &Path) -> Result<(), String> {
@@ -386,6 +771,416 @@ fn ensure_root_scaffold(root: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn build_legacy_workspace_memory_snapshot(root: &Path, agent_id: &str) -> Result<String, String> {
+    let agent_home = root.join("agents").join(agent_id);
+    let mut sections = Vec::new();
+
+    let memory_content = fs::read_to_string(agent_home.join("MEMORY.md")).unwrap_or_default();
+    let mut memory_bullets = extract_section_bullets(&memory_content, "## Core Memory");
+    let preference_bullets = extract_section_bullets(&memory_content, "## 用户偏好");
+    for item in preference_bullets {
+        if memory_bullets
+            .iter()
+            .any(|existing| existing.trim().eq_ignore_ascii_case(item.trim()))
+        {
+            continue;
+        }
+        memory_bullets.push(item);
+    }
+    memory_bullets.retain(|item| !item.trim().is_empty());
+    if !memory_bullets.is_empty() {
+        let memory_excerpt = memory_bullets
+            .into_iter()
+            .take(4)
+            .map(|item| format!("- {}", trim_to_char_limit(&item, 80)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("MEMORY 核心点：\n{}", memory_excerpt));
+    }
+
+    let working_content = fs::read_to_string(agent_home.join("WORKING.md")).unwrap_or_default();
+    let working_bullets = extract_section_bullets(&working_content, "## IM Latest Context")
+        .into_iter()
+        .filter(|item| !item.contains("Last user:"))
+        .take(3)
+        .map(|item| format!("- {}", trim_to_char_limit(&item, 90)))
+        .collect::<Vec<_>>();
+    if !working_bullets.is_empty() {
+        sections.push(format!("WORKING 当前上下文：\n{}", working_bullets.join("\n")));
+    }
+
+    let decisions_content = fs::read_to_string(agent_home.join("DECISIONS.md")).unwrap_or_default();
+    let decision_bullets = extract_section_bullets(&decisions_content, "## Decision Log")
+        .into_iter()
+        .filter(|item| !item.contains("No decisions logged yet"))
+        .take(3)
+        .map(|item| format!("- {}", trim_to_char_limit(&item, 80)))
+        .collect::<Vec<_>>();
+    if !decision_bullets.is_empty() {
+        sections.push(format!("DECISIONS：\n{}", decision_bullets.join("\n")));
+    }
+
+    if sections.is_empty() {
+        Ok("当前智能体还没有可加载的核心 md 记忆内容。".to_string())
+    } else {
+        Ok(format!(
+            "核心记忆摘录：\n{}",
+            sections.join("\n\n")
+        ))
+    }
+}
+
+fn build_categorized_memory_snapshot(
+    root: &Path,
+    agent_id: &str,
+    current_prompt: Option<&str>,
+) -> Result<Option<String>, String> {
+    let agent_home = root.join("agents").join(agent_id);
+    ensure_category_memory_scaffold(&agent_home)?;
+
+    let selected_categories = select_memory_categories_for_query(current_prompt);
+    let mut selected_labels = Vec::new();
+    let mut sections = Vec::new();
+
+    for category in selected_categories.into_iter().take(2) {
+        let path = category_memory_file_path(&agent_home, category.key);
+        if !path.exists() {
+            continue;
+        }
+
+        let content = safe_read_trimmed(
+            path,
+            if category.key == "general" {
+                380
+            } else {
+                260
+            },
+        )?;
+        if content.is_empty() {
+            continue;
+        }
+
+        selected_labels.push(category.title);
+        sections.push(format!(
+            "{}（{}）:\n{}",
+            category.title, category.description, content
+        ));
+    }
+
+    if sections.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "相关分类记忆（{}）：\n{}",
+            selected_labels.join("、"),
+            sections.join("\n\n")
+        )))
+    }
+}
+
+fn ensure_category_memory_scaffold(agent_home: &Path) -> Result<(), String> {
+    let dir = category_memory_dir(agent_home);
+    fs::create_dir_all(&dir).map_err(|error| format!("创建分类记忆目录失败: {error}"))?;
+
+    let index_path = dir.join("INDEX.md");
+    if !index_path.exists() {
+        fs::write(&index_path, build_category_index_content())
+            .map_err(|error| format!("写入分类记忆索引失败: {error}"))?;
+    }
+
+    Ok(())
+}
+
+fn category_memory_dir(agent_home: &Path) -> PathBuf {
+    agent_home.join(CATEGORY_MEMORY_DIR)
+}
+
+fn category_memory_file_path(agent_home: &Path, key: &str) -> PathBuf {
+    category_memory_dir(agent_home).join(format!("{key}.md"))
+}
+
+fn build_category_index_content() -> String {
+    let mut content = String::from(
+        "# INDEX.md - Categorized Memory\n\nThis directory stores curated memory shards grouped by topic so runtime can load only the most relevant memory for each question.\n\n## Categories\n\n",
+    );
+
+    for category in MEMORY_CATEGORY_DEFINITIONS {
+        let _ = writeln!(
+            content,
+            "- `{}` / `{}`: {}",
+            category.key, category.title, category.description
+        );
+    }
+
+    content
+}
+
+fn build_category_file_template(category: MemoryCategoryDefinition) -> String {
+    format!(
+        "# {}.md\n\n## Purpose\n\n{}\n\n## Entries\n\n",
+        category.title, category.description
+    )
+}
+
+fn read_agent_category_memory_files(
+    root: &Path,
+    agent_id: &str,
+) -> Result<Vec<AgentWorkspaceFile>, String> {
+    let category_dir = root.join("agents").join(agent_id).join(CATEGORY_MEMORY_DIR);
+    if !category_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = fs::read_dir(&category_dir)
+        .map_err(|error| format!("读取分类记忆目录失败: {error}"))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let file_name = path.file_name()?.to_str()?.to_string();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md")
+                || !memory_wiki::is_daily_log_file(&path)
+            {
+                return None;
+            }
+            Some((file_name, path))
+        })
+        .collect::<Vec<_>>();
+
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    Ok(entries
+        .into_iter()
+        .map(|(file_name, path)| {
+            let relative_path = PathBuf::from("agents")
+                .join(agent_id)
+                .join("memory")
+                .join("categories")
+                .join(&file_name);
+            read_workspace_file("agent", "private", &file_name, relative_path, path, false)
+        })
+        .collect())
+}
+
+fn classify_memory_categories(
+    user_message: &str,
+    assistant_message: &str,
+    summary: &str,
+) -> Vec<MemoryCategoryDefinition> {
+    let combined = normalize_memory_match_text(&format!(
+        "{}\n{}\n{}",
+        user_message, assistant_message, summary
+    ));
+
+    let mut categories = vec![memory_category_definition("general").expect("general category")];
+    for category in MEMORY_CATEGORY_DEFINITIONS
+        .iter()
+        .copied()
+        .filter(|category| category.key != "general")
+    {
+        if contains_any_keyword(&combined, category.storage_keywords) {
+            categories.push(category);
+        }
+    }
+
+    categories
+}
+
+fn select_memory_categories_for_query(
+    current_prompt: Option<&str>,
+) -> Vec<MemoryCategoryDefinition> {
+    let mut categories = vec![memory_category_definition("general").expect("general category")];
+    let prompt = normalize_memory_match_text(current_prompt.unwrap_or_default());
+
+    if prompt.is_empty() {
+        for key in ["projects", "commitments", "decisions"] {
+            if let Some(category) = memory_category_definition(key) {
+                categories.push(category);
+            }
+        }
+        return categories;
+    }
+
+    for category in MEMORY_CATEGORY_DEFINITIONS
+        .iter()
+        .copied()
+        .filter(|category| category.key != "general")
+    {
+        if contains_any_keyword(&prompt, category.query_keywords)
+            || contains_any_keyword(&prompt, category.storage_keywords)
+        {
+            categories.push(category);
+        }
+    }
+
+    if categories.len() == 1 {
+        if contains_memory_recall_signal(&prompt) {
+            categories.extend(
+                MEMORY_CATEGORY_DEFINITIONS
+                    .iter()
+                    .copied()
+                    .filter(|category| category.key != "general"),
+            );
+        } else {
+            for key in ["projects", "commitments", "decisions"] {
+                if let Some(category) = memory_category_definition(key) {
+                    categories.push(category);
+                }
+            }
+        }
+    }
+
+    categories
+}
+
+fn memory_category_definition(key: &str) -> Option<MemoryCategoryDefinition> {
+    MEMORY_CATEGORY_DEFINITIONS
+        .iter()
+        .copied()
+        .find(|category| category.key == key)
+}
+
+fn normalize_memory_match_text(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+fn contains_any_keyword(content: &str, keywords: &[&str]) -> bool {
+    keywords
+        .iter()
+        .map(|keyword| keyword.trim().to_lowercase())
+        .filter(|keyword| !keyword.is_empty())
+        .any(|keyword| content.contains(&keyword))
+}
+
+fn contains_memory_recall_signal(content: &str) -> bool {
+    contains_any_keyword(
+        content,
+        &[
+            "之前",
+            "上次",
+            "继续",
+            "还记得",
+            "按我们之前",
+            "以前",
+            "历史",
+            "记忆",
+            "沉淀",
+            "last time",
+            "previously",
+            "remember",
+            "continue",
+            "history",
+        ],
+    )
+}
+
+fn append_category_memory_entries(
+    agent_home: &Path,
+    notes: &[(String, String)],
+    source_ref: &str,
+) -> Result<(), String> {
+    ensure_category_memory_scaffold(agent_home)?;
+
+    for (category_key, note) in notes {
+        let Some(category) = memory_category_definition(category_key) else {
+            continue;
+        };
+        let path = category_memory_file_path(agent_home, category.key);
+        let existing = if path.exists() {
+            fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            build_category_file_template(category)
+        };
+
+        fs::write(
+            &path,
+            append_category_memory_file(&existing, note, source_ref),
+        )
+        .map_err(|error| format!("写入分类记忆 {} 失败: {error}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn append_category_memory_file(existing: &str, note: &str, source_ref: &str) -> String {
+    let mut next = existing.trim_end().to_string();
+    if !next.contains("## Entries") {
+        next.push_str("\n\n## Entries\n");
+    }
+
+    if next.contains(note) {
+        return format!("{next}\n");
+    }
+
+    let _ = writeln!(next, "\n- {}", note);
+    let _ = writeln!(next, "  - Source: `{}`", source_ref);
+    next.push('\n');
+    next
+}
+
+fn safe_read_trimmed(path: PathBuf, limit: usize) -> Result<String, String> {
+    if !path.exists() {
+        return Ok(String::new());
+    }
+
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("读取 workspace 记忆文件 {} 失败: {error}", path.display()))?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+
+    Ok(trim_to_char_limit(trimmed, limit))
+}
+
+fn read_meaningful_heartbeat_file(
+    path: PathBuf,
+    placeholder: &str,
+    limit: usize,
+) -> Result<String, String> {
+    let content = safe_read_trimmed(path, limit)?;
+    if content.is_empty() {
+        return Ok(String::new());
+    }
+
+    if normalize_heartbeat_instruction_text(&content)
+        == normalize_heartbeat_instruction_text(placeholder)
+    {
+        return Ok(String::new());
+    }
+
+    Ok(content)
+}
+
+fn normalize_heartbeat_instruction_text(value: &str) -> String {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn trim_to_char_limit(value: &str, limit: usize) -> String {
+    if limit == 0 {
+        return String::new();
+    }
+
+    let mut result = String::new();
+    let mut chars = value.chars();
+    for _ in 0..limit {
+        match chars.next() {
+            Some(ch) => result.push(ch),
+            None => return result,
+        }
+    }
+
+    if chars.next().is_some() {
+        result.push('…');
+    }
+
+    result
 }
 
 fn render_template(
@@ -448,6 +1243,9 @@ fn read_agent_daily_logs(root: &Path, agent_id: &str) -> Result<Vec<AgentWorkspa
             if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
                 return None;
             }
+            if !is_agent_daily_log_name(&file_name) {
+                return None;
+            }
             Some((file_name, path))
         })
         .collect::<Vec<_>>();
@@ -465,6 +1263,21 @@ fn read_agent_daily_logs(root: &Path, agent_id: &str) -> Result<Vec<AgentWorkspa
             read_workspace_file("agent", "dailyLog", &file_name, relative_path, path, false)
         })
         .collect())
+}
+
+fn is_agent_daily_log_name(file_name: &str) -> bool {
+    if file_name.len() != 13 || !file_name.ends_with(".md") {
+        return false;
+    }
+
+    let stem = &file_name[..10];
+    let bytes = stem.as_bytes();
+    bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
 }
 
 fn shared_file_is_read_only(file_name: &str) -> bool {
@@ -507,6 +1320,21 @@ fn resolve_writable_workspace_path(
             .join(agent_id)
             .join("memory")
             .join(&normalized[3]));
+    }
+
+    if normalized.len() == 5
+        && normalized[0] == "agents"
+        && normalized[1] == agent_id
+        && normalized[2] == "memory"
+        && normalized[3] == "categories"
+        && normalized[4].ends_with(".md")
+    {
+        return Ok(root
+            .join("agents")
+            .join(agent_id)
+            .join("memory")
+            .join("categories")
+            .join(&normalized[4]));
     }
 
     Err("只允许修改当前智能体可写的 workspace markdown 文件".to_string())
@@ -636,12 +1464,113 @@ fn format_timestamp(timestamp_secs: i64, pattern: &str) -> String {
         .unwrap_or_else(|| "1970-01-01 00:00:00".to_string())
 }
 
+fn current_timestamp_file_label() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    millis.to_string()
+}
+
 fn summarize_memory_entry(user_message: &str, assistant_message: &str) -> String {
     let user_compact = user_message.replace('\n', " ").trim().to_string();
     let assistant_compact = assistant_message.replace('\n', " ").trim().to_string();
     let user_summary = truncate_for_memory(&user_compact, 80);
     let assistant_summary = truncate_for_memory(&assistant_compact, 100);
-    format!("用户提到：{}；智能体回复：{}", user_summary, assistant_summary)
+    format!(
+        "用户提到：{}；智能体回复：{}",
+        user_summary, assistant_summary
+    )
+}
+
+fn compact_memory_text(value: &str, limit: usize) -> String {
+    truncate_for_memory(&value.replace('\n', " ").trim().to_string(), limit)
+}
+
+fn build_category_memory_notes(
+    user_message: &str,
+    assistant_message: &str,
+    summary: &str,
+    categories: &[MemoryCategoryDefinition],
+) -> Vec<(String, String)> {
+    let mut notes = Vec::new();
+    let user_compact = compact_memory_text(user_message, 120);
+    let assistant_compact = compact_memory_text(assistant_message, 120);
+    let summary_compact = compact_memory_text(summary, 120);
+
+    for category in categories {
+        let note = match category.key {
+            "user_profile" if !user_compact.is_empty() => format!("用户画像：{}", user_compact),
+            "preferences" if !user_compact.is_empty() => format!("用户偏好：{}", user_compact),
+            "projects" if !user_compact.is_empty() => format!("项目上下文：{}", user_compact),
+            "commitments" if !user_compact.is_empty() => format!("待跟进事项：{}", user_compact),
+            "decisions" if !user_compact.is_empty() => format!("已确认约定：{}", user_compact),
+            "relationships" if !user_compact.is_empty() => format!("人物关系：{}", user_compact),
+            "general" if !summary_compact.is_empty() => format!("对话摘要：{}", summary_compact),
+            _ if !summary_compact.is_empty() => format!("记忆摘录：{}", summary_compact),
+            _ => continue,
+        };
+        notes.push((category.key.to_string(), note));
+    }
+
+    if notes.is_empty() && !assistant_compact.is_empty() {
+        notes.push((
+            "general".to_string(),
+            format!("对话摘要：{}", assistant_compact),
+        ));
+    }
+
+    dedupe_memory_notes(notes)
+}
+
+fn dedupe_memory_notes(notes: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut seen = Vec::new();
+    let mut deduped = Vec::new();
+    for (category, note) in notes {
+        let normalized = note.trim().to_lowercase();
+        if normalized.is_empty() || seen.iter().any(|item| item == &normalized) {
+            continue;
+        }
+        seen.push(normalized);
+        deduped.push((category, note));
+    }
+    deduped
+}
+
+fn format_category_titles(categories: &[MemoryCategoryDefinition]) -> Option<String> {
+    let titles = categories
+        .iter()
+        .map(|category| category.title)
+        .collect::<Vec<_>>();
+    if titles.is_empty() {
+        None
+    } else {
+        Some(titles.join("、"))
+    }
+}
+
+fn select_core_memory_points(notes: &[(String, String)]) -> Vec<String> {
+    notes.iter()
+        .filter(|(category, _)| matches!(category.as_str(), "user_profile" | "preferences" | "decisions"))
+        .map(|(_, note)| note.clone())
+        .take(12)
+        .collect()
+}
+
+fn build_ingest_summary(notes: &[(String, String)], fallback: &str) -> String {
+    let selected = notes
+        .iter()
+        .filter(|(category, _)| category != "general")
+        .take(2)
+        .map(|(_, note)| note.as_str())
+        .collect::<Vec<_>>();
+
+    if !selected.is_empty() {
+        return truncate_for_memory(&selected.join("；"), 180);
+    }
+
+    truncate_for_memory(fallback, 180)
 }
 
 fn truncate_for_memory(value: &str, limit: usize) -> String {
@@ -655,11 +1584,54 @@ fn truncate_for_memory(value: &str, limit: usize) -> String {
     truncated
 }
 
-fn upsert_working_memory(existing: &str, user_id: &str, timestamp: &str, summary: &str) -> String {
+fn sanitize_workspace_segment(value: &str, fallback: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+
+    if sanitized.is_empty() {
+        fallback.to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn sanitize_workspace_file_name(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    let candidate = if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed
+    };
+    let path = Path::new(candidate);
+    let file_name = path
+        .file_name()
+        .and_then(|item| item.to_str())
+        .unwrap_or(fallback);
+    sanitize_workspace_segment(file_name, fallback)
+}
+
+fn upsert_working_memory(
+    existing: &str,
+    user_id: &str,
+    summary: &str,
+    source_ref: &str,
+    categories: &[MemoryCategoryDefinition],
+) -> String {
     let marker = "## IM Latest Context";
+    let category_titles = format_category_titles(categories).unwrap_or_else(|| "GENERAL_MEMORY".to_string());
     let replacement = format!(
-        "{marker}\n\n- Last user: `{}`\n- Updated at: {}\n- Summary: {}\n",
-        user_id, timestamp, summary
+        "{marker}\n\n- Last user: `{}`\n- Current note: {}\n- Categories: {}\n- Source: `{}`\n",
+        user_id, summary, category_titles, source_ref
     );
 
     if let Some(index) = existing.find(marker) {
@@ -671,30 +1643,104 @@ fn upsert_working_memory(existing: &str, user_id: &str, timestamp: &str, summary
     }
 }
 
-fn append_memory_summary(existing: &str, user_id: &str, timestamp: &str, summary: &str) -> String {
-    let mut next = existing.trim_end().to_string();
-    if !next.contains("## IM Persistent Memory") {
-        next.push_str("\n\n## IM Persistent Memory\n");
+fn append_core_memory_points(existing: &str, points: &[String]) -> String {
+    let marker = "## Core Memory";
+    let mut entries = extract_section_bullets(existing, marker);
+    for point in points {
+        let normalized = point.trim().to_lowercase();
+        if normalized.is_empty()
+            || entries
+                .iter()
+                .any(|item| item.trim().eq_ignore_ascii_case(point.trim()))
+        {
+            continue;
+        }
+        entries.push(point.trim().to_string());
     }
-    let _ = writeln!(next, "- {} | `{}` | {}", timestamp, user_id, summary);
+
+    if entries.len() > 12 {
+        entries = entries.split_off(entries.len() - 12);
+    }
+
+    let cleaned = strip_markdown_section(
+        &strip_markdown_section(existing, "## IM Persistent Memory"),
+        marker,
+    );
+    let mut next = cleaned.trim_end().to_string();
+
+    if !entries.is_empty() {
+        next.push_str(&format!("\n\n{marker}\n"));
+        for entry in entries {
+            next.push_str(&format!("\n- {}\n", entry));
+        }
+    }
     next.push('\n');
     next
+}
+
+fn extract_section_bullets(existing: &str, marker: &str) -> Vec<String> {
+    let mut bullets = Vec::new();
+    let mut in_section = false;
+
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed == marker {
+            in_section = true;
+            continue;
+        }
+        if in_section && trimmed.starts_with("## ") {
+            break;
+        }
+        if in_section && trimmed.starts_with("- ") {
+            bullets.push(trimmed.trim_start_matches("- ").trim().to_string());
+        }
+    }
+
+    bullets
+}
+
+fn strip_markdown_section(existing: &str, marker: &str) -> String {
+    let mut next = String::new();
+    let mut in_section = false;
+
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed == marker {
+            in_section = true;
+            continue;
+        }
+        if in_section && trimmed.starts_with("## ") {
+            in_section = false;
+        }
+        if !in_section {
+            next.push_str(line);
+            next.push('\n');
+        }
+    }
+
+    next.trim_end().to_string()
 }
 
 fn append_daily_log_entry(
     existing: &str,
     user_id: &str,
     timestamp: &str,
-    user_message: &str,
-    assistant_message: &str,
+    summary: &str,
+    source_ref: &str,
+    categories: &[MemoryCategoryDefinition],
 ) -> String {
     let mut next = existing.trim_end().to_string();
     if !next.ends_with('\n') {
         next.push('\n');
     }
     let _ = writeln!(next, "\n## {} · {}", timestamp, user_id);
-    let _ = writeln!(next, "\n### User\n\n{}", user_message.trim());
-    let _ = writeln!(next, "\n### Agent\n\n{}", assistant_message.trim());
+    let _ = writeln!(next, "\n- Summary: {}", summary);
+    let _ = writeln!(
+        next,
+        "- Categories: {}",
+        format_category_titles(categories).unwrap_or_else(|| "GENERAL_MEMORY".to_string())
+    );
+    let _ = writeln!(next, "- Source: `{}`", source_ref);
     next.push('\n');
     next
 }
@@ -735,7 +1781,7 @@ fn fallback_template(file_name: &str) -> &'static str {
 fn root_fallback_template(file_name: &str) -> &'static str {
     match file_name {
         "AGENTS.md" => {
-            "# AGENTS.md - NineClaw Agent Workspace Protocol\n\nRoot files are shared memory. `agents/<agent-id>/` is private memory.\n"
+            "# AGENTS.md - NineClaw Agent Workspace Protocol\n\nRoot files are system policy notes only. `agents/<agent-id>/` is private memory.\n"
         }
         "SOUL.md" => {
             "# SOUL.md\n\n- Be helpful, direct, and competent\n- Do not leak private data\n- Ask before external actions\n"
@@ -744,7 +1790,7 @@ fn root_fallback_template(file_name: &str) -> &'static str {
             "# USER.md\n\n- **Name:**\n- **What to call them:**\n- **Timezone:**\n- **Notes:**\n"
         }
         "MEMORY.md" => {
-            "# MEMORY.md - System Memory\n\nPut only stable, cross-agent facts here.\n"
+            "# MEMORY.md - System Notes\n\nDeprecated as runtime memory source. Keep only operator-level notes here, not agent memory.\n"
         }
         "TOOLS.md" => {
             "# TOOLS.md - System Tools\n\nPut shared environment notes here. Do not store live secrets in markdown.\n"
@@ -907,6 +1953,116 @@ mod tests {
         let scope_error = write_agent_workspace_file("guard", "agents/other/MEMORY.md", "nope")
             .expect_err("reject foreign agent path");
         assert!(scope_error.contains("只允许修改当前智能体可写的 workspace markdown 文件"));
+
+        fs::remove_dir_all(&root).expect("cleanup");
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
+    fn append_agent_memory_entry_updates_legacy_memory_files() {
+        let _guard = workspace_test_lock().lock().expect("lock workspace test");
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+
+        let seed = AgentWorkspaceSeed {
+            id: "memory-agent",
+            name: "记忆助理",
+            summary: "用于验证原始记忆模式",
+            description: "负责把记忆写回核心文件",
+            accent_color: Some("#556677"),
+            is_builtin: false,
+        };
+
+        ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        append_agent_memory_entry(
+            "memory-agent",
+            "user-1",
+            "我是产品经理，这个项目下周要上线，之后统一按周报格式同步。",
+            "收到，我会继续按周报格式跟进上线计划，并保留这个约定。",
+        )
+        .expect("append legacy memory");
+
+        let memory = fs::read_to_string(root.join("agents").join("memory-agent").join("MEMORY.md"))
+            .expect("read memory");
+        assert!(memory.contains("## Core Memory"));
+        assert!(memory.contains("用户画像"));
+        assert!(memory.contains("已确认约定"));
+        assert!(!memory.contains("## IM Persistent Memory"));
+
+        let working =
+            fs::read_to_string(root.join("agents").join("memory-agent").join("WORKING.md"))
+                .expect("read working");
+        assert!(working.contains("user-1"));
+        assert!(working.contains("Current note"));
+        assert!(working.contains("memory/raw/"));
+
+        let source_index = fs::read_to_string(
+            root.join("agents")
+                .join("memory-agent")
+                .join("memory")
+                .join("SOURCE_INDEX.md"),
+        )
+        .expect("read source index");
+        assert!(source_index.contains("memory/raw/"));
+
+        let raw_source_dir = root
+            .join("agents")
+            .join("memory-agent")
+            .join("memory")
+            .join("raw")
+            .join(current_date_label());
+        assert!(raw_source_dir.exists());
+
+        let daily_log = fs::read_to_string(
+            root.join("agents")
+                .join("memory-agent")
+                .join("memory")
+                .join(format!("{}.md", current_date_label())),
+        )
+        .expect("read daily log");
+        assert!(daily_log.contains("Summary:"));
+        assert!(daily_log.contains("Source:"));
+
+        fs::remove_dir_all(&root).expect("cleanup");
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
+    fn workspace_prompt_loads_relevant_categorized_memory_for_query() {
+        let _guard = workspace_test_lock().lock().expect("lock workspace test");
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+
+        let seed = AgentWorkspaceSeed {
+            id: "query-agent",
+            name: "查询助理",
+            summary: "用于验证分类查询",
+            description: "负责按问题抽取记忆",
+            accent_color: Some("#778899"),
+            is_builtin: false,
+        };
+
+        ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        append_agent_memory_entry(
+            "query-agent",
+            "user-2",
+            "这个项目的发布节奏定成双周一次，我喜欢你用表格给我汇报。",
+            "明白，我会记住双周发布节奏，并且后续优先用表格汇报。",
+        )
+        .expect("append legacy memory");
+
+        let prompt = build_workspace_system_prompt_for_query(
+            "query-agent",
+            Some("继续这个项目的发布规划，并按我之前喜欢的汇报格式整理。"),
+        )
+        .expect("workspace prompt");
+
+        assert!(prompt.contains("WIKI_INDEX.md"));
+        assert!(prompt.contains("SOURCE_INDEX.md"));
+        assert!(prompt.contains("MEMORY.md"));
+        assert!(prompt.contains("WORKING.md"));
+        assert!(prompt.contains("核心记忆摘录"));
+        assert!(!prompt.contains("独立记忆检索工具返回的结果"));
 
         fs::remove_dir_all(&root).expect("cleanup");
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);

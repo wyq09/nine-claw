@@ -1,5 +1,5 @@
-use crate::agents::ConversationAgentConfig;
 use super::Channel;
+use crate::agents::ConversationAgentConfig;
 
 /// Configuration variants for creating channels via the factory.
 ///
@@ -21,9 +21,19 @@ pub enum ChannelConfig {
         ai_api_key: String,
         ai_model: String,
     },
+    Lark {
+        channel_id: String,
+        agent_config: Option<ConversationAgentConfig>,
+        app_id: String,
+        app_secret: String,
+        ai_provider_id: String,
+        ai_api_format: String,
+        ai_base_url: String,
+        ai_api_key: String,
+        ai_model: String,
+    },
     // ── Future channels ──
     // DingTalk { client_id: String, client_secret: String, ... },
-    // Lark { app_id: String, app_secret: String, ... },
 }
 
 impl ChannelConfig {
@@ -31,6 +41,7 @@ impl ChannelConfig {
     pub fn channel_id(&self) -> String {
         match self {
             ChannelConfig::WeChat { channel_id, .. } => channel_id.clone(),
+            ChannelConfig::Lark { channel_id, .. } => channel_id.clone(),
         }
     }
 }
@@ -56,6 +67,29 @@ pub fn create_channel(config: ChannelConfig) -> Result<Box<dyn Channel>, String>
         } => {
             use super::wechat::WeChatChannel;
             let mut ch = WeChatChannel::new(&channel_id, &token, &base_url, route_tag.as_deref());
+            ch.set_ai_config(
+                &ai_provider_id,
+                &ai_api_format,
+                &ai_base_url,
+                &ai_api_key,
+                &ai_model,
+                agent_config,
+            );
+            Ok(Box::new(ch))
+        }
+        ChannelConfig::Lark {
+            channel_id,
+            agent_config,
+            app_id,
+            app_secret,
+            ai_provider_id,
+            ai_api_format,
+            ai_base_url,
+            ai_api_key,
+            ai_model,
+        } => {
+            use super::lark::LarkChannel;
+            let mut ch = LarkChannel::new(&channel_id, &app_id, &app_secret);
             ch.set_ai_config(
                 &ai_provider_id,
                 &ai_api_format,

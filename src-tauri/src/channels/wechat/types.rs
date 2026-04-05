@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub const MSG_TYPE_USER: i32 = 1;
 pub const MSG_TYPE_BOT: i32 = 2;
 pub const MSG_ITEM_TYPE_TEXT: i32 = 1;
+pub const MSG_ITEM_TYPE_VOICE: i32 = 2;
 pub const MSG_ITEM_TYPE_IMAGE: i32 = 3;
 pub const MSG_ITEM_TYPE_VIDEO: i32 = 4;
 pub const MSG_ITEM_TYPE_FILE: i32 = 8;
@@ -54,6 +55,7 @@ pub struct MessageItem {
     pub image_item: Option<ImageItem>,
     pub file_item: Option<FileItem>,
     pub video_item: Option<VideoItem>,
+    pub voice_item: Option<VoiceItem>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -89,6 +91,21 @@ pub struct VideoItem {
     pub video_base64: Option<String>,
     /// Video URL (if provided by the platform).
     pub video_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct VoiceItem {
+    /// Base64-encoded voice/audio data.
+    pub voice_base64: Option<String>,
+    /// Voice URL (if provided by the platform).
+    pub voice_url: Option<String>,
+    /// Optional transcript text returned by the platform.
+    pub text: Option<String>,
+    /// Optional duration in milliseconds.
+    pub duration_ms: Option<i64>,
+    /// Optional original file name.
+    pub file_name: Option<String>,
 }
 
 /// Response from get_bot_qrcode.

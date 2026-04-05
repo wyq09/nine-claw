@@ -24,3 +24,12 @@ dist-ssr
 *.sw?
 .*/*
 skills/*
+src-tauri/resources/pi-runtime/windows/*
+!src-tauri/resources/pi-runtime/windows/.gitkeep
+src-tauri/resources/pi-runtime/macos/*
+!src-tauri/resources/pi-runtime/macos/.gitkeep
+src-tauri/resources/pi-runtime/linux/*
+!src-tauri/resources/pi-runtime/linux/.gitkeep
+
+release-artifacts/
+src-tauri/.listenhub/

@@ -1,3 +1,4 @@
+use crate::agents::ConversationAgentConfig;
 use serde::{Deserialize, Serialize};
 
 /// Status of a bot channel.
@@ -19,6 +20,8 @@ pub struct BotMessage {
     pub direction: String,
     pub content: String,
     pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<ConversationAgentConfig>,
 }
 
 /// Media types supported by channels.
@@ -28,6 +31,7 @@ pub enum MediaType {
     Image,
     File,
     Video,
+    Audio,
 }
 
 /// Payload for sending media through a channel.
