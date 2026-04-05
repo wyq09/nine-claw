@@ -40,6 +40,18 @@ const STARTUP_TIMEOUT_MS = 15_000
 
 const args = parseArgs(process.argv.slice(2))
 
+const PROXY_ENV_KEYS = ['all_proxy', 'ALL_PROXY', 'http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY'] as const
+
+type StartupController = {
+  waitUntilReady: Promise<void>
+  isReady(): boolean
+  getLastError(): string | null
+  getLoopbackProxyError(): string | null
+  noteError(message: string): void
+  markReady(message: string): void
+  markFailure(message: string): void
+}
+
 const logger = {
   debug: (...parts: unknown[]) => forwardSdkLog('debug', parts),
   info: (...parts: unknown[]) => forwardSdkLog('info', parts),
@@ -47,22 +59,10 @@ const logger = {
   error: (...parts: unknown[]) => forwardSdkLog('error', parts),
 }
 
-const client = new Lark.Client({
-  appId: args.appId,
-  appSecret: args.appSecret,
-  appType: Lark.AppType.SelfBuild,
-  domain: Lark.Domain.Feishu,
-  logger,
-})
-
-const wsClient = new Lark.WSClient({
-  appId: args.appId,
-  appSecret: args.appSecret,
-  logger,
-  loggerLevel: Lark.LoggerLevel.info,
-})
-
 let shuttingDown = false
+let startupController: StartupController | null = null
+let client = createClient()
+let wsClient = createWsClient()
 
 function parseArgs(argv: string[]): ParsedArgs {
   const values = new Map<string, string>()
@@ -105,6 +105,81 @@ function emitStatus(level: 'processing' | 'done' | 'warn' | 'error', message: st
   })
 }
 
+function createClient() {
+  return new Lark.Client({
+    appId: args.appId,
+    appSecret: args.appSecret,
+    appType: Lark.AppType.SelfBuild,
+    domain: Lark.Domain.Feishu,
+    logger,
+  })
+}
+
+function createWsClient() {
+  return new Lark.WSClient({
+    appId: args.appId,
+    appSecret: args.appSecret,
+    logger,
+    loggerLevel: Lark.LoggerLevel.info,
+  })
+}
+
+function createStartupController(): StartupController {
+  let settled = false
+  let ready = false
+  let lastErrorMessage: string | null = null
+  let loopbackProxyError: string | null = null
+  let resolveReady!: () => void
+  let rejectReady!: (error: Error) => void
+
+  const waitUntilReady = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve
+    rejectReady = reject
+  })
+
+  return {
+    waitUntilReady,
+    isReady: () => ready,
+    getLastError: () => lastErrorMessage,
+    getLoopbackProxyError: () => loopbackProxyError,
+    noteError(message: string) {
+      const trimmed = message.trim()
+      if (!trimmed) {
+        return
+      }
+
+      if (
+        !lastErrorMessage ||
+        lastErrorMessage.endsWith('connect failed') ||
+        trimmed.length >= lastErrorMessage.length
+      ) {
+        lastErrorMessage = trimmed
+      }
+
+      if (looksLikeLoopbackProxyConnectError(trimmed)) {
+        loopbackProxyError = trimmed
+      }
+    },
+    markReady(message: string) {
+      if (settled) {
+        return
+      }
+      settled = true
+      ready = true
+      emitStatus('done', message)
+      resolveReady()
+    },
+    markFailure(message: string) {
+      if (settled) {
+        return
+      }
+      settled = true
+      lastErrorMessage = message.trim() || lastErrorMessage
+      rejectReady(new Error(message))
+    },
+  }
+}
+
 function emitResponse(requestId: string | undefined, ok: boolean, error?: string): void {
   if (!requestId) {
     return
@@ -135,12 +210,12 @@ function forwardSdkLog(level: 'debug' | 'info' | 'warn' | 'error', parts: unknow
   }
 
   if (message.includes('ws connect success')) {
-    emitStatus('done', `飞书机器人已连接，当前绑定智能体: ${args.agentLabel}`)
+    startupController?.markReady(`飞书机器人已连接，当前绑定智能体: ${args.agentLabel}`)
     return
   }
 
   if (message.includes('ws client ready')) {
-    emitStatus('done', `飞书长连接已就绪，当前绑定智能体: ${args.agentLabel}`)
+    emitStatus('processing', `飞书长连接握手中，当前绑定智能体: ${args.agentLabel}`)
     return
   }
 
@@ -150,13 +225,70 @@ function forwardSdkLog(level: 'debug' | 'info' | 'warn' | 'error', parts: unknow
   }
 
   if (level === 'error') {
-    emitStatus('error', `飞书 SDK: ${message}`)
+    const errorMessage = `飞书 SDK: ${message}`
+    startupController?.noteError(errorMessage)
+    emitStatus('error', errorMessage)
     return
   }
 
   if (level === 'warn') {
     emitStatus('warn', `飞书 SDK: ${message}`)
   }
+}
+
+function parseProxyUrl(rawValue: string): URL | null {
+  const trimmed = rawValue.trim()
+  if (!trimmed) {
+    return null
+  }
+
+  try {
+    return new URL(trimmed.includes('://') ? trimmed : `http://${trimmed}`)
+  } catch {
+    return null
+  }
+}
+
+function looksLikeLoopbackHost(hostname: string): boolean {
+  const normalized = hostname.trim().replace(/^\[|\]$/g, '').toLowerCase()
+  return normalized === '127.0.0.1' || normalized === 'localhost' || normalized === '::1'
+}
+
+function getLoopbackProxyEnvBindings(): Array<{ key: typeof PROXY_ENV_KEYS[number]; value: string }> {
+  const bindings: Array<{ key: typeof PROXY_ENV_KEYS[number]; value: string }> = []
+  for (const key of PROXY_ENV_KEYS) {
+    const value = process.env[key]
+    if (!value) {
+      continue
+    }
+
+    const parsed = parseProxyUrl(value)
+    if (!parsed || !looksLikeLoopbackHost(parsed.hostname)) {
+      continue
+    }
+
+    bindings.push({ key, value })
+  }
+  return bindings
+}
+
+function clearLoopbackProxyEnv(bindings: Array<{ key: typeof PROXY_ENV_KEYS[number]; value: string }>): void {
+  for (const binding of bindings) {
+    delete process.env[binding.key]
+  }
+}
+
+function describeLoopbackProxyEnv(bindings: Array<{ key: typeof PROXY_ENV_KEYS[number]; value: string }>): string {
+  return bindings.map((binding) => `${binding.key}=${binding.value}`).join(', ')
+}
+
+function looksLikeLoopbackProxyConnectError(message: string): boolean {
+  const lower = message.toLowerCase()
+  const mentionsLoopback =
+    lower.includes('127.0.0.1') || lower.includes('localhost') || lower.includes('::1')
+  const looksLikeConnectFailure = ['connect', 'econnrefused', 'eperm', 'etimedout', 'ehostunreach', 'enetunreach', 'econnreset']
+    .some((token) => lower.includes(token))
+  return mentionsLoopback && looksLikeConnectFailure
 }
 
 function stringifyLogPart(value: unknown): string {
@@ -543,18 +675,67 @@ async function main(): Promise<void> {
     },
   })
 
-  // The Feishu SDK may hang indefinitely if the long connection never reaches ready.
-  const startupTimeout = new Promise<never>((_, reject) => {
-    const timer = setTimeout(() => {
-      reject(
-        new Error(
-          `飞书长连接在 ${Math.floor(STARTUP_TIMEOUT_MS / 1000)} 秒内未就绪，请检查开放平台事件订阅和机器人权限`,
-        ),
+  const loopbackProxyBindings = getLoopbackProxyEnvBindings()
+  let directRetryUsed = false
+
+  while (true) {
+    startupController = createStartupController()
+    const currentController = startupController
+
+    const startupTimeout = new Promise<never>((_, reject) => {
+      const timer = setTimeout(() => {
+        const lastError = currentController.getLastError()
+        const suffix = lastError ? `；最近错误：${lastError}` : ''
+        reject(
+          new Error(
+            `飞书长连接在 ${Math.floor(STARTUP_TIMEOUT_MS / 1000)} 秒内未就绪，请检查开放平台事件订阅和机器人权限${suffix}`,
+          ),
+        )
+      }, STARTUP_TIMEOUT_MS)
+      timer.unref?.()
+    })
+
+    void wsClient.start({ eventDispatcher: dispatcher }).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error)
+      currentController.noteError(message)
+      currentController.markFailure(`飞书机器人启动失败: ${message}`)
+    })
+
+    try {
+      await Promise.race([currentController.waitUntilReady, startupTimeout])
+      break
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const shouldRetryDirect =
+        !directRetryUsed &&
+        loopbackProxyBindings.length > 0 &&
+        !!currentController.getLoopbackProxyError()
+
+      if (!shouldRetryDirect) {
+        throw error
+      }
+
+      directRetryUsed = true
+      emitStatus(
+        'warn',
+        `检测到飞书启动命中了本地代理且连接失败，正在绕过本地代理直连重试：${describeLoopbackProxyEnv(loopbackProxyBindings)}`,
       )
-    }, STARTUP_TIMEOUT_MS)
-    timer.unref?.()
-  })
-  await Promise.race([wsClient.start({ eventDispatcher: dispatcher }), startupTimeout])
+      clearLoopbackProxyEnv(loopbackProxyBindings)
+      try {
+        wsClient.close({ force: true })
+      } catch {
+        // ignore close failure before retry
+      }
+      client = createClient()
+      wsClient = createWsClient()
+      startupController = null
+
+      if (!looksLikeLoopbackProxyConnectError(message)) {
+        continue
+      }
+    }
+  }
+
   emitStatus('done', `飞书机器人长连接已启动，当前绑定智能体: ${args.agentLabel}`)
 }
 

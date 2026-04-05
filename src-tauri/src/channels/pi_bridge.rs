@@ -1,5 +1,6 @@
 use crate::agents::{self, ConversationAgentConfig};
 use crate::dev_trace::{dev_trace, dev_trace_block};
+use crate::pi_runtime::{self, PiRuntimeLocation};
 use crate::skills;
 use md5::{Digest, Md5};
 use serde_json::json;
@@ -151,7 +152,7 @@ pub struct PiBridge {
     // sessions field reserved for future persistent-session reuse
     #[allow(dead_code)]
     sessions: Mutex<HashMap<String, ()>>,
-    pi_executable: PathBuf,
+    pi_runtime: PiRuntimeLocation,
     provider_id: String,
     api_format: String,
     base_url: String,
@@ -162,7 +163,7 @@ pub struct PiBridge {
 
 impl PiBridge {
     pub fn new(
-        pi_executable: PathBuf,
+        pi_runtime: PiRuntimeLocation,
         provider_id: &str,
         api_format: &str,
         base_url: &str,
@@ -172,7 +173,7 @@ impl PiBridge {
     ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            pi_executable,
+            pi_runtime,
             provider_id: provider_id.to_string(),
             api_format: api_format.to_string(),
             base_url: base_url.to_string(),
@@ -477,7 +478,8 @@ impl PiBridge {
             fs::remove_file(&models_path).map_err(|e| format!("清理旧的 models.json 失败: {e}"))?;
         }
 
-        let mut cmd = Command::new(&self.pi_executable);
+        let mut cmd = Command::new(&self.pi_runtime.executable);
+        pi_runtime::apply_runtime_environment(&mut cmd, &self.pi_runtime);
         cmd.args([
             "--mode",
             "rpc",
@@ -522,30 +524,22 @@ impl PiBridge {
                 agents::build_agent_system_prompt_for_prompt(agent_config, Some(prompt))
             {
                 system_prompt_chars += system_prompt.chars().count();
-                system_prompt_sections.push((
-                    "agent_system_prompt".to_string(),
-                    system_prompt.clone(),
-                ));
+                system_prompt_sections
+                    .push(("agent_system_prompt".to_string(), system_prompt.clone()));
                 cmd.args(["--append-system-prompt", &system_prompt]);
             }
 
             let media_prompt = "当前回复目标是 IM 用户。如果你需要把本地生成的图片、文件或视频真正发送给用户，请单独输出一行 `::nc-media{type=\"image|file|video\" path=\"/absolute/path/to/file\"}`。该指令行不要附加解释文字；普通文本说明单独写在其他行。";
             system_prompt_chars += media_prompt.chars().count();
             system_prompt_sections.push(("im_media".to_string(), media_prompt.to_string()));
-            cmd.args([
-                "--append-system-prompt",
-                media_prompt,
-            ]);
+            cmd.args(["--append-system-prompt", media_prompt]);
             let memory_isolation_prompt = "记忆隔离规则：当前智能体只能使用自己的私有工作区记忆。禁止读取、引用、总结或迁移其他智能体 `agents/<other-agent-id>/` 下的任何 markdown 记忆文件。";
             system_prompt_chars += memory_isolation_prompt.chars().count();
             system_prompt_sections.push((
                 "memory_isolation".to_string(),
                 memory_isolation_prompt.to_string(),
             ));
-            cmd.args([
-                "--append-system-prompt",
-                memory_isolation_prompt,
-            ]);
+            cmd.args(["--append-system-prompt", memory_isolation_prompt]);
 
             for skill_path in skills::resolve_skill_directories(&agent_config.skill_ids)? {
                 let skill_path = skill_path.to_string_lossy().to_string();
@@ -556,20 +550,21 @@ impl PiBridge {
         let mut child = cmd.spawn().map_err(|e| {
             format!(
                 "启动 pi 失败（executable={}）: {e}",
-                self.pi_executable.display()
+                self.pi_runtime.executable.display()
             )
         })?;
         dev_trace(
             "bot.pi",
             format!(
-                "启动 pi: channel={} user={} pid={} provider={} model={} prompt_chars={} system_prompt_chars={}",
+                "启动 pi: channel={} user={} pid={} provider={} model={} prompt_chars={} system_prompt_chars={} pi_path={}",
                 channel_id,
                 user_id,
                 child.id(),
                 self.provider_id,
                 self.model,
                 prompt.chars().count(),
-                system_prompt_chars
+                system_prompt_chars,
+                self.pi_runtime.executable.display()
             ),
         );
         for (label, content) in &system_prompt_sections {

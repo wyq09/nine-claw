@@ -103230,26 +103230,17 @@ var import_node_crypto = require("node:crypto");
 var Lark = __toESM(require_lib2(), 1);
 var STARTUP_TIMEOUT_MS = 15e3;
 var args = parseArgs(process.argv.slice(2));
+var PROXY_ENV_KEYS = ["all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"];
 var logger = {
   debug: (...parts) => forwardSdkLog("debug", parts),
   info: (...parts) => forwardSdkLog("info", parts),
   warn: (...parts) => forwardSdkLog("warn", parts),
   error: (...parts) => forwardSdkLog("error", parts)
 };
-var client = new Lark.Client({
-  appId: args.appId,
-  appSecret: args.appSecret,
-  appType: Lark.AppType.SelfBuild,
-  domain: Lark.Domain.Feishu,
-  logger
-});
-var wsClient = new Lark.WSClient({
-  appId: args.appId,
-  appSecret: args.appSecret,
-  logger,
-  loggerLevel: Lark.LoggerLevel.info
-});
 var shuttingDown = false;
+var startupController = null;
+var client = createClient();
+var wsClient = createWsClient();
 function parseArgs(argv) {
   const values = /* @__PURE__ */ new Map();
   for (let index = 0; index < argv.length; index += 1) {
@@ -103286,6 +103277,70 @@ function emitStatus(level, message) {
     timestamp: Date.now()
   });
 }
+function createClient() {
+  return new Lark.Client({
+    appId: args.appId,
+    appSecret: args.appSecret,
+    appType: Lark.AppType.SelfBuild,
+    domain: Lark.Domain.Feishu,
+    logger
+  });
+}
+function createWsClient() {
+  return new Lark.WSClient({
+    appId: args.appId,
+    appSecret: args.appSecret,
+    logger,
+    loggerLevel: Lark.LoggerLevel.info
+  });
+}
+function createStartupController() {
+  let settled = false;
+  let ready = false;
+  let lastErrorMessage = null;
+  let loopbackProxyError = null;
+  let resolveReady;
+  let rejectReady;
+  const waitUntilReady = new Promise((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  return {
+    waitUntilReady,
+    isReady: () => ready,
+    getLastError: () => lastErrorMessage,
+    getLoopbackProxyError: () => loopbackProxyError,
+    noteError(message) {
+      const trimmed = message.trim();
+      if (!trimmed) {
+        return;
+      }
+      if (!lastErrorMessage || lastErrorMessage.endsWith("connect failed") || trimmed.length >= lastErrorMessage.length) {
+        lastErrorMessage = trimmed;
+      }
+      if (looksLikeLoopbackProxyConnectError(trimmed)) {
+        loopbackProxyError = trimmed;
+      }
+    },
+    markReady(message) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      ready = true;
+      emitStatus("done", message);
+      resolveReady();
+    },
+    markFailure(message) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      lastErrorMessage = message.trim() || lastErrorMessage;
+      rejectReady(new Error(message));
+    }
+  };
+}
 function emitResponse(requestId, ok, error) {
   if (!requestId) {
     return;
@@ -103309,11 +103364,11 @@ function forwardSdkLog(level, parts) {
     return;
   }
   if (message.includes("ws connect success")) {
-    emitStatus("done", `\u98DE\u4E66\u673A\u5668\u4EBA\u5DF2\u8FDE\u63A5\uFF0C\u5F53\u524D\u7ED1\u5B9A\u667A\u80FD\u4F53: ${args.agentLabel}`);
+    startupController?.markReady(`\u98DE\u4E66\u673A\u5668\u4EBA\u5DF2\u8FDE\u63A5\uFF0C\u5F53\u524D\u7ED1\u5B9A\u667A\u80FD\u4F53: ${args.agentLabel}`);
     return;
   }
   if (message.includes("ws client ready")) {
-    emitStatus("done", `\u98DE\u4E66\u957F\u8FDE\u63A5\u5DF2\u5C31\u7EEA\uFF0C\u5F53\u524D\u7ED1\u5B9A\u667A\u80FD\u4F53: ${args.agentLabel}`);
+    emitStatus("processing", `\u98DE\u4E66\u957F\u8FDE\u63A5\u63E1\u624B\u4E2D\uFF0C\u5F53\u524D\u7ED1\u5B9A\u667A\u80FD\u4F53: ${args.agentLabel}`);
     return;
   }
   if (message.includes("client closed") || message.includes("closed manually")) {
@@ -103321,12 +103376,58 @@ function forwardSdkLog(level, parts) {
     return;
   }
   if (level === "error") {
-    emitStatus("error", `\u98DE\u4E66 SDK: ${message}`);
+    const errorMessage = `\u98DE\u4E66 SDK: ${message}`;
+    startupController?.noteError(errorMessage);
+    emitStatus("error", errorMessage);
     return;
   }
   if (level === "warn") {
     emitStatus("warn", `\u98DE\u4E66 SDK: ${message}`);
   }
+}
+function parseProxyUrl(rawValue) {
+  const trimmed = rawValue.trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    return new URL(trimmed.includes("://") ? trimmed : `http://${trimmed}`);
+  } catch {
+    return null;
+  }
+}
+function looksLikeLoopbackHost(hostname) {
+  const normalized = hostname.trim().replace(/^\[|\]$/g, "").toLowerCase();
+  return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1";
+}
+function getLoopbackProxyEnvBindings() {
+  const bindings = [];
+  for (const key of PROXY_ENV_KEYS) {
+    const value = process.env[key];
+    if (!value) {
+      continue;
+    }
+    const parsed = parseProxyUrl(value);
+    if (!parsed || !looksLikeLoopbackHost(parsed.hostname)) {
+      continue;
+    }
+    bindings.push({ key, value });
+  }
+  return bindings;
+}
+function clearLoopbackProxyEnv(bindings) {
+  for (const binding of bindings) {
+    delete process.env[binding.key];
+  }
+}
+function describeLoopbackProxyEnv(bindings) {
+  return bindings.map((binding) => `${binding.key}=${binding.value}`).join(", ");
+}
+function looksLikeLoopbackProxyConnectError(message) {
+  const lower = message.toLowerCase();
+  const mentionsLoopback = lower.includes("127.0.0.1") || lower.includes("localhost") || lower.includes("::1");
+  const looksLikeConnectFailure = ["connect", "econnrefused", "eperm", "etimedout", "ehostunreach", "enetunreach", "econnreset"].some((token) => lower.includes(token));
+  return mentionsLoopback && looksLikeConnectFailure;
 }
 function stringifyLogPart(value) {
   if (typeof value === "string") {
@@ -103661,17 +103762,55 @@ async function main() {
       });
     }
   });
-  const startupTimeout = new Promise((_, reject) => {
-    const timer = setTimeout(() => {
-      reject(
-        new Error(
-          `\u98DE\u4E66\u957F\u8FDE\u63A5\u5728 ${Math.floor(STARTUP_TIMEOUT_MS / 1e3)} \u79D2\u5185\u672A\u5C31\u7EEA\uFF0C\u8BF7\u68C0\u67E5\u5F00\u653E\u5E73\u53F0\u4E8B\u4EF6\u8BA2\u9605\u548C\u673A\u5668\u4EBA\u6743\u9650`
-        )
+  const loopbackProxyBindings = getLoopbackProxyEnvBindings();
+  let directRetryUsed = false;
+  while (true) {
+    startupController = createStartupController();
+    const currentController = startupController;
+    const startupTimeout = new Promise((_, reject) => {
+      const timer = setTimeout(() => {
+        const lastError = currentController.getLastError();
+        const suffix = lastError ? `\uFF1B\u6700\u8FD1\u9519\u8BEF\uFF1A${lastError}` : "";
+        reject(
+          new Error(
+            `\u98DE\u4E66\u957F\u8FDE\u63A5\u5728 ${Math.floor(STARTUP_TIMEOUT_MS / 1e3)} \u79D2\u5185\u672A\u5C31\u7EEA\uFF0C\u8BF7\u68C0\u67E5\u5F00\u653E\u5E73\u53F0\u4E8B\u4EF6\u8BA2\u9605\u548C\u673A\u5668\u4EBA\u6743\u9650${suffix}`
+          )
+        );
+      }, STARTUP_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    void wsClient.start({ eventDispatcher: dispatcher }).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      currentController.noteError(message);
+      currentController.markFailure(`\u98DE\u4E66\u673A\u5668\u4EBA\u542F\u52A8\u5931\u8D25: ${message}`);
+    });
+    try {
+      await Promise.race([currentController.waitUntilReady, startupTimeout]);
+      break;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const shouldRetryDirect = !directRetryUsed && loopbackProxyBindings.length > 0 && !!currentController.getLoopbackProxyError();
+      if (!shouldRetryDirect) {
+        throw error;
+      }
+      directRetryUsed = true;
+      emitStatus(
+        "warn",
+        `\u68C0\u6D4B\u5230\u98DE\u4E66\u542F\u52A8\u547D\u4E2D\u4E86\u672C\u5730\u4EE3\u7406\u4E14\u8FDE\u63A5\u5931\u8D25\uFF0C\u6B63\u5728\u7ED5\u8FC7\u672C\u5730\u4EE3\u7406\u76F4\u8FDE\u91CD\u8BD5\uFF1A${describeLoopbackProxyEnv(loopbackProxyBindings)}`
       );
-    }, STARTUP_TIMEOUT_MS);
-    timer.unref?.();
-  });
-  await Promise.race([wsClient.start({ eventDispatcher: dispatcher }), startupTimeout]);
+      clearLoopbackProxyEnv(loopbackProxyBindings);
+      try {
+        wsClient.close({ force: true });
+      } catch {
+      }
+      client = createClient();
+      wsClient = createWsClient();
+      startupController = null;
+      if (!looksLikeLoopbackProxyConnectError(message)) {
+        continue;
+      }
+    }
+  }
   emitStatus("done", `\u98DE\u4E66\u673A\u5668\u4EBA\u957F\u8FDE\u63A5\u5DF2\u542F\u52A8\uFF0C\u5F53\u524D\u7ED1\u5B9A\u667A\u80FD\u4F53: ${args.agentLabel}`);
 }
 process.on("SIGINT", () => {

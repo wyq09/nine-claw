@@ -153,7 +153,7 @@ impl Channel for LarkChannel {
         let node_path = crate::pi_runtime::resolve_command_path(&["node.exe", "node"])
             .ok_or_else(|| "未找到 Node.js，无法启动飞书机器人".to_string())?;
         let helper_path = resolve_lark_helper_path(&app)?;
-        let pi_executable = crate::pi_runtime::require_pi_executable(&app)?;
+        let pi_runtime = crate::pi_runtime::require_pi_runtime_location(&app)?;
 
         let mut child = Command::new(node_path)
             .arg(&helper_path)
@@ -541,11 +541,11 @@ impl Channel for LarkChannel {
             let ai_mdl = self.ai_model.clone();
             let agent_config = self.agent_config.clone();
             let user_states = user_states.clone();
-            let pi_executable = pi_executable.clone();
+            let pi_runtime = pi_runtime.clone();
 
             thread::spawn(move || {
                 let bridge = PiBridge::new(
-                    pi_executable,
+                    pi_runtime,
                     &ai_pid,
                     &ai_fmt,
                     &ai_base,

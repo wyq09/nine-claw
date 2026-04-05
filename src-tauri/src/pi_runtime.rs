@@ -130,6 +130,20 @@ fn prepend_to_path(path: &Path) {
     }
 }
 
+pub(crate) fn apply_runtime_environment(command: &mut Command, location: &PiRuntimeLocation) {
+    if let Some(parent) = location.executable.parent() {
+        prepend_to_path(parent);
+    }
+
+    if let Some(resource_root) = location.resource_root.as_ref() {
+        command.env("NINECLAW_PI_RUNTIME_ROOT", resource_root.as_os_str());
+        let mono_root = resource_root.join("pi-mono");
+        if mono_root.is_dir() {
+            command.env("NINECLAW_PI_MONO_ROOT", mono_root.as_os_str());
+        }
+    }
+}
+
 fn windows_common_bin_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
@@ -227,27 +241,16 @@ pub(crate) fn resolve_pi_executable(app: &AppHandle) -> Option<PiRuntimeLocation
     })
 }
 
-pub(crate) fn require_pi_executable(app: &AppHandle) -> Result<PathBuf, String> {
-    resolve_pi_executable(app)
-        .map(|location| location.executable)
-        .ok_or_else(|| "未找到 pi 运行时。请先执行 `npm install` 并运行 `npm run prepare:pi-runtime` 生成内置运行时，或者确认系统 `pi` 已在 PATH 中可用。".to_string())
+pub(crate) fn require_pi_runtime_location(app: &AppHandle) -> Result<PiRuntimeLocation, String> {
+    resolve_pi_executable(app).ok_or_else(|| {
+        "未找到 pi 运行时。请先执行 `npm install` 并运行 `npm run prepare:pi-runtime` 生成内置运行时，或者确认系统 `pi` 已在 PATH 中可用。".to_string()
+    })
 }
 
 pub(crate) fn create_pi_command(app: &AppHandle) -> Result<Command, String> {
-    let location = resolve_pi_executable(app).ok_or_else(|| {
-        "未找到 pi 运行时。请先执行 `npm install` 并运行 `npm run prepare:pi-runtime` 生成内置运行时，或者确认系统 `pi` 已在 PATH 中可用。".to_string()
-    })?;
+    let location = require_pi_runtime_location(app)?;
     let mut command = Command::new(&location.executable);
-    if let Some(parent) = location.executable.parent() {
-        prepend_to_path(parent);
-    }
-    if let Some(resource_root) = location.resource_root.as_ref() {
-        command.env("NINECLAW_PI_RUNTIME_ROOT", resource_root.as_os_str());
-        let mono_root = resource_root.join("pi-mono");
-        if mono_root.is_dir() {
-            command.env("NINECLAW_PI_MONO_ROOT", mono_root.as_os_str());
-        }
-    }
+    apply_runtime_environment(&mut command, &location);
     Ok(command)
 }
 

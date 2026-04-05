@@ -758,9 +758,9 @@ fn generate_agentic_heartbeat_message(
     };
 
     let prompt = build_agentic_heartbeat_prompt(due, outcome)?;
-    let pi_executable = crate::pi_runtime::require_pi_executable(app)?;
+    let pi_runtime = crate::pi_runtime::require_pi_runtime_location(app)?;
     let bridge = PiBridge::new(
-        pi_executable,
+        pi_runtime,
         provider_id,
         api_format,
         base_url,

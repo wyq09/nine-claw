@@ -697,7 +697,7 @@ impl Channel for WeChatChannel {
         if self.token.is_empty() {
             return Err("微信 token 未配置，请先登录".to_string());
         }
-        let pi_executable = crate::pi_runtime::require_pi_executable(&app)?;
+        let pi_runtime = crate::pi_runtime::require_pi_runtime_location(&app)?;
 
         *self.status.lock().unwrap() = ChannelStatus::Connected;
         self.running.store(true, Ordering::SeqCst);
@@ -917,7 +917,7 @@ impl Channel for WeChatChannel {
                 };
                 let api = WeChatApi::new(&base_url, &token, route_tag.as_deref());
                 let bridge = PiBridge::new(
-                    pi_executable,
+                    pi_runtime,
                     &ai_pid,
                     &ai_fmt,
                     &ai_base,
