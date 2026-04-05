@@ -32,7 +32,8 @@ import type {
 const HISTORY_STORAGE_KEY = 'nineclaw.history.v4'
 const LEGACY_HISTORY_STORAGE_KEYS = ['yqagent.history.v4']
 const MAX_HISTORY_ITEMS = 30
-const TITLE_MAX_LENGTH = 24
+const TITLE_MIN_LENGTH = 10
+const TITLE_MAX_LENGTH = 20
 
 function createId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
@@ -157,42 +158,103 @@ function truncateTitle(value: string, maxLength = TITLE_MAX_LENGTH): string {
     return chars.join('')
   }
 
-  return `${chars.slice(0, maxLength).join('')}…`
-}
-
-function deriveConversationTitle(prompt: string, existingTitle?: string): string {
-  const promptText = prompt.replace(/\s+/g, ' ').trim()
-  const titleText = existingTitle?.replace(/\s+/g, ' ').trim() ?? ''
-
-  if (titleText && titleText !== promptText && Array.from(titleText).length <= TITLE_MAX_LENGTH + 2) {
-    return titleText
+  if (maxLength <= 1) {
+    return '…'
   }
 
-  const withoutMarkdown = promptText
+  return `${chars.slice(0, maxLength - 1).join('')}…`
+}
+
+function extractTitlePrefix(title: string | undefined): string {
+  const normalized = title?.trim() ?? ''
+  return normalized.match(/^\[[^\]]+\]\s*/)?.[0] ?? ''
+}
+
+function normalizeTitleSource(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
     .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '$1')
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/[#>*_~]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
 
-  const firstClause =
-    withoutMarkdown
-      .split(/[\n。！？!?；;]+/)
-      .map((part) => part.trim())
-      .find(Boolean) ?? withoutMarkdown
-
-  const normalized = firstClause
+function cleanupTitleClause(text: string): string {
+  return text
     .replace(
-      /^(请你?|麻烦你?|帮我(?:把|将)?|帮忙|我想请你|我想让你|我需要你|需要你|请帮我|可以帮我|能否帮我|能不能帮我)\s*/u,
+      /^(请你?|麻烦你?|帮我(?:把|将)?|帮忙|我想请你|我想让你|我需要你|需要你|请帮我|可以帮我|能否帮我|能不能帮我|请协助|协助我)\s*/u,
       '',
     )
     .replace(
       /^(please|help me(?: to)?|can you|could you|would you|i need you to|i need to|i want to)\s+/i,
       '',
     )
-    .replace(/^(做下|做个|做一下|处理下|处理一下|看下|看一下|看看|检查下|检查一下|分析下|分析一下)\s*/u, '')
-    .replace(/(?:可以吗|行吗|谢谢|thanks)[。！？!? ]*$/iu, '')
+    .replace(/^(做下|做个|做一下|处理下|处理一下|看下|看一下|看看|检查下|检查一下|分析下|分析一下|优化下|优化一下)\s*/u, '')
+    .replace(/^(关于|有关|针对|对于|围绕|这个|这个问题|这个需求|这里|目前|现在)\s*/u, '')
+    .replace(/(?:可以吗|行吗|谢谢|thanks|thank you)[。！？!? ]*$/iu, '')
     .replace(/^[：:;,.，。！？!?、"'“”‘’()（）【】[\]-_\s]+|[：:;,.，。！？!?、"'“”‘’()（）【】[\]-_\s]+$/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
 
-  const title = normalized || titleText || promptText
-  return truncateTitle(title || '新会话')
+function isWeakTitleClause(text: string): boolean {
+  return /^(一下|看看|分析|处理|优化|检查|修复|问题|需求|内容|结果|情况|消息|对话|回复|记录)$/u.test(text)
+}
+
+function collectTitleClauses(text: string): string[] {
+  return normalizeTitleSource(text)
+    .split(/[\n。！？!?；;：:]+/)
+    .flatMap((segment) => segment.split(/[，,、]/))
+    .map((segment) => cleanupTitleClause(segment))
+    .filter((segment) => segment.length > 1 && !isWeakTitleClause(segment))
+}
+
+function joinTitleParts(parts: string[]): string {
+  if (parts.length === 0) {
+    return ''
+  }
+
+  return parts.reduce((title, part) => {
+    if (!title) {
+      return part
+    }
+
+    const next = `${title}，${part}`
+    return Array.from(next).length <= TITLE_MAX_LENGTH ? next : title
+  }, '')
+}
+
+function deriveConversationTitle(prompt: string, answer = '', existingTitle?: string): string {
+  const prefix = extractTitlePrefix(existingTitle)
+  const candidates = [...collectTitleClauses(prompt), ...collectTitleClauses(answer)]
+
+  let baseTitle = ''
+  const selectedParts: string[] = []
+
+  for (const candidate of candidates) {
+    const nextParts = [...selectedParts, candidate]
+    const nextTitle = joinTitleParts(nextParts)
+    if (!nextTitle) {
+      continue
+    }
+
+    baseTitle = nextTitle
+    selectedParts.push(candidate)
+    if (Array.from(baseTitle).length >= TITLE_MIN_LENGTH) {
+      break
+    }
+  }
+
+  if (!baseTitle) {
+    const fallback = cleanupTitleClause(normalizeTitleSource(prompt || answer || existingTitle || ''))
+    baseTitle = fallback || '新会话'
+  }
+
+  const compactTitle = truncateTitle(baseTitle)
+  return `${prefix}${compactTitle}`.trim()
 }
 
 function deriveBotChannelLabel(channelId: string): string {
@@ -448,7 +510,7 @@ function parseHistorySnapshot(raw: string | null): HistoryItem[] {
 
         return {
           id,
-          title: deriveConversationTitle(parsedTurns[0]?.prompt ?? title, title),
+          title: deriveConversationTitle(parsedTurns[0]?.prompt ?? title, parsedTurns[0]?.answer ?? '', title),
           status,
           createdAt,
           updatedAt,
@@ -654,6 +716,22 @@ export function usePiAgent() {
     setRunningHistoryIds((previous) => previous.filter((item) => item !== historyId))
     currentTurnIdsRef.current.delete(historyId)
     receivedFirstDeltaRef.current.delete(historyId)
+  }
+
+  const refreshHistoryTitle = (historyId: string) => {
+    updateHistoryItem(historyId, (item) => {
+      const firstTurn = item.turns[0]
+      const nextTitle = deriveConversationTitle(firstTurn?.prompt ?? item.title, firstTurn?.answer ?? '', item.title)
+
+      if (nextTitle === item.title) {
+        return item
+      }
+
+      return {
+        ...item,
+        title: nextTitle,
+      }
+    })
   }
 
   useEffect(() => {
@@ -882,6 +960,7 @@ export function usePiAgent() {
         usage: usage ?? turn.usage,
       }))
       updateSessionStatus(currentHistoryId, 'done')
+      refreshHistoryTitle(currentHistoryId)
       markSessionSettled(currentHistoryId)
       return
     }
@@ -903,6 +982,7 @@ export function usePiAgent() {
         completedAt: turn.completedAt ?? Date.now(),
       }))
       updateSessionStatus(currentHistoryId, 'error')
+      refreshHistoryTitle(currentHistoryId)
       markSessionSettled(currentHistoryId)
     }
   })
@@ -1012,6 +1092,7 @@ export function usePiAgent() {
         completedAt: turn.completedAt ?? Date.now(),
       }))
       updateSessionStatus(historyId, 'done')
+      refreshHistoryTitle(historyId)
       return
     }
 
@@ -1027,6 +1108,7 @@ export function usePiAgent() {
         completedAt: turn.completedAt ?? Date.now(),
       }))
       updateSessionStatus(historyId, 'error')
+      refreshHistoryTitle(historyId)
     }
   })
 

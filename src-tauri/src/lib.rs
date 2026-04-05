@@ -7,6 +7,7 @@ mod heartbeat;
 mod pi_runtime;
 mod skills;
 
+use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as _};
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,103 @@ const PI_RUNTIME_DIR_NAME: &str = "nineclaw-pi-runtime";
 const HISTORY_STATE_KEY: &str = "history_v1";
 const PROVIDER_CONFIGS_STATE_KEY: &str = "provider_configs_v1";
 const CUSTOM_PROVIDER_META_STATE_KEY: &str = "custom_provider_meta_v1";
+
+fn open_path_in_default_app(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut cmd = Command::new("open");
+        cmd.arg(path);
+        cmd
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", ""]);
+        cmd.arg(path);
+        cmd
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(path);
+        cmd
+    };
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("打开文件失败: {error}"))
+}
+
+fn resolve_local_file_path(file_path: &str) -> Result<PathBuf, String> {
+    let trimmed = file_path.trim();
+    if trimmed.is_empty() {
+        return Err("文件路径不能为空".to_string());
+    }
+
+    let decoded = if let Some(raw_path) = trimmed.strip_prefix("file://") {
+        urlencoding::decode(raw_path)
+            .map(|value| value.into_owned())
+            .unwrap_or_else(|_| raw_path.to_string())
+    } else {
+        trimmed.to_string()
+    };
+
+    let path = PathBuf::from(&decoded);
+    let resolved_path = if path.is_absolute() {
+        path
+    } else if let Ok(current_dir) = std::env::current_dir() {
+        current_dir.join(path)
+    } else {
+        PathBuf::from(&decoded)
+    };
+
+    if !resolved_path.exists() {
+        return Err(format!("文件不存在: {}", resolved_path.display()));
+    }
+
+    Ok(resolved_path)
+}
+
+fn infer_media_mime_type(path: &Path, mime_hint: Option<&str>) -> String {
+    if let Some(mime_hint) = mime_hint {
+        let trimmed = mime_hint.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png".to_string(),
+        Some("jpg") | Some("jpeg") => "image/jpeg".to_string(),
+        Some("gif") => "image/gif".to_string(),
+        Some("webp") => "image/webp".to_string(),
+        Some("bmp") => "image/bmp".to_string(),
+        Some("svg") => "image/svg+xml".to_string(),
+        Some("mp4") => "video/mp4".to_string(),
+        Some("mov") => "video/quicktime".to_string(),
+        Some("webm") => "video/webm".to_string(),
+        Some("m4v") => "video/x-m4v".to_string(),
+        Some("avi") => "video/x-msvideo".to_string(),
+        Some("mkv") => "video/x-matroska".to_string(),
+        Some("mp3") => "audio/mpeg".to_string(),
+        Some("wav") => "audio/wav".to_string(),
+        Some("m4a") => "audio/mp4".to_string(),
+        Some("aac") => "audio/aac".to_string(),
+        Some("ogg") => "audio/ogg".to_string(),
+        Some("opus") => "audio/ogg".to_string(),
+        Some("amr") => "audio/amr".to_string(),
+        Some("silk") => "audio/silk".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
 
 #[derive(Clone, Serialize)]
 struct PiTokenUsagePayload {
@@ -1011,6 +1109,41 @@ async fn persist_chat_attachments(
     })
     .await
     .map_err(|error| format!("持久化聊天附件失败: {error}"))?
+}
+
+#[tauri::command]
+async fn open_local_file(file_path: String) -> Result<(), String> {
+    let resolved_path = resolve_local_file_path(&file_path)?;
+
+    tauri::async_runtime::spawn_blocking(move || open_path_in_default_app(&resolved_path))
+        .await
+        .map_err(|error| format!("打开本地文件失败: {error}"))?
+}
+
+#[tauri::command]
+async fn load_local_media_preview(
+    file_path: String,
+    mime_type: Option<String>,
+) -> Result<String, String> {
+    let resolved_path = resolve_local_file_path(&file_path)?;
+    let mime_hint = mime_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = fs::read(&resolved_path)
+            .map_err(|error| format!("读取本地媒体失败 {}: {error}", resolved_path.display()))?;
+        let mime = infer_media_mime_type(&resolved_path, mime_hint.as_deref());
+        Ok(format!(
+            "data:{};base64,{}",
+            mime,
+            BASE64_ENGINE.encode(bytes)
+        ))
+    })
+    .await
+    .map_err(|error| format!("加载本地媒体预览失败: {error}"))?
 }
 
 #[tauri::command]
@@ -2481,6 +2614,8 @@ pub fn run() {
             stream_pi_prompt,
             abort_pi_stream,
             persist_chat_attachments,
+            open_local_file,
+            load_local_media_preview,
             clear_pi_session,
             clear_pi_session_for_id,
             bot_login_wechat,

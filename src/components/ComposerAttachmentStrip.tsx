@@ -1,4 +1,6 @@
 import { X } from 'lucide-react'
+import { useLocalMediaPreview } from '../hooks/useLocalMediaPreview'
+import { normalizeLocalAssetSource } from '../lib/inlineMedia'
 import type { PersistedChatAttachment } from '../types'
 
 const KIND_LABELS: Record<PersistedChatAttachment['kind'], string> = {
@@ -33,23 +35,53 @@ export function ComposerAttachmentStrip({
       </div>
       <div className="composer-attachment-list">
         {attachments.map((attachment) => (
-          <div key={attachment.id} className={`composer-attachment-chip ${attachment.kind}`}>
-            <span className="composer-attachment-kind">{KIND_LABELS[attachment.kind]}</span>
-            <span className="composer-attachment-name" title={attachment.fileName}>
-              {attachment.fileName}
-            </span>
-            <button
-              type="button"
-              className="composer-attachment-remove"
-              aria-label={`移除附件 ${attachment.fileName}`}
-              onClick={() => onRemove(attachment.id)}
-              disabled={uploading}
-            >
-              <X size={14} />
-            </button>
-          </div>
+          <ComposerAttachmentChip
+            key={attachment.id}
+            attachment={attachment}
+            uploading={uploading}
+            onRemove={onRemove}
+          />
         ))}
       </div>
+    </div>
+  )
+}
+
+function ComposerAttachmentChip({
+  attachment,
+  uploading,
+  onRemove,
+}: {
+  attachment: PersistedChatAttachment
+  uploading: boolean
+  onRemove: (attachmentId: string) => void
+}) {
+  const previewSrc = useLocalMediaPreview({
+    path: attachment.filePath,
+    mimeType: attachment.mimeType,
+    fallbackSrc: normalizeLocalAssetSource(attachment.filePath),
+    enabled: attachment.kind === 'image',
+  })
+
+  return (
+    <div className={`composer-attachment-chip ${attachment.kind}`}>
+      {attachment.kind === 'image' ? (
+        <img className="composer-attachment-thumb" src={previewSrc} alt={attachment.fileName} />
+      ) : (
+        <span className="composer-attachment-kind">{KIND_LABELS[attachment.kind]}</span>
+      )}
+      <span className="composer-attachment-name" title={attachment.fileName}>
+        {attachment.fileName}
+      </span>
+      <button
+        type="button"
+        className="composer-attachment-remove"
+        aria-label={`移除附件 ${attachment.fileName}`}
+        onClick={() => onRemove(attachment.id)}
+        disabled={uploading}
+      >
+        <X size={14} />
+      </button>
     </div>
   )
 }

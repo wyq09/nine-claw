@@ -120,6 +120,8 @@ function parseDirectiveMediaLine(line: string): InlineMediaAttachment | null {
   const body = trimmed.slice('::nc-media{'.length, -1)
   let rawType = ''
   let rawPath = ''
+  let rawName = ''
+  let rawLabel = ''
   for (const match of body.matchAll(/(\w+)=("([^"]*)"|'([^']*)'|([^\s]+))/g)) {
     const key = match[1]
     const normalized = (match[3] ?? match[4] ?? match[5] ?? '').trim()
@@ -127,6 +129,10 @@ function parseDirectiveMediaLine(line: string): InlineMediaAttachment | null {
       rawType = normalized
     } else if (key === 'path') {
       rawPath = decodeLocalPathSource(normalized)
+    } else if (key === 'name') {
+      rawName = decodeLocalPathSource(normalized)
+    } else if (key === 'label') {
+      rawLabel = decodeLocalPathSource(normalized)
     }
   }
 
@@ -135,20 +141,23 @@ function parseDirectiveMediaLine(line: string): InlineMediaAttachment | null {
   }
 
   const kind = inferAttachmentKind(rawPath, rawType)
+  const fileName = rawName || getPathFileName(rawPath) || 'attachment'
+  const label =
+    rawLabel ||
+    (kind === 'image'
+      ? '图片'
+      : kind === 'video'
+        ? '视频'
+        : kind === 'audio'
+          ? '语音'
+          : '文件')
 
   return {
     kind,
-    label:
-      kind === 'image'
-        ? '图片'
-        : kind === 'video'
-          ? '视频'
-          : kind === 'audio'
-            ? '语音'
-            : '文件',
+    label,
     path: rawPath,
     src: normalizeLocalAssetSource(rawPath),
-    fileName: getPathFileName(rawPath) || 'attachment',
+    fileName,
   }
 }
 

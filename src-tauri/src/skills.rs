@@ -540,24 +540,58 @@ fn parse_skill_manifest(content: &str) -> SkillManifest {
 
     if matches!(lines.peek(), Some(line) if line.trim() == "---") {
         lines.next();
+        let mut frontmatter_lines = Vec::new();
+        let mut block_scalar_indent: Option<usize> = None;
         while let Some(line) = lines.next() {
             let trimmed = line.trim();
+            let indent = line.chars().take_while(|char| char.is_whitespace()).count();
+
+            if let Some(active_indent) = block_scalar_indent {
+                if trimmed.is_empty() {
+                    frontmatter_lines.push(line.to_string());
+                    continue;
+                }
+                if indent > active_indent {
+                    frontmatter_lines.push(line.to_string());
+                    continue;
+                }
+                block_scalar_indent = None;
+            }
+
             if trimmed == "---" {
                 break;
             }
 
+            if let Some((_, value)) = trimmed.split_once(':') {
+                let value = value.trim();
+                if matches!(value, "|" | "|-" | "|+" | ">" | ">-" | ">+") {
+                    block_scalar_indent = Some(indent);
+                }
+            }
+            frontmatter_lines.push(line.to_string());
+        }
+
+        let mut index = 0usize;
+        while index < frontmatter_lines.len() {
+            let line = &frontmatter_lines[index];
+            let trimmed = line.trim();
             if let Some((key, value)) = trimmed.split_once(':') {
-                let normalized = strip_wrapping_quotes(value.trim());
-                match key.trim() {
+                let key = key.trim();
+                let value = value.trim();
+                let (normalized, consumed) = parse_frontmatter_value(&frontmatter_lines, index, line, value);
+                match key {
                     "name" if manifest.name.is_none() => {
-                        manifest.name = Some(normalized.to_string())
+                        manifest.name = Some(normalized);
                     }
                     "description" if manifest.description.is_none() => {
-                        manifest.description = Some(normalized.to_string())
+                        manifest.description = Some(normalized);
                     }
                     _ => {}
                 }
+                index += consumed;
+                continue;
             }
+            index += 1;
         }
     }
 
@@ -596,6 +630,98 @@ fn parse_skill_manifest(content: &str) -> SkillManifest {
     }
 
     manifest
+}
+
+fn parse_frontmatter_value(
+    lines: &[String],
+    start_index: usize,
+    original_line: &str,
+    raw_value: &str,
+) -> (String, usize) {
+    if !matches!(raw_value, "|" | "|-" | "|+" | ">" | ">-" | ">+") {
+        return (strip_wrapping_quotes(raw_value).to_string(), 1);
+    }
+
+    let key_indent = original_line.chars().take_while(|char| char.is_whitespace()).count();
+    let mut block_lines = Vec::new();
+    let mut index = start_index + 1;
+    let mut block_indent: Option<usize> = None;
+
+    while index < lines.len() {
+        let candidate = &lines[index];
+        let trimmed = candidate.trim();
+        let indent = candidate.chars().take_while(|char| char.is_whitespace()).count();
+
+        if trimmed.is_empty() {
+            if block_indent.is_some() {
+                block_lines.push(String::new());
+                index += 1;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+
+        let current_block_indent = block_indent.unwrap_or(indent);
+        if indent <= key_indent || indent < current_block_indent {
+            break;
+        }
+
+        block_indent = Some(current_block_indent);
+        let content = candidate
+            .get(current_block_indent..)
+            .unwrap_or(trimmed)
+            .trim_end()
+            .to_string();
+        block_lines.push(content);
+        index += 1;
+    }
+
+    let value = if raw_value.starts_with('>') {
+        fold_frontmatter_block_lines(&block_lines)
+    } else {
+        trim_frontmatter_block_lines(block_lines).join("\n")
+    };
+
+    (value, index.saturating_sub(start_index))
+}
+
+fn trim_frontmatter_block_lines(lines: Vec<String>) -> Vec<String> {
+    let start = lines.iter().position(|line| !line.trim().is_empty()).unwrap_or(lines.len());
+    let end = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+
+    lines[start..end].to_vec()
+}
+
+fn fold_frontmatter_block_lines(lines: &[String]) -> String {
+    let trimmed = trim_frontmatter_block_lines(lines.to_vec());
+    let mut paragraphs = Vec::new();
+    let mut current = String::new();
+
+    for line in trimmed {
+        if line.trim().is_empty() {
+            if !current.is_empty() {
+                paragraphs.push(current.trim().to_string());
+                current.clear();
+            }
+            continue;
+        }
+
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(line.trim());
+    }
+
+    if !current.is_empty() {
+        paragraphs.push(current.trim().to_string());
+    }
+
+    paragraphs.join("\n")
 }
 
 fn strip_wrapping_quotes(value: &str) -> &str {
@@ -678,6 +804,53 @@ Automate browser interactions for data collection.
             SkillManifest {
                 name: Some("Browser Skill".to_string()),
                 description: Some("Automate browser interactions for data collection.".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_manifest_supports_literal_multiline_description() {
+        let manifest = parse_skill_manifest(
+            r#"---
+name: multiline-skill
+description: |
+  第一行简介
+  ---
+  第二行才是补充说明
+metadata:
+  short-description: ignored
+---
+"#,
+        );
+
+        assert_eq!(
+            manifest,
+            SkillManifest {
+                name: Some("multiline-skill".to_string()),
+                description: Some("第一行简介\n---\n第二行才是补充说明".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_manifest_supports_folded_multiline_description() {
+        let manifest = parse_skill_manifest(
+            r#"---
+name: folded-skill
+description: >
+  第一行简介
+  第二行继续补充
+
+  第二段说明
+---
+"#,
+        );
+
+        assert_eq!(
+            manifest,
+            SkillManifest {
+                name: Some("folded-skill".to_string()),
+                description: Some("第一行简介 第二行继续补充\n第二段说明".to_string()),
             }
         );
     }

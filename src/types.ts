@@ -196,7 +196,7 @@ export type HistoryItem = {
 
 export type ViewKey = 'chat' | 'skills' | 'resources' | 'agents'
 
-export type SettingsTab = 'general' | 'appearance' | 'providers' | 'bots' | 'shortcuts'
+export type SettingsTab = 'general' | 'appearance' | 'providers' | 'shortcuts'
 
 export type SkillLibraryTab = 'installed' | 'system'
 

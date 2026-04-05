@@ -1,12 +1,16 @@
 import type { ChatAttachmentKind, ChatAttachmentUpload, PersistedChatAttachment } from '../types'
 import { decodeLocalPathSource, getPathFileName } from './inlineMedia'
 
-function escapeMarkdownLabel(label: string): string {
-  return label.replace(/\\/g, '\\\\').replace(/\]/g, '\\]')
-}
-
 function encodeAttachmentPath(path: string): string {
   return encodeURI(path)
+}
+
+function escapeDirectiveValue(value: string): string {
+  return encodeURI(value)
+}
+
+function getAttachmentDirectiveLabel(kind: PersistedChatAttachment['kind']): string {
+  return kind === 'image' ? '图片' : kind === 'video' ? '视频' : kind === 'audio' ? '语音' : '文件'
 }
 
 export function buildPromptWithAttachments(
@@ -17,9 +21,11 @@ export function buildPromptWithAttachments(
     return prompt
   }
 
-  const attachmentLines = attachments.map(
-    (attachment) => `[${escapeMarkdownLabel(attachment.fileName || '附件')}](${encodeAttachmentPath(attachment.filePath)})`,
-  )
+  const attachmentLines = attachments.map((attachment) => {
+    const encodedPath = encodeAttachmentPath(attachment.filePath)
+    const encodedName = escapeDirectiveValue(attachment.fileName || '附件')
+    return `::nc-media{type="${attachment.kind}" path="${encodedPath}" name="${encodedName}" label="${getAttachmentDirectiveLabel(attachment.kind)}"}`
+  })
   const trimmedPrompt = prompt.trim()
   if (!trimmedPrompt) {
     return attachmentLines.join('\n')

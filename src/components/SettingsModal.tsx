@@ -215,7 +215,6 @@ export function SettingsModal({
               <SettingsTabButton active={tab === 'general'} icon="settings" label="通用" onClick={() => onSelectTab('general')} />
               <SettingsTabButton active={tab === 'appearance'} icon="sparkles" label="个性化" onClick={() => onSelectTab('appearance')} />
               <SettingsTabButton active={tab === 'providers'} icon="provider" label="大模型 Provider" onClick={() => onSelectTab('providers')} />
-              <SettingsTabButton active={tab === 'bots'} icon="message" label="IM 机器人" onClick={() => onSelectTab('bots')} />
               <SettingsTabButton active={tab === 'shortcuts'} icon="keyboard" label="快捷键" onClick={() => onSelectTab('shortcuts')} />
             </div>
           </div>
@@ -229,9 +228,7 @@ export function SettingsModal({
                     ? '个性化'
                     : tab === 'providers'
                       ? '大模型 Provider'
-                      : tab === 'bots'
-                        ? 'IM 机器人'
-                        : '快捷键'}
+                      : '快捷键'}
               </h2>
               <button type="button" className="icon-button subtle" onClick={onClose} aria-label="关闭设置">
                 <AppIcon name="close" size={20} />
@@ -588,20 +585,6 @@ export function SettingsModal({
                     </>
                   )}
                 </div>
-              </div>
-            ) : null}
-
-            {tab === 'bots' ? (
-              <div className="bot-detail-panel">
-                <div className="bot-detail-head">
-                  <div className="bot-detail-title">
-                    <AppIcon name="message" size={18} />
-                    <strong>IM 机器人已迁移</strong>
-                  </div>
-                </div>
-                <p className="settings-note">
-                  每个智能体现在独立维护自己的 IM 机器人绑定。请前往「智能体管理」打开对应智能体，在编辑弹窗里配置渠道、扫码绑定和启动 Bot。
-                </p>
               </div>
             ) : null}
 

@@ -282,7 +282,7 @@ function parseStoredCustomProviderMeta(raw: string | null | undefined): CustomPr
   }
 }
 
-function summarizePrompt(prompt: string, maxLength = 26): string {
+function summarizePrompt(prompt: string, maxLength = 20): string {
   const compact = prompt.replace(/\s+/g, ' ').trim()
   if (!compact) {
     return '新会话'
@@ -599,6 +599,53 @@ function formatInstalledSkillSource(skill: InstalledSkillItem): string {
   return skill.installType === 'symlink' ? '符号链接' : '本地目录'
 }
 
+function normalizeSkillDescription(description: string | null | undefined): string {
+  const trimmed = description?.trim()
+  return trimmed ? trimmed : '暂无技能说明。'
+}
+
+function shouldCollapseSkillDescription(description: string): boolean {
+  return description.length > 96 || description.includes('\n')
+}
+
+type SkillDescriptionDisclosureProps = {
+  description: string | null | undefined
+  collapsedLines?: number
+  className?: string
+}
+
+function SkillDescriptionDisclosure({
+  description,
+  collapsedLines = 2,
+  className = '',
+}: SkillDescriptionDisclosureProps) {
+  const normalizedDescription = normalizeSkillDescription(description)
+  const expandable = shouldCollapseSkillDescription(normalizedDescription)
+  const [expanded, setExpanded] = useState(false)
+
+  return (
+    <div className={`skill-description-block ${expanded ? 'expanded' : ''} ${className}`.trim()}>
+      <p
+        className={`skill-description-text ${expanded ? 'expanded' : 'collapsed'}`}
+        style={expanded ? undefined : { WebkitLineClamp: collapsedLines }}
+      >
+        {normalizedDescription}
+      </p>
+      {expandable ? (
+        <button
+          type="button"
+          className={`skill-description-toggle ${expanded ? 'expanded' : ''}`}
+          onClick={() => setExpanded((current) => !current)}
+          aria-expanded={expanded}
+        >
+          <span>{expanded ? '收起介绍' : '展开介绍'}</span>
+          <AppIcon name="chevron-down" size={14} />
+        </button>
+      ) : null}
+    </div>
+  )
+}
+
 function formatWorkspaceFileSectionLabel(section: AgentWorkspaceFile['section']): string {
   if (section === 'private') {
     return '私有文件'
@@ -771,6 +818,26 @@ function formatTokenCount(value: number | undefined): string {
   }
 
   return value.toLocaleString('zh-CN')
+}
+
+function useLiveNow(enabled: boolean, intervalMs = 1000): number {
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    if (!enabled) {
+      setNow(Date.now())
+      return
+    }
+
+    setNow(Date.now())
+    const timer = window.setInterval(() => {
+      setNow(Date.now())
+    }, intervalMs)
+
+    return () => window.clearInterval(timer)
+  }, [enabled, intervalMs])
+
+  return now
 }
 
 function hasUsageMetrics(usage?: TokenUsage): boolean {
@@ -3057,7 +3124,7 @@ function App() {
                       title={item.title}
                     >
                       <span className="history-card-copy">
-                        <span className="history-card-title">{summarizePrompt(item.title, 24)}</span>
+                        <span className="history-card-title">{summarizePrompt(item.title, 20)}</span>
                         {item.agent ? <span className="history-card-agent">{item.agent.name}</span> : null}
                       </span>
                       <span className={`history-card-time ${getStatusTone(item.status)}`}>
@@ -3341,6 +3408,7 @@ function ChatView({
   onSessionLlmSelectChange,
 }: ChatViewProps) {
   const [copiedTurnId, setCopiedTurnId] = useState('')
+  const [copiedPromptTurnId, setCopiedPromptTurnId] = useState('')
   const [previewImage, setPreviewImage] = useState<{ src: string; alt: string } | null>(null)
   const turns = activeHistoryItem?.turns ?? []
   const activeTurnId = turns.at(-1)?.id ?? ''
@@ -3373,6 +3441,16 @@ function ChatView({
     await navigator.clipboard.writeText(answer)
     setCopiedTurnId(turnId)
     window.setTimeout(() => setCopiedTurnId((current) => (current === turnId ? '' : current)), 1600)
+  }
+
+  const handleCopyPrompt = async (turnId: string, prompt: string) => {
+    if (!prompt) {
+      return
+    }
+
+    await navigator.clipboard.writeText(prompt)
+    setCopiedPromptTurnId(turnId)
+    window.setTimeout(() => setCopiedPromptTurnId((current) => (current === turnId ? '' : current)), 1600)
   }
 
   const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -3415,56 +3493,81 @@ function ChatView({
 
             <div className="chat-message-list">
               {turns.map((item) => (
-                <article
-                  key={item.id}
-                  id={`chat-turn-${item.id}`}
-                  className={`chat-turn ${item.id === activeTurnId ? 'active' : ''}`}
-                >
-                  <div className="prompt-block">
-                    <PromptBubbleContent content={item.prompt} onImageClick={handleMarkdownImageClick} />
-                    <div className="prompt-timestamp">{formatAbsoluteTime(item.createdAt)}</div>
-                  </div>
+                (() => {
+                  const isStreamingTurn = sessionRunning && item.id === activeTurnId
+                  const isWaitingOnly = isTurnWaitingOnly(item, isStreamingTurn, showExecutionRail)
+                  const shouldShowActions =
+                    !isWaitingOnly &&
+                    Boolean(
+                      item.answer ||
+                        getElapsedMs(item.createdAt, item.completedAt, isStreamingTurn) ||
+                        hasUsageMetrics(item.usage),
+                    )
 
-                  <div className="chat-response">
-                    <div className="chat-response-head">
-                      <div className="answer-panel-title">
-                        <AppIcon name="bot" size={18} />
-                        <span>回复内容</span>
-                      </div>
-                    </div>
-                    <div className="answer-result-card">
-                      <div className="chat-response-body">
-                        <TurnResponseBody
-                          turn={item}
-                          agentBuilderActionBusyId={agentBuilderActionBusyId}
-                          agentBuilderActionError={agentBuilderActionError}
-                          agentBuilderActionNotice={agentBuilderActionNotice}
-                          agentBuilderActionTargetId={agentBuilderActionTargetId}
-                          loading={sessionRunning}
-                          activeTurnId={activeTurnId}
-                          onCreateAgentDraft={onCreateAgentDraft}
-                          showExecutionRail={showExecutionRail}
-                          onImageClick={handleMarkdownImageClick}
-                        />
-                      </div>
-                      {item.answer || getElapsedMs(item.createdAt, item.completedAt, sessionRunning && item.id === activeTurnId) || hasUsageMetrics(item.usage) ? (
-                        <div className="answer-result-actions">
-                          <TurnExecutionDetails turn={item} isStreaming={sessionRunning && item.id === activeTurnId} />
+                  return (
+                    <article
+                      key={item.id}
+                      id={`chat-turn-${item.id}`}
+                      className={`chat-turn ${item.id === activeTurnId ? 'active' : ''}`}
+                    >
+                      <div className="prompt-block">
+                        <PromptBubbleContent content={item.prompt} onImageClick={handleMarkdownImageClick} />
+                        <div className="prompt-meta">
+                          <div className="prompt-timestamp">{formatAbsoluteTime(item.createdAt)}</div>
                           <button
                             type="button"
-                            className={`answer-copy-icon-button ${copiedTurnId === item.id ? 'copied' : ''}`}
-                            onClick={() => void handleCopyAnswer(item.id, item.answer)}
-                            aria-label={copiedTurnId === item.id ? '已复制结果' : '复制结果'}
-                            title={copiedTurnId === item.id ? '已复制结果' : '复制结果'}
-                            disabled={!item.answer}
+                            className={`prompt-copy-icon-button ${copiedPromptTurnId === item.id ? 'copied' : ''}`}
+                            onClick={() => void handleCopyPrompt(item.id, item.prompt)}
+                            aria-label={copiedPromptTurnId === item.id ? '已复制提问' : '复制提问'}
+                            title={copiedPromptTurnId === item.id ? '已复制提问' : '复制提问'}
                           >
-                            {copiedTurnId === item.id ? <Check size={18} /> : <Copy size={18} />}
+                            {copiedPromptTurnId === item.id ? <Check size={15} /> : <Copy size={15} />}
                           </button>
                         </div>
-                      ) : null}
-                    </div>
-                  </div>
-                </article>
+                      </div>
+
+                      <div className="chat-response">
+                        <div className="chat-response-head">
+                          <div className="answer-panel-title">
+                            <AppIcon name="bot" size={18} />
+                            <span>回复内容</span>
+                          </div>
+                        </div>
+                        <div className={`answer-result-card${isWaitingOnly ? ' answer-result-card-waiting' : ''}`}>
+                          <div className="chat-response-body">
+                            <TurnResponseBody
+                              turn={item}
+                              agentBuilderActionBusyId={agentBuilderActionBusyId}
+                              agentBuilderActionError={agentBuilderActionError}
+                              agentBuilderActionNotice={agentBuilderActionNotice}
+                              agentBuilderActionTargetId={agentBuilderActionTargetId}
+                              loading={sessionRunning}
+                              activeTurnId={activeTurnId}
+                              onCreateAgentDraft={onCreateAgentDraft}
+                              showExecutionRail={showExecutionRail}
+                              onImageClick={handleMarkdownImageClick}
+                            />
+                          </div>
+                          {shouldShowActions ? (
+                            <div className="answer-result-actions">
+                              <TurnExecutionDetails turn={item} isStreaming={isStreamingTurn} />
+                              <button
+                                type="button"
+                                className={`answer-copy-icon-button ${copiedTurnId === item.id ? 'copied' : ''}`}
+                                onClick={() => void handleCopyAnswer(item.id, item.answer)}
+                                aria-label={copiedTurnId === item.id ? '已复制结果' : '复制结果'}
+                                title={copiedTurnId === item.id ? '已复制结果' : '复制结果'}
+                                disabled={!item.answer}
+                              >
+                                {copiedTurnId === item.id ? <Check size={18} /> : <Copy size={18} />}
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    </article>
+                  )
+                })()
               ))}
             </div>
           </>
@@ -3634,6 +3737,7 @@ function TurnResponseBody({
 }) {
   const toolById = new Map(turn.toolCalls.map((t) => [t.toolCallId, t]))
   const segments = turn.responseSegments
+  const isActiveStreamingTurn = loading && turn.id === activeTurnId
 
   if (segments && segments.length > 0) {
     let lastTextSegmentIndex = -1
@@ -3649,7 +3753,7 @@ function TurnResponseBody({
         {segments.map((seg, index) => {
           if (seg.type === 'text') {
             const isStreaming = Boolean(
-              loading && turn.id === activeTurnId && index === lastTextSegmentIndex,
+              isActiveStreamingTurn && index === lastTextSegmentIndex,
             )
             if (!seg.text.trim() && !isStreaming) {
               return null
@@ -3702,19 +3806,38 @@ function TurnResponseBody({
       ) : null}
       {hasLegacyTools ? <ToolCallList toolCalls={legacyTools} onImageClick={onImageClick} /> : null}
       {!turn.answer && !hasLegacyTools ? (
-        <p className="placeholder-copy">
-          {loading && turn.id === activeTurnId
-            ? '正在等待 pi 返回首段内容…'
-            : turn.status === 'done'
+        isActiveStreamingTurn ? (
+          <TurnWaitingIndicator startedAt={turn.createdAt} />
+        ) : (
+          <p className="placeholder-copy">
+            {turn.status === 'done'
               ? '本轮已结束，但模型没有返回任何可渲染内容。'
               : turn.status === 'error'
                 ? '本轮执行失败，未产出可渲染内容。'
                 : legacyTools.length > 0
                   ? '本轮主要产出了工具调用结果。'
                   : '当前轮次还没有输出内容。'}
-        </p>
+          </p>
+        )
       ) : null}
     </>
+  )
+}
+
+function TurnWaitingIndicator({ startedAt }: { startedAt: number }) {
+  const now = useLiveNow(true, 500)
+  const elapsed = Math.max(0, now - startedAt)
+
+  return (
+    <div className="turn-waiting-indicator" role="status" aria-live="polite">
+      <span className="turn-waiting-dots" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </span>
+      <span className="turn-waiting-label">处理中</span>
+      <span className="turn-waiting-time">已执行 {formatDurationLabel(elapsed)}</span>
+    </div>
   )
 }
 
@@ -3859,6 +3982,27 @@ function formatToolCallText(text: string, fallback: string, pretty = true): stri
   }
 }
 
+function hasRenderableTurnContent(turn: ConversationTurn, showExecutionRail: boolean): boolean {
+  if (turn.answer.trim()) {
+    return true
+  }
+
+  if (turn.responseSegments?.length) {
+    return turn.responseSegments.some((segment) => {
+      if (segment.type === 'text') {
+        return segment.text.trim().length > 0
+      }
+      return showExecutionRail && turn.toolCalls.some((toolCall) => toolCall.toolCallId === segment.toolCallId)
+    })
+  }
+
+  return showExecutionRail && turn.toolCalls.length > 0
+}
+
+function isTurnWaitingOnly(turn: ConversationTurn, isStreaming: boolean, showExecutionRail: boolean): boolean {
+  return isStreaming && !hasRenderableTurnContent(turn, showExecutionRail)
+}
+
 function ToolCallContentBlock({
   content,
   isStreaming,
@@ -3918,7 +4062,7 @@ function ToolCallCard({
   onImageClick?: (src: string, alt: string) => void
 }) {
   const isStreaming = toolCall.state === 'running'
-  const [detailsOpen, setDetailsOpen] = useState(() => isStreaming)
+  const [detailsOpen, setDetailsOpen] = useState(false)
 
   const argsLive = formatToolCallText(toolCall.argsText, '无参数', false)
   const resultLive = formatToolCallText(toolCall.resultText, '暂无输出', false)
@@ -3933,10 +4077,9 @@ function ToolCallCard({
     >
       <summary className="tool-call-summary">
         <div className="tool-call-head">
-          <div className="tool-call-title-group">
-            <span className="tool-call-kicker">工具调用</span>
-            <strong>{toolCall.toolName}</strong>
-            <span className="tool-call-hint">{isStreaming ? '流式输出中…' : '点开看详情'}</span>
+          <div className="tool-call-title-row">
+            <AppIcon name="wrench" size={15} />
+            <strong title={toolCall.toolName}>{toolCall.toolName}</strong>
           </div>
           <div className="tool-call-summary-right">
             {isStreaming ? (
@@ -3986,6 +4129,7 @@ function ToolCallList({
 }
 
 function TurnExecutionDetails({ turn, isStreaming }: { turn: ConversationTurn; isStreaming: boolean }) {
+  useLiveNow(isStreaming, 500)
   const totalDuration = getElapsedMs(turn.createdAt, turn.completedAt, isStreaming)
   const usage = turn.usage
 
@@ -4124,9 +4268,9 @@ function SkillsView({
                     <div className="skill-icon">
                       <AppIcon name="puzzle" size={18} />
                     </div>
-                    <div>
+                    <div className="skill-title-copy">
                       <h3>{skill.name}</h3>
-                      <p>{skill.description}</p>
+                      <SkillDescriptionDisclosure description={skill.description} />
                     </div>
                   </div>
                 </div>
@@ -4182,9 +4326,9 @@ function SkillsView({
                   <div className="skill-icon">
                     <AppIcon name="bag" size={18} />
                   </div>
-                  <div>
+                  <div className="skill-title-copy">
                     <h3>{skill.name}</h3>
-                    <p>{skill.description}</p>
+                    <SkillDescriptionDisclosure description={skill.description} />
                   </div>
                 </div>
               </div>
@@ -4481,21 +4625,27 @@ function AgentSkillPickerDialog({
             skills.map((skill) => {
               const active = selectedSkillIds.includes(skill.id)
               return (
-                <button
+                <article
                   key={skill.id}
-                  type="button"
                   className={`agent-skill-option ${active ? 'active' : ''}`}
-                  onClick={() => onToggleSkill(skill.id)}
                 >
-                  <span className="agent-skill-option-copy">
+                  <div className="agent-skill-option-copy">
                     <strong>{skill.name}</strong>
-                    <span>{skill.description || '暂无技能说明。'}</span>
+                    <SkillDescriptionDisclosure description={skill.description} className="skill-description-inset" />
                     <small>
                       {formatInstalledSkillScopeLabel(skill.scope)} · {formatInstalledSkillSource(skill)}
                     </small>
-                  </span>
-                  <span className="agent-skill-option-action">{active ? '已添加' : '添加技能'}</span>
-                </button>
+                  </div>
+                  <div className="agent-skill-option-actions">
+                    <button
+                      type="button"
+                      className="agent-skill-option-action"
+                      onClick={() => onToggleSkill(skill.id)}
+                    >
+                      {active ? '已添加' : '添加技能'}
+                    </button>
+                  </div>
+                </article>
               )
             })
           ) : (
@@ -4839,35 +4989,43 @@ function AgentEditorDialog({
               {mountedSkills.length > 0 || missingSkillIds.length > 0 ? (
                 <div className="agent-mounted-skill-list">
                   {mountedSkills.map((skill) => (
-                    <button
+                    <article
                       key={skill.id}
-                      type="button"
                       className="agent-mounted-skill"
-                      onClick={() => onToggleSkill(skill.id)}
                     >
-                      <span>
+                      <div className="agent-mounted-skill-copy">
                         <strong>{skill.name}</strong>
+                        <SkillDescriptionDisclosure description={skill.description} className="skill-description-inset" />
                         <small>
                           {formatInstalledSkillScopeLabel(skill.scope)} · {formatInstalledSkillSource(skill)}
                         </small>
-                      </span>
-                      <AppIcon name="close" size={16} />
-                    </button>
+                      </div>
+                      <button
+                        type="button"
+                        className="agent-mounted-skill-action"
+                        onClick={() => onToggleSkill(skill.id)}
+                      >
+                        <AppIcon name="close" size={16} />
+                        <span>移除</span>
+                      </button>
+                    </article>
                   ))}
 
                   {missingSkillIds.map((skillId) => (
-                    <button
-                      key={skillId}
-                      type="button"
-                      className="agent-mounted-skill missing"
-                      onClick={() => onToggleSkill(skillId)}
-                    >
-                      <span>
+                    <article key={skillId} className="agent-mounted-skill missing">
+                      <div className="agent-mounted-skill-copy">
                         <strong>{skillId}</strong>
                         <small>本地未找到，点击即可移除</small>
-                      </span>
-                      <AppIcon name="close" size={16} />
-                    </button>
+                      </div>
+                      <button
+                        type="button"
+                        className="agent-mounted-skill-action"
+                        onClick={() => onToggleSkill(skillId)}
+                      >
+                        <AppIcon name="close" size={16} />
+                        <span>移除</span>
+                      </button>
+                    </article>
                   ))}
                 </div>
               ) : (

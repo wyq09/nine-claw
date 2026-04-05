@@ -56,6 +56,17 @@ export async function persistChatAttachments(payload: {
   })
 }
 
+export async function openLocalFile(filePath: string): Promise<void> {
+  await invoke('open_local_file', { filePath })
+}
+
+export async function loadLocalMediaPreview(filePath: string, mimeType?: string | null): Promise<string> {
+  return invoke<string>('load_local_media_preview', {
+    filePath,
+    mimeType: mimeType ?? null,
+  })
+}
+
 export async function testLlmProviderConnection(payload: {
   apiFormat: 'openai' | 'anthropic'
   baseUrl: string
