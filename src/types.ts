@@ -338,6 +338,8 @@ export type BotDefinition = {
 
 export type BotConfig = {
   enabled: boolean
+  /** 用户点「断开」后为 true；为 false 时应用重启会自动拉起已绑定凭证的通道 */
+  imChannelPaused?: boolean
   clientId: string
   clientSecret: string
   status: '未连接' | '待接入' | '已连接' | '登录中' | '错误'

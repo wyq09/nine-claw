@@ -4,9 +4,16 @@ pub fn dev_trace(scope: &str, message: impl AsRef<str>) {
     }
 }
 
+fn dev_trace_blocks_enabled() -> bool {
+    cfg!(debug_assertions)
+        || std::env::var("NINECLAW_DEV_TRACE_BLOCKS")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+}
+
 #[allow(dead_code)]
 pub fn dev_trace_block(scope: &str, label: impl AsRef<str>, content: impl AsRef<str>) {
-    if !cfg!(debug_assertions) {
+    if !dev_trace_blocks_enabled() {
         return;
     }
 

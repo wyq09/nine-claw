@@ -18,6 +18,8 @@ use tauri::{AppHandle, Emitter};
 
 use self::api::WeChatApi;
 use self::types::*;
+use crate::channels::im_message_merge_window_ms;
+use crate::channels::im_reply_format::{resolve_reply_card_items, wechat_im_text_segments};
 use crate::channels::pi_bridge::{PiBridge, PiProcessOutcome, PiRunHandle};
 use crate::channels::types::{BotMessage, ChannelStatus, MediaPayload, MediaType};
 use crate::channels::Channel;
@@ -478,7 +480,6 @@ const CHUNK_SIZE: usize = 3900;
 const POLL_INTERVAL_SECS: u64 = 3;
 /// Chunk size for on_chunk frontend streaming (characters).
 const STREAM_CHUNK_SIZE: usize = 500;
-const MESSAGE_COLLECT_WINDOW_MS: u64 = 800;
 
 /// Internal message routed from monitor thread to worker thread.
 struct WorkItem {
@@ -948,10 +949,11 @@ impl Channel for WeChatChannel {
                                 None
                             } else {
                                 let elapsed = now_timestamp_ms() - state.last_inbound_at;
-                                if elapsed >= MESSAGE_COLLECT_WINDOW_MS as i64 {
+                                let merge_ms = im_message_merge_window_ms() as i64;
+                                if elapsed >= merge_ms {
                                     None
                                 } else {
-                                    Some((MESSAGE_COLLECT_WINDOW_MS as i64 - elapsed) as u64)
+                                    Some((merge_ms - elapsed) as u64)
                                 }
                             }
                         };
@@ -1147,7 +1149,12 @@ impl Channel for WeChatChannel {
                                     );
                                 }
                                 if !text_reply.is_empty() {
-                                    send_reply_chunks(&rt, &api, &user_id, &text_reply, ct_opt);
+                                    let cards = resolve_reply_card_items(&text_reply, false);
+                                    for seg in wechat_im_text_segments(&cards) {
+                                        if !seg.is_empty() {
+                                            send_reply_chunks(&rt, &api, &user_id, &seg, ct_opt);
+                                        }
+                                    }
                                 }
                                 for media in media_items {
                                     if let Err(error) =

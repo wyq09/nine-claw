@@ -80,6 +80,8 @@ import {
 import type { QrCodeEvent, BotStatusEvent } from './lib/piClient'
 import { buildPromptWithAttachments } from './lib/composerAttachments'
 import { extractInlineMediaAttachments, normalizeMarkdownImageSources } from './lib/inlineMedia'
+import { resolveReplyCardItems } from './lib/replyCardFormat'
+import ReplyCardStack from './components/ReplyCardStack'
 
 const ABSOLUTE_TIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
   year: 'numeric',
@@ -361,7 +363,7 @@ function buildBotConfigStatusPatch(event: BotStatusEvent): Partial<BotConfig> | 
       return { status: '错误', enabled: false, errorMessage: event.message }
     case 'warn':
       if (event.message.includes('已关闭') || event.message.includes('已停止') || event.message.includes('已退出')) {
-        return { status: '未连接', enabled: false }
+        return { status: '未连接', enabled: false, imChannelPaused: true }
       }
       return null
     default:
@@ -1026,34 +1028,6 @@ function resolveActiveProviderConfig(
   for (const providerId of orderedProviderIds) {
     const config = providerConfigs[providerId]
     if (!config?.added || !config.enabled || !config.model.trim()) {
-      continue
-    }
-
-    return {
-      providerId,
-      apiFormat: config.apiFormat,
-      baseUrl: config.baseUrl.trim(),
-      apiKey: config.apiKey.trim(),
-      model: config.model.trim(),
-    }
-  }
-
-  return null
-}
-
-function resolveBotRuntimeConfig(
-  selectedProviderId: ProviderId,
-  providerConfigs: Record<string, ProviderConfig>,
-  allProviderIds: string[],
-): ProviderRuntimeConfig | null {
-  const orderedProviderIds = [
-    selectedProviderId,
-    ...allProviderIds.filter((providerId) => providerId !== selectedProviderId),
-  ]
-
-  for (const providerId of orderedProviderIds) {
-    const config = providerConfigs[providerId]
-    if (!config?.added || !isProviderConfigComplete(config)) {
       continue
     }
 
@@ -2719,9 +2693,15 @@ function App() {
         const loginToken = result.bot_token ?? ''
         const loginBaseUrl = result.base_url ?? 'https://ilinkai.weixin.qq.com'
 
-        const botRuntime = resolveBotRuntimeConfig(selectedProviderId, providerConfigs, allProviderIds)
+        if (!selectedManagedAgent) {
+          throw new Error('请先保存当前智能体，再绑定微信 Bot。')
+        }
+        const botRuntime = resolveRuntimeFromAgentSnapshot(
+          buildConversationAgentSnapshot(selectedManagedAgent),
+          providerConfigs,
+        )
         if (!botRuntime) {
-          throw new Error('请先在 Provider 设置中补全 Base URL、API Key 和模型，再启动微信 Bot。')
+          throw new Error('请先在设置中配置该智能体默认模型对应的 Provider（Base URL、API Key）。')
         }
 
         updateAgentBotConfig('wechat', {
@@ -2729,6 +2709,7 @@ function App() {
           clientId: result.account_id ?? '',
           clientSecret: loginBaseUrl,
           token: loginToken,
+          imChannelPaused: false,
           ...buildBotRuntimeBindingConfig(botRuntime),
           errorMessage: undefined,
         })
@@ -2736,9 +2717,6 @@ function App() {
 
         // Auto-start the bot polling immediately after login
         try {
-          if (!selectedManagedAgent) {
-            throw new Error('请先保存当前智能体，再启动微信 Bot。')
-          }
           await botStartWechat(getBotChannelRuntimeId(selectedManagedAgent.id, 'wechat'), selectedManagedAgent.id, loginToken, {
             baseUrl: loginBaseUrl || undefined,
             providerId: botRuntime.providerId,
@@ -2747,7 +2725,7 @@ function App() {
             apiKey: botRuntime.apiKey,
             providerBaseUrl: botRuntime.baseUrl,
           })
-          updateAgentBotConfig('wechat', { enabled: true })
+          updateAgentBotConfig('wechat', { enabled: true, imChannelPaused: false })
         } catch (startError) {
           updateAgentBotConfig('wechat', {
             status: '错误',
@@ -2785,11 +2763,17 @@ function App() {
     }
     setBotLoading(true)
     try {
-      const botRuntime = resolveBotRuntimeConfig(selectedProviderId, providerConfigs, allProviderIds)
+      const botRuntime = resolveRuntimeFromAgentSnapshot(
+        buildConversationAgentSnapshot(selectedManagedAgent),
+        providerConfigs,
+      )
       if (!botRuntime) {
-        throw new Error('请先在 Provider 设置中补全 Base URL、API Key 和模型，再启动微信 Bot。')
+        throw new Error('请先在设置中配置该智能体默认模型对应的 Provider（Base URL、API Key）。')
       }
-      updateAgentBotConfig('wechat', buildBotRuntimeBindingConfig(botRuntime))
+      updateAgentBotConfig('wechat', {
+        ...buildBotRuntimeBindingConfig(botRuntime),
+        imChannelPaused: false,
+      })
       await botStartWechat(getBotChannelRuntimeId(selectedManagedAgent.id, 'wechat'), selectedManagedAgent.id, config.token, {
         baseUrl: config.clientSecret || undefined,
         routeTag: config.routeTag || undefined,
@@ -2799,7 +2783,12 @@ function App() {
         apiKey: botRuntime.apiKey,
         providerBaseUrl: botRuntime.baseUrl,
       })
-      updateAgentBotConfig('wechat', { status: '已连接', enabled: true, errorMessage: undefined })
+      updateAgentBotConfig('wechat', {
+        status: '已连接',
+        enabled: true,
+        imChannelPaused: false,
+        errorMessage: undefined,
+      })
     } catch (error) {
       updateAgentBotConfig('wechat', { status: '错误', errorMessage: String(error) })
     } finally {
@@ -2814,7 +2803,7 @@ function App() {
     setBotLoading(true)
     try {
       await botStopWechat(getBotChannelRuntimeId(selectedManagedAgent.id, 'wechat'))
-      updateAgentBotConfig('wechat', { status: '未连接', enabled: false })
+      updateAgentBotConfig('wechat', { status: '未连接', enabled: false, imChannelPaused: true })
     } catch (error) {
       updateAgentBotConfig('wechat', { status: '错误', errorMessage: String(error) })
     } finally {
@@ -2839,13 +2828,17 @@ function App() {
 
     setBotLoading(true)
     try {
-      const botRuntime = resolveBotRuntimeConfig(selectedProviderId, providerConfigs, allProviderIds)
+      const botRuntime = resolveRuntimeFromAgentSnapshot(
+        buildConversationAgentSnapshot(selectedManagedAgent),
+        providerConfigs,
+      )
       if (!botRuntime) {
-        throw new Error('请先在 Provider 设置中补全 Base URL、API Key 和模型，再启动飞书 Bot。')
+        throw new Error('请先在设置中配置该智能体默认模型对应的 Provider（Base URL、API Key）。')
       }
 
       updateAgentBotConfig('lark', {
         ...buildBotRuntimeBindingConfig(botRuntime),
+        imChannelPaused: false,
         status: '登录中',
         errorMessage: undefined,
       })
@@ -2863,7 +2856,12 @@ function App() {
         },
       )
 
-      updateAgentBotConfig('lark', { status: '已连接', enabled: true, errorMessage: undefined })
+      updateAgentBotConfig('lark', {
+        status: '已连接',
+        enabled: true,
+        imChannelPaused: false,
+        errorMessage: undefined,
+      })
     } catch (error) {
       updateAgentBotConfig('lark', { status: '错误', errorMessage: String(error) })
     } finally {
@@ -2878,7 +2876,12 @@ function App() {
     setBotLoading(true)
     try {
       await botStopLark(getBotChannelRuntimeId(selectedManagedAgent.id, 'lark'))
-      updateAgentBotConfig('lark', { status: '未连接', enabled: false, errorMessage: undefined })
+      updateAgentBotConfig('lark', {
+        status: '未连接',
+        enabled: false,
+        imChannelPaused: true,
+        errorMessage: undefined,
+      })
     } catch (error) {
       updateAgentBotConfig('lark', { status: '错误', errorMessage: String(error) })
     } finally {
@@ -3873,33 +3876,15 @@ function MarkdownBlock({
     [contentWithoutAttachments],
   )
 
-  const handleClick = (event: MouseEvent<HTMLDivElement>) => {
-    if (!onImageClick) {
-      return
-    }
-
-    const target = event.target
-    if (!(target instanceof HTMLElement)) {
-      return
-    }
-
-    const image = target.closest('img')
-    if (!(image instanceof HTMLImageElement) || !image.src) {
-      return
-    }
-
-    event.preventDefault()
-    onImageClick(image.src, image.alt)
-  }
+  const replyCardItems = useMemo(
+    () => resolveReplyCardItems(normalizedContent || '', isStreaming),
+    [normalizedContent, isStreaming],
+  )
 
   return (
     <>
       {normalizedContent ? (
-        <div className="markdown-content" onClick={handleClick}>
-          <Suspense fallback={<MarkdownFallback content={normalizedContent} />}>
-            <MarkdownRenderer content={normalizedContent} isStreaming={isStreaming} />
-          </Suspense>
-        </div>
+        <ReplyCardStack items={replyCardItems} isStreaming={isStreaming} onImageClick={onImageClick} />
       ) : null}
       {attachments.length > 0 ? <InlineMediaAttachmentList attachments={attachments} onImageClick={onImageClick} /> : null}
       {agentDraft ? (

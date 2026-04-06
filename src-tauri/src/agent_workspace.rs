@@ -464,7 +464,7 @@ pub fn build_workspace_system_prompt_for_query(
             .to_string(),
     );
     sections.push(
-        "写回：短期写 WORKING.md；稳定事实写 MEMORY.md；决定写 DECISIONS.md；共享资料写 PUBLIC_CONTEXT.md。"
+        "写回：短期写 WORKING.md；偏好写 memory/categories/preferences.md；项目写 memory/categories/projects.md；决定写 DECISIONS.md；共享资料写 PUBLIC_CONTEXT.md。MEMORY.md 仅存放人设和核心原则，运行时不可自动写入。"
             .to_string(),
     );
     if bootstrap_exists {
@@ -602,7 +602,6 @@ pub fn append_agent_memory_entry(
     let categories = classify_memory_categories(user_message, assistant_message, &summary);
     let category_notes =
         build_category_memory_notes(user_message, assistant_message, &summary, &categories);
-    let core_memory_points = select_core_memory_points(&category_notes);
     let ingest_summary = build_ingest_summary(&category_notes, &summary);
     let source_ref = memory_wiki::record_conversation_ingest(
         &agent_home,
@@ -629,15 +628,7 @@ pub fn append_agent_memory_entry(
     )
     .map_err(|error| format!("写入 WORKING.md 失败: {error}"))?;
 
-    let memory_path = agent_home.join("MEMORY.md");
-    let memory_existing = fs::read_to_string(&memory_path)
-        .unwrap_or_else(|_| fallback_template("MEMORY.md").to_string());
-    fs::write(
-        &memory_path,
-        append_core_memory_points(&memory_existing, &core_memory_points),
-    )
-    .map_err(|error| format!("写入 MEMORY.md 失败: {error}"))?;
-
+    // MEMORY.md 不再自动写入 — 仅保留人设和核心原则，由用户手动编辑
     append_category_memory_entries(&agent_home, &category_notes, &source_ref)?;
 
     let daily_log_path = agent_home
@@ -1757,7 +1748,7 @@ fn fallback_template(file_name: &str) -> &'static str {
             "# ROLE.md\n\n## Mission\n\n{{AGENT_DESCRIPTION}}\n\n## Ownership\n\n- Define ownership here\n\n## Do Not\n\n- Leak private memory\n- Act externally without confirmation\n"
         }
         "MEMORY.md" => {
-            "# MEMORY.md\n\nThis is the curated private memory for `{{AGENT_NAME}}`.\n"
+            "# MEMORY.md\n\n这是 `{{AGENT_NAME}}` 的核心记忆文件。\n\n## 人设\n\n- 性格基调：（由用户或 BOOTSTRAP 定义）\n- 说话风格：（由用户或 BOOTSTRAP 定义）\n\n## 核心原则\n\n- （由用户或 BOOTSTRAP 定义，如嫡系理念、活人感等原则）\n\n> 此文件不会在对话过程中被自动修改。如需调整，请手动编辑。\n"
         }
         "TOOLS.md" => {
             "# TOOLS.md\n\n## Tool Bias\n\n- Preferred tools:\n- Avoid when possible:\n"
@@ -1837,6 +1828,12 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn lock_workspace_test() -> std::sync::MutexGuard<'static, ()> {
+        workspace_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     fn temp_root() -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1847,7 +1844,7 @@ mod tests {
 
     #[test]
     fn scaffold_agent_home_from_templates() {
-        let _guard = workspace_test_lock().lock().expect("lock workspace test");
+        let _guard = lock_workspace_test();
         let root = temp_root();
         std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
 
@@ -1877,10 +1874,10 @@ mod tests {
 
         let prompt = build_workspace_system_prompt("test-agent").expect("workspace prompt");
         assert!(prompt.contains("BOOTSTRAP.md"));
-        assert!(prompt.contains("agents/test-agent"));
 
         let bundle = read_agent_workspace_bundle("test-agent").expect("workspace bundle");
         assert_eq!(bundle.agent_id, "test-agent");
+        assert_eq!(bundle.agent_home, "agents/test-agent");
         assert!(bundle
             .files
             .iter()
@@ -1896,7 +1893,7 @@ mod tests {
 
     #[test]
     fn write_agent_workspace_file_updates_private_memory() {
-        let _guard = workspace_test_lock().lock().expect("lock workspace test");
+        let _guard = lock_workspace_test();
         let root = temp_root();
         std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
 
@@ -1931,7 +1928,7 @@ mod tests {
 
     #[test]
     fn reject_generated_or_out_of_scope_workspace_paths() {
-        let _guard = workspace_test_lock().lock().expect("lock workspace test");
+        let _guard = lock_workspace_test();
         let root = temp_root();
         std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
 
@@ -1960,7 +1957,7 @@ mod tests {
 
     #[test]
     fn append_agent_memory_entry_updates_legacy_memory_files() {
-        let _guard = workspace_test_lock().lock().expect("lock workspace test");
+        let _guard = lock_workspace_test();
         let root = temp_root();
         std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
 
@@ -1984,10 +1981,31 @@ mod tests {
 
         let memory = fs::read_to_string(root.join("agents").join("memory-agent").join("MEMORY.md"))
             .expect("read memory");
-        assert!(memory.contains("## Core Memory"));
-        assert!(memory.contains("用户画像"));
-        assert!(memory.contains("已确认约定"));
-        assert!(!memory.contains("## IM Persistent Memory"));
+        // MEMORY.md 不再被自动写入，应保持模板内容
+        assert!(memory.contains("核心记忆文件") || memory.contains("核心原则"));
+        assert!(!memory.contains("## Core Memory"));
+        assert!(!memory.contains("用户画像"));
+
+        // 分类文件应被正确写入
+        let user_profile = fs::read_to_string(
+            root.join("agents")
+                .join("memory-agent")
+                .join("memory")
+                .join("categories")
+                .join("user_profile.md"),
+        )
+        .expect("read user_profile category");
+        assert!(user_profile.contains("用户画像"));
+
+        let decisions = fs::read_to_string(
+            root.join("agents")
+                .join("memory-agent")
+                .join("memory")
+                .join("categories")
+                .join("decisions.md"),
+        )
+        .expect("read decisions category");
+        assert!(decisions.contains("已确认约定") || decisions.contains("周报格式"));
 
         let working =
             fs::read_to_string(root.join("agents").join("memory-agent").join("WORKING.md"))
@@ -2029,7 +2047,7 @@ mod tests {
 
     #[test]
     fn workspace_prompt_loads_relevant_categorized_memory_for_query() {
-        let _guard = workspace_test_lock().lock().expect("lock workspace test");
+        let _guard = lock_workspace_test();
         let root = temp_root();
         std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
 

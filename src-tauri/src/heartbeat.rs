@@ -721,51 +721,34 @@ fn generate_agentic_heartbeat_message(
     due: &DueHeartbeat,
     outcome: Option<&ShellTaskOutcome>,
 ) -> Result<Option<String>, String> {
-    let channel_key = configured_channel_key(&due.schedule.channel_id);
-    let bot_config = due.agent.bot_configs.get(channel_key);
-
-    let provider_id = bot_config
-        .and_then(|config| config.ai_provider_id.as_ref())
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(due.agent.default_provider_id.trim());
-    let model = bot_config
-        .and_then(|config| config.ai_model.as_ref())
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(due.agent.default_model.trim());
-
-    if provider_id.is_empty() || model.is_empty() {
-        return Ok(None);
-    }
-
-    let api_format = bot_config
-        .and_then(|config| config.ai_api_format.as_ref())
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(default_provider_api_format(provider_id));
-    let base_url = bot_config
-        .and_then(|config| config.ai_base_url.as_ref())
-        .map(|value| value.trim())
-        .unwrap_or_default();
-    let api_key = bot_config
-        .and_then(|config| config.ai_api_key.as_ref())
-        .map(|value| value.trim())
-        .unwrap_or_default();
-
     let Some(agent_config) = agents::get_conversation_agent_config(app, &due.agent.id)? else {
         return Ok(None);
     };
+
+    let runtime = match crate::resolve_im_llm_runtime(
+        app,
+        &due.agent.default_provider_id,
+        &due.agent.default_model,
+    ) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    let base_normalized = crate::normalized_provider_runtime_base_url(
+        &runtime.base_url,
+        &runtime.api_format,
+        &runtime.provider_id,
+    );
 
     let prompt = build_agentic_heartbeat_prompt(due, outcome)?;
     let pi_runtime = crate::pi_runtime::require_pi_runtime_location(app)?;
     let bridge = PiBridge::new(
         pi_runtime,
-        provider_id,
-        api_format,
-        base_url,
-        api_key,
-        model,
+        &runtime.provider_id,
+        &runtime.api_format,
+        &base_normalized,
+        &runtime.api_key,
+        &runtime.model,
         Some(agent_config),
     );
     let synthetic_user = format!("{}#heartbeat", due.schedule.target_user_id);
@@ -838,17 +821,6 @@ fn build_agentic_heartbeat_prompt(
     );
 
     Ok(sections.join("\n\n"))
-}
-
-fn configured_channel_key(channel_id: &str) -> &str {
-    channel_id.split(':').next().unwrap_or(channel_id)
-}
-
-fn default_provider_api_format(provider_id: &str) -> &'static str {
-    match provider_id {
-        "anthropic" => "anthropic",
-        _ => "openai",
-    }
 }
 
 fn split_text_and_media(content: &str) -> (String, Vec<ParsedMediaItem>) {

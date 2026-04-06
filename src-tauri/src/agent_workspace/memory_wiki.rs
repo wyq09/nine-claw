@@ -21,25 +21,34 @@ pub(super) fn ensure_memory_wiki_scaffold(agent_home: &Path) -> Result<(), Strin
     fs::create_dir_all(memory_dir.join("raw"))
         .map_err(|error| format!("创建 raw source 目录失败: {error}"))?;
 
+    let wiki_index_path = memory_dir.join(WIKI_INDEX_FILE);
+    let mut needs_wiki_rebuild = !wiki_index_path.exists();
+
     let lint_path = memory_dir.join(LINT_FILE);
     if !lint_path.exists() {
         fs::write(&lint_path, build_lint_template())
             .map_err(|error| format!("写入 LINT.md 失败: {error}"))?;
+        needs_wiki_rebuild = true;
     }
 
     let source_index_path = memory_dir.join(SOURCE_INDEX_FILE);
     if !source_index_path.exists() {
         fs::write(&source_index_path, build_source_index_template())
             .map_err(|error| format!("写入 SOURCE_INDEX.md 失败: {error}"))?;
+        needs_wiki_rebuild = true;
     }
 
     let log_path = memory_dir.join(LOG_FILE);
     if !log_path.exists() {
         fs::write(&log_path, build_log_template())
             .map_err(|error| format!("写入 LOG.md 失败: {error}"))?;
+        needs_wiki_rebuild = true;
     }
 
-    rebuild_wiki_index(agent_home)
+    if needs_wiki_rebuild {
+        rebuild_wiki_index(agent_home)?;
+    }
+    Ok(())
 }
 
 pub(super) fn build_memory_wiki_snapshot(

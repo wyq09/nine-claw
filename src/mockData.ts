@@ -132,11 +132,17 @@ export const providerDefinitions: ProviderDefinition[] = [
 
 export function createInitialBotConfigs(): Record<string, BotConfig> {
   return {
-    dingtalk: { enabled: true, clientId: '', clientSecret: '', status: '未连接' },
-    lark: { enabled: false, clientId: '', clientSecret: '', status: '未连接' },
-    wechat_work: { enabled: false, clientId: '', clientSecret: '', status: '未连接' },
-    wechat_work_bot: { enabled: false, clientId: '', clientSecret: '', status: '未连接' },
-    wechat: { enabled: false, clientId: '', clientSecret: 'https://ilinkai.weixin.qq.com', status: '未连接' },
+    dingtalk: { enabled: true, imChannelPaused: false, clientId: '', clientSecret: '', status: '未连接' },
+    lark: { enabled: false, imChannelPaused: false, clientId: '', clientSecret: '', status: '未连接' },
+    wechat_work: { enabled: false, imChannelPaused: false, clientId: '', clientSecret: '', status: '未连接' },
+    wechat_work_bot: { enabled: false, imChannelPaused: false, clientId: '', clientSecret: '', status: '未连接' },
+    wechat: {
+      enabled: false,
+      imChannelPaused: false,
+      clientId: '',
+      clientSecret: 'https://ilinkai.weixin.qq.com',
+      status: '未连接',
+    },
   }
 }
 

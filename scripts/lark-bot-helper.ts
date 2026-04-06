@@ -209,13 +209,13 @@ function forwardSdkLog(level: 'debug' | 'info' | 'warn' | 'error', parts: unknow
     return
   }
 
-  if (message.includes('ws connect success')) {
+  if (message.includes('ws connect success') || message.includes('event-dispatch is ready')) {
     startupController?.markReady(`飞书机器人已连接，当前绑定智能体: ${args.agentLabel}`)
     return
   }
 
   if (message.includes('ws client ready')) {
-    emitStatus('processing', `飞书长连接握手中，当前绑定智能体: ${args.agentLabel}`)
+    startupController?.markReady(`飞书机器人已连接，当前绑定智能体: ${args.agentLabel}`)
     return
   }
 
@@ -613,7 +613,10 @@ async function main(): Promise<void> {
     void shutdown()
   })
 
-  const dispatcher = new Lark.EventDispatcher({}).register({
+  const dispatcher = new Lark.EventDispatcher({
+    logger,
+    loggerLevel: Lark.LoggerLevel.info,
+  }).register({
     'im.message.receive_v1': async (data: {
       sender: { sender_id?: { open_id?: string; user_id?: string; union_id?: string }; sender_type?: string }
       message: {

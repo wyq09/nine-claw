@@ -11,15 +11,72 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ABORT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PI_FIRST_OUTPUT_TIMEOUT: Duration = Duration::from_secs(60);
 const PI_IDLE_OUTPUT_TIMEOUT: Duration = Duration::from_secs(60);
 const PI_TOTAL_RUNTIME_TIMEOUT: Duration = Duration::from_secs(180);
 const CHILD_KILL_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn pi_reuse_im_enabled() -> bool {
+    std::env::var("NINECLAW_PI_REUSE_IM")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+}
+
+struct ImPooledPi {
+    child: Child,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    stdout_rx: mpsc::Receiver<Result<String, String>>,
+    stderr_buffer: Arc<Mutex<String>>,
+    fingerprint: String,
+}
+
+type ImPiPoolMap = HashMap<String, Arc<Mutex<Option<ImPooledPi>>>>;
+
+fn im_pi_pool() -> &'static Mutex<ImPiPoolMap> {
+    static POOL: OnceLock<Mutex<ImPiPoolMap>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fingerprint_im_pi_turn(
+    provider_id: &str,
+    api_format: &str,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    session_path: &str,
+    system_prompt_sections: &[(String, String)],
+    skill_paths: &[PathBuf],
+) -> String {
+    let mut blob: Vec<u8> = Vec::new();
+    blob.extend_from_slice(provider_id.as_bytes());
+    blob.push(0);
+    blob.extend_from_slice(api_format.as_bytes());
+    blob.push(0);
+    blob.extend_from_slice(base_url.as_bytes());
+    blob.push(0);
+    blob.extend_from_slice(api_key.as_bytes());
+    blob.push(0);
+    blob.extend_from_slice(model.as_bytes());
+    blob.push(0);
+    blob.extend_from_slice(session_path.as_bytes());
+    blob.push(0);
+    for (label, content) in system_prompt_sections {
+        blob.extend_from_slice(label.as_bytes());
+        blob.push(1);
+        blob.extend_from_slice(content.as_bytes());
+        blob.push(2);
+    }
+    for path in skill_paths {
+        blob.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        blob.push(3);
+    }
+    format!("{:x}", Md5::digest(&blob))
+}
 
 fn spawn_pi_stdout_logger<R>(
     reader: R,
@@ -426,6 +483,109 @@ impl PiBridge {
         }
     }
 
+    fn spawn_pi_child_fresh(
+        &self,
+        mut cmd: Command,
+        channel_id: &str,
+        user_id: &str,
+        system_prompt_chars: usize,
+        prompt: &str,
+        system_prompt_sections: &[(String, String)],
+    ) -> Result<
+        (
+            Child,
+            Arc<Mutex<Option<ChildStdin>>>,
+            mpsc::Receiver<Result<String, String>>,
+            Arc<Mutex<String>>,
+        ),
+        String,
+    > {
+        let mut child = cmd.spawn().map_err(|e| {
+            format!(
+                "启动 pi 失败（executable={}）: {e}",
+                self.pi_runtime.executable.display()
+            )
+        })?;
+        dev_trace(
+            "bot.pi",
+            format!(
+                "启动 pi: channel={} user={} pid={} provider={} model={} prompt_chars={} system_prompt_chars={} pi_path={}",
+                channel_id,
+                user_id,
+                child.id(),
+                self.provider_id,
+                self.model,
+                prompt.chars().count(),
+                system_prompt_chars,
+                self.pi_runtime.executable.display()
+            ),
+        );
+        for (label, content) in system_prompt_sections {
+            dev_trace(
+                "bot.pi",
+                format!(
+                    "system_prompt_part: channel={} user={} label={} chars={}",
+                    channel_id,
+                    user_id,
+                    label,
+                    content.chars().count()
+                ),
+            );
+            dev_trace_block(
+                "bot.pi",
+                format!(
+                    "system_prompt_part channel={} user={} label={} chars={}",
+                    channel_id,
+                    user_id,
+                    label,
+                    content.chars().count()
+                ),
+                content,
+            );
+        }
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "无法获取 pi stdin".to_string())?;
+        let stdin = Arc::new(Mutex::new(Some(stdin)));
+
+        {
+            let mut stdin_guard = stdin
+                .lock()
+                .map_err(|e| format!("锁定 pi stdin 失败: {e}"))?;
+            let stdin_writer = stdin_guard
+                .as_mut()
+                .ok_or_else(|| "pi stdin 已关闭，无法写入 prompt".to_string())?;
+            let prompt_cmd = json!({
+                "id": "prompt-1",
+                "type": "prompt",
+                "message": prompt,
+            })
+            .to_string();
+            writeln!(stdin_writer, "{prompt_cmd}")
+                .map_err(|e| format!("写入 prompt 失败: {e}"))?;
+            stdin_writer
+                .flush()
+                .map_err(|e| format!("flush stdin 失败: {e}"))?;
+        }
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "无法获取 pi stdout".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "无法获取 pi stderr".to_string())?;
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let stderr_buffer = Arc::new(Mutex::new(String::new()));
+        spawn_pi_stdout_logger(stdout, "bot.pi.raw", stdout_tx);
+        spawn_pi_stderr_logger(stderr, "bot.pi.stderr", stderr_buffer.clone());
+
+        Ok((child, stdin, stdout_rx, stderr_buffer))
+    }
+
     /// Process an incoming message through pi, calling `on_chunk` every `chunk_size` characters.
     pub fn process_message<F>(
         &self,
@@ -508,6 +668,7 @@ impl PiBridge {
             cmd.args(["--api-key", &self.api_key]);
         }
 
+        let mut skill_paths: Vec<PathBuf> = Vec::new();
         let mut system_prompt_chars = 0usize;
         let mut system_prompt_sections: Vec<(String, String)> = Vec::new();
         if let Some(agent_config) = self.agent_config.as_ref() {
@@ -542,99 +703,131 @@ impl PiBridge {
             cmd.args(["--append-system-prompt", memory_isolation_prompt]);
 
             for skill_path in skills::resolve_skill_directories(&agent_config.skill_ids)? {
-                let skill_path = skill_path.to_string_lossy().to_string();
-                cmd.args(["--skill", &skill_path]);
+                skill_paths.push(skill_path.clone());
+                cmd.args(["--skill", &skill_path.to_string_lossy()]);
             }
         }
 
-        let mut child = cmd.spawn().map_err(|e| {
-            format!(
-                "启动 pi 失败（executable={}）: {e}",
-                self.pi_runtime.executable.display()
-            )
-        })?;
-        dev_trace(
-            "bot.pi",
-            format!(
-                "启动 pi: channel={} user={} pid={} provider={} model={} prompt_chars={} system_prompt_chars={} pi_path={}",
-                channel_id,
-                user_id,
-                child.id(),
-                self.provider_id,
-                self.model,
-                prompt.chars().count(),
-                system_prompt_chars,
-                self.pi_runtime.executable.display()
-            ),
+        let session_path_str = session_path.to_string_lossy().to_string();
+        let fingerprint = fingerprint_im_pi_turn(
+            self.provider_id.trim(),
+            self.api_format.trim(),
+            self.base_url.trim(),
+            self.api_key.trim(),
+            self.model.trim(),
+            &session_path_str,
+            &system_prompt_sections,
+            &skill_paths,
         );
-        for (label, content) in &system_prompt_sections {
-            dev_trace(
-                "bot.pi",
-                format!(
-                    "system_prompt_part: channel={} user={} label={} chars={}",
-                    channel_id,
-                    user_id,
-                    label,
-                    content.chars().count()
-                ),
-            );
-            dev_trace_block(
-                "bot.pi",
-                format!(
-                    "system_prompt_part channel={} user={} label={} chars={}",
-                    channel_id,
-                    user_id,
-                    label,
-                    content.chars().count()
-                ),
-                content,
-            );
-        }
 
-        // Write prompt to stdin
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "无法获取 pi stdin".to_string())?;
-        let stdin = Arc::new(Mutex::new(Some(stdin)));
+        let pool_slot = {
+            let mut map = im_pi_pool()
+                .lock()
+                .map_err(|_| "锁定 IM pi 池失败".to_string())?;
+            map.entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(None)))
+                .clone()
+        };
+        let mut pool_guard = pool_slot
+            .lock()
+            .map_err(|_| "锁定 IM pi 会话槽失败".to_string())?;
+
+        let (mut child, stdin, stdout_rx, stderr_buffer, reused_from_pool) =
+            if pi_reuse_im_enabled() {
+                if let Some(mut prev) = pool_guard.take() {
+                    let still_running = prev
+                        .child
+                        .try_wait()
+                        .map_err(|e| format!("检查池化 pi 状态失败: {e}"))?
+                        .is_none();
+                    if prev.fingerprint == fingerprint && still_running {
+                        dev_trace(
+                            "bot.pi",
+                            format!(
+                                "复用池化 pi: channel={} user={} pid={}",
+                                channel_id,
+                                user_id,
+                                prev.child.id(),
+                            ),
+                        );
+                        let ImPooledPi {
+                            child,
+                            stdin,
+                            stdout_rx,
+                            stderr_buffer,
+                            fingerprint: _,
+                        } = prev;
+                        (child, stdin, stdout_rx, stderr_buffer, true)
+                    } else {
+                        let _ = prev.child.kill();
+                        let _ = Self::wait_for_child_exit(&mut prev.child, CHILD_KILL_GRACE_TIMEOUT);
+                        drop(prev);
+                        let (c, i, o, e) = self.spawn_pi_child_fresh(
+                            cmd,
+                            channel_id,
+                            user_id,
+                            system_prompt_chars,
+                            prompt,
+                            &system_prompt_sections,
+                        )?;
+                        (c, i, o, e, false)
+                    }
+                } else {
+                    let (c, i, o, e) = self.spawn_pi_child_fresh(
+                        cmd,
+                        channel_id,
+                        user_id,
+                        system_prompt_chars,
+                        prompt,
+                        &system_prompt_sections,
+                    )?;
+                    (c, i, o, e, false)
+                }
+            } else {
+                let (c, i, o, e) = self.spawn_pi_child_fresh(
+                    cmd,
+                    channel_id,
+                    user_id,
+                    system_prompt_chars,
+                    prompt,
+                    &system_prompt_sections,
+                )?;
+                (c, i, o, e, false)
+            };
+
         let run_handle = Arc::new(PiRunHandle {
             abort_requested: Arc::new(AtomicBool::new(false)),
             pid: child.id(),
             stdin: stdin.clone(),
         });
-        {
-            let mut stdin_guard = stdin
-                .lock()
-                .map_err(|e| format!("锁定 pi stdin 失败: {e}"))?;
-            let stdin_writer = stdin_guard
-                .as_mut()
-                .ok_or_else(|| "pi stdin 已关闭，无法写入 prompt".to_string())?;
-            let prompt_cmd = json!({
-                "id": "prompt-1",
-                "type": "prompt",
-                "message": prompt,
-            })
-            .to_string();
-            writeln!(stdin_writer, "{}", prompt_cmd)
-                .map_err(|e| format!("写入 prompt 失败: {e}"))?;
-            stdin_writer
-                .flush()
-                .map_err(|e| format!("flush stdin 失败: {e}"))?;
+
+        if reused_from_pool {
+            let prompt_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let prompt_id = format!("prompt-{prompt_ns}");
+            {
+                let mut stdin_guard = stdin
+                    .lock()
+                    .map_err(|e| format!("锁定 pi stdin 失败: {e}"))?;
+                let stdin_writer = stdin_guard
+                    .as_mut()
+                    .ok_or_else(|| "pi stdin 已关闭，无法写入 prompt".to_string())?;
+                let prompt_cmd = json!({
+                    "id": prompt_id,
+                    "type": "prompt",
+                    "message": prompt,
+                })
+                .to_string();
+                writeln!(stdin_writer, "{prompt_cmd}")
+                    .map_err(|e| format!("写入 prompt 失败: {e}"))?;
+                stdin_writer
+                    .flush()
+                    .map_err(|e| format!("flush stdin 失败: {e}"))?;
+            }
         }
         on_run_start(run_handle.clone());
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "无法获取 pi stdout".to_string())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "无法获取 pi stderr".to_string())?;
-        let (stdout_tx, stdout_rx) = mpsc::channel();
-        let stderr_buffer = Arc::new(Mutex::new(String::new()));
-        spawn_pi_stdout_logger(stdout, "bot.pi.raw", stdout_tx);
-        spawn_pi_stderr_logger(stderr, "bot.pi.stderr", stderr_buffer.clone());
 
         let mut full_text = String::new();
         let mut chunk_buffer = String::new();
@@ -645,6 +838,8 @@ impl PiBridge {
         let mut saw_abort_event = false;
         let mut saw_assistant_activity = false;
         let started_at = Instant::now();
+        let ttft_start = Instant::now();
+        let mut logged_ttft = false;
 
         loop {
             if started_at.elapsed() >= PI_TOTAL_RUNTIME_TIMEOUT {
@@ -677,7 +872,22 @@ impl PiBridge {
                 .unwrap_or(Duration::from_secs(0));
             let timeout = base_timeout.min(remaining_total);
             let line = match stdout_rx.recv_timeout(timeout) {
-                Ok(Ok(line)) => line,
+                Ok(Ok(line)) => {
+                    if !logged_ttft {
+                        logged_ttft = true;
+                        dev_trace(
+                            "bot.pi",
+                            format!(
+                                "stdout_ttft_ms={} channel={} user={} reused_pool={}",
+                                ttft_start.elapsed().as_millis(),
+                                channel_id,
+                                user_id,
+                                reused_from_pool
+                            ),
+                        );
+                    }
+                    line
+                }
                 Ok(Err(_)) => {
                     if run_handle.is_abort_requested() {
                         saw_abort_event = true;
@@ -867,26 +1077,22 @@ impl PiBridge {
         if !chunk_buffer.is_empty() && !run_handle.is_abort_requested() && !saw_abort_event {
             on_chunk(&chunk_buffer);
         }
-        if let Ok(mut stdin_guard) = stdin.lock() {
-            let _ = stdin_guard.take();
-        }
-
-        let exit_outcome = Self::wait_for_child_exit(
-            &mut child,
-            if run_handle.is_abort_requested() || saw_abort_event {
-                ABORT_WAIT_TIMEOUT
-            } else {
-                Duration::from_secs(30)
-            },
-        )?;
-        let exit_status = exit_outcome.status;
 
         let stderr_text = stderr_buffer
             .lock()
             .map(|stderr| stderr.clone())
             .unwrap_or_else(|_| String::new());
 
+        let close_stdin = || {
+            if let Ok(mut stdin_guard) = stdin.lock() {
+                let _ = stdin_guard.take();
+            }
+        };
+
         if run_handle.is_abort_requested() || saw_abort_event {
+            close_stdin();
+            let _ = child.kill();
+            let _ = Self::wait_for_child_exit(&mut child, ABORT_WAIT_TIMEOUT);
             dev_trace(
                 "bot.pi",
                 format!("已中止: channel={} user={}", channel_id, user_id),
@@ -894,8 +1100,15 @@ impl PiBridge {
             return Ok(PiProcessOutcome::Aborted);
         }
 
-        // If pi exited without producing any assistant events, surface a more useful reason.
+        let still_alive_after_turn = child
+            .try_wait()
+            .map_err(|e| format!("检查 pi 退出状态失败: {e}"))?
+            .is_none();
+
         if full_text.is_empty() && !saw_done && !saw_agent_end {
+            close_stdin();
+            let exit_outcome = Self::wait_for_child_exit(&mut child, Duration::from_secs(30))?;
+            let exit_status = exit_outcome.status;
             let reason = if !stderr_text.trim().is_empty() {
                 stderr_text.trim().to_string()
             } else if saw_prompt_response || saw_any_output || saw_assistant_activity {
@@ -940,6 +1153,30 @@ impl PiBridge {
             );
             return Err(reason);
         }
+
+        if pi_reuse_im_enabled() && still_alive_after_turn {
+            *pool_guard = Some(ImPooledPi {
+                child,
+                stdin,
+                stdout_rx,
+                stderr_buffer,
+                fingerprint,
+            });
+            dev_trace(
+                "bot.pi",
+                format!(
+                    "完成(池化回收): channel={} user={} chars={}",
+                    channel_id,
+                    user_id,
+                    full_text.chars().count()
+                ),
+            );
+            return Ok(PiProcessOutcome::Completed(full_text));
+        }
+
+        close_stdin();
+        let exit_outcome = Self::wait_for_child_exit(&mut child, Duration::from_secs(30))?;
+        let exit_status = exit_outcome.status;
 
         if exit_status.map(|status| !status.success()).unwrap_or(true) {
             let reason = if exit_outcome.timed_out && stderr_text.trim().is_empty() {

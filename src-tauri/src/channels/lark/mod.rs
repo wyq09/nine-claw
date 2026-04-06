@@ -1,5 +1,6 @@
 use crate::agent_workspace;
 use crate::agents::ConversationAgentConfig;
+use crate::channels::im_message_merge_window_ms;
 use crate::channels::pi_bridge::{PiBridge, PiProcessOutcome, PiRunHandle};
 use crate::channels::types::{BotMessage, ChannelStatus, MediaPayload, MediaType};
 use crate::channels::Channel;
@@ -21,7 +22,6 @@ use uuid::Uuid;
 const TEXT_CHUNK_SIZE: usize = 3000;
 const STREAM_CHUNK_SIZE: usize = 500;
 const REQUEST_TIMEOUT_SECS: u64 = 90;
-const MESSAGE_COLLECT_WINDOW_MS: u64 = 800;
 const STARTUP_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Clone, Debug)]
@@ -135,6 +135,31 @@ impl LarkChannel {
             .map(|agent| format!("{} ({})", agent.name, agent.id))
             .unwrap_or_else(|| "未绑定智能体".to_string())
     }
+
+    fn resolve_helper_node_path(
+        pi_runtime: &crate::pi_runtime::PiRuntimeLocation,
+    ) -> Result<PathBuf, String> {
+        if cfg!(target_os = "macos") {
+            if let Some(system_node) = crate::pi_runtime::resolve_command_path(&["node"]) {
+                return Ok(system_node);
+            }
+        }
+
+        if let Some(resource_root) = pi_runtime.resource_root.as_ref() {
+            let bundled_name = if cfg!(target_os = "windows") {
+                "node.exe"
+            } else {
+                "node"
+            };
+            let bundled_node = resource_root.join(bundled_name);
+            if bundled_node.is_file() {
+                return Ok(bundled_node);
+            }
+        }
+
+        crate::pi_runtime::resolve_command_path(&["node.exe", "node"])
+            .ok_or_else(|| "未找到 Node.js，无法启动飞书机器人".to_string())
+    }
 }
 
 impl Channel for LarkChannel {
@@ -150,10 +175,9 @@ impl Channel for LarkChannel {
             let _ = self.stop();
         }
 
-        let node_path = crate::pi_runtime::resolve_command_path(&["node.exe", "node"])
-            .ok_or_else(|| "未找到 Node.js，无法启动飞书机器人".to_string())?;
         let helper_path = resolve_lark_helper_path(&app)?;
         let pi_runtime = crate::pi_runtime::require_pi_runtime_location(&app)?;
+        let node_path = Self::resolve_helper_node_path(&pi_runtime)?;
 
         let mut child = Command::new(node_path)
             .arg(&helper_path)
@@ -576,10 +600,11 @@ impl Channel for LarkChannel {
                                 None
                             } else {
                                 let elapsed = now_timestamp_ms() - state.last_inbound_at;
-                                if elapsed >= MESSAGE_COLLECT_WINDOW_MS as i64 {
+                                let merge_ms = im_message_merge_window_ms() as i64;
+                                if elapsed >= merge_ms {
                                     None
                                 } else {
-                                    Some((MESSAGE_COLLECT_WINDOW_MS as i64 - elapsed) as u64)
+                                    Some((merge_ms - elapsed) as u64)
                                 }
                             }
                         };

@@ -103363,12 +103363,12 @@ function forwardSdkLog(level, parts) {
   if (!message) {
     return;
   }
-  if (message.includes("ws connect success")) {
+  if (message.includes("ws connect success") || message.includes("event-dispatch is ready")) {
     startupController?.markReady(`\u98DE\u4E66\u673A\u5668\u4EBA\u5DF2\u8FDE\u63A5\uFF0C\u5F53\u524D\u7ED1\u5B9A\u667A\u80FD\u4F53: ${args.agentLabel}`);
     return;
   }
   if (message.includes("ws client ready")) {
-    emitStatus("processing", `\u98DE\u4E66\u957F\u8FDE\u63A5\u63E1\u624B\u4E2D\uFF0C\u5F53\u524D\u7ED1\u5B9A\u667A\u80FD\u4F53: ${args.agentLabel}`);
+    startupController?.markReady(`\u98DE\u4E66\u673A\u5668\u4EBA\u5DF2\u8FDE\u63A5\uFF0C\u5F53\u524D\u7ED1\u5B9A\u667A\u80FD\u4F53: ${args.agentLabel}`);
     return;
   }
   if (message.includes("client closed") || message.includes("closed manually")) {
@@ -103719,7 +103719,10 @@ async function main() {
   rl.on("close", () => {
     void shutdown();
   });
-  const dispatcher = new Lark.EventDispatcher({}).register({
+  const dispatcher = new Lark.EventDispatcher({
+    logger,
+    loggerLevel: Lark.LoggerLevel.info
+  }).register({
     "im.message.receive_v1": async (data) => {
       const senderType = data.sender?.sender_type?.toLowerCase() ?? "";
       if (senderType && senderType !== "user") {

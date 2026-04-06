@@ -70,6 +70,9 @@ pub struct AgentInput {
 #[serde(rename_all = "camelCase")]
 pub struct AgentBotConfig {
     pub enabled: bool,
+    /// 用户点击「断开」后为 true；为 false 时应用启动会尝试自动拉起已绑定凭证的通道。
+    #[serde(default)]
+    pub im_channel_paused: bool,
     pub client_id: String,
     pub client_secret: String,
     pub status: String,
@@ -1472,6 +1475,7 @@ fn normalize_bot_configs(
 fn normalize_bot_config(config: AgentBotConfig) -> AgentBotConfig {
     AgentBotConfig {
         enabled: config.enabled,
+        im_channel_paused: config.im_channel_paused,
         client_id: config.client_id.trim().to_string(),
         client_secret: config.client_secret.trim().to_string(),
         status: normalize_bot_status(&config.status),

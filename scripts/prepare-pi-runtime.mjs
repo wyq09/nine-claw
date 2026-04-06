@@ -149,6 +149,7 @@ function copyMacLibraries(sourceExecutable, targetDir) {
   const queue = [fs.realpathSync(sourceExecutable)]
   const visited = new Set()
   const copied = new Set()
+  const aliasPaths = new Set()
 
   while (queue.length > 0) {
     const current = queue.pop()
@@ -166,22 +167,153 @@ function copyMacLibraries(sourceExecutable, targetDir) {
         resolvedDependency = resolveRealPathIfExists(
           path.resolve(path.dirname(current), '..', 'lib', path.basename(rawDependency)),
         )
+      } else if (rawDependency.startsWith('@loader_path/')) {
+        resolvedDependency = resolveRealPathIfExists(
+          path.resolve(path.dirname(current), rawDependency.replace('@loader_path/', '')),
+        )
+      } else if (rawDependency.startsWith('@executable_path/')) {
+        resolvedDependency = resolveRealPathIfExists(
+          path.resolve(path.dirname(sourceExecutable), rawDependency.replace('@executable_path/', '')),
+        )
       } else if (rawDependency.startsWith('/')) {
         resolvedDependency = resolveRealPathIfExists(rawDependency)
       }
 
-      if (!resolvedDependency || copied.has(resolvedDependency)) continue
+      if (!resolvedDependency) continue
 
       fs.mkdirSync(libDir, { recursive: true })
       const targetPath = path.join(libDir, path.basename(resolvedDependency))
-      fs.copyFileSync(resolvedDependency, targetPath)
-      fs.chmodSync(targetPath, 0o755)
-      copied.add(resolvedDependency)
-      queue.push(resolvedDependency)
+      if (!copied.has(resolvedDependency)) {
+        fs.copyFileSync(resolvedDependency, targetPath)
+        fs.chmodSync(targetPath, 0o755)
+        copied.add(resolvedDependency)
+        queue.push(resolvedDependency)
+      }
+
+      const aliasName = path.basename(rawDependency)
+      if (aliasName && aliasName !== path.basename(resolvedDependency)) {
+        const aliasPath = path.join(libDir, aliasName)
+        if (!aliasPaths.has(aliasPath) && !fs.existsSync(aliasPath)) {
+          fs.symlinkSync(path.basename(resolvedDependency), aliasPath)
+          aliasPaths.add(aliasPath)
+        }
+      }
     }
   }
 
   return Array.from(copied)
+}
+
+function listMacDependencies(binaryPath) {
+  const output = runCommand('otool', ['-L', binaryPath])
+  return output
+    .split('\n')
+    .slice(1)
+    .map((line) => line.trim().split(' ')[0])
+    .filter(Boolean)
+}
+
+function listMacRpaths(binaryPath) {
+  const output = runCommand('otool', ['-l', binaryPath])
+  const lines = output.split('\n')
+  const rpaths = []
+
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!lines[index]?.includes('cmd LC_RPATH')) continue
+    const pathLine = lines
+      .slice(index, index + 6)
+      .find((line) => line.trim().startsWith('path '))
+    if (!pathLine) continue
+    const match = pathLine.trim().match(/^path\s+(.+?)\s+\(offset/)
+    if (match?.[1]) {
+      rpaths.push(match[1])
+    }
+  }
+
+  return rpaths
+}
+
+function rewriteMacBinary(binaryPath, libDir) {
+  const bundledLibTargets = new Map()
+  for (const entry of fs.readdirSync(libDir, { withFileTypes: true })) {
+    if (!entry.isFile() && !entry.isSymbolicLink()) continue
+    bundledLibTargets.set(entry.name, path.join(libDir, entry.name))
+  }
+
+  const binaryDir = path.dirname(binaryPath)
+  const binaryInLibDir = binaryDir === libDir
+
+  for (const rawDependency of listMacDependencies(binaryPath)) {
+    if (rawDependency.startsWith('/usr/lib/') || rawDependency.startsWith('/System/')) {
+      continue
+    }
+
+    let targetName = null
+    if (rawDependency.startsWith('@rpath/')) {
+      const rpathName = path.basename(rawDependency)
+      if (bundledLibTargets.has(rpathName)) {
+        targetName = rpathName
+      }
+    } else if (rawDependency.startsWith('@loader_path/') || rawDependency.startsWith('@executable_path/')) {
+      const loaderName = path.basename(rawDependency)
+      if (bundledLibTargets.has(loaderName)) {
+        targetName = loaderName
+      }
+    } else if (rawDependency.startsWith('/')) {
+      const resolvedDependency = resolveRealPathIfExists(rawDependency)
+      const resolvedName = resolvedDependency ? path.basename(resolvedDependency) : null
+      const rawName = path.basename(rawDependency)
+      if (rawName && bundledLibTargets.has(rawName)) {
+        targetName = rawName
+      } else if (resolvedName && bundledLibTargets.has(resolvedName)) {
+        targetName = resolvedName
+      }
+    }
+
+    if (!targetName) continue
+
+    const rewrittenPath = binaryInLibDir
+      ? `@loader_path/${targetName}`
+      : `@loader_path/lib/${targetName}`
+    runCommand('install_name_tool', ['-change', rawDependency, rewrittenPath, binaryPath])
+  }
+
+  if (binaryInLibDir) {
+    runCommand('install_name_tool', ['-id', `@loader_path/${path.basename(binaryPath)}`, binaryPath])
+    return
+  }
+
+  const desiredRpath = '@loader_path/lib'
+  if (!listMacRpaths(binaryPath).includes(desiredRpath)) {
+    runCommand('install_name_tool', ['-add_rpath', desiredRpath, binaryPath])
+  }
+
+  const legacyRpath = '@loader_path/../lib'
+  if (listMacRpaths(binaryPath).includes(legacyRpath)) {
+    runCommand('install_name_tool', ['-delete_rpath', legacyRpath, binaryPath])
+  }
+}
+
+function finalizeMacRuntimeBundle(targetDir, nodeTargetPath) {
+  const libDir = path.join(targetDir, 'lib')
+  if (!fs.existsSync(libDir)) {
+    return
+  }
+
+  for (const entry of fs.readdirSync(libDir, { withFileTypes: true })) {
+    if (!entry.isFile()) continue
+    rewriteMacBinary(path.join(libDir, entry.name), libDir)
+  }
+  for (const entry of fs.readdirSync(libDir, { withFileTypes: true })) {
+    if (!entry.isFile()) continue
+    signMacBinary(path.join(libDir, entry.name))
+  }
+  rewriteMacBinary(nodeTargetPath, libDir)
+  signMacBinary(nodeTargetPath)
+}
+
+function signMacBinary(binaryPath) {
+  runCommand('codesign', ['--force', '--sign', '-', '--timestamp=none', binaryPath])
 }
 
 function copyLinuxLibraries(sourceExecutable, targetDir) {
@@ -267,11 +399,15 @@ function writeLauncher(platformDir, targetDir) {
     '# Bundled pi launcher generated during build.',
     'set -eu',
     'SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"',
+    'NODE_BIN="$SCRIPT_DIR/node"',
+    'if [ "$(uname -s)" = "Darwin" ] && command -v node >/dev/null 2>&1; then',
+    '  NODE_BIN="$(command -v node)"',
+    'fi',
     'if [ -d "$SCRIPT_DIR/lib" ]; then',
     '  export DYLD_LIBRARY_PATH="$SCRIPT_DIR/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"',
     '  export LD_LIBRARY_PATH="$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
     'fi',
-    'exec "$SCRIPT_DIR/node" "$SCRIPT_DIR/pi-package/dist/cli.js" "$@"',
+    'exec "$NODE_BIN" "$SCRIPT_DIR/pi-package/dist/cli.js" "$@"',
     '',
   ].join('\n')
   fs.writeFileSync(launcherPath, content)
@@ -448,6 +584,9 @@ function main() {
     fs.chmodSync(nodeTargetPath, 0o755)
   }
   const copiedLibraries = copyBundledLibraries(platformDir, nodeExecutable, targetDir)
+  if (platformDir === 'macos') {
+    finalizeMacRuntimeBundle(targetDir, nodeTargetPath)
+  }
 
   copyRecursive(packageDir, packageTargetPath)
   rewritePackageSymlinks(packageTargetPath, packageDir)

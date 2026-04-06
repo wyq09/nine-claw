@@ -188,7 +188,7 @@ fn bundled_runtime_candidates(app: &AppHandle) -> Vec<PathBuf> {
     //   <resource_dir>/pi-runtime/macos/pi
     let search_roots: Vec<PathBuf> = vec![resource_dir.join("resources"), resource_dir.clone()];
 
-    let mut candidates = development_runtime_candidates();
+    let mut candidates = Vec::new();
     for search_root in &search_roots {
         for executable_name in executable_names {
             candidates.push(
@@ -204,6 +204,7 @@ fn bundled_runtime_candidates(app: &AppHandle) -> Vec<PathBuf> {
             );
         }
     }
+    candidates.extend(development_runtime_candidates());
 
     candidates
 }

@@ -185,6 +185,19 @@ struct ProviderRuntimeConfig {
     model: String,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredProviderPrefsRow {
+    #[serde(default)]
+    added: bool,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    api_format: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderPreferencesPayload {
@@ -695,7 +708,65 @@ fn normalize_provider_api_format(value: &str, provider_id: &str) -> &'static str
     }
 }
 
-fn normalized_provider_runtime_base_url(
+/// 微信/飞书 IM 必须使用绑定智能体的默认模型；Base URL / API Key 从应用全局 Provider 配置读取。
+pub(crate) fn resolve_im_llm_runtime(
+    app: &AppHandle,
+    default_provider_id: &str,
+    default_model: &str,
+) -> Result<ProviderRuntimeConfig, String> {
+    let provider_id = default_provider_id.trim().to_string();
+    let model = default_model.trim().to_string();
+    if provider_id.is_empty() || model.is_empty() {
+        return Err("智能体未配置默认 Provider 或模型".to_string());
+    }
+
+    let prefs = load_provider_preferences(app.clone())?;
+    let raw = prefs
+        .provider_configs
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if raw.is_empty() {
+        return Err("未找到全局 Provider 配置".to_string());
+    }
+
+    let map: HashMap<String, StoredProviderPrefsRow> =
+        serde_json::from_str(&raw).map_err(|e| format!("解析 Provider 配置失败: {e}"))?;
+
+    let row = map
+        .get(provider_id.as_str())
+        .ok_or_else(|| format!("全局设置中未找到 Provider「{provider_id}」"))?;
+
+    if !row.added {
+        return Err(format!("请先在设置中添加 Provider「{provider_id}」"));
+    }
+
+    let base_url = row.base_url.trim().to_string();
+    let api_key = row.api_key.trim().to_string();
+    if base_url.is_empty() || api_key.is_empty() {
+        return Err(format!(
+            "Provider「{provider_id}」的 Base URL 或 API Key 未填写完整"
+        ));
+    }
+
+    let api_format_raw = row.api_format.trim();
+    let api_format = if api_format_raw.is_empty() {
+        default_provider_api_format(&provider_id).to_string()
+    } else {
+        normalize_provider_api_format(api_format_raw, &provider_id).to_string()
+    };
+
+    Ok(ProviderRuntimeConfig {
+        provider_id,
+        api_format,
+        base_url,
+        api_key,
+        model,
+    })
+}
+
+pub(crate) fn normalized_provider_runtime_base_url(
     base_url: &str,
     api_format: &str,
     provider_id: &str,
@@ -1377,6 +1448,8 @@ async fn stream_pi_prompt(
         let mut assistant_terminal_error: Option<String> = None;
         let mut saw_any_output = false;
         let started_at = Instant::now();
+        let ttft_start = Instant::now();
+        let mut logged_ttft = false;
 
         loop {
             if started_at.elapsed() >= PI_TOTAL_RUNTIME_TIMEOUT {
@@ -1417,7 +1490,20 @@ async fn stream_pi_prompt(
                 .unwrap_or(Duration::from_secs(0));
             let timeout = base_timeout.min(remaining_total);
             let line = match stdout_rx.recv_timeout(timeout) {
-                Ok(Ok(current_line)) => current_line,
+                Ok(Ok(current_line)) => {
+                    if !logged_ttft {
+                        logged_ttft = true;
+                        dev_trace(
+                            "desktop.stream",
+                            format!(
+                                "stdout_ttft_ms={} session={}",
+                                ttft_start.elapsed().as_millis(),
+                                normalized_session_id
+                            ),
+                        );
+                    }
+                    current_line
+                }
                 Ok(Err(error)) => {
                     remove_runtime_handle(&normalized_session_id)?;
                     if abort_requested.load(Ordering::SeqCst) {
@@ -2205,14 +2291,25 @@ fn start_wechat_channel(
     token: String,
     base_url: Option<String>,
     route_tag: Option<String>,
-    provider_id: Option<String>,
-    provider_api_format: Option<String>,
-    model: Option<String>,
-    api_key: Option<String>,
-    provider_base_url: Option<String>,
+    _provider_id: Option<String>,
+    _provider_api_format: Option<String>,
+    _model: Option<String>,
+    _api_key: Option<String>,
+    _provider_base_url: Option<String>,
 ) -> Result<(), String> {
     let agent_config = agents::get_conversation_agent_config(&app, &agent_id)?
         .ok_or_else(|| "绑定的智能体不存在，无法启动 IM 机器人".to_string())?;
+
+    let runtime = resolve_im_llm_runtime(
+        &app,
+        &agent_config.default_provider_id,
+        &agent_config.default_model,
+    )?;
+    let normalized_base = normalized_provider_runtime_base_url(
+        &runtime.base_url,
+        &runtime.api_format,
+        &runtime.provider_id,
+    );
 
     let mut mgr = channel_manager()
         .lock()
@@ -2225,11 +2322,11 @@ fn start_wechat_channel(
         token,
         base_url: base_url.unwrap_or_default(),
         route_tag,
-        ai_provider_id: provider_id.unwrap_or_default(),
-        ai_api_format: provider_api_format.unwrap_or_else(|| "openai".to_string()),
-        ai_base_url: provider_base_url.unwrap_or_default(),
-        ai_api_key: api_key.unwrap_or_default(),
-        ai_model: model.unwrap_or_default(),
+        ai_provider_id: runtime.provider_id.clone(),
+        ai_api_format: runtime.api_format.clone(),
+        ai_base_url: normalized_base,
+        ai_api_key: runtime.api_key.clone(),
+        ai_model: runtime.model.clone(),
     })?;
     drop(mgr);
     if let Some(mut channel) = old {
@@ -2249,14 +2346,25 @@ fn start_lark_channel(
     agent_id: String,
     app_id: String,
     app_secret: String,
-    provider_id: Option<String>,
-    provider_api_format: Option<String>,
-    model: Option<String>,
-    api_key: Option<String>,
-    provider_base_url: Option<String>,
+    _provider_id: Option<String>,
+    _provider_api_format: Option<String>,
+    _model: Option<String>,
+    _api_key: Option<String>,
+    _provider_base_url: Option<String>,
 ) -> Result<(), String> {
     let agent_config = agents::get_conversation_agent_config(&app, &agent_id)?
         .ok_or_else(|| "绑定的智能体不存在，无法启动 IM 机器人".to_string())?;
+
+    let runtime = resolve_im_llm_runtime(
+        &app,
+        &agent_config.default_provider_id,
+        &agent_config.default_model,
+    )?;
+    let normalized_base = normalized_provider_runtime_base_url(
+        &runtime.base_url,
+        &runtime.api_format,
+        &runtime.provider_id,
+    );
 
     let mut mgr = channel_manager()
         .lock()
@@ -2267,11 +2375,11 @@ fn start_lark_channel(
         agent_config: Some(agent_config),
         app_id,
         app_secret,
-        ai_provider_id: provider_id.unwrap_or_default(),
-        ai_api_format: provider_api_format.unwrap_or_else(|| "openai".to_string()),
-        ai_base_url: provider_base_url.unwrap_or_default(),
-        ai_api_key: api_key.unwrap_or_default(),
-        ai_model: model.unwrap_or_default(),
+        ai_provider_id: runtime.provider_id.clone(),
+        ai_api_format: runtime.api_format.clone(),
+        ai_base_url: normalized_base,
+        ai_api_key: runtime.api_key.clone(),
+        ai_model: runtime.model.clone(),
     })?;
     drop(mgr);
     if let Some(mut channel) = old {
@@ -2306,36 +2414,36 @@ fn auto_start_bound_im_services(app: &AppHandle) -> Result<(), String> {
 
     for agent in agent_records {
         for (channel_key, config) in &agent.bot_configs {
-            if !config.enabled {
+            if config.im_channel_paused {
                 continue;
             }
 
-            let provider_id = config
-                .ai_provider_id
-                .as_ref()
-                .filter(|value| !value.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| agent.default_provider_id.clone());
-            let model = config
-                .ai_model
-                .as_ref()
-                .filter(|value| !value.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| agent.default_model.clone());
-            let provider_api_format = config
-                .ai_api_format
-                .as_ref()
-                .filter(|value| !value.trim().is_empty())
-                .cloned()
-                .or_else(|| Some(default_provider_api_format(&provider_id).to_string()));
-            let provider_base_url = config.ai_base_url.clone();
-            let api_key = config.ai_api_key.clone();
+            let has_credentials = match channel_key.as_str() {
+                "wechat" => config
+                    .token
+                    .as_ref()
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false),
+                "lark" => {
+                    !config.client_id.trim().is_empty() && !config.client_secret.trim().is_empty()
+                }
+                _ => false,
+            };
 
-            if provider_id.trim().is_empty() || model.trim().is_empty() {
+            if !has_credentials {
+                continue;
+            }
+
+            if let Err(error) = resolve_im_llm_runtime(
+                app,
+                &agent.default_provider_id,
+                &agent.default_model,
+            ) {
                 log::warn!(
-                    "跳过自动启动 {} 机器人: 智能体 {} 缺少模型配置",
+                    "跳过自动启动智能体 {} 的 {} 机器人: {}",
+                    agent.id,
                     channel_key,
-                    agent.id
+                    error
                 );
                 continue;
             }
@@ -2361,11 +2469,11 @@ fn auto_start_bound_im_services(app: &AppHandle) -> Result<(), String> {
                         token.clone(),
                         base_url,
                         config.route_tag.clone(),
-                        Some(provider_id),
-                        provider_api_format,
-                        Some(model),
-                        api_key,
-                        provider_base_url,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     ) {
                         log::warn!("自动启动智能体 {} 的微信机器人失败: {}", agent.id, error);
                     } else {
@@ -2385,11 +2493,11 @@ fn auto_start_bound_im_services(app: &AppHandle) -> Result<(), String> {
                         agent.id.clone(),
                         app_id.to_string(),
                         app_secret.to_string(),
-                        Some(provider_id),
-                        provider_api_format,
-                        Some(model),
-                        api_key,
-                        provider_base_url,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     ) {
                         log::warn!("自动启动智能体 {} 的飞书机器人失败: {}", agent.id, error);
                     } else {
