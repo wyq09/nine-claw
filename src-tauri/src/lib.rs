@@ -1,10 +1,12 @@
 mod agent_workspace;
 mod agents;
 mod channels;
+mod peer_gateway;
 mod chat_attachments;
 mod dev_trace;
 mod heartbeat;
 mod pi_runtime;
+mod pi_timeouts;
 mod skills;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as _};
@@ -15,6 +17,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +25,36 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Build a reqwest client that auto-detects proxy availability.
+/// If proxy env vars are set and the proxy port is reachable, use proxy.
+/// Otherwise, skip proxy to avoid connecting to a dead port.
+fn build_http_client() -> reqwest::Client {
+    let proxy_available = std::env::var("http_proxy")
+        .or_else(|_| std::env::var("https_proxy"))
+        .or_else(|_| std::env::var("all_proxy"))
+        .ok()
+        .and_then(|proxy_url| {
+            // Extract host:port from proxy URL like "http://127.0.0.1:7890" or "socks5://127.0.0.1:7890"
+            let stripped = proxy_url
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .trim_start_matches("socks5://")
+                .trim_start_matches("socks5h://");
+            TcpStream::connect_timeout(
+                &stripped.parse().ok()?,
+                Duration::from_millis(500),
+            )
+            .ok()
+        })
+        .is_some();
+
+    let mut builder = reqwest::Client::builder();
+    if !proxy_available {
+        builder = builder.no_proxy();
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
 use tauri::{AppHandle, Emitter, Manager, PhysicalSize, Size};
 
 use agent_workspace::AgentWorkspaceBundle;
@@ -210,9 +243,6 @@ struct ChildExitOutcome {
     timed_out: bool,
 }
 
-const PI_FIRST_OUTPUT_TIMEOUT: Duration = Duration::from_secs(60);
-const PI_IDLE_OUTPUT_TIMEOUT: Duration = Duration::from_secs(60);
-const PI_TOTAL_RUNTIME_TIMEOUT: Duration = Duration::from_secs(180);
 const CHILD_KILL_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn spawn_pi_stdout_logger<R>(
@@ -1018,6 +1048,35 @@ fn extract_text_content(value: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
+/// 流式 `text_delta` 与 `message_update.done` / `message_end` / `agent_end` 中的正文快照在空白或拼接上
+/// 可能略有差异；若 `strip_prefix` 失败就整段重发，会把同一段回复追加多遍（用户看到 2～3 条重复内容）。
+fn assistant_text_fragment_to_append(emitted: &str, snapshot: &str) -> String {
+    if snapshot.is_empty() {
+        return String::new();
+    }
+    if emitted.is_empty() {
+        return snapshot.to_string();
+    }
+    if emitted == snapshot {
+        return String::new();
+    }
+    if let Some(rest) = snapshot.strip_prefix(emitted) {
+        return rest.to_string();
+    }
+    let emitted_trim = emitted.trim_end();
+    let snapshot_trim = snapshot.trim_end();
+    if emitted_trim == snapshot_trim {
+        return String::new();
+    }
+    if let Some(rest) = snapshot_trim.strip_prefix(emitted_trim) {
+        return rest.to_string();
+    }
+    if let Some(rest) = snapshot.strip_prefix(emitted_trim) {
+        return rest.to_string();
+    }
+    String::new()
+}
+
 fn resize_main_window_to_screen(app: &tauri::AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         return;
@@ -1450,11 +1509,14 @@ async fn stream_pi_prompt(
         let started_at = Instant::now();
         let ttft_start = Instant::now();
         let mut logged_ttft = false;
+        let pi_total_runtime_timeout = pi_timeouts::pi_total_runtime_timeout();
+        let pi_first_output_timeout = pi_timeouts::pi_first_output_timeout();
+        let pi_idle_output_timeout = pi_timeouts::pi_idle_output_timeout();
 
         loop {
-            if started_at.elapsed() >= PI_TOTAL_RUNTIME_TIMEOUT {
+            if started_at.elapsed() >= pi_total_runtime_timeout {
                 let timeout_error =
-                    format!("pi 总运行超时（>{} 秒）", PI_TOTAL_RUNTIME_TIMEOUT.as_secs());
+                    format!("pi 总运行超时（>{} 秒）", pi_total_runtime_timeout.as_secs());
                 dev_trace(
                     "desktop.stream",
                     format!("pi 超时: session={} error={}", normalized_session_id, timeout_error),
@@ -1481,11 +1543,11 @@ async fn stream_pi_prompt(
             }
 
             let base_timeout = if saw_any_output {
-                PI_IDLE_OUTPUT_TIMEOUT
+                pi_idle_output_timeout
             } else {
-                PI_FIRST_OUTPUT_TIMEOUT
+                pi_first_output_timeout
             };
-            let remaining_total = PI_TOTAL_RUNTIME_TIMEOUT
+            let remaining_total = pi_total_runtime_timeout
                 .checked_sub(started_at.elapsed())
                 .unwrap_or(Duration::from_secs(0));
             let timeout = base_timeout.min(remaining_total);
@@ -1528,11 +1590,11 @@ async fn stream_pi_prompt(
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     let timeout_error = if timeout == remaining_total {
-                        format!("pi 总运行超时（>{} 秒）", PI_TOTAL_RUNTIME_TIMEOUT.as_secs())
+                        format!("pi 总运行超时（>{} 秒）", pi_total_runtime_timeout.as_secs())
                     } else if saw_any_output {
-                        format!("等待 pi 后续输出超时（>{} 秒）", PI_IDLE_OUTPUT_TIMEOUT.as_secs())
+                        format!("等待 pi 后续输出超时（>{} 秒）", pi_idle_output_timeout.as_secs())
                     } else {
-                        format!("等待 pi 首包输出超时（>{} 秒）", PI_FIRST_OUTPUT_TIMEOUT.as_secs())
+                        format!("等待 pi 首包输出超时（>{} 秒）", pi_first_output_timeout.as_secs())
                     };
                     dev_trace(
                         "desktop.stream",
@@ -1729,19 +1791,9 @@ async fn stream_pi_prompt(
                 if delta_type == "done" {
                     let final_text =
                         extract_text_content(assistant_event.and_then(|item| item.get("message")));
-                    if let Some(final_text) = final_text {
-                        let missing_text = if emitted_assistant_text.is_empty() {
-                            final_text
-                        } else if let Some(suffix) =
-                            final_text.strip_prefix(&emitted_assistant_text)
-                        {
-                            suffix.to_string()
-                        } else if final_text != emitted_assistant_text {
-                            final_text
-                        } else {
-                            String::new()
-                        };
-
+                    if let Some(snapshot) = final_text {
+                        let missing_text =
+                            assistant_text_fragment_to_append(&emitted_assistant_text, &snapshot);
                         if !missing_text.is_empty() {
                             emitted_assistant_text.push_str(&missing_text);
                             emit_stream_event(
@@ -1790,18 +1842,9 @@ async fn stream_pi_prompt(
                     == Some("assistant");
 
                 if is_assistant {
-                    if let Some(final_text) = extract_text_content(message) {
-                        let missing_text = if emitted_assistant_text.is_empty() {
-                            final_text
-                        } else if let Some(suffix) = final_text.strip_prefix(&emitted_assistant_text)
-                        {
-                            suffix.to_string()
-                        } else if final_text != emitted_assistant_text {
-                            final_text
-                        } else {
-                            String::new()
-                        };
-
+                    if let Some(snapshot) = extract_text_content(message) {
+                        let missing_text =
+                            assistant_text_fragment_to_append(&emitted_assistant_text, &snapshot);
                         if !missing_text.is_empty() {
                             emitted_assistant_text.push_str(&missing_text);
                             emit_stream_event(
@@ -1924,19 +1967,9 @@ async fn stream_pi_prompt(
                     if let Some(last_assistant) = messages.iter().rev().find(|message| {
                         message.get("role").and_then(|item| item.as_str()) == Some("assistant")
                     }) {
-                        if let Some(final_text) = extract_text_content(Some(last_assistant)) {
-                            let missing_text = if emitted_assistant_text.is_empty() {
-                                final_text
-                            } else if let Some(suffix) =
-                                final_text.strip_prefix(&emitted_assistant_text)
-                            {
-                                suffix.to_string()
-                            } else if final_text != emitted_assistant_text {
-                                final_text
-                            } else {
-                                String::new()
-                            };
-
+                        if let Some(snapshot) = extract_text_content(Some(last_assistant)) {
+                            let missing_text =
+                                assistant_text_fragment_to_append(&emitted_assistant_text, &snapshot);
                             if !missing_text.is_empty() {
                                 emitted_assistant_text.push_str(&missing_text);
                                 emit_stream_event(
@@ -2402,6 +2435,40 @@ async fn bot_stop_wechat(channel_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn rotate_agent_peer_inbound_secret(
+    app: AppHandle,
+    agent_id: String,
+) -> Result<agents::AgentRecord, String> {
+    agents::rotate_agent_peer_inbound_secret(&app, &agent_id)
+}
+
+#[tauri::command]
+fn get_peer_gateway_info(app: AppHandle) -> peer_gateway::PeerGatewayInfo {
+    peer_gateway::get_peer_gateway_info(&app)
+}
+
+#[tauri::command]
+fn load_peer_gateway_settings(app: AppHandle) -> Result<peer_gateway::PeerGatewaySettings, String> {
+    peer_gateway::load_peer_gateway_settings(&app)
+}
+
+#[tauri::command]
+fn save_peer_gateway_settings(
+    app: AppHandle,
+    settings: peer_gateway::PeerGatewaySettings,
+) -> Result<peer_gateway::PeerGatewayInfo, String> {
+    if peer_gateway::peer_bind_from_env().is_some() {
+        return Err(
+            "已设置环境变量 NINECLAW_PEER_BIND，监听地址由环境变量决定；请取消该变量后再使用应用内设置。"
+                .into(),
+        );
+    }
+    peer_gateway::save_peer_gateway_settings(&app, &settings)?;
+    peer_gateway::restart_peer_gateway(&app)?;
+    Ok(peer_gateway::get_peer_gateway_info(&app))
+}
+
+#[tauri::command]
 async fn bot_stop_lark(channel_id: String) -> Result<(), String> {
     let mut mgr = channel_manager()
         .lock()
@@ -2553,10 +2620,7 @@ async fn test_llm_provider_connection(
         return Err("模型名称不能为空".to_string());
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(45))
-        .build()
-        .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))?;
+    let client = build_http_client();
 
     let (url, request) = match api_format {
         "anthropic" => {
@@ -2690,6 +2754,18 @@ pub fn run() {
             if let Err(error) = auto_start_bound_im_services(&app.handle()) {
                 log::warn!("应用启动时自动检测 IM 机器人绑定失败: {}", error);
             }
+            match agents::backfill_peer_inbound_secrets(&app.handle()) {
+                Ok(count) if count > 0 => {
+                    log::info!("已为 {count} 个智能体补全对等入站独立密钥");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log::warn!("对等入站密钥补全未执行: {error}");
+                }
+            }
+            if let Err(error) = peer_gateway::restart_peer_gateway(&app.handle()) {
+                log::warn!("对等网关启动: {error}");
+            }
             heartbeat::start_heartbeat_scheduler(app.handle().clone());
 
             if cfg!(debug_assertions) {
@@ -2714,6 +2790,10 @@ pub fn run() {
             get_default_agent,
             create_agent,
             update_agent,
+            rotate_agent_peer_inbound_secret,
+            get_peer_gateway_info,
+            load_peer_gateway_settings,
+            save_peer_gateway_settings,
             archive_agent,
             delete_agent,
             set_default_agent,

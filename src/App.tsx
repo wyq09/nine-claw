@@ -43,6 +43,7 @@ import type {
   PersistedChatAttachment,
   CustomProviderMeta,
   ProviderApiFormat,
+  PeerGatewayInfo,
   ResourceItem,
 
   SettingsTab,
@@ -64,12 +65,14 @@ import {
   botStopWechat,
   createAgent,
   getDefaultAgent,
+  getPeerGatewayInfo,
   installSystemSkill,
   listInstalledSkills,
   listAgents,
   loadProviderPreferences,
   listSystemSkillCatalog,
   readAgentWorkspaceBundle,
+  rotateAgentPeerInboundSecret,
   saveProviderPreferences,
   setDefaultAgent,
   subscribeQrCode,
@@ -2889,6 +2892,24 @@ function App() {
     }
   }
 
+  const handleRotatePeerSecret = async () => {
+    if (!selectedManagedAgent) {
+      return
+    }
+    setBotLoading(true)
+    setAgentFormError('')
+    setAgentFormNotice('')
+    try {
+      await rotateAgentPeerInboundSecret(selectedManagedAgent.id)
+      await refreshAgents(selectedManagedAgent.id)
+      setAgentFormNotice('已重新生成该智能体的对等入站密钥并写入数据库。')
+    } catch (error) {
+      setAgentFormError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBotLoading(false)
+    }
+  }
+
   const renderContent = () => {
     if (view === 'chat') {
       return (
@@ -3024,6 +3045,7 @@ function App() {
         onWechatLogin={handleWechatLogin}
         onWechatStart={handleWechatStart}
         onWechatStop={handleWechatStop}
+        onRotatePeerSecret={handleRotatePeerSecret}
         searchValue={agentSearch}
         selectedAgent={selectedManagedAgent}
         selectedBotConfig={selectedManagedBotConfig}
@@ -3038,6 +3060,7 @@ function App() {
         qrStatus={qrStatus}
         setBotLoading={setBotLoading}
         setQrDialogOpen={setQrDialogOpen}
+        managedAgentId={managedAgentId}
       />
     )
   }
@@ -4653,6 +4676,86 @@ function AgentSkillPickerDialog({
   )
 }
 
+function buildAgentPeerSnippet(
+  info: PeerGatewayInfo,
+  savedAgentId: string | null,
+  peerSecret: string,
+): string {
+  const lines: string[] = []
+  lines.push('── NineClaw 智能体对等接入说明 ──')
+  lines.push('')
+  if (info.envOverrideActive) {
+    lines.push('【说明】监听地址由环境变量 NINECLAW_PEER_BIND 决定，与应用内「设置 → 通用」中的端口无关。')
+    lines.push('')
+  }
+  if (!info.enabled) {
+    lines.push(
+      '【注意】当前未监听对等 HTTP。请在 NineClaw「设置 → 通用 → 对等 HTTP（虾）」中启用并配置端口（默认 1052），或设置环境变量 NINECLAW_PEER_BIND。',
+    )
+    lines.push('')
+  }
+  if (info.listenAddress) {
+    lines.push(`进程监听：${info.listenAddress}`)
+  }
+  if (info.publicBaseUrl) {
+    lines.push(`API 接口地址：${info.publicBaseUrl}`)
+  }
+  if (info.inboundUrl) {
+    lines.push(`入站接口（POST）：${info.inboundUrl}`)
+  }
+  if (info.healthUrl) {
+    lines.push(`健康检查（GET）：${info.healthUrl}`)
+  }
+  lines.push('')
+  lines.push('鉴权：请求头 Authorization: Bearer <本智能体入站密钥>')
+  lines.push('')
+  if (savedAgentId) {
+    lines.push(`本智能体 ID（JSON 字段 toAgentId）：${savedAgentId}`)
+  } else {
+    lines.push('本智能体 ID：请先保存智能体，保存后即可在此看到稳定 ID。')
+  }
+  lines.push(
+    peerSecret
+      ? `本智能体入站密钥：${peerSecret}`
+      : '本智能体入站密钥：（保存智能体后由系统生成；或在「机器人 → 虾/对等」查看 / 重新生成）',
+  )
+  lines.push('')
+  lines.push('请求 JSON 示例：')
+  lines.push(
+    JSON.stringify(
+      {
+        protocol: 'nineclaw-peer',
+        version: 1,
+        fromAgentId: '<我的名字>',
+        toAgentId: savedAgentId || '<保存后替换为本智能体ID>',
+        threadId: '同一会话固定字符串',
+        text: '你好',
+      },
+      null,
+      2,
+    ),
+  )
+  lines.push('')
+  lines.push('同步成功时响应示例（统一信封，字段均为 camelCase）：')
+  lines.push(
+    JSON.stringify(
+      {
+        protocol: 'nineclaw-peer',
+        version: 1,
+        ok: true,
+        kind: 'inboundReply',
+        fromAgentId: '<我的名字>',
+        toAgentId: savedAgentId || '<本智能体ID>',
+        threadId: '同一会话固定字符串',
+        reply: '助手回复正文',
+      },
+      null,
+      2,
+    ),
+  )
+  return lines.join('\n')
+}
+
 type AgentEditorDialogProps = {
   agentDraft: AgentInput | null
   agentDeleteConfirmOpen: boolean
@@ -4679,6 +4782,8 @@ type AgentEditorDialogProps = {
   onSetDefaultAgent: () => void
   onToggleSkill: (skillId: string) => void
   selectedAgent: AgentRecord | null
+  /** 已保存智能体的 id；新建为空字符串 */
+  managedAgentId: string
 }
 
 function AgentEditorDialog({
@@ -4707,10 +4812,43 @@ function AgentEditorDialog({
   onSetDefaultAgent,
   onToggleSkill,
   selectedAgent,
+  managedAgentId,
 }: AgentEditorDialogProps) {
+  const [peerGatewayInfo, setPeerGatewayInfo] = useState<PeerGatewayInfo | null>(null)
+  const [peerGatewayLoadError, setPeerGatewayLoadError] = useState('')
+  const [peerSnippetCopied, setPeerSnippetCopied] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    setPeerGatewayLoadError('')
+    void getPeerGatewayInfo()
+      .then((value) => {
+        if (!cancelled) {
+          setPeerGatewayInfo(value)
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setPeerGatewayLoadError(error instanceof Error ? error.message : String(error))
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [managedAgentId])
+
   if (!agentDraft) {
     return null
   }
+
+  const peerDraftConfigs = createAgentBotConfigState(agentDraft.botConfigs)
+  const peerDraftSecret =
+    peerDraftConfigs.peer?.peerSharedSecret?.trim() || peerDraftConfigs.peer?.clientSecret?.trim() || ''
+  const savedAgentIdForPeer = managedAgentId.trim() || null
+  const peerSnippetText =
+    peerGatewayInfo !== null
+      ? buildAgentPeerSnippet(peerGatewayInfo, savedAgentIdForPeer, peerDraftSecret)
+      : ''
 
   const selectedModelValue =
     agentDraft.defaultProviderId.trim() && agentDraft.defaultModel.trim()
@@ -4811,6 +4949,73 @@ function AgentEditorDialog({
         </div>
 
         <div className="agent-editor-dialog-scroll">
+          <div className="agent-peer-integration-card">
+            <div className="agent-peer-integration-head">
+              <strong>对等 HTTP（虾）对接</strong>
+              <span>全应用共用一个监听端口；下列地址与「可复制说明」会包含本智能体的密钥与 ID。</span>
+            </div>
+            {peerGatewayLoadError ? (
+              <div className="skills-feedback error agent-feedback inline">
+                <span>读取网关信息失败：{peerGatewayLoadError}</span>
+              </div>
+            ) : null}
+            {peerGatewayInfo ? (
+              <>
+                <div className="agent-peer-api-grid">
+                  <label className="input-field">
+                    <span>监听地址（NINECLAW_PEER_BIND）</span>
+                    <input
+                      readOnly
+                      value={
+                        peerGatewayInfo.enabled && peerGatewayInfo.listenAddress
+                          ? peerGatewayInfo.listenAddress
+                          : '未配置（未监听）'
+                      }
+                    />
+                  </label>
+                  <label className="input-field">
+                    <span>入站 API（POST）</span>
+                    <input readOnly value={peerGatewayInfo.inboundUrl ?? '—'} />
+                  </label>
+                  <label className="input-field">
+                    <span>健康检查（GET）</span>
+                    <input readOnly value={peerGatewayInfo.healthUrl ?? '—'} />
+                  </label>
+                </div>
+                <div className="agent-peer-snippet-toolbar">
+                  <span className="agent-peer-snippet-label">给对方的一键说明（含密钥）</span>
+                  <button
+                    type="button"
+                    className="outline-button"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(peerSnippetText).then(() => {
+                        setPeerSnippetCopied(true)
+                        window.setTimeout(() => setPeerSnippetCopied(false), 2000)
+                      })
+                    }}
+                  >
+                    {peerSnippetCopied ? (
+                      <>
+                        <Check size={16} />
+                        <span>已复制</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy size={16} />
+                        <span>复制全文</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+                <pre className="agent-peer-snippet-pre">{peerSnippetText}</pre>
+              </>
+            ) : (
+              <div className="agent-workspace-hint">
+                <span>正在读取对等网关信息…</span>
+              </div>
+            )}
+          </div>
+
           <div className="agent-detail-card agent-editor-card">
             <div className="agent-detail-hero" style={{ borderColor: `${editorAccent}1f` }}>
               <div className="agent-detail-hero-main">
@@ -5431,6 +5636,7 @@ function AgentEditorDialog({
 }
 
 type AgentBotBindingDialogProps = {
+  agentId: string
   agentName: string
   botConfigs: Record<string, BotConfig>
   botLoading: boolean
@@ -5441,6 +5647,7 @@ type AgentBotBindingDialogProps = {
   onClose: () => void
   onLarkStart: () => void
   onLarkStop: () => void
+  onRotatePeerSecret: () => void
   onSave: () => void
   onSelectBot: (id: BotChannelId) => void
   onWechatLogin: () => void
@@ -5458,6 +5665,7 @@ type AgentBotBindingDialogProps = {
 }
 
 function AgentBotBindingDialog({
+  agentId,
   agentName,
   botConfigs,
   botLoading,
@@ -5468,6 +5676,7 @@ function AgentBotBindingDialog({
   onClose,
   onLarkStart,
   onLarkStop,
+  onRotatePeerSecret,
   onSave,
   onSelectBot,
   onWechatLogin,
@@ -5564,25 +5773,59 @@ function AgentBotBindingDialog({
                   </div>
                 </div>
 
-                <div className="agent-form-grid">
-                  <label className="input-field">
-                    <span>{selectedBotDefinition.keyLabel}</span>
-                    <input
-                      value={selectedBotConfig.clientId}
-                      onChange={(event) => onBotConfigChange(selectedBotId, { clientId: event.target.value })}
-                      placeholder={selectedBotDefinition.keyPlaceholder}
-                    />
-                  </label>
+                {selectedBotId === 'peer' ? (
+                  <div className="agent-form-grid">
+                    <label className="input-field agent-field-full">
+                      <span>智能体 ID（对方填 toAgentId）</span>
+                      <input readOnly value={agentId} />
+                    </label>
+                    <label className="input-field agent-field-full">
+                      <span>本智能体入站密钥（Bearer）</span>
+                      <input
+                        value={
+                          selectedBotConfig.peerSharedSecret?.trim()
+                            ? selectedBotConfig.peerSharedSecret
+                            : selectedBotConfig.clientSecret
+                        }
+                        onChange={(event) =>
+                          onBotConfigChange('peer', { peerSharedSecret: event.target.value })
+                        }
+                        placeholder="保存智能体后由系统自动分配，也可自填"
+                        autoComplete="off"
+                      />
+                    </label>
+                    <div className="bot-action-row agent-field-full">
+                      <button
+                        type="button"
+                        className="outline-button"
+                        onClick={onRotatePeerSecret}
+                        disabled={botLoading || saving}
+                      >
+                        <span>{botLoading ? '处理中…' : '重新生成密钥'}</span>
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="agent-form-grid">
+                    <label className="input-field">
+                      <span>{selectedBotDefinition.keyLabel}</span>
+                      <input
+                        value={selectedBotConfig.clientId}
+                        onChange={(event) => onBotConfigChange(selectedBotId, { clientId: event.target.value })}
+                        placeholder={selectedBotDefinition.keyPlaceholder}
+                      />
+                    </label>
 
-                  <label className="input-field">
-                    <span>{selectedBotDefinition.secretLabel}</span>
-                    <input
-                      value={selectedBotConfig.clientSecret}
-                      onChange={(event) => onBotConfigChange(selectedBotId, { clientSecret: event.target.value })}
-                      placeholder={selectedBotDefinition.secretPlaceholder}
-                    />
-                  </label>
-                </div>
+                    <label className="input-field">
+                      <span>{selectedBotDefinition.secretLabel}</span>
+                      <input
+                        value={selectedBotConfig.clientSecret}
+                        onChange={(event) => onBotConfigChange(selectedBotId, { clientSecret: event.target.value })}
+                        placeholder={selectedBotDefinition.secretPlaceholder}
+                      />
+                    </label>
+                  </div>
+                )}
 
                 {selectedBotId === 'wechat' ? (
                   <>
@@ -5621,6 +5864,13 @@ function AgentBotBindingDialog({
                       </button>
                     </div>
                   </>
+                ) : selectedBotId === 'peer' ? (
+                  <div className="agent-workspace-hint">
+                    <span>
+                      全应用只需环境变量 <code>NINECLAW_PEER_BIND</code>（如 <code>127.0.0.1:17312</code>）开启监听；<strong>每个智能体各自密钥</strong>鉴权，无全平台共用 Secret。新建或保存智能体会自动补密钥；「重新生成」立即写库。详见{' '}
+                      <code>docs/AGENT_PEER_INTEROP.md</code>。
+                    </span>
+                  </div>
                 ) : (
                   <div className="agent-workspace-hint">
                     <span>该渠道当前先支持独立保存绑定信息，运行接入稍后补齐。</span>
@@ -5985,12 +6235,14 @@ type AgentsViewProps = {
   onWechatLogin: () => void
   onWechatStart: () => void
   onWechatStop: () => void
+  onRotatePeerSecret: () => void
   setQrDialogOpen: (open: boolean) => void
   searchValue: string
   selectedAgent: AgentRecord | null
   selectedBotConfig: BotConfig
   selectedBotDefinition: (typeof botDefinitions)[number]
   selectedBotId: BotChannelId
+  managedAgentId: string
 }
 
 function AgentsView({
@@ -6056,12 +6308,14 @@ function AgentsView({
   onWechatLogin,
   onWechatStart,
   onWechatStop,
+  onRotatePeerSecret,
   setQrDialogOpen,
   searchValue,
   selectedAgent,
   selectedBotConfig,
   selectedBotDefinition,
   selectedBotId,
+  managedAgentId,
 }: AgentsViewProps) {
   const studioCountLabel = loading ? '正在同步智能体…' : '已保存智能体'
 
@@ -6205,11 +6459,13 @@ function AgentsView({
           onSetDefaultAgent={onSetDefaultAgent}
           onToggleSkill={onToggleSkill}
           selectedAgent={selectedAgent}
+          managedAgentId={managedAgentId}
         />
       ) : null}
 
       {agentBotBindingDialogOpen && selectedAgent ? (
         <AgentBotBindingDialog
+          agentId={selectedAgent.id}
           agentName={selectedAgent.name}
           botConfigs={botConfigs}
           botLoading={botLoading}
@@ -6220,6 +6476,7 @@ function AgentsView({
           onClose={onCloseBotBindingDialog}
           onLarkStart={onLarkStart}
           onLarkStop={onLarkStop}
+          onRotatePeerSecret={onRotatePeerSecret}
           onSave={onSaveAgent}
           onSelectBot={onSelectBot}
           onWechatLogin={onWechatLogin}

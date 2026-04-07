@@ -1,6 +1,7 @@
 use crate::agents::{self, ConversationAgentConfig};
 use crate::dev_trace::{dev_trace, dev_trace_block};
 use crate::pi_runtime::{self, PiRuntimeLocation};
+use crate::pi_timeouts;
 use crate::skills;
 use md5::{Digest, Md5};
 use serde_json::json;
@@ -16,9 +17,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ABORT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-const PI_FIRST_OUTPUT_TIMEOUT: Duration = Duration::from_secs(60);
-const PI_IDLE_OUTPUT_TIMEOUT: Duration = Duration::from_secs(60);
-const PI_TOTAL_RUNTIME_TIMEOUT: Duration = Duration::from_secs(180);
 const CHILD_KILL_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn pi_reuse_im_enabled() -> bool {
@@ -840,9 +838,12 @@ impl PiBridge {
         let started_at = Instant::now();
         let ttft_start = Instant::now();
         let mut logged_ttft = false;
+        let pi_total_runtime_timeout = pi_timeouts::pi_total_runtime_timeout();
+        let pi_first_output_timeout = pi_timeouts::pi_first_output_timeout();
+        let pi_idle_output_timeout = pi_timeouts::pi_idle_output_timeout();
 
         loop {
-            if started_at.elapsed() >= PI_TOTAL_RUNTIME_TIMEOUT {
+            if started_at.elapsed() >= pi_total_runtime_timeout {
                 let _ = child.kill();
                 let _ = Self::wait_for_child_exit(&mut child, CHILD_KILL_GRACE_TIMEOUT);
                 if let Ok(mut stdin_guard) = stdin.lock() {
@@ -850,7 +851,7 @@ impl PiBridge {
                 }
                 let error = format!(
                     "pi 总运行超时（>{} 秒）",
-                    PI_TOTAL_RUNTIME_TIMEOUT.as_secs()
+                    pi_total_runtime_timeout.as_secs()
                 );
                 dev_trace(
                     "bot.pi",
@@ -863,11 +864,11 @@ impl PiBridge {
             }
 
             let base_timeout = if saw_any_output {
-                PI_IDLE_OUTPUT_TIMEOUT
+                pi_idle_output_timeout
             } else {
-                PI_FIRST_OUTPUT_TIMEOUT
+                pi_first_output_timeout
             };
-            let remaining_total = PI_TOTAL_RUNTIME_TIMEOUT
+            let remaining_total = pi_total_runtime_timeout
                 .checked_sub(started_at.elapsed())
                 .unwrap_or(Duration::from_secs(0));
             let timeout = base_timeout.min(remaining_total);
@@ -899,17 +900,17 @@ impl PiBridge {
                     let timeout_reason = if timeout == remaining_total {
                         format!(
                             "pi 总运行超时（>{} 秒）",
-                            PI_TOTAL_RUNTIME_TIMEOUT.as_secs()
+                            pi_total_runtime_timeout.as_secs()
                         )
                     } else if saw_any_output {
                         format!(
                             "等待 pi 后续输出超时（>{} 秒）",
-                            PI_IDLE_OUTPUT_TIMEOUT.as_secs()
+                            pi_idle_output_timeout.as_secs()
                         )
                     } else {
                         format!(
                             "等待 pi 首包输出超时（>{} 秒）",
-                            PI_FIRST_OUTPUT_TIMEOUT.as_secs()
+                            pi_first_output_timeout.as_secs()
                         )
                     };
                     dev_trace(

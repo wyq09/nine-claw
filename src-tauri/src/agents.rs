@@ -94,6 +94,9 @@ pub struct AgentBotConfig {
     pub ai_model: Option<String>,
     #[serde(default)]
     pub error_message: Option<String>,
+    /// 对等入站专用：每个智能体独立密钥；也可用 `clientSecret` 字段填写（界面第二格）。
+    #[serde(default)]
+    pub peer_shared_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -235,6 +238,13 @@ pub fn delete_agent(app: &AppHandle, agent_id: String) -> Result<(), String> {
 pub fn set_default_agent(app: &AppHandle, agent_id: String) -> Result<Option<AgentRecord>, String> {
     let connection = crate::open_history_db(app)?;
     set_default_agent_with_connection(&connection, &agent_id)
+}
+
+/// 读取智能体完整记录（含 `bot_configs`），供对等网关等按智能体解析密钥。
+pub fn get_agent_record(app: &AppHandle, agent_id: &str) -> Result<Option<AgentRecord>, String> {
+    let connection = crate::open_history_db(app)?;
+    ensure_agents_ready(&connection)?;
+    get_active_agent_by_id(&connection, agent_id)
 }
 
 pub fn get_conversation_agent_config(
@@ -837,7 +847,9 @@ fn create_agent_with_connection(
         .map_err(|error| format!("写入智能体失败: {error}"))?;
 
     replace_agent_skills(&transaction, &agent_id, &normalized.skill_ids, now)?;
-    replace_agent_bot_bindings(&transaction, &agent_id, &normalized.bot_configs, now)?;
+    let mut bot_configs = normalized.bot_configs;
+    apply_peer_inbound_defaults(&mut bot_configs, None);
+    replace_agent_bot_bindings(&transaction, &agent_id, &bot_configs, now)?;
     if agent_workspace::runtime_sync_enabled() {
         agent_workspace::ensure_agent_workspace(workspace_seed, true)
             .map_err(|error| format!("创建智能体工作区失败: {error}"))?;
@@ -858,9 +870,8 @@ fn update_agent_with_connection(
     payload: AgentInput,
 ) -> Result<AgentRecord, String> {
     ensure_agents_ready(connection)?;
-    if get_active_agent_by_id(connection, agent_id)?.is_none() {
-        return Err("要更新的智能体不存在".to_string());
-    }
+    let existing = get_active_agent_by_id(connection, agent_id)?
+        .ok_or_else(|| "要更新的智能体不存在".to_string())?;
 
     let normalized = normalize_agent_input(payload)?;
     let now = crate::chrono_like_timestamp();
@@ -906,7 +917,9 @@ fn update_agent_with_connection(
         .map_err(|error| format!("更新智能体失败: {error}"))?;
 
     replace_agent_skills(&transaction, agent_id, &normalized.skill_ids, now)?;
-    replace_agent_bot_bindings(&transaction, agent_id, &normalized.bot_configs, now)?;
+    let mut bot_configs = normalized.bot_configs;
+    apply_peer_inbound_defaults(&mut bot_configs, existing.bot_configs.get("peer"));
+    replace_agent_bot_bindings(&transaction, agent_id, &bot_configs, now)?;
     transaction
         .commit()
         .map_err(|error| format!("提交智能体更新失败: {error}"))?;
@@ -1080,6 +1093,127 @@ fn replace_agent_skills(
     }
 
     Ok(())
+}
+
+fn random_peer_inbound_secret() -> String {
+    format!("ncp_{}", Uuid::new_v4().simple())
+}
+
+fn peer_binding_has_secret(config: &AgentBotConfig) -> bool {
+    config
+        .peer_shared_secret
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        || !config.client_secret.trim().is_empty()
+}
+
+fn new_peer_binding_with_secret() -> AgentBotConfig {
+    normalize_bot_config(AgentBotConfig {
+        enabled: false,
+        im_channel_paused: false,
+        client_id: String::new(),
+        client_secret: String::new(),
+        status: "未连接".to_string(),
+        token: None,
+        base_url: None,
+        route_tag: None,
+        ai_provider_id: None,
+        ai_api_format: None,
+        ai_base_url: None,
+        ai_api_key: None,
+        ai_model: None,
+        error_message: None,
+        peer_shared_secret: Some(random_peer_inbound_secret()),
+    })
+}
+
+/// 保证 `peer` 渠道存在且带有入站密钥：新建时生成；更新时若表单清空则保留库中旧密钥。
+fn apply_peer_inbound_defaults(
+    bot_configs: &mut HashMap<String, AgentBotConfig>,
+    previous_peer: Option<&AgentBotConfig>,
+) {
+    use std::collections::hash_map::Entry;
+
+    match bot_configs.entry("peer".to_string()) {
+        Entry::Vacant(slot) => {
+            slot.insert(new_peer_binding_with_secret());
+        }
+        Entry::Occupied(mut entry) => {
+            let config = entry.get_mut();
+            if peer_binding_has_secret(config) {
+                return;
+            }
+            if let Some(prev) = previous_peer {
+                if let Some(secret) = prev
+                    .peer_shared_secret
+                    .as_deref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                {
+                    config.peer_shared_secret = Some(secret);
+                    return;
+                }
+                let trimmed = prev.client_secret.trim();
+                if !trimmed.is_empty() {
+                    config.client_secret = prev.client_secret.clone();
+                    return;
+                }
+            }
+            config.peer_shared_secret = Some(random_peer_inbound_secret());
+        }
+    }
+}
+
+/// 启动时补全历史智能体的对等密钥（幂等）。
+pub fn backfill_peer_inbound_secrets(app: &AppHandle) -> Result<u32, String> {
+    let mut connection = crate::open_history_db(app)?;
+    ensure_agents_ready(&connection)?;
+    let agents = list_agents_with_connection(&connection)?;
+    let now = crate::chrono_like_timestamp();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("对等密钥补全事务失败: {error}"))?;
+    let mut updated = 0u32;
+    for agent in agents {
+        let mut configs = agent.bot_configs.clone();
+        let previous = agent.bot_configs.get("peer");
+        apply_peer_inbound_defaults(&mut configs, previous);
+        if configs.get("peer") != agent.bot_configs.get("peer") {
+            replace_agent_bot_bindings(&transaction, &agent.id, &configs, now)?;
+            updated += 1;
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("对等密钥补全提交失败: {error}"))?;
+    Ok(updated)
+}
+
+/// 轮换某智能体的对等入站密钥并立即落库。
+pub fn rotate_agent_peer_inbound_secret(app: &AppHandle, agent_id: &str) -> Result<AgentRecord, String> {
+    let mut connection = crate::open_history_db(app)?;
+    ensure_agents_ready(&connection)?;
+    let Some(record) = get_active_agent_by_id(&connection, agent_id)? else {
+        return Err("智能体不存在".to_string());
+    };
+    let now = crate::chrono_like_timestamp();
+    let mut configs = record.bot_configs.clone();
+    let previous = record.bot_configs.get("peer");
+    apply_peer_inbound_defaults(&mut configs, previous);
+    if let Some(peer) = configs.get_mut("peer") {
+        peer.peer_shared_secret = Some(random_peer_inbound_secret());
+        peer.client_secret.clear();
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("轮换对等密钥事务失败: {error}"))?;
+    replace_agent_bot_bindings(&transaction, agent_id, &configs, now)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("轮换对等密钥提交失败: {error}"))?;
+    get_active_agent_by_id(&connection, agent_id)?
+        .ok_or_else(|| "轮换后读取智能体失败".to_string())
 }
 
 fn replace_agent_bot_bindings(
@@ -1513,6 +1647,10 @@ fn normalize_bot_config(config: AgentBotConfig) -> AgentBotConfig {
             .filter(|value| !value.is_empty()),
         error_message: config
             .error_message
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        peer_shared_secret: config
+            .peer_shared_secret
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
     }

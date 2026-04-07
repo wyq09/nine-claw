@@ -3107,6 +3107,117 @@ button {
   box-shadow: none;
 }
 
+.agent-peer-integration-card {
+  margin-bottom: 20px;
+  padding: 18px 20px;
+  border-radius: 22px;
+  border: 1px solid rgba(17, 17, 20, 0.08);
+  background: linear-gradient(135deg, rgba(124, 92, 250, 0.07), rgba(14, 165, 233, 0.05));
+  display: grid;
+  gap: 14px;
+}
+
+.agent-peer-integration-head {
+  display: grid;
+  gap: 4px;
+}
+
+.agent-peer-integration-head strong {
+  font-size: 15px;
+}
+
+.agent-peer-integration-head span {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.agent-peer-api-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.agent-peer-snippet-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.agent-peer-snippet-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.agent-peer-snippet-toolbar .outline-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.agent-peer-snippet-pre {
+  margin: 0;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.06);
+  border: 1px solid rgba(17, 17, 20, 0.06);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 280px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+}
+
+.settings-peer-gateway-block {
+  margin-top: 8px;
+  padding-top: 20px;
+  border-top: 1px solid rgba(17, 17, 20, 0.08);
+  display: grid;
+  gap: 14px;
+}
+
+.settings-peer-gateway-title {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-peer-gateway-title span {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.settings-peer-field {
+  min-width: 0;
+  width: 100%;
+  max-width: 320px;
+}
+
+.settings-peer-field input {
+  width: 100%;
+}
+
+.settings-peer-live-urls {
+  font-size: 12px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.settings-row.stacked {
+  align-items: flex-start;
+}
+
+.settings-peer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .agent-editor-dialog-footer {
   display: flex;
   flex-wrap: wrap;

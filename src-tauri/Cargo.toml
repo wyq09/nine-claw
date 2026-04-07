@@ -30,6 +30,8 @@ tauri = { version = "2.10.3", features = ["protocol-asset"] }
 tauri-plugin-log = "2"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["limit"] }
 md-5 = "0.10"
 base64 = "0.22"
 qrcode = "0.14"

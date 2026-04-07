@@ -310,7 +310,24 @@ export type AgentWorkspaceBundle = {
   files: AgentWorkspaceFile[]
 }
 
-export type BotChannelId = 'dingtalk' | 'lark' | 'wechat_work' | 'wechat_work_bot' | 'wechat'
+export type BotChannelId = 'dingtalk' | 'lark' | 'peer' | 'wechat_work' | 'wechat_work_bot' | 'wechat'
+
+export type PeerGatewayInfo = {
+  enabled: boolean
+  /** 已由环境变量 NINECLAW_PEER_BIND 覆盖，应用内端口无效 */
+  envOverrideActive: boolean
+  listenAddress: string | null
+  publicBaseUrl: string | null
+  inboundUrl: string | null
+  healthUrl: string | null
+}
+
+export type PeerGatewaySettings = {
+  enabled: boolean
+  host: string
+  port: number
+  publicBase: string
+}
 
 export type RuntimeDependencyStatus = {
   platform: string
@@ -356,6 +373,8 @@ export type BotConfig = {
   aiModel?: string
   /** Error message when status === '错误' */
   errorMessage?: string
+  /** 对等入站专用（优先于下方 clientSecret 映射）；也可仅在「虾 / 对等」里填 clientSecret */
+  peerSharedSecret?: string
 }
 
 export type AgentBotBindings = Record<string, BotConfig>

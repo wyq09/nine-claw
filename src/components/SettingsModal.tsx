@@ -1,8 +1,15 @@
-import { useEffect, useState } from 'react'
-import { testLlmProviderConnection } from '../lib/piClient'
+import { useCallback, useEffect, useState } from 'react'
+import {
+  getPeerGatewayInfo,
+  loadPeerGatewaySettings,
+  savePeerGatewaySettings,
+  testLlmProviderConnection,
+} from '../lib/piClient'
 import type {
   AppearanceSettings,
   GeneralSettings,
+  PeerGatewayInfo,
+  PeerGatewaySettings,
   ProviderApiFormat,
   ProviderConfig,
   ProviderDefinition,
@@ -140,6 +147,29 @@ export function SettingsModal({
   const [providerTestLoading, setProviderTestLoading] = useState(false)
   const [providerTestNote, setProviderTestNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
   const [providerDeleteConfirmId, setProviderDeleteConfirmId] = useState<ProviderId | null>(null)
+
+  const [peerGatewayDraft, setPeerGatewayDraft] = useState<PeerGatewaySettings | null>(null)
+  const [peerGatewayInfo, setPeerGatewayInfo] = useState<PeerGatewayInfo | null>(null)
+  const [peerGatewayLoadError, setPeerGatewayLoadError] = useState('')
+  const [peerGatewaySaveError, setPeerGatewaySaveError] = useState('')
+  const [peerGatewaySaveNotice, setPeerGatewaySaveNotice] = useState('')
+  const [peerGatewaySaving, setPeerGatewaySaving] = useState(false)
+
+  const refreshPeerGateway = useCallback(() => {
+    setPeerGatewayLoadError('')
+    void Promise.all([loadPeerGatewaySettings(), getPeerGatewayInfo()])
+      .then(([settings, info]) => {
+        setPeerGatewayDraft(settings)
+        setPeerGatewayInfo(info)
+      })
+      .catch((error: unknown) => {
+        setPeerGatewayLoadError(error instanceof Error ? error.message : String(error))
+      })
+  }, [])
+
+  useEffect(() => {
+    refreshPeerGateway()
+  }, [refreshPeerGateway])
 
   const addedProviders = allProviderDefinitions.filter((p) => providerConfigs[p.id]?.added)
   const availableProviders = allProviderDefinitions.filter((p) => !providerConfigs[p.id]?.added)
@@ -280,6 +310,163 @@ export function SettingsModal({
                     }))
                   }
                 />
+
+                <div className="settings-peer-gateway-block">
+                  <div className="settings-peer-gateway-title">
+                    <strong>外部智能体 接口对接</strong>
+                    <span>
+                      供其他智能体或脚本调用；修改后点击「保存并重启监听」生效。要给<strong>别的机器</strong>连，监听主机须为{' '}
+                      <code>0.0.0.0</code>（默认），并在下方「对外展示基址」填本机局域网 IP（如{' '}
+                      <code>http://192.168.x.x:1052</code>）；对方用该基址访问。仅本机可填{' '}
+                      <code>127.0.0.1</code>。
+                    </span>
+                  </div>
+                  {peerGatewayLoadError ? (
+                    <div className="skills-feedback error agent-feedback inline">
+                      <span>{peerGatewayLoadError}</span>
+                    </div>
+                  ) : null}
+                  {peerGatewaySaveError ? (
+                    <div className="skills-feedback error agent-feedback inline">
+                      <span>{peerGatewaySaveError}</span>
+                    </div>
+                  ) : null}
+                  {peerGatewaySaveNotice ? (
+                    <div className="skills-feedback success agent-feedback inline">
+                      <span>{peerGatewaySaveNotice}</span>
+                    </div>
+                  ) : null}
+                  {peerGatewayInfo?.envOverrideActive ? (
+                    <div className="agent-workspace-hint">
+                      <span>
+                        当前由环境变量 <code>NINECLAW_PEER_BIND</code> 指定监听地址，下方端口与主机在应用内<strong>无效</strong>；取消该环境变量后可在此配置。
+                      </span>
+                    </div>
+                  ) : null}
+                  {peerGatewayDraft && peerGatewayInfo ? (
+                    <>
+                      <SettingSwitch
+                        checked={peerGatewayDraft.enabled}
+                        description="关闭后停止监听，不接收对等入站请求"
+                        label="启用对等入站"
+                        onChange={() => {
+                          setPeerGatewayDraft((previous) =>
+                            previous ? { ...previous, enabled: !previous.enabled } : previous,
+                          )
+                          setPeerGatewaySaveNotice('')
+                        }}
+                      />
+                      <div className="settings-row">
+                        <div>
+                          <strong>监听主机</strong>
+                          <p>
+                            <code>0.0.0.0</code>：所有网卡（默认，局域网/other 虾可连）；<code>127.0.0.1</code>
+                            ：仅本机进程可连。
+                          </p>
+                        </div>
+                        <label className="input-field settings-peer-field">
+                          <input
+                            value={peerGatewayDraft.host}
+                            disabled={peerGatewayInfo.envOverrideActive}
+                            onChange={(event) => {
+                              setPeerGatewayDraft((previous) =>
+                                previous ? { ...previous, host: event.target.value } : previous,
+                              )
+                              setPeerGatewaySaveNotice('')
+                            }}
+                          />
+                        </label>
+                      </div>
+                      <div className="settings-row">
+                        <div>
+                          <strong>监听端口</strong>
+                          <p>默认 1052；勿与系统其他服务冲突。</p>
+                        </div>
+                        <label className="input-field settings-peer-field">
+                          <input
+                            type="number"
+                            min={1}
+                            max={65535}
+                            value={peerGatewayDraft.port}
+                            disabled={peerGatewayInfo.envOverrideActive}
+                            onChange={(event) => {
+                              const next = Number.parseInt(event.target.value, 10)
+                              setPeerGatewayDraft((previous) =>
+                                previous
+                                  ? { ...previous, port: Number.isFinite(next) ? next : previous.port }
+                                  : previous,
+                              )
+                              setPeerGatewaySaveNotice('')
+                            }}
+                          />
+                        </label>
+                      </div>
+                      <div className="settings-row">
+                        <div>
+                          <strong>对外展示基址（可选）</strong>
+                          <p>
+                            给对接方复制的 API 根 URL。监听为 <code>0.0.0.0</code> 时<strong>务必</strong>填本机局域网
+                            IP（如 <code>http://192.168.1.5:1052</code>），留空会误显示为 127.0.0.1。
+                          </p>
+                        </div>
+                        <label className="input-field settings-peer-field">
+                          <input
+                            placeholder="例如 http://192.168.1.5:1052"
+                            value={peerGatewayDraft.publicBase}
+                            disabled={peerGatewayInfo.envOverrideActive}
+                            onChange={(event) => {
+                              setPeerGatewayDraft((previous) =>
+                                previous ? { ...previous, publicBase: event.target.value } : previous,
+                              )
+                              setPeerGatewaySaveNotice('')
+                            }}
+                          />
+                        </label>
+                      </div>
+                      <div className="settings-row stacked">
+                        <div>
+                          <strong>当前解析结果</strong>
+                          <p className="settings-peer-live-urls">
+                            <span>
+                              监听：{peerGatewayInfo.listenAddress ?? '—'} · POST{' '}
+                              {peerGatewayInfo.inboundUrl ?? '—'}
+                            </span>
+                          </p>
+                        </div>
+                      </div>
+                      <div className="settings-peer-actions">
+                        <button
+                          type="button"
+                          className="outline-button primary"
+                          disabled={peerGatewaySaving || peerGatewayInfo.envOverrideActive}
+                          onClick={() => {
+                            if (!peerGatewayDraft || peerGatewayInfo.envOverrideActive) {
+                              return
+                            }
+                            setPeerGatewaySaving(true)
+                            setPeerGatewaySaveError('')
+                            setPeerGatewaySaveNotice('')
+                            void savePeerGatewaySettings(peerGatewayDraft)
+                              .then((info) => {
+                                setPeerGatewayInfo(info)
+                                setPeerGatewaySaveNotice('已保存并重启监听。')
+                              })
+                              .catch((error: unknown) => {
+                                setPeerGatewaySaveError(error instanceof Error ? error.message : String(error))
+                              })
+                              .finally(() => setPeerGatewaySaving(false))
+                          }}
+                        >
+                          {peerGatewaySaving ? '保存中…' : '保存并重启监听'}
+                        </button>
+                      </div>
+                    </>
+                  ) : !peerGatewayLoadError ? (
+                    <div className="agent-workspace-hint">
+                      <span>正在加载对等网关配置…</span>
+                    </div>
+                  ) : null}
+                </div>
               </div>
             ) : null}
 

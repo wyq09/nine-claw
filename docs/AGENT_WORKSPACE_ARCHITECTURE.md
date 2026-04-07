@@ -96,8 +96,9 @@
    - 只追加，不改写
    - 保留原始对话、附件和来源路径
 2. Curated wiki
-   - `MEMORY.md`、`WORKING.md`、分类记忆、决策、daily log
-   - LLM 维护这个层，负责总结、交叉引用和沉淀
+   - `MEMORY.md`、`WORKING.md`、`memory/categories/*.md`、决策、daily log
+   - 对话 ingest 默认只写 raw、daily、`WORKING.md` 与索引；`memory/categories/*.md` 不自动追加（避免流水账），由整理任务或环境变量 `NINECLAW_APPEND_CATEGORY_MEMORY_ON_INGEST=1` 控制旧行为
+   - LLM 与用户维护整理层：总结、交叉引用、沉淀到 `MEMORY.md` / `DECISIONS.md` 等
 3. Schema
    - `AGENTS.md`、当前 agent 私有 markdown、`LINT.md`
    - 定义 ingest / query / lint 的规则

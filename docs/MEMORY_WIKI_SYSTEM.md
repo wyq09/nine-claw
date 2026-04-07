@@ -2,7 +2,7 @@
 
 ## Goal
 
-把现有的 agent memory 从“主 `MEMORY.md` + daily log”升级成更接近 LLM Wiki 的结构，让知识能持续编译、索引和维护，而不是每轮都从原始来源重新拼。
+把 agent memory 从「单文件 + daily log」升级成接近 Wiki 的分层：原始来源可审计，整理层可编辑，索引可导航。
 
 ## Layers
 
@@ -10,64 +10,56 @@
 
 - `agents/<agent-id>/memory/raw/`
 - `agents/<agent-id>/inbox/`
-- 对话原文、导入附件、渠道收件副本都在这里
-- 这些文件只追加和登记，不做摘要式覆盖
+- 对话原文、附件副本：只追加登记，不做摘要式覆盖
 
 ### Curated Wiki
 
-- `MEMORY.md`
-- `WORKING.md`
-- `DECISIONS.md`
-- `memory/categories/*.md`
-- `memory/YYYY-MM-DD.md`
-
-这一层是 LLM 维护过的知识层，允许持续改写和整理。
+- `MEMORY.md`（人设与核心原则，**不**由 ingest 自动改写）
+- `WORKING.md`（短期上下文，ingest 会更新）
+- `DECISIONS.md`、`memory/categories/*.md`（**默认由人/模型整理**，不从每轮对话自动灌条目）
+- `memory/YYYY-MM-DD.md`（按日流水，ingest 追加摘要行）
 
 ### Schema And Operations
 
-- `AGENTS.md`
-- 当前 agent 私有 markdown
-- `memory/WIKI_INDEX.md`
-- `memory/SOURCE_INDEX.md`
-- `memory/LOG.md`
-- `memory/LINT.md`
-
-这一层告诉模型应该怎么 ingest / query / lint。
+- `AGENTS.md`、agent 私有 markdown
+- `memory/WIKI_INDEX.md`（含 **Topic map**：从核心页 `##` 标题生成的导航）
+- `memory/SOURCE_INDEX.md`（每条含 `Index: type=… ts=… cats=…` 便于 `rg` 过滤）
+- `memory/LOG.md`、`memory/LINT.md`
 
 ## Runtime Flow
 
-1. 运行前先注入当前 agent 的核心私有文件。
-2. 再注入 `WIKI_INDEX.md`、`SOURCE_INDEX.md`、`LOG.md`、`LINT.md`。
-3. 再按当前问题抽取相关分类记忆。
-4. 最后补最近两天的 daily log。
+1. 注入核心私有文件。
+2. 注入 `WIKI_INDEX.md`、`SOURCE_INDEX.md`、`LOG.md`、`LINT.md`。
+3. 按问题抽取相关分类记忆（若对应 shard 存在且有内容）。
+4. 补最近两天的 daily log。
 
 ## Write Flow
 
 ### Ingest
 
-每次新的桌面聊天、Bot 对话或附件导入都会：
+每次桌面聊天 / Bot / 附件会：
 
-- 把原始内容记入 `memory/raw/` 或 `inbox/`
-- 更新 `SOURCE_INDEX.md`
+- 写入 `memory/raw/`（或 inbox）原文或登记
+- 更新 `SOURCE_INDEX.md`（含结构化 `Index` 行）
 - 追加 `LOG.md`
 - 刷新 `WIKI_INDEX.md`
-- 同步沉淀到 `MEMORY.md` / `WORKING.md` / 分类记忆
+- 更新 `WORKING.md` 与当日 `memory/YYYY-MM-DD.md`
+- **默认不再**向 `memory/categories/*.md` 追加（避免分类文件变成流水账）。若需恢复旧行为，启动前设置环境变量 `NINECLAW_APPEND_CATEGORY_MEMORY_ON_INGEST=1`（或 `true` / `yes`）。
 
 ### Query
 
-模型回答历史问题时，先读 `WIKI_INDEX.md` 再决定进具体页，避免把所有 memory 全量塞进上下文。
+先读 `WIKI_INDEX.md`（含 Topic map），再下钻具体页；涉及附件/来源时查 `SOURCE_INDEX.md` 中的 `Path` / `Index` 行。
 
 ### Lint
 
-`LINT.md` 提供维护检查表，要求模型定期注意：
+`LINT.md` 要求定期检查：把 daily / raw 中的重要结论合并进 `DECISIONS.md`、`MEMORY.md` 或 category shards，并处理矛盾与过期结论。
 
-- 冲突或过期结论
-- 缺失交叉引用
-- 没有被索引覆盖的高频概念
-- 还缺哪些 source
+### 自动提炼到 MEMORY.md
+
+当前产品选择：**不**在后台静默写 `MEMORY.md`。推荐由模型在「整理任务」中根据 daily + SOURCE_INDEX 提出修改稿，人工确认后写入。
 
 ## Why This Helps
 
-- raw sources 和 wiki synthesis 分层后，来源和结论不再混在一起
-- `SOURCE_INDEX.md` / `LOG.md` 给模型一个轻量可导航的历史面板
-- 桌面聊天、Bot、附件现在都走同一套记忆沉淀路径
+- Raw 与 synthesis 分离，结论可追溯
+- `Index` 行支持按类型/时间/分类键快速过滤，为后续向量检索留接口
+- 分类文件默认人工/批量整理，可读性优于每轮自动 bullet

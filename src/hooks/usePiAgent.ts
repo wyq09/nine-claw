@@ -265,6 +265,9 @@ function deriveBotChannelLabel(channelId: string): string {
   if (baseChannelId === 'lark') {
     return '飞书'
   }
+  if (baseChannelId === 'peer') {
+    return '外部'
+  }
   return baseChannelId
 }
 

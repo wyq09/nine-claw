@@ -85,6 +85,15 @@ export const botDefinitions: BotDefinition[] = [
     secretLabel: 'iLink 服务地址',
     secretPlaceholder: 'https://ilinkai.weixin.qq.com',
   },
+  {
+    id: 'peer',
+    name: '虾 / 对等互通',
+    guideLabel: 'HTTP 入站',
+    keyLabel: '说明',
+    keyPlaceholder: '见文档 docs/AGENT_PEER_INTEROP.md',
+    secretLabel: '本智能体入站密钥',
+    secretPlaceholder: '保存智能体后自动生成，可自填或点重新生成',
+  },
 ]
 
 export const providerDefinitions: ProviderDefinition[] = [
@@ -141,6 +150,13 @@ export function createInitialBotConfigs(): Record<string, BotConfig> {
       imChannelPaused: false,
       clientId: '',
       clientSecret: 'https://ilinkai.weixin.qq.com',
+      status: '未连接',
+    },
+    peer: {
+      enabled: false,
+      imChannelPaused: false,
+      clientId: '',
+      clientSecret: '',
       status: '未连接',
     },
   }

@@ -11,6 +11,8 @@ const DEFAULT_WORKSPACE_RELATIVE_PATH: &str = ".nineclaw/workspace";
 const LEGACY_WORKSPACE_RELATIVE_PATH: &str = ".openclaw/workspace";
 const PRIMARY_WORKSPACE_ROOT_ENV: &str = "NINECLAW_WORKSPACE_ROOT";
 const LEGACY_WORKSPACE_ROOT_ENVS: &[&str] = &["NINECLAW_AGENT_WORKSPACE_ROOT"];
+/// 设为 `1` / `true` / `yes` 时，每次 ingest 仍向 `memory/categories/*.md` 追加条目（易成流水账；默认关闭）。
+const APPEND_CATEGORY_MEMORY_ENV: &str = "NINECLAW_APPEND_CATEGORY_MEMORY_ON_INGEST";
 const TEMPLATE_DIR: &str = "agents/_templates";
 const CATEGORY_MEMORY_DIR: &str = "memory/categories";
 const WORKSPACE_SYSTEM_PROMPT_CHAR_LIMIT: usize = 1200;
@@ -60,6 +62,15 @@ struct MemoryCategoryDefinition {
     description: &'static str,
     storage_keywords: &'static [&'static str],
     query_keywords: &'static [&'static str],
+}
+
+fn append_category_memory_on_ingest() -> bool {
+    std::env::var(APPEND_CATEGORY_MEMORY_ENV)
+        .map(|value| {
+            let value = value.trim().to_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes")
+        })
+        .unwrap_or(false)
 }
 
 const MEMORY_CATEGORY_DEFINITIONS: &[MemoryCategoryDefinition] = &[
@@ -464,7 +475,7 @@ pub fn build_workspace_system_prompt_for_query(
             .to_string(),
     );
     sections.push(
-        "写回：短期写 WORKING.md；偏好写 memory/categories/preferences.md；项目写 memory/categories/projects.md；决定写 DECISIONS.md；共享资料写 PUBLIC_CONTEXT.md。MEMORY.md 仅存放人设和核心原则，运行时不可自动写入。"
+        "写回：短期写 WORKING.md；长期请整理 memory/categories/*.md、DECISIONS.md、PUBLIC_CONTEXT.md。MEMORY.md 仅人设与核心原则，运行时不可自动写入。对话 ingest 默认只增长 raw、daily、SOURCE_INDEX/LOG；分类文件不自动追加（避免流水账）。若需恢复每次对话写分类，设置环境变量 NINECLAW_APPEND_CATEGORY_MEMORY_ON_INGEST=1。"
             .to_string(),
     );
     if bootstrap_exists {
@@ -629,7 +640,9 @@ pub fn append_agent_memory_entry(
     .map_err(|error| format!("写入 WORKING.md 失败: {error}"))?;
 
     // MEMORY.md 不再自动写入 — 仅保留人设和核心原则，由用户手动编辑
-    append_category_memory_entries(&agent_home, &category_notes, &source_ref)?;
+    if append_category_memory_on_ingest() {
+        append_category_memory_entries(&agent_home, &category_notes, &source_ref)?;
+    }
 
     let daily_log_path = agent_home
         .join("memory")
@@ -1956,10 +1969,11 @@ mod tests {
     }
 
     #[test]
-    fn append_agent_memory_entry_updates_legacy_memory_files() {
+    fn append_agent_memory_entry_writes_raw_log_and_skips_category_shards_by_default() {
         let _guard = lock_workspace_test();
         let root = temp_root();
         std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+        std::env::remove_var(APPEND_CATEGORY_MEMORY_ENV);
 
         let seed = AgentWorkspaceSeed {
             id: "memory-agent",
@@ -1986,26 +2000,16 @@ mod tests {
         assert!(!memory.contains("## Core Memory"));
         assert!(!memory.contains("用户画像"));
 
-        // 分类文件应被正确写入
-        let user_profile = fs::read_to_string(
-            root.join("agents")
-                .join("memory-agent")
-                .join("memory")
-                .join("categories")
-                .join("user_profile.md"),
-        )
-        .expect("read user_profile category");
-        assert!(user_profile.contains("用户画像"));
-
-        let decisions = fs::read_to_string(
-            root.join("agents")
-                .join("memory-agent")
-                .join("memory")
-                .join("categories")
-                .join("decisions.md"),
-        )
-        .expect("read decisions category");
-        assert!(decisions.contains("已确认约定") || decisions.contains("周报格式"));
+        let user_profile_path = root
+            .join("agents")
+            .join("memory-agent")
+            .join("memory")
+            .join("categories")
+            .join("user_profile.md");
+        assert!(
+            !user_profile_path.exists(),
+            "category shards should not be auto-appended by default"
+        );
 
         let working =
             fs::read_to_string(root.join("agents").join("memory-agent").join("WORKING.md"))
@@ -2022,6 +2026,16 @@ mod tests {
         )
         .expect("read source index");
         assert!(source_index.contains("memory/raw/"));
+        assert!(source_index.contains("Index: type=conversation"));
+
+        let wiki_index = fs::read_to_string(
+            root.join("agents")
+                .join("memory-agent")
+                .join("memory")
+                .join("WIKI_INDEX.md"),
+        )
+        .expect("read wiki index");
+        assert!(wiki_index.contains("Topic map"));
 
         let raw_source_dir = root
             .join("agents")
@@ -2043,6 +2057,56 @@ mod tests {
 
         fs::remove_dir_all(&root).expect("cleanup");
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
+    fn append_agent_memory_entry_appends_category_shards_when_env_enabled() {
+        let _guard = lock_workspace_test();
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+        std::env::set_var(APPEND_CATEGORY_MEMORY_ENV, "1");
+
+        let seed = AgentWorkspaceSeed {
+            id: "memory-agent-env",
+            name: "记忆助理",
+            summary: "验证环境变量写回分类",
+            description: "负责验证分类追加",
+            accent_color: Some("#556677"),
+            is_builtin: false,
+        };
+
+        ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        append_agent_memory_entry(
+            "memory-agent-env",
+            "user-1",
+            "我是产品经理，这个项目下周要上线，之后统一按周报格式同步。",
+            "收到，我会继续按周报格式跟进上线计划，并保留这个约定。",
+        )
+        .expect("append memory with categories");
+
+        let user_profile = fs::read_to_string(
+            root.join("agents")
+                .join("memory-agent-env")
+                .join("memory")
+                .join("categories")
+                .join("user_profile.md"),
+        )
+        .expect("read user_profile category");
+        assert!(user_profile.contains("用户画像"));
+
+        let decisions = fs::read_to_string(
+            root.join("agents")
+                .join("memory-agent-env")
+                .join("memory")
+                .join("categories")
+                .join("decisions.md"),
+        )
+        .expect("read decisions category");
+        assert!(decisions.contains("已确认约定") || decisions.contains("周报格式"));
+
+        fs::remove_dir_all(&root).expect("cleanup");
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+        std::env::remove_var(APPEND_CATEGORY_MEMORY_ENV);
     }
 
     #[test]

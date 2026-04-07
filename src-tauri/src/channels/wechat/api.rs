@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as Base64Engine};
 use rand::Rng;
 use serde_json::json;
+use std::net::TcpStream;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -9,6 +10,33 @@ use super::types::*;
 /// Timeout for each getUpdates request. Keep short for reliable periodic polling.
 const GET_UPDATES_TIMEOUT_MS: u64 = 8_000;
 const API_TIMEOUT_MS: u64 = 15_000;
+
+/// Build a reqwest client that auto-detects proxy availability.
+fn build_http_client() -> reqwest::Client {
+    let proxy_available = std::env::var("http_proxy")
+        .or_else(|_| std::env::var("https_proxy"))
+        .or_else(|_| std::env::var("all_proxy"))
+        .ok()
+        .and_then(|proxy_url| {
+            let stripped = proxy_url
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .trim_start_matches("socks5://")
+                .trim_start_matches("socks5h://");
+            TcpStream::connect_timeout(
+                &stripped.parse().ok()?,
+                Duration::from_millis(500),
+            )
+            .ok()
+        })
+        .is_some();
+
+    let mut builder = reqwest::Client::builder();
+    if !proxy_available {
+        builder = builder.no_proxy();
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
 
 /// HTTP client for the iLink Bot API (async).
 #[derive(Clone)]
@@ -22,7 +50,7 @@ pub struct WeChatApi {
 impl WeChatApi {
     pub fn new(base_url: &str, token: &str, route_tag: Option<&str>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: build_http_client(),
             base_url: base_url.trim().trim_end_matches('/').to_string(),
             token: token.to_string(),
             route_tag: route_tag.map(|s| s.to_string()),
@@ -212,7 +240,7 @@ impl WeChatApi {
             urlencoding::encode(bot_type)
         );
 
-        let response = reqwest::Client::new()
+        let response = build_http_client()
             .get(&url)
             .timeout(Duration::from_millis(15_000))
             .send()
@@ -240,7 +268,7 @@ impl WeChatApi {
             urlencoding::encode(qrcode)
         );
 
-        let response = reqwest::Client::new()
+        let response = build_http_client()
             .get(&url)
             .header("iLink-App-ClientVersion", "1")
             .timeout(Duration::from_millis(35_000))

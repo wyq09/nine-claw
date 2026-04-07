@@ -4,6 +4,8 @@ import type {
   AgentInput,
   AgentRecord,
   AgentWorkspaceBundle,
+  PeerGatewayInfo,
+  PeerGatewaySettings,
   ConversationAgentSnapshot,
   ChatAttachmentUpload,
   InstalledSkillItem,
@@ -139,6 +141,24 @@ export async function createAgent(payload: AgentInput): Promise<AgentRecord> {
 
 export async function updateAgent(agentId: string, payload: AgentInput): Promise<AgentRecord> {
   return invoke<AgentRecord>('update_agent', { agentId, payload })
+}
+
+export async function rotateAgentPeerInboundSecret(agentId: string): Promise<AgentRecord> {
+  return invoke<AgentRecord>('rotate_agent_peer_inbound_secret', { agentId })
+}
+
+export async function getPeerGatewayInfo(): Promise<PeerGatewayInfo> {
+  return invoke<PeerGatewayInfo>('get_peer_gateway_info')
+}
+
+export async function loadPeerGatewaySettings(): Promise<PeerGatewaySettings> {
+  return invoke<PeerGatewaySettings>('load_peer_gateway_settings')
+}
+
+export async function savePeerGatewaySettings(
+  settings: PeerGatewaySettings,
+): Promise<PeerGatewayInfo> {
+  return invoke<PeerGatewayInfo>('save_peer_gateway_settings', { settings })
 }
 
 export async function archiveAgent(agentId: string): Promise<void> {

@@ -294,6 +294,14 @@ fn append_source_index_entry(
     );
     let _ = writeln!(next, "  - Path: `{}`", relative_path);
     let _ = writeln!(next, "  - Summary: {}", truncate_for_memory(summary, 220));
+    let cats_keys = categories.map(format_category_keys).unwrap_or_default();
+    let _ = writeln!(
+        next,
+        "  - Index: type={} ts=`{}` cats=`{}`",
+        source_type,
+        timestamp,
+        cats_keys
+    );
     if let Some(categories) = categories {
         if let Some(labels) = format_category_titles(categories) {
             let _ = writeln!(next, "  - Categories: {}", labels);
@@ -363,7 +371,37 @@ fn build_wiki_index_content(agent_home: &Path) -> Result<String, String> {
         let _ = writeln!(content, "- `{}`: {}", file_name, summary);
     }
 
-    content.push_str("\n## Category Shards\n\n");
+    content.push_str("\n## Topic map (headings)\n\n");
+    let nav_files = [
+        "MEMORY.md",
+        "WORKING.md",
+        "DECISIONS.md",
+        "PUBLIC_CONTEXT.md",
+    ];
+    let mut any_topic = false;
+    for file_name in nav_files {
+        let path = agent_home.join(file_name);
+        if !path.exists() {
+            continue;
+        }
+        let titles = extract_h2_titles(&path, 12).unwrap_or_default();
+        if titles.is_empty() {
+            continue;
+        }
+        any_topic = true;
+        let _ = writeln!(content, "### `{}`\n", file_name);
+        for title in titles {
+            let _ = writeln!(content, "- {}", title);
+        }
+        content.push('\n');
+    }
+    if !any_topic {
+        content.push_str(
+            "No `##` section titles found in core pages yet. Add headings to MEMORY.md / WORKING.md / DECISIONS.md so this map becomes useful.\n\n",
+        );
+    }
+
+    content.push_str("## Category Shards\n\n");
     let category_dir = category_memory_dir(agent_home);
     if category_dir.exists() {
         let mut category_entries = fs::read_dir(&category_dir)
@@ -418,6 +456,30 @@ fn build_wiki_index_content(agent_home: &Path) -> Result<String, String> {
     let _ = writeln!(content, "- Raw sources: {} files", raw_source_count);
 
     Ok(content)
+}
+
+fn extract_h2_titles(path: &Path, limit: usize) -> Result<Vec<String>, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("读取 markdown 文件失败 {}: {error}", path.display()))?;
+    let mut titles = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("## ") else {
+            continue;
+        };
+        if rest.starts_with('#') {
+            continue;
+        }
+        let title = rest.trim();
+        if title.is_empty() || title.eq_ignore_ascii_case("entries") {
+            continue;
+        }
+        titles.push(title.to_string());
+        if titles.len() >= limit {
+            break;
+        }
+    }
+    Ok(titles)
 }
 
 fn summarize_markdown_file(path: &Path) -> Result<String, String> {
@@ -522,6 +584,14 @@ fn format_category_titles(categories: &[MemoryCategoryDefinition]) -> Option<Str
     }
 }
 
+fn format_category_keys(categories: &[MemoryCategoryDefinition]) -> String {
+    categories
+        .iter()
+        .map(|category| category.key)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn trim_non_empty(value: &str) -> Option<&str> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -532,7 +602,7 @@ fn trim_non_empty(value: &str) -> Option<&str> {
 }
 
 fn build_source_index_template() -> String {
-    "# SOURCE_INDEX.md\n\nThis file registers immutable raw sources and uploaded artifacts. The LLM should never rewrite the underlying source files; it should only update the curated wiki around them.\n\n## Entries\n".to_string()
+    "# SOURCE_INDEX.md\n\nThis file registers immutable raw sources and uploaded artifacts. The LLM should never rewrite the underlying source files; it should only update the curated wiki around them.\n\nEach entry includes an `Index:` line (`type=… ts=… cats=…`) for quick filtering (e.g. `rg \"Index: type=conversation\"`).\n\n## Entries\n".to_string()
 }
 
 fn build_log_template() -> String {
@@ -540,5 +610,5 @@ fn build_log_template() -> String {
 }
 
 fn build_lint_template() -> String {
-    "# LINT.md\n\n## Health Checklist\n\n- Check for contradictions between category shards and the main MEMORY.md.\n- Flag stale claims that newer sources or newer decisions supersede.\n- Look for orphan pages or concepts mentioned repeatedly without a dedicated page.\n- Add missing cross references when a new source changes multiple topics.\n- Suggest the next source or question when the wiki has a clear gap.\n\n## Last Pass\n\n- No lint pass recorded yet.\n".to_string()
+    "# LINT.md\n\n## Health Checklist\n\n- Periodically merge important lines from `memory/YYYY-MM-DD.md` and `memory/raw/` into category shards, DECISIONS.md, or MEMORY.md (ingest no longer appends categories by default).\n- Check for contradictions between category shards and the main MEMORY.md.\n- Flag stale claims that newer sources or newer decisions supersede.\n- Look for orphan pages or concepts mentioned repeatedly without a dedicated page.\n- Add missing cross references when a new source changes multiple topics.\n- Suggest the next source or question when the wiki has a clear gap.\n\n## Last Pass\n\n- No lint pass recorded yet.\n".to_string()
 }
