@@ -39,3 +39,4 @@ rand = "0.8"
 urlencoding = "2.1"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["clock"] }
+openssl = "0.10"

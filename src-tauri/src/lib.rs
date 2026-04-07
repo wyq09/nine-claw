@@ -1,10 +1,10 @@
 mod agent_workspace;
 mod agents;
 mod channels;
-mod peer_gateway;
 mod chat_attachments;
 mod dev_trace;
 mod heartbeat;
+mod peer_gateway;
 mod pi_runtime;
 mod pi_timeouts;
 mod prompt_attachments;
@@ -42,11 +42,7 @@ fn build_http_client() -> reqwest::Client {
                 .trim_start_matches("https://")
                 .trim_start_matches("socks5://")
                 .trim_start_matches("socks5h://");
-            TcpStream::connect_timeout(
-                &stripped.parse().ok()?,
-                Duration::from_millis(500),
-            )
-            .ok()
+            TcpStream::connect_timeout(&stripped.parse().ok()?, Duration::from_millis(500)).ok()
         })
         .is_some();
 
@@ -153,6 +149,10 @@ pub(crate) fn infer_media_mime_type(path: &Path, mime_hint: Option<&str>) -> Str
         }
     }
 
+    if let Some(sniffed) = sniff_media_mime_type(path) {
+        return sniffed;
+    }
+
     match path
         .extension()
         .and_then(|value| value.to_str())
@@ -181,6 +181,93 @@ pub(crate) fn infer_media_mime_type(path: &Path, mime_hint: Option<&str>) -> Str
         Some("silk") => "audio/silk".to_string(),
         _ => "application/octet-stream".to_string(),
     }
+}
+
+fn sniff_media_mime_type(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0u8; 64];
+    let read_len = file.read(&mut header).ok()?;
+    detect_media_mime_from_bytes(&header[..read_len]).map(str::to_string)
+}
+
+fn detect_media_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+
+    if bytes.len() >= 3 && bytes[0..3] == [0xFF, 0xD8, 0xFF] {
+        return Some("image/jpeg");
+    }
+
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+
+    if bytes.len() >= 2 && &bytes[0..2] == b"BM" {
+        return Some("image/bmp");
+    }
+
+    if bytes.len() >= 6 && bytes.starts_with(b"<?xml ") && bytes.windows(4).any(|w| w == b"<svg") {
+        return Some("image/svg+xml");
+    }
+
+    if bytes.windows(4).any(|w| w == b"<svg") {
+        return Some("image/svg+xml");
+    }
+
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        if matches!(
+            brand,
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis"
+        ) {
+            return Some("image/heic");
+        }
+        if matches!(brand, b"mif1" | b"msf1" | b"heif") {
+            return Some("image/heif");
+        }
+        if brand == b"qt  " {
+            return Some("video/quicktime");
+        }
+        return Some("video/mp4");
+    }
+
+    if bytes.len() >= 4 && bytes[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        if bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"webm")) {
+            return Some("video/webm");
+        }
+        return Some("video/x-matroska");
+    }
+
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+
+    if bytes.starts_with(b"ID3") {
+        return Some("audio/mpeg");
+    }
+
+    if bytes.len() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0 {
+        return Some("audio/mpeg");
+    }
+
+    if bytes.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+
+    if bytes.starts_with(b"#!AMR\n") || bytes.starts_with(b"#!AMR-WB\n") {
+        return Some("audio/amr");
+    }
+
+    if bytes.starts_with(b"%PDF-") {
+        return Some("application/pdf");
+    }
+
+    None
 }
 
 #[derive(Clone, Serialize)]
@@ -272,6 +359,40 @@ fn spawn_pi_stdout_logger<R>(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod lib_tests {
+    use super::infer_media_mime_type;
+    use std::fs;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn write_temp_file(extension: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "nineclaw-mime-test-{}.{}",
+            Uuid::new_v4(),
+            extension
+        ));
+        fs::write(&path, bytes).expect("write temp media file");
+        path
+    }
+
+    #[test]
+    fn infer_media_mime_type_prefers_magic_bytes_over_misleading_extension() {
+        let path = write_temp_file("png", &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F']);
+        let mime = infer_media_mime_type(&path, None);
+        let _ = fs::remove_file(&path);
+        assert_eq!(mime, "image/jpeg");
+    }
+
+    #[test]
+    fn infer_media_mime_type_detects_png_from_header() {
+        let path = write_temp_file("bin", &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        let mime = infer_media_mime_type(&path, None);
+        let _ = fs::remove_file(&path);
+        assert_eq!(mime, "image/png");
+    }
 }
 
 fn spawn_pi_stderr_logger<R>(reader: R, scope: &'static str, buffer: Arc<Mutex<String>>)
@@ -1294,8 +1415,7 @@ async fn stream_pi_prompt(
         return Err("prompt 不能为空".to_string());
     }
 
-    let prepared_input =
-        prompt_attachments::prepare_prompt_input(&trimmed_prompt, &attachments)?;
+    let prepared_input = prompt_attachments::prepare_prompt_input(&trimmed_prompt, &attachments)?;
 
     let normalized_session_id = session_id
         .as_deref()
@@ -2510,11 +2630,9 @@ fn auto_start_bound_im_services(app: &AppHandle) -> Result<(), String> {
                 continue;
             }
 
-            if let Err(error) = resolve_im_llm_runtime(
-                app,
-                &agent.default_provider_id,
-                &agent.default_model,
-            ) {
+            if let Err(error) =
+                resolve_im_llm_runtime(app, &agent.default_provider_id, &agent.default_model)
+            {
                 log::warn!(
                     "跳过自动启动智能体 {} 的 {} 机器人: {}",
                     agent.id,

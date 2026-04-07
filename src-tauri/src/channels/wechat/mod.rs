@@ -4,6 +4,7 @@ pub mod types;
 use crate::agent_workspace;
 use crate::agents::ConversationAgentConfig;
 use crate::dev_trace::dev_trace;
+use openssl::symm::Cipher;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +14,7 @@ use std::thread;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as Base64Engine};
-use serde_json::json;
+use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
 use self::api::WeChatApi;
@@ -284,7 +285,10 @@ fn build_inbound_prompt(text: &str, attachments: &[InboundAttachment]) -> Inboun
                 .unwrap_or_default()
                 .to_string(),
             file_path: attachment.saved_path.clone(),
-            mime_type: String::new(),
+            mime_type: Path::new(&attachment.saved_path)
+                .is_file()
+                .then(|| crate::infer_media_mime_type(Path::new(&attachment.saved_path), None))
+                .unwrap_or_default(),
             kind: match attachment.media_type {
                 MediaType::Image => "image",
                 MediaType::Video => "video",
@@ -328,30 +332,471 @@ fn build_inbound_prompt(text: &str, attachments: &[InboundAttachment]) -> Inboun
     }
 }
 
-fn download_url_bytes(rt: &tokio::runtime::Runtime, url: &str) -> Result<Vec<u8>, String> {
-    rt.block_on(async {
-        let response = reqwest::get(url)
-            .await
-            .map_err(|error| format!("下载附件失败: {error}"))?;
-        if !response.status().is_success() {
-            return Err(format!("下载附件失败: HTTP {}", response.status()));
+fn normalize_optional_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn lookup_extra_string(extra: &HashMap<String, Value>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = extra.get(*key).and_then(|value| value.as_str()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
         }
-        response
-            .bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|error| format!("读取附件失败: {error}"))
+    }
+    None
+}
+
+fn lookup_container_string(
+    extra: &HashMap<String, Value>,
+    container_keys: &[&str],
+    field_keys: &[&str],
+) -> Option<String> {
+    for container_key in container_keys {
+        let Some(map) = extra
+            .get(*container_key)
+            .and_then(|value| value.as_object())
+        else {
+            continue;
+        };
+        for field_key in field_keys {
+            if let Some(value) = map.get(*field_key).and_then(|value| value.as_str()) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_item_string(
+    direct_value: Option<&str>,
+    nested_extra: Option<&HashMap<String, Value>>,
+    item_extra: &HashMap<String, Value>,
+    container_keys: &[&str],
+    field_keys: &[&str],
+) -> Option<String> {
+    normalize_optional_string(direct_value)
+        .or_else(|| nested_extra.and_then(|extra| lookup_extra_string(extra, field_keys)))
+        .or_else(|| lookup_container_string(item_extra, container_keys, field_keys))
+        .or_else(|| lookup_extra_string(item_extra, field_keys))
+}
+
+fn extract_text_item_content(item: &MessageItem) -> Option<String> {
+    resolve_item_string(
+        item.text_item
+            .as_ref()
+            .and_then(|text_item| text_item.text.as_deref()),
+        item.text_item.as_ref().map(|text_item| &text_item.extra),
+        &item.extra,
+        &["text_item", "text"],
+        &["text", "content"],
+    )
+}
+
+fn extract_image_fields(item: &MessageItem) -> (Option<String>, Option<String>) {
+    (
+        resolve_item_string(
+            item.image_item
+                .as_ref()
+                .and_then(|image_item| image_item.image_base64.as_deref()),
+            item.image_item.as_ref().map(|image_item| &image_item.extra),
+            &item.extra,
+            &["image_item", "image"],
+            &["image_base64", "base64", "data", "content"],
+        ),
+        resolve_item_string(
+            item.image_item
+                .as_ref()
+                .and_then(|image_item| image_item.image_url.as_deref()),
+            item.image_item.as_ref().map(|image_item| &image_item.extra),
+            &item.extra,
+            &["image_item", "image"],
+            &["image_url", "url", "download_url", "file_url"],
+        ),
+    )
+}
+
+fn extract_file_fields(item: &MessageItem) -> (Option<String>, Option<String>, Option<String>) {
+    (
+        resolve_item_string(
+            item.file_item
+                .as_ref()
+                .and_then(|file_item| file_item.file_name.as_deref()),
+            item.file_item.as_ref().map(|file_item| &file_item.extra),
+            &item.extra,
+            &["file_item", "file"],
+            &["file_name", "name", "title"],
+        ),
+        resolve_item_string(
+            item.file_item
+                .as_ref()
+                .and_then(|file_item| file_item.file_base64.as_deref()),
+            item.file_item.as_ref().map(|file_item| &file_item.extra),
+            &item.extra,
+            &["file_item", "file"],
+            &["file_base64", "base64", "data", "content"],
+        ),
+        resolve_item_string(
+            item.file_item
+                .as_ref()
+                .and_then(|file_item| file_item.file_url.as_deref()),
+            item.file_item.as_ref().map(|file_item| &file_item.extra),
+            &item.extra,
+            &["file_item", "file"],
+            &["file_url", "url", "download_url"],
+        ),
+    )
+}
+
+fn extract_video_fields(item: &MessageItem) -> (Option<String>, Option<String>, Option<String>) {
+    (
+        resolve_item_string(
+            None,
+            item.video_item.as_ref().map(|video_item| &video_item.extra),
+            &item.extra,
+            &["video_item", "video"],
+            &["file_name", "name", "title"],
+        ),
+        resolve_item_string(
+            item.video_item
+                .as_ref()
+                .and_then(|video_item| video_item.video_base64.as_deref()),
+            item.video_item.as_ref().map(|video_item| &video_item.extra),
+            &item.extra,
+            &["video_item", "video"],
+            &["video_base64", "base64", "data", "content"],
+        ),
+        resolve_item_string(
+            item.video_item
+                .as_ref()
+                .and_then(|video_item| video_item.video_url.as_deref()),
+            item.video_item.as_ref().map(|video_item| &video_item.extra),
+            &item.extra,
+            &["video_item", "video"],
+            &["video_url", "url", "download_url", "file_url"],
+        ),
+    )
+}
+
+fn extract_voice_fields(
+    item: &MessageItem,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    (
+        resolve_item_string(
+            item.voice_item
+                .as_ref()
+                .and_then(|voice_item| voice_item.file_name.as_deref()),
+            item.voice_item.as_ref().map(|voice_item| &voice_item.extra),
+            &item.extra,
+            &["voice_item", "voice", "audio_item", "audio"],
+            &["file_name", "name", "title"],
+        ),
+        resolve_item_string(
+            item.voice_item
+                .as_ref()
+                .and_then(|voice_item| voice_item.voice_base64.as_deref()),
+            item.voice_item.as_ref().map(|voice_item| &voice_item.extra),
+            &item.extra,
+            &["voice_item", "voice", "audio_item", "audio"],
+            &["voice_base64", "audio_base64", "base64", "data", "content"],
+        ),
+        resolve_item_string(
+            item.voice_item
+                .as_ref()
+                .and_then(|voice_item| voice_item.voice_url.as_deref()),
+            item.voice_item.as_ref().map(|voice_item| &voice_item.extra),
+            &item.extra,
+            &["voice_item", "voice", "audio_item", "audio"],
+            &["voice_url", "audio_url", "url", "download_url", "file_url"],
+        ),
+        resolve_item_string(
+            item.voice_item
+                .as_ref()
+                .and_then(|voice_item| voice_item.text.as_deref()),
+            item.voice_item.as_ref().map(|voice_item| &voice_item.extra),
+            &item.extra,
+            &["voice_item", "voice", "audio_item", "audio"],
+            &["text", "transcript", "asr_text"],
+        ),
+    )
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CdnMediaRef {
+    encrypt_query_param: Option<String>,
+    aes_key: Option<String>,
+    full_url: Option<String>,
+}
+
+const WECHAT_DEFAULT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+
+fn lookup_container_media_string(
+    extra: &HashMap<String, Value>,
+    container_keys: &[&str],
+    field_keys: &[&str],
+) -> Option<String> {
+    for container_key in container_keys {
+        let Some(map) = extra
+            .get(*container_key)
+            .and_then(|value| value.as_object())
+        else {
+            continue;
+        };
+        let Some(media) = map.get("media").and_then(|value| value.as_object()) else {
+            continue;
+        };
+        for field_key in field_keys {
+            if let Some(value) = media.get(*field_key).and_then(|value| value.as_str()) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_cdn_media_fields(
+    item_extra: &HashMap<String, Value>,
+    container_keys: &[&str],
+    media: Option<&CdnMedia>,
+    preferred_aes_key: Option<&str>,
+) -> Option<CdnMediaRef> {
+    let encrypt_query_param =
+        normalize_optional_string(media.and_then(|media| media.encrypt_query_param.as_deref()))
+            .or_else(|| {
+                lookup_container_media_string(item_extra, container_keys, &["encrypt_query_param"])
+            });
+    let full_url = normalize_optional_string(media.and_then(|media| media.full_url.as_deref()))
+        .or_else(|| lookup_container_media_string(item_extra, container_keys, &["full_url"]));
+    let aes_key = normalize_optional_string(preferred_aes_key)
+        .or_else(|| normalize_optional_string(media.and_then(|media| media.aes_key.as_deref())))
+        .or_else(|| {
+            lookup_container_media_string(item_extra, container_keys, &["aes_key", "aeskey"])
+        });
+
+    if encrypt_query_param.is_none() && full_url.is_none() && aes_key.is_none() {
+        return None;
+    }
+
+    Some(CdnMediaRef {
+        encrypt_query_param,
+        aes_key,
+        full_url,
     })
+}
+
+fn extract_image_cdn_fields(item: &MessageItem) -> Option<CdnMediaRef> {
+    extract_cdn_media_fields(
+        &item.extra,
+        &["image_item", "image"],
+        item.image_item
+            .as_ref()
+            .and_then(|image_item| image_item.media.as_ref()),
+        item.image_item
+            .as_ref()
+            .and_then(|image_item| image_item.aeskey.as_deref()),
+    )
+}
+
+fn extract_file_cdn_fields(item: &MessageItem) -> Option<CdnMediaRef> {
+    extract_cdn_media_fields(
+        &item.extra,
+        &["file_item", "file"],
+        item.file_item
+            .as_ref()
+            .and_then(|file_item| file_item.media.as_ref()),
+        None,
+    )
+}
+
+fn extract_video_cdn_fields(item: &MessageItem) -> Option<CdnMediaRef> {
+    extract_cdn_media_fields(
+        &item.extra,
+        &["video_item", "video"],
+        item.video_item
+            .as_ref()
+            .and_then(|video_item| video_item.media.as_ref()),
+        None,
+    )
+}
+
+fn extract_voice_cdn_fields(item: &MessageItem) -> Option<CdnMediaRef> {
+    extract_cdn_media_fields(
+        &item.extra,
+        &["voice_item", "voice", "audio_item", "audio"],
+        item.voice_item
+            .as_ref()
+            .and_then(|voice_item| voice_item.media.as_ref()),
+        None,
+    )
+}
+
+fn file_name_from_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let last_segment = trimmed
+        .split('?')
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if last_segment.is_empty() {
+        return None;
+    }
+
+    urlencoding::decode(last_segment)
+        .map(|value| value.into_owned())
+        .ok()
+        .or_else(|| Some(last_segment.to_string()))
+}
+
+fn download_url_bytes(
+    rt: &tokio::runtime::Runtime,
+    api: &WeChatApi,
+    url: &str,
+) -> Result<Vec<u8>, String> {
+    rt.block_on(api.download_attachment(url))
+}
+
+fn download_public_url_bytes(
+    rt: &tokio::runtime::Runtime,
+    api: &WeChatApi,
+    url: &str,
+) -> Result<Vec<u8>, String> {
+    rt.block_on(api.download_public_attachment(url))
+}
+
+fn build_wechat_cdn_download_url(encrypt_query_param: &str) -> String {
+    format!(
+        "{}/download?encrypted_query_param={}",
+        WECHAT_DEFAULT_CDN_BASE_URL,
+        urlencoding::encode(encrypt_query_param)
+    )
+}
+
+fn decode_hex_bytes(raw: &str) -> Result<Vec<u8>, String> {
+    let trimmed = raw.trim();
+    if trimmed.len() % 2 != 0 {
+        return Err(format!("十六进制长度必须为偶数，实际为 {}", trimmed.len()));
+    }
+
+    let mut bytes = Vec::with_capacity(trimmed.len() / 2);
+    for chunk in trimmed.as_bytes().chunks(2) {
+        let pair =
+            std::str::from_utf8(chunk).map_err(|error| format!("解析十六进制失败: {error}"))?;
+        let value = u8::from_str_radix(pair, 16)
+            .map_err(|error| format!("解析十六进制失败 {pair}: {error}"))?;
+        bytes.push(value);
+    }
+    Ok(bytes)
+}
+
+fn parse_wechat_aes_key(raw_key: &str) -> Result<Vec<u8>, String> {
+    let trimmed = raw_key.trim();
+    if trimmed.is_empty() {
+        return Err("AES key 为空".to_string());
+    }
+
+    if trimmed.len() == 32
+        && trimmed
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return decode_hex_bytes(trimmed);
+    }
+
+    let decoded = BASE64_ENGINE
+        .decode(trimmed)
+        .map_err(|error| format!("解析 AES key Base64 失败: {error}"))?;
+    if decoded.len() == 16 {
+        return Ok(decoded);
+    }
+
+    if decoded.len() == 32 && decoded.iter().all(|byte| byte.is_ascii_hexdigit()) {
+        let ascii_hex = std::str::from_utf8(&decoded)
+            .map_err(|error| format!("解析 AES key ASCII 十六进制失败: {error}"))?;
+        return decode_hex_bytes(ascii_hex);
+    }
+
+    Err(format!(
+        "AES key 解码后长度异常，期望 16 字节或 32 字符十六进制，实际 {} 字节",
+        decoded.len()
+    ))
+}
+
+fn decrypt_wechat_cdn_payload(ciphertext: &[u8], aes_key: &str) -> Result<Vec<u8>, String> {
+    let key = parse_wechat_aes_key(aes_key)?;
+    openssl::symm::decrypt(Cipher::aes_128_ecb(), &key, None, ciphertext)
+        .map_err(|error| format!("AES-128-ECB 解密失败: {error}"))
+}
+
+fn download_cdn_bytes(
+    rt: &tokio::runtime::Runtime,
+    api: &WeChatApi,
+    cdn_media: &CdnMediaRef,
+) -> Result<Vec<u8>, String> {
+    let download_url = if let Some(full_url) = cdn_media
+        .full_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        full_url.to_string()
+    } else if let Some(encrypt_query_param) = cdn_media
+        .encrypt_query_param
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        build_wechat_cdn_download_url(encrypt_query_param)
+    } else {
+        return Err("缺少微信 CDN 下载地址".to_string());
+    };
+
+    let encrypted = download_public_url_bytes(rt, api, &download_url)?;
+    if let Some(aes_key) = cdn_media
+        .aes_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        decrypt_wechat_cdn_payload(&encrypted, aes_key)
+    } else {
+        Ok(encrypted)
+    }
 }
 
 fn persist_wechat_attachment(
     rt: &tokio::runtime::Runtime,
+    api: &WeChatApi,
     agent_id: &str,
     user_id: &str,
     media_type: MediaType,
     file_name_hint: Option<&str>,
     base64_data: Option<&str>,
     url_data: Option<&str>,
+    cdn_media: Option<&CdnMediaRef>,
     transcript: Option<&str>,
 ) -> Result<Option<InboundAttachment>, String> {
     let data = if let Some(raw) = base64_data.filter(|value| !value.trim().is_empty()) {
@@ -361,7 +806,9 @@ fn persist_wechat_attachment(
                 .map_err(|error| format!("解析附件 Base64 失败: {error}"))?,
         )
     } else if let Some(url) = url_data.filter(|value| !value.trim().is_empty()) {
-        Some(download_url_bytes(rt, url.trim())?)
+        Some(download_url_bytes(rt, api, url.trim())?)
+    } else if let Some(cdn_media) = cdn_media {
+        Some(download_cdn_bytes(rt, api, cdn_media)?)
     } else {
         None
     };
@@ -374,6 +821,12 @@ fn persist_wechat_attachment(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+        .or_else(|| url_data.and_then(file_name_from_url))
+        .or_else(|| {
+            cdn_media
+                .and_then(|media| media.full_url.as_deref())
+                .and_then(file_name_from_url)
+        })
         .unwrap_or_else(|| {
             format!(
                 "{}.{}",
@@ -407,6 +860,7 @@ fn persist_wechat_attachment(
 
 fn extract_inbound_message(
     rt: &tokio::runtime::Runtime,
+    api: &WeChatApi,
     items: &Option<Vec<MessageItem>>,
     agent_id: Option<&str>,
     user_id: &str,
@@ -420,72 +874,104 @@ fn extract_inbound_message(
 
     for item in items {
         if item.item_type == Some(MSG_ITEM_TYPE_TEXT) || item.text_item.is_some() {
-            if let Some(ref ti) = item.text_item {
-                if let Some(ref t) = ti.text {
-                    text.push_str(t);
-                }
+            if let Some(item_text) = extract_text_item_content(item) {
+                text.push_str(&item_text);
             }
         }
 
         if let Some(agent_id) = agent_id {
-            if let Some(ref image_item) = item.image_item {
+            let (image_base64, image_url) = extract_image_fields(item);
+            let image_cdn = extract_image_cdn_fields(item);
+            if item.item_type == Some(MSG_ITEM_TYPE_IMAGE)
+                || item.image_item.is_some()
+                || image_base64.is_some()
+                || image_url.is_some()
+                || image_cdn.is_some()
+            {
                 if let Some(attachment) = persist_wechat_attachment(
                     rt,
+                    api,
                     agent_id,
                     user_id,
                     MediaType::Image,
                     Some("image.png"),
-                    image_item.image_base64.as_deref(),
-                    image_item.image_url.as_deref(),
+                    image_base64.as_deref(),
+                    image_url.as_deref(),
+                    image_cdn.as_ref(),
                     None,
                 )? {
                     attachments.push(attachment);
                 }
             }
 
-            if let Some(ref file_item) = item.file_item {
+            let (file_name, file_base64, file_url) = extract_file_fields(item);
+            let file_cdn = extract_file_cdn_fields(item);
+            if item.item_type == Some(MSG_ITEM_TYPE_FILE)
+                || item.file_item.is_some()
+                || file_base64.is_some()
+                || file_url.is_some()
+                || file_cdn.is_some()
+            {
                 if let Some(attachment) = persist_wechat_attachment(
                     rt,
+                    api,
                     agent_id,
                     user_id,
                     MediaType::File,
-                    file_item.file_name.as_deref(),
-                    file_item.file_base64.as_deref(),
-                    file_item.file_url.as_deref(),
+                    file_name.as_deref(),
+                    file_base64.as_deref(),
+                    file_url.as_deref(),
+                    file_cdn.as_ref(),
                     None,
                 )? {
                     attachments.push(attachment);
                 }
             }
 
-            if let Some(ref video_item) = item.video_item {
+            let (video_name, video_base64, video_url) = extract_video_fields(item);
+            let video_cdn = extract_video_cdn_fields(item);
+            if item.item_type == Some(MSG_ITEM_TYPE_VIDEO)
+                || item.video_item.is_some()
+                || video_base64.is_some()
+                || video_url.is_some()
+                || video_cdn.is_some()
+            {
                 if let Some(attachment) = persist_wechat_attachment(
                     rt,
+                    api,
                     agent_id,
                     user_id,
                     MediaType::Video,
-                    Some("video.mp4"),
-                    video_item.video_base64.as_deref(),
-                    video_item.video_url.as_deref(),
+                    video_name.as_deref().or(Some("video.mp4")),
+                    video_base64.as_deref(),
+                    video_url.as_deref(),
+                    video_cdn.as_ref(),
                     None,
                 )? {
                     attachments.push(attachment);
                 }
             }
 
-            if item.item_type == Some(MSG_ITEM_TYPE_VOICE) || item.voice_item.is_some() {
-                let Some(ref voice_item) = item.voice_item else {
-                    continue;
-                };
+            let (voice_name, voice_base64, voice_url, voice_text) = extract_voice_fields(item);
+            let voice_cdn = extract_voice_cdn_fields(item);
+            if item.item_type == Some(MSG_ITEM_TYPE_VOICE)
+                || item.voice_item.is_some()
+                || voice_base64.is_some()
+                || voice_url.is_some()
+                || voice_text.is_some()
+                || voice_cdn.is_some()
+            {
                 if let Some(attachment) = persist_wechat_attachment(
                     rt,
+                    api,
                     agent_id,
                     user_id,
                     MediaType::Audio,
-                    voice_item.file_name.as_deref().or(Some("voice.mp3")),
-                    voice_item.voice_base64.as_deref(),
-                    voice_item.voice_url.as_deref(),
-                    voice_item.text.as_deref(),
+                    voice_name.as_deref().or(Some("voice.mp3")),
+                    voice_base64.as_deref(),
+                    voice_url.as_deref(),
+                    voice_cdn.as_ref(),
+                    voice_text.as_deref(),
                 )? {
                     attachments.push(attachment);
                 }
@@ -808,6 +1294,7 @@ impl Channel for WeChatChannel {
 
                                     let inbound = match extract_inbound_message(
                                         &rt,
+                                        &api,
                                         &msg.item_list,
                                         agent_config.as_ref().map(|config| config.id.as_str()),
                                         &from_user,
@@ -1445,5 +1932,94 @@ fn emit_bot_message(
     };
     if let Err(e) = app.emit("bot://message", &payload) {
         log::error!("emit bot://message 失败: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_flattened_image_fields() {
+        let item = MessageItem {
+            item_type: Some(MSG_ITEM_TYPE_IMAGE),
+            extra: HashMap::from([
+                ("image_url".to_string(), json!("https://example.com/a.png")),
+                ("image_base64".to_string(), json!("Zm9v")),
+            ]),
+            ..Default::default()
+        };
+
+        let (base64_data, url_data) = extract_image_fields(&item);
+        assert_eq!(base64_data.as_deref(), Some("Zm9v"));
+        assert_eq!(url_data.as_deref(), Some("https://example.com/a.png"));
+    }
+
+    #[test]
+    fn extracts_nested_file_fields_from_extra_container() {
+        let item = MessageItem {
+            item_type: Some(MSG_ITEM_TYPE_FILE),
+            extra: HashMap::from([(
+                "file_item".to_string(),
+                json!({
+                    "file_name": "report.pdf",
+                    "download_url": "/media/report.pdf"
+                }),
+            )]),
+            ..Default::default()
+        };
+
+        let (file_name, _base64_data, url_data) = extract_file_fields(&item);
+        assert_eq!(file_name.as_deref(), Some("report.pdf"));
+        assert_eq!(url_data.as_deref(), Some("/media/report.pdf"));
+    }
+
+    #[test]
+    fn derives_file_name_from_url() {
+        assert_eq!(
+            file_name_from_url("https://example.com/files/%E6%8A%A5%E5%91%8A.pdf?sig=1").as_deref(),
+            Some("报告.pdf")
+        );
+    }
+
+    #[test]
+    fn extracts_cdn_image_fields() {
+        let item = MessageItem {
+            item_type: Some(MSG_ITEM_TYPE_IMAGE),
+            image_item: Some(ImageItem {
+                aeskey: Some("00112233445566778899aabbccddeeff".to_string()),
+                media: Some(CdnMedia {
+                    encrypt_query_param: Some("encrypted-token".to_string()),
+                    full_url: Some("https://cdn.example.com/download?id=1".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let cdn = extract_image_cdn_fields(&item).expect("cdn fields");
+        assert_eq!(cdn.encrypt_query_param.as_deref(), Some("encrypted-token"));
+        assert_eq!(
+            cdn.full_url.as_deref(),
+            Some("https://cdn.example.com/download?id=1")
+        );
+        assert_eq!(
+            cdn.aes_key.as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
+    }
+
+    #[test]
+    fn parses_wechat_aes_keys_from_hex_and_base64_hex() {
+        let raw_hex = "00112233445566778899aabbccddeeff";
+        let decoded_hex = parse_wechat_aes_key(raw_hex).expect("parse raw hex key");
+        assert_eq!(decoded_hex, decode_hex_bytes(raw_hex).expect("hex decode"));
+
+        let base64_of_hex = BASE64_ENGINE.encode(raw_hex.as_bytes());
+        let decoded_base64_hex =
+            parse_wechat_aes_key(&base64_of_hex).expect("parse base64-encoded hex key");
+        assert_eq!(decoded_base64_hex, decoded_hex);
     }
 }

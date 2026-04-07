@@ -23,11 +23,7 @@ fn build_http_client() -> reqwest::Client {
                 .trim_start_matches("https://")
                 .trim_start_matches("socks5://")
                 .trim_start_matches("socks5h://");
-            TcpStream::connect_timeout(
-                &stripped.parse().ok()?,
-                Duration::from_millis(500),
-            )
-            .ok()
+            TcpStream::connect_timeout(&stripped.parse().ok()?, Duration::from_millis(500)).ok()
         })
         .is_some();
 
@@ -63,9 +59,8 @@ impl WeChatApi {
         BASE64_ENGINE.encode(uint_val.to_string().as_bytes())
     }
 
-    fn build_headers(&self, body_len: usize) -> reqwest::header::HeaderMap {
+    fn build_auth_headers(&self) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("Content-Type", "application/json".parse().unwrap());
         headers.insert("AuthorizationType", "ilink_bot_token".parse().unwrap());
         if !self.token.is_empty() {
             headers.insert(
@@ -73,12 +68,68 @@ impl WeChatApi {
                 format!("Bearer {}", self.token).parse().unwrap(),
             );
         }
-        headers.insert("Content-Length", body_len.to_string().parse().unwrap());
         headers.insert("X-WECHAT-UIN", Self::random_uin().parse().unwrap());
         if let Some(tag) = &self.route_tag {
             headers.insert("SKRouteTag", tag.parse().unwrap());
         }
         headers
+    }
+
+    fn build_headers(&self, body_len: usize) -> reqwest::header::HeaderMap {
+        let mut headers = self.build_auth_headers();
+        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert("Content-Length", body_len.to_string().parse().unwrap());
+        headers
+    }
+
+    async fn download_url(&self, url: &str, with_auth_headers: bool) -> Result<Vec<u8>, String> {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return Err("附件 URL 为空".to_string());
+        }
+
+        let resolved_url = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            trimmed.to_string()
+        } else {
+            let base = reqwest::Url::parse(&format!("{}/", self.base_url.trim_end_matches('/')))
+                .map_err(|error| format!("解析微信 base_url 失败: {error}"))?;
+            base.join(trimmed)
+                .map_err(|error| format!("拼接微信附件 URL 失败: {error}"))?
+                .to_string()
+        };
+
+        let request = self.client.get(&resolved_url);
+        let request = if with_auth_headers {
+            request.headers(self.build_auth_headers())
+        } else {
+            request
+        };
+
+        let response = request
+            .timeout(Duration::from_millis(API_TIMEOUT_MS))
+            .send()
+            .await
+            .map_err(|error| format!("下载附件失败: {error}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("下载附件失败: HTTP {status} {text}"));
+        }
+
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| format!("读取附件失败: {error}"))
+    }
+
+    pub async fn download_attachment(&self, url: &str) -> Result<Vec<u8>, String> {
+        self.download_url(url, true).await
+    }
+
+    pub async fn download_public_attachment(&self, url: &str) -> Result<Vec<u8>, String> {
+        self.download_url(url, false).await
     }
 
     /// Long-poll for new messages.

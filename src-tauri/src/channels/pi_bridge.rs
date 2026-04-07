@@ -254,8 +254,66 @@ impl PiBridge {
         std::env::temp_dir().join(format!("nineclaw-bot-session-{key}.jsonl"))
     }
 
+    fn ephemeral_session_file_path(key: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("nineclaw-bot-session-{key}-media-{nonce}.jsonl"))
+    }
+
     fn pi_runtime_dir() -> PathBuf {
         std::env::temp_dir().join("nineclaw-pi-runtime")
+    }
+
+    fn attachment_requires_fresh_session(attachment: &PromptAttachmentInput) -> bool {
+        let kind = attachment.kind.trim().to_ascii_lowercase();
+        if kind == "image" || kind == "video" {
+            return true;
+        }
+
+        let mime = attachment.mime_type.trim().to_ascii_lowercase();
+        mime.starts_with("image/") || mime.starts_with("video/")
+    }
+
+    fn has_multimodal_attachments(attachments: &[PromptAttachmentInput]) -> bool {
+        attachments
+            .iter()
+            .any(Self::attachment_requires_fresh_session)
+    }
+
+    fn log_attachment_debug(
+        channel_id: &str,
+        user_id: &str,
+        attachments: &[PromptAttachmentInput],
+    ) {
+        for (index, attachment) in attachments.iter().enumerate() {
+            let path = attachment.file_path.trim();
+            let bytes = if path.is_empty() {
+                None
+            } else {
+                fs::read(path).ok()
+            };
+            let size = bytes.as_ref().map(|data| data.len()).unwrap_or(0);
+            let digest = bytes
+                .as_ref()
+                .map(|data| format!("{:x}", Md5::digest(data)))
+                .unwrap_or_else(|| "unavailable".to_string());
+            dev_trace(
+                "bot.pi",
+                format!(
+                    "prompt_attachment: channel={} user={} index={} kind={} mime={} path={} bytes={} md5={}",
+                    channel_id,
+                    user_id,
+                    index,
+                    attachment.kind.trim(),
+                    attachment.mime_type.trim(),
+                    path,
+                    size,
+                    digest
+                ),
+            );
+        }
     }
 
     fn normalize_provider_base_url(value: &str) -> &str {
@@ -563,8 +621,7 @@ impl PiBridge {
                 "images": prepared_input.images,
             })
             .to_string();
-            writeln!(stdin_writer, "{prompt_cmd}")
-                .map_err(|e| format!("写入 prompt 失败: {e}"))?;
+            writeln!(stdin_writer, "{prompt_cmd}").map_err(|e| format!("写入 prompt 失败: {e}"))?;
             stdin_writer
                 .flush()
                 .map_err(|e| format!("flush stdin 失败: {e}"))?;
@@ -651,9 +708,27 @@ impl PiBridge {
         S: FnOnce(Arc<PiRunHandle>),
     {
         let key = self.session_key(channel_id, user_id);
-        let session_path = Self::session_file_path(&key);
+        let fresh_multimodal_session = Self::has_multimodal_attachments(attachments);
+        let session_path = if fresh_multimodal_session {
+            Self::ephemeral_session_file_path(&key)
+        } else {
+            Self::session_file_path(&key)
+        };
         let runtime_dir = Self::prepare_runtime_dir()?;
         let prepared_input = prompt_attachments::prepare_prompt_input(prompt, attachments)?;
+        Self::log_attachment_debug(channel_id, user_id, attachments);
+        dev_trace(
+            "bot.pi",
+            format!(
+                "prompt_payload: channel={} user={} message_chars={} images={} fresh_multimodal_session={} session={}",
+                channel_id,
+                user_id,
+                prepared_input.message.chars().count(),
+                prepared_input.images.len(),
+                fresh_multimodal_session,
+                session_path.display()
+            ),
+        );
 
         // Write models config if needed
         let models_path = runtime_dir.join("models.json");
@@ -708,12 +783,10 @@ impl PiBridge {
                     .env("NINECLAW_AGENT_HOME", agent_home.as_os_str());
             }
 
-            if let Some(system_prompt) =
-                agents::build_agent_system_prompt_for_prompt(
-                    agent_config,
-                    Some(prepared_input.message.as_str()),
-                )
-            {
+            if let Some(system_prompt) = agents::build_agent_system_prompt_for_prompt(
+                agent_config,
+                Some(prepared_input.message.as_str()),
+            ) {
                 system_prompt_chars += system_prompt.chars().count();
                 system_prompt_sections
                     .push(("agent_system_prompt".to_string(), system_prompt.clone()));
@@ -762,8 +835,23 @@ impl PiBridge {
             .lock()
             .map_err(|_| "锁定 IM pi 会话槽失败".to_string())?;
 
+        if fresh_multimodal_session {
+            if let Some(mut prev) = pool_guard.take() {
+                let prev_pid = prev.child.id();
+                let _ = prev.child.kill();
+                let _ = Self::wait_for_child_exit(&mut prev.child, CHILD_KILL_GRACE_TIMEOUT);
+                dev_trace(
+                    "bot.pi",
+                    format!(
+                        "清理旧池化 pi: channel={} user={} old_pid={} reason=fresh_multimodal_session",
+                        channel_id, user_id, prev_pid
+                    ),
+                );
+            }
+        }
+
         let (mut child, stdin, stdout_rx, stderr_buffer, reused_from_pool) =
-            if pi_reuse_im_enabled() {
+            if pi_reuse_im_enabled() && !fresh_multimodal_session {
                 if let Some(mut prev) = pool_guard.take() {
                     let still_running = prev
                         .child
@@ -790,7 +878,8 @@ impl PiBridge {
                         (child, stdin, stdout_rx, stderr_buffer, true)
                     } else {
                         let _ = prev.child.kill();
-                        let _ = Self::wait_for_child_exit(&mut prev.child, CHILD_KILL_GRACE_TIMEOUT);
+                        let _ =
+                            Self::wait_for_child_exit(&mut prev.child, CHILD_KILL_GRACE_TIMEOUT);
                         drop(prev);
                         let (c, i, o, e) = self.spawn_pi_child_fresh(
                             cmd,
@@ -814,15 +903,15 @@ impl PiBridge {
                     (c, i, o, e, false)
                 }
             } else {
-                    let (c, i, o, e) = self.spawn_pi_child_fresh(
-                        cmd,
-                        channel_id,
-                        user_id,
-                        system_prompt_chars,
-                        &prepared_input,
-                        &system_prompt_sections,
-                    )?;
-                    (c, i, o, e, false)
+                let (c, i, o, e) = self.spawn_pi_child_fresh(
+                    cmd,
+                    channel_id,
+                    user_id,
+                    system_prompt_chars,
+                    &prepared_input,
+                    &system_prompt_sections,
+                )?;
+                (c, i, o, e, false)
             };
 
         let run_handle = Arc::new(PiRunHandle {
@@ -1188,7 +1277,7 @@ impl PiBridge {
             return Err(reason);
         }
 
-        if pi_reuse_im_enabled() && still_alive_after_turn {
+        if pi_reuse_im_enabled() && !fresh_multimodal_session && still_alive_after_turn {
             *pool_guard = Some(ImPooledPi {
                 child,
                 stdin,

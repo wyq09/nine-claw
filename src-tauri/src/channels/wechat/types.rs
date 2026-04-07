@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 
 // ── iLink Bot API Constants ──
 pub const MSG_TYPE_USER: i32 = 1;
 pub const MSG_TYPE_BOT: i32 = 2;
 pub const MSG_ITEM_TYPE_TEXT: i32 = 1;
-pub const MSG_ITEM_TYPE_VOICE: i32 = 2;
-pub const MSG_ITEM_TYPE_IMAGE: i32 = 3;
-pub const MSG_ITEM_TYPE_VIDEO: i32 = 4;
-pub const MSG_ITEM_TYPE_FILE: i32 = 8;
+pub const MSG_ITEM_TYPE_IMAGE: i32 = 2;
+pub const MSG_ITEM_TYPE_VOICE: i32 = 3;
+pub const MSG_ITEM_TYPE_FILE: i32 = 4;
+pub const MSG_ITEM_TYPE_VIDEO: i32 = 5;
 pub const MSG_STATE_FINISH: i32 = 2;
 
 /// iLink protocol version — must match a known version.
@@ -56,46 +58,76 @@ pub struct MessageItem {
     pub file_item: Option<FileItem>,
     pub video_item: Option<VideoItem>,
     pub voice_item: Option<VoiceItem>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct TextItem {
     pub text: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct CdnMedia {
+    pub encrypt_query_param: Option<String>,
+    pub aes_key: Option<String>,
+    pub encrypt_type: Option<i32>,
+    pub full_url: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct ImageItem {
+    pub media: Option<CdnMedia>,
+    pub thumb_media: Option<CdnMedia>,
+    /// Raw AES-128 key as a 32-char hex string; preferred over media.aes_key for inbound images.
+    pub aeskey: Option<String>,
+    pub url: Option<String>,
     /// Base64-encoded image data.
     pub image_base64: Option<String>,
     /// Image URL (if provided by the platform).
     pub image_url: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct FileItem {
+    pub media: Option<CdnMedia>,
     /// Base64-encoded file data.
     pub file_base64: Option<String>,
     /// Original file name.
     pub file_name: Option<String>,
     /// File URL (if provided by the platform).
     pub file_url: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct VideoItem {
+    pub media: Option<CdnMedia>,
+    pub thumb_media: Option<CdnMedia>,
     /// Base64-encoded video data.
     pub video_base64: Option<String>,
     /// Video URL (if provided by the platform).
     pub video_url: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct VoiceItem {
+    pub media: Option<CdnMedia>,
     /// Base64-encoded voice/audio data.
     pub voice_base64: Option<String>,
     /// Voice URL (if provided by the platform).
@@ -106,6 +138,8 @@ pub struct VoiceItem {
     pub duration_ms: Option<i64>,
     /// Optional original file name.
     pub file_name: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 /// Response from get_bot_qrcode.
