@@ -2,6 +2,7 @@ use crate::agents::{self, ConversationAgentConfig};
 use crate::dev_trace::{dev_trace, dev_trace_block};
 use crate::pi_runtime::{self, PiRuntimeLocation};
 use crate::pi_timeouts;
+use crate::prompt_attachments::{self, PreparedPromptInput, PromptAttachmentInput};
 use crate::skills;
 use md5::{Digest, Md5};
 use serde_json::json;
@@ -362,7 +363,7 @@ impl PiBridge {
                 provider.insert("authHeader".to_string(), json!(true));
                 provider.insert(
                     "models".to_string(),
-                    json!([{ "id": model, "api": "anthropic-messages" }]),
+                    json!([{ "id": model, "api": "anthropic-messages", "input": ["text", "image"] }]),
                 );
             }
             _ => {
@@ -376,7 +377,7 @@ impl PiBridge {
                 );
                 provider.insert(
                     "models".to_string(),
-                    json!([{ "id": model, "api": "openai-completions" }]),
+                    json!([{ "id": model, "api": "openai-completions", "input": ["text", "image"] }]),
                 );
             }
         }
@@ -487,7 +488,7 @@ impl PiBridge {
         channel_id: &str,
         user_id: &str,
         system_prompt_chars: usize,
-        prompt: &str,
+        prepared_input: &PreparedPromptInput,
         system_prompt_sections: &[(String, String)],
     ) -> Result<
         (
@@ -513,7 +514,7 @@ impl PiBridge {
                 child.id(),
                 self.provider_id,
                 self.model,
-                prompt.chars().count(),
+                prepared_input.message.chars().count(),
                 system_prompt_chars,
                 self.pi_runtime.executable.display()
             ),
@@ -558,7 +559,8 @@ impl PiBridge {
             let prompt_cmd = json!({
                 "id": "prompt-1",
                 "type": "prompt",
-                "message": prompt,
+                "message": prepared_input.message,
+                "images": prepared_input.images,
             })
             .to_string();
             writeln!(stdin_writer, "{prompt_cmd}")
@@ -596,10 +598,11 @@ impl PiBridge {
     where
         F: FnMut(&str),
     {
-        match self.process_message_interruptible(
+        match self.process_message_with_attachments_interruptible(
             channel_id,
             user_id,
             prompt,
+            &[],
             chunk_size,
             on_chunk,
             |_| {},
@@ -615,6 +618,31 @@ impl PiBridge {
         user_id: &str,
         prompt: &str,
         chunk_size: usize,
+        on_chunk: F,
+        on_run_start: S,
+    ) -> Result<PiProcessOutcome, String>
+    where
+        F: FnMut(&str),
+        S: FnOnce(Arc<PiRunHandle>),
+    {
+        self.process_message_with_attachments_interruptible(
+            channel_id,
+            user_id,
+            prompt,
+            &[],
+            chunk_size,
+            on_chunk,
+            on_run_start,
+        )
+    }
+
+    pub fn process_message_with_attachments_interruptible<F, S>(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        prompt: &str,
+        attachments: &[PromptAttachmentInput],
+        chunk_size: usize,
         mut on_chunk: F,
         on_run_start: S,
     ) -> Result<PiProcessOutcome, String>
@@ -625,6 +653,7 @@ impl PiBridge {
         let key = self.session_key(channel_id, user_id);
         let session_path = Self::session_file_path(&key);
         let runtime_dir = Self::prepare_runtime_dir()?;
+        let prepared_input = prompt_attachments::prepare_prompt_input(prompt, attachments)?;
 
         // Write models config if needed
         let models_path = runtime_dir.join("models.json");
@@ -680,7 +709,10 @@ impl PiBridge {
             }
 
             if let Some(system_prompt) =
-                agents::build_agent_system_prompt_for_prompt(agent_config, Some(prompt))
+                agents::build_agent_system_prompt_for_prompt(
+                    agent_config,
+                    Some(prepared_input.message.as_str()),
+                )
             {
                 system_prompt_chars += system_prompt.chars().count();
                 system_prompt_sections
@@ -765,7 +797,7 @@ impl PiBridge {
                             channel_id,
                             user_id,
                             system_prompt_chars,
-                            prompt,
+                            &prepared_input,
                             &system_prompt_sections,
                         )?;
                         (c, i, o, e, false)
@@ -776,21 +808,21 @@ impl PiBridge {
                         channel_id,
                         user_id,
                         system_prompt_chars,
-                        prompt,
+                        &prepared_input,
                         &system_prompt_sections,
                     )?;
                     (c, i, o, e, false)
                 }
             } else {
-                let (c, i, o, e) = self.spawn_pi_child_fresh(
-                    cmd,
-                    channel_id,
-                    user_id,
-                    system_prompt_chars,
-                    prompt,
-                    &system_prompt_sections,
-                )?;
-                (c, i, o, e, false)
+                    let (c, i, o, e) = self.spawn_pi_child_fresh(
+                        cmd,
+                        channel_id,
+                        user_id,
+                        system_prompt_chars,
+                        &prepared_input,
+                        &system_prompt_sections,
+                    )?;
+                    (c, i, o, e, false)
             };
 
         let run_handle = Arc::new(PiRunHandle {
@@ -815,7 +847,8 @@ impl PiBridge {
                 let prompt_cmd = json!({
                     "id": prompt_id,
                     "type": "prompt",
-                    "message": prompt,
+                    "message": prepared_input.message,
+                    "images": prepared_input.images,
                 })
                 .to_string();
                 writeln!(stdin_writer, "{prompt_cmd}")

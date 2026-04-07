@@ -24,6 +24,7 @@ export async function streamPiPrompt(
     sessionId?: string | null
     providerConfig?: ProviderRuntimeConfig | null
     agentConfig?: ConversationAgentSnapshot | null
+    attachments?: PersistedChatAttachment[]
   },
 ): Promise<void> {
   await invoke('stream_pi_prompt', {
@@ -31,6 +32,7 @@ export async function streamPiPrompt(
     sessionId: options?.sessionId ?? null,
     providerConfig: options?.providerConfig ?? null,
     agentConfig: options?.agentConfig ?? null,
+    attachments: options?.attachments ?? [],
   })
 }
 

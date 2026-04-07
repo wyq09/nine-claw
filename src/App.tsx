@@ -2093,6 +2093,7 @@ function App() {
       providerConfig: effectiveChatRuntime,
       agent: activeHistoryItem ? activeHistoryItem.agent ?? null : preferredComposerAgent,
       sessionLlm: sessionLlmDisplay,
+      attachments: composerAttachments,
     })
   }
 

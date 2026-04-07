@@ -22,6 +22,7 @@ import type {
   HistoryItem,
   HistoryStatus,
   PiStreamPayload,
+  PersistedChatAttachment,
   ProviderId,
   ProviderRuntimeConfig,
   TokenUsage,
@@ -1142,6 +1143,7 @@ export function usePiAgent() {
       providerConfig?: ProviderRuntimeConfig | null
       agent?: ConversationAgentSnapshot | null
       sessionLlm?: { providerId: ProviderId; model: string } | null
+      attachments?: PersistedChatAttachment[]
     },
     options?: { forceNewSession?: boolean },
   ) => {
@@ -1208,6 +1210,7 @@ export function usePiAgent() {
         sessionId: nextHistoryId,
         providerConfig: context?.providerConfig,
         agentConfig: context?.agent,
+        attachments: context?.attachments ?? [],
       })
 
       if (currentTurnIdsRef.current.get(nextHistoryId) === turn.id) {
@@ -1247,6 +1250,7 @@ export function usePiAgent() {
       providerConfig?: ProviderRuntimeConfig | null
       agent?: ConversationAgentSnapshot | null
       sessionLlm?: { providerId: ProviderId; model: string } | null
+      attachments?: PersistedChatAttachment[]
     },
   ) => submitPromptInternal(rawPrompt, context)
 
@@ -1256,6 +1260,7 @@ export function usePiAgent() {
       providerConfig?: ProviderRuntimeConfig | null
       agent?: ConversationAgentSnapshot | null
       sessionLlm?: { providerId: ProviderId; model: string } | null
+      attachments?: PersistedChatAttachment[]
     },
   ) => submitPromptInternal(rawPrompt, context, { forceNewSession: true })
 

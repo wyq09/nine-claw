@@ -7,6 +7,7 @@ mod dev_trace;
 mod heartbeat;
 mod pi_runtime;
 mod pi_timeouts;
+mod prompt_attachments;
 mod skills;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as _};
@@ -144,7 +145,7 @@ fn resolve_local_file_path(file_path: &str) -> Result<PathBuf, String> {
     Ok(resolved_path)
 }
 
-fn infer_media_mime_type(path: &Path, mime_hint: Option<&str>) -> String {
+pub(crate) fn infer_media_mime_type(path: &Path, mime_hint: Option<&str>) -> String {
     if let Some(mime_hint) = mime_hint {
         let trimmed = mime_hint.trim();
         if !trimmed.is_empty() {
@@ -862,7 +863,8 @@ fn custom_provider_object(
                 json!([
                   {
                     "id": model,
-                    "api": "anthropic-messages"
+                    "api": "anthropic-messages",
+                    "input": ["text", "image"]
                   }
                 ]),
             );
@@ -881,7 +883,8 @@ fn custom_provider_object(
                 json!([
                   {
                     "id": model,
-                    "api": "openai-completions"
+                    "api": "openai-completions",
+                    "input": ["text", "image"]
                   }
                 ]),
             );
@@ -1283,11 +1286,16 @@ async fn stream_pi_prompt(
     session_id: Option<String>,
     provider_config: Option<ProviderRuntimeConfig>,
     agent_config: Option<ConversationAgentConfig>,
+    attachments: Option<Vec<prompt_attachments::PromptAttachmentInput>>,
 ) -> Result<(), String> {
     let trimmed_prompt = prompt.trim().to_string();
-    if trimmed_prompt.is_empty() {
+    let attachments = attachments.unwrap_or_default();
+    if trimmed_prompt.is_empty() && attachments.is_empty() {
         return Err("prompt 不能为空".to_string());
     }
+
+    let prepared_input =
+        prompt_attachments::prepare_prompt_input(&trimmed_prompt, &attachments)?;
 
     let normalized_session_id = session_id
         .as_deref()
@@ -1400,7 +1408,7 @@ async fn stream_pi_prompt(
             format!(
                 "准备启动 pi: session={} prompt_chars={} system_prompt_chars={} skill_count={} provider={} model={} agent={} pi_path={}",
                 normalized_session_id,
-                trimmed_prompt.chars().count(),
+                prepared_input.message.chars().count(),
                 system_prompt_chars,
                 skill_count,
                 provider_config
@@ -1469,7 +1477,8 @@ async fn stream_pi_prompt(
             let prompt_command = json!({
               "id": format!("prompt-{}", normalized_session_id),
               "type": "prompt",
-              "message": trimmed_prompt,
+              "message": prepared_input.message,
+              "images": prepared_input.images,
             })
             .to_string();
 

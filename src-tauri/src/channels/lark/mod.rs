@@ -5,6 +5,7 @@ use crate::channels::pi_bridge::{PiBridge, PiProcessOutcome, PiRunHandle};
 use crate::channels::types::{BotMessage, ChannelStatus, MediaPayload, MediaType};
 use crate::channels::Channel;
 use crate::dev_trace::dev_trace;
+use crate::prompt_attachments::PromptAttachmentInput;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
@@ -32,6 +33,7 @@ struct WorkItem {
 #[derive(Clone)]
 struct UserTurnState {
     pending_texts: Vec<String>,
+    pending_attachments: Vec<PromptAttachmentInput>,
     receive_target: ReplyTarget,
     last_inbound_at: i64,
     queued: bool,
@@ -58,6 +60,7 @@ struct InboundAttachment {
 struct InboundMessagePayload {
     prompt_text: String,
     display_text: String,
+    prompt_attachments: Vec<PromptAttachmentInput>,
 }
 
 #[derive(Clone, Debug)]
@@ -440,6 +443,7 @@ impl Channel for LarkChannel {
                                     guard.entry(session_user_id.clone()).or_insert_with(|| {
                                         UserTurnState {
                                             pending_texts: Vec::new(),
+                                            pending_attachments: Vec::new(),
                                             receive_target: ReplyTarget {
                                                 receive_id: receive_id.clone(),
                                                 receive_id_type: receive_id_type.clone(),
@@ -452,6 +456,9 @@ impl Channel for LarkChannel {
                                     });
 
                                 state.pending_texts.push(inbound.prompt_text);
+                                state
+                                    .pending_attachments
+                                    .extend(inbound.prompt_attachments.clone());
                                 state.receive_target = ReplyTarget {
                                     receive_id: receive_id.clone(),
                                     receive_id_type: receive_id_type.clone(),
@@ -614,7 +621,7 @@ impl Channel for LarkChannel {
                             continue;
                         }
 
-                        let (prompt_text, receive_target) = {
+                        let (prompt_text, prompt_attachments, receive_target) = {
                             let mut guard = match user_states.lock() {
                                 Ok(guard) => guard,
                                 Err(_) => break,
@@ -637,6 +644,7 @@ impl Channel for LarkChannel {
                                 merge_pending_user_messages(&std::mem::take(
                                     &mut state.pending_texts,
                                 )),
+                                std::mem::take(&mut state.pending_attachments),
                                 state.receive_target.clone(),
                             )
                         };
@@ -668,10 +676,11 @@ impl Channel for LarkChannel {
                         let user_id_for_state = session_user_id.clone();
                         let app_for_cb = app_handle.clone();
                         let state_for_run = user_states.clone();
-                        let result = bridge.process_message_interruptible(
+                        let result = bridge.process_message_with_attachments_interruptible(
                             &channel_id,
                             &session_user_id,
                             &prompt_text,
+                            &prompt_attachments,
                             STREAM_CHUNK_SIZE,
                             |chunk: &str| {
                                 emit_bot_message(
@@ -1020,7 +1029,12 @@ fn cleanup_idle_user_state(
 
     let should_remove = guard
         .get(user_id)
-        .map(|state| !state.running && !state.queued && state.pending_texts.is_empty())
+        .map(|state| {
+            !state.running
+                && !state.queued
+                && state.pending_texts.is_empty()
+                && state.pending_attachments.is_empty()
+        })
         .unwrap_or(false);
 
     if should_remove {
@@ -1399,6 +1413,26 @@ fn build_inbound_prompt(text: &str, attachments: &[InboundAttachment]) -> Inboun
     for attachment in attachments {
         display_lines.push(attachment_display_line(attachment));
     }
+    let prompt_attachments = attachments
+        .iter()
+        .map(|attachment| PromptAttachmentInput {
+            file_name: Path::new(&attachment.saved_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            file_path: attachment.saved_path.clone(),
+            mime_type: String::new(),
+            kind: match attachment.media_type {
+                MediaType::Image => "image",
+                MediaType::Video => "video",
+                MediaType::Audio => "audio",
+                MediaType::File => "file",
+            }
+            .to_string(),
+            transcript: attachment.transcript.clone(),
+        })
+        .collect();
 
     let mut prompt_parts = Vec::new();
     if !normalized_text.is_empty() {
@@ -1428,6 +1462,7 @@ fn build_inbound_prompt(text: &str, attachments: &[InboundAttachment]) -> Inboun
     InboundMessagePayload {
         prompt_text: prompt_parts.join("\n\n").trim().to_string(),
         display_text: display_lines.join("\n").trim().to_string(),
+        prompt_attachments,
     }
 }
 
