@@ -17,6 +17,7 @@ import type {
   AgentCollaborationConfig,
   AgentExecutionMode,
   AgentSharedContextPolicy,
+  BotConversationTarget,
   ConversationAgentSnapshot,
   ConversationTurn,
   HistoryItem,
@@ -282,8 +283,23 @@ function buildBotConversationTitle(message: BotMessageEvent): string {
 }
 
 function withBotAgentMetadata(item: HistoryItem, message: BotMessageEvent): HistoryItem {
+  const botTarget = {
+    channelId: message.channel_id,
+    userId: message.user_id,
+  } satisfies BotConversationTarget
+
   if (!message.agent) {
-    return item
+    if (
+      item.botTarget?.channelId === botTarget.channelId &&
+      item.botTarget?.userId === botTarget.userId
+    ) {
+      return item
+    }
+
+    return {
+      ...item,
+      botTarget,
+    }
   }
 
   const channelLabel = deriveBotChannelLabel(message.channel_id)
@@ -296,6 +312,7 @@ function withBotAgentMetadata(item: HistoryItem, message: BotMessageEvent): Hist
     ...item,
     title: nextTitle,
     agent: message.agent,
+    botTarget,
   }
 }
 
@@ -359,6 +376,25 @@ function parseResponseSegments(raw: unknown): ResponseSegment[] | undefined {
     return undefined
   }
   return out
+}
+
+function parseBotConversationTarget(value: unknown): BotConversationTarget | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined
+  }
+
+  const candidate = value as Record<string, unknown>
+  const channelId = typeof candidate.channelId === 'string' ? candidate.channelId.trim() : ''
+  const userId = typeof candidate.userId === 'string' ? candidate.userId.trim() : ''
+
+  if (!channelId || !userId) {
+    return undefined
+  }
+
+  return {
+    channelId,
+    userId,
+  }
 }
 
 function parseHistorySnapshot(raw: string | null): HistoryItem[] {
@@ -511,6 +547,7 @@ function parseHistorySnapshot(raw: string | null): HistoryItem[] {
         const sessionLlmProviderId = candidate.sessionLlmProviderId
         const sessionLlmModel = candidate.sessionLlmModel
         const agent = parseConversationAgentSnapshot(candidate.agent)
+        const botTarget = parseBotConversationTarget(candidate.botTarget)
 
         return {
           id,
@@ -520,6 +557,7 @@ function parseHistorySnapshot(raw: string | null): HistoryItem[] {
           updatedAt,
           turns: parsedTurns,
           ...(agent ? { agent } : {}),
+          ...(botTarget ? { botTarget } : {}),
           ...(typeof sessionLlmProviderId === 'string' && sessionLlmProviderId
             ? { sessionLlmProviderId }
             : {}),
@@ -854,6 +892,17 @@ export function usePiAgent() {
       return
     }
 
+    if (payload.event === 'final_text' && typeof payload.text === 'string') {
+      updateTurn(currentHistoryId, currentTurnId, (turn) => ({
+        ...turn,
+        answer: payload.text ?? turn.answer,
+        responseSegments: payload.text
+          ? [...(turn.responseSegments ?? []).filter((segment) => segment.type === 'tool'), { type: 'text', text: payload.text }]
+          : turn.responseSegments,
+      }))
+      return
+    }
+
     if (payload.event === 'tool_execution_start') {
       const entry = buildToolCallEntry(payload)
       updateTurn(currentHistoryId, currentTurnId, (turn) => {
@@ -1017,6 +1066,31 @@ export function usePiAgent() {
   /** Map `channel_id:user_id` → { historyId, turnId } for tracking active bot sessions. */
   const botSessionMapRef = useRef<Map<string, { historyId: string; turnId: string }>>(new Map())
 
+  useEffect(() => {
+    const nextMap = new Map<string, { historyId: string; turnId: string }>()
+
+    for (const item of history) {
+      const channelId = item.botTarget?.channelId?.trim()
+      const userId = item.botTarget?.userId?.trim()
+      const latestTurnId = item.turns[item.turns.length - 1]?.id
+      if (!channelId || !userId || !latestTurnId) {
+        continue
+      }
+
+      const sessionKey = `${channelId}:${userId}`
+      if (nextMap.has(sessionKey)) {
+        continue
+      }
+
+      nextMap.set(sessionKey, {
+        historyId: item.id,
+        turnId: latestTurnId,
+      })
+    }
+
+    botSessionMapRef.current = nextMap
+  }, [history])
+
   const handleBotMessage = useEffectEvent((msg: BotMessageEvent) => {
     const sessionKey = `${msg.channel_id}:${msg.user_id}`
 
@@ -1059,6 +1133,10 @@ export function usePiAgent() {
           createdAt: now,
           updatedAt: now,
           turns: [turn],
+          botTarget: {
+            channelId: msg.channel_id,
+            userId: msg.user_id,
+          },
           ...(msg.agent ? { agent: msg.agent } : {}),
         }
         setHistory((prev) => [newSession, ...prev].slice(0, MAX_HISTORY_ITEMS))

@@ -5,6 +5,10 @@ use crate::channels::pi_bridge::{PiBridge, PiProcessOutcome, PiRunHandle};
 use crate::channels::types::{BotMessage, ChannelStatus, MediaPayload, MediaType};
 use crate::channels::Channel;
 use crate::dev_trace::dev_trace;
+use crate::media_directives::{
+    build_media_directive_line, parse_markdown_media_reference, parse_media_directive_fields,
+    parse_plain_media_path_reference,
+};
 use crate::prompt_attachments::PromptAttachmentInput;
 use serde_json::json;
 use std::collections::HashMap;
@@ -737,6 +741,15 @@ impl Channel for LarkChannel {
                                 }
 
                                 let (text_reply, media_items) = split_text_and_media(&full_text);
+                                let media_items = persist_outbound_media_items(
+                                    agent_config.as_ref().map(|config| config.id.as_str()),
+                                    &session_user_id,
+                                    media_items,
+                                );
+                                let cleaned_text_reply =
+                                    clean_media_fallback_text(&text_reply, !media_items.is_empty());
+                                let display_reply =
+                                    build_outbound_display_text(&cleaned_text_reply, &media_items);
                                 if text_reply.is_empty() && media_items.is_empty() {
                                     emit_bot_status(
                                         &app_handle,
@@ -764,20 +777,20 @@ impl Channel for LarkChannel {
                                         agent_id,
                                         &session_user_id,
                                         &prompt_text,
-                                        if text_reply.is_empty() {
+                                        if display_reply.is_empty() {
                                             &full_text
                                         } else {
-                                            &text_reply
+                                            &display_reply
                                         },
                                     );
                                 }
 
-                                if !text_reply.is_empty() {
+                                if !cleaned_text_reply.is_empty() {
                                     if let Err(error) = send_text_chunks(
                                         &helper_stdin,
                                         &pending_requests,
                                         &receive_target,
-                                        &text_reply,
+                                        &cleaned_text_reply,
                                     ) {
                                         emit_bot_status(
                                             &app_handle,
@@ -789,12 +802,12 @@ impl Channel for LarkChannel {
                                     }
                                 }
 
-                                for media in media_items {
+                                for media in &media_items {
                                     if let Err(error) = send_media_item(
                                         &helper_stdin,
                                         &pending_requests,
                                         &receive_target,
-                                        &media,
+                                        media,
                                     ) {
                                         emit_bot_status(
                                             &app_handle,
@@ -818,7 +831,7 @@ impl Channel for LarkChannel {
                                     &channel_id,
                                     &session_user_id,
                                     "outbound_done",
-                                    &full_text,
+                                    &display_reply,
                                     agent_config.as_ref(),
                                 );
                                 cleanup_idle_user_state(&user_states, &session_user_id);
@@ -1266,37 +1279,13 @@ fn is_audio_path(path: &str) -> bool {
 }
 
 fn parse_media_directive(line: &str) -> Option<ParsedMediaItem> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with("::nc-media{") || !trimmed.ends_with('}') {
-        return None;
-    }
-
-    let body = &trimmed["::nc-media{".len()..trimmed.len() - 1];
-    let mut media_type = None;
-    let mut path = None;
-
-    for pair in body.split_whitespace() {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        let normalized = value
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
-        match key {
-            "type" => media_type = Some(normalized),
-            "path" => path = Some(normalized),
-            _ => {}
-        }
-    }
-
-    let path = path?;
+    let parsed = parse_media_directive_fields(line)?;
+    let path = parsed.path;
     if !Path::new(&path).is_absolute() {
         return None;
     }
 
-    let media_type = match media_type.as_deref() {
+    let media_type = match parsed.media_type.as_deref() {
         Some("image") => MediaType::Image,
         Some("video") => MediaType::Video,
         Some("audio") | Some("voice") => MediaType::Audio,
@@ -1314,6 +1303,37 @@ fn parse_media_directive(line: &str) -> Option<ParsedMediaItem> {
         }
     };
 
+    let file_name = parsed.name.unwrap_or_else(|| {
+        Path::new(&path)
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "attachment".to_string())
+    });
+
+    Some(ParsedMediaItem {
+        media_type,
+        file_name,
+        file_path: path,
+    })
+}
+
+fn parse_markdown_media(line: &str) -> Option<ParsedMediaItem> {
+    let reference = parse_markdown_media_reference(line)?;
+    let path = reference.path;
+    if !Path::new(&path).is_absolute() {
+        return None;
+    }
+
+    let media_type = if line.trim().starts_with("![") || is_image_path(&path) {
+        MediaType::Image
+    } else if is_video_path(&path) {
+        MediaType::Video
+    } else if is_audio_path(&path) {
+        MediaType::Audio
+    } else {
+        MediaType::File
+    };
+
     let file_name = Path::new(&path)
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
@@ -1326,30 +1346,21 @@ fn parse_media_directive(line: &str) -> Option<ParsedMediaItem> {
     })
 }
 
-fn parse_markdown_media(line: &str) -> Option<ParsedMediaItem> {
-    let trimmed = line.trim();
-    let start = trimmed.find('(')?;
-    let end = trimmed.rfind(')')?;
-    if end <= start + 1 {
-        return None;
-    }
+fn parse_plain_path_media(line: &str) -> Option<ParsedMediaItem> {
+    let reference = parse_plain_media_path_reference(line)?;
+    let path = reference.path;
 
-    let path = trimmed[start + 1..end].trim();
-    if !Path::new(path).is_absolute() {
-        return None;
-    }
-
-    let media_type = if trimmed.starts_with("![") || is_image_path(path) {
+    let media_type = if is_image_path(&path) {
         MediaType::Image
-    } else if is_video_path(path) {
+    } else if is_video_path(&path) {
         MediaType::Video
-    } else if is_audio_path(path) {
+    } else if is_audio_path(&path) {
         MediaType::Audio
     } else {
         MediaType::File
     };
 
-    let file_name = Path::new(path)
+    let file_name = Path::new(&path)
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or_else(|| "attachment".to_string());
@@ -1357,7 +1368,7 @@ fn parse_markdown_media(line: &str) -> Option<ParsedMediaItem> {
     Some(ParsedMediaItem {
         media_type,
         file_name,
-        file_path: path.to_string(),
+        file_path: path,
     })
 }
 
@@ -1366,7 +1377,10 @@ fn split_text_and_media(content: &str) -> (String, Vec<ParsedMediaItem>) {
     let mut media_items = Vec::new();
 
     for line in content.lines() {
-        if let Some(item) = parse_media_directive(line).or_else(|| parse_markdown_media(line)) {
+        if let Some(item) = parse_media_directive(line)
+            .or_else(|| parse_markdown_media(line))
+            .or_else(|| parse_plain_path_media(line))
+        {
             media_items.push(item);
         } else {
             text_lines.push(line);
@@ -1374,6 +1388,110 @@ fn split_text_and_media(content: &str) -> (String, Vec<ParsedMediaItem>) {
     }
 
     (text_lines.join("\n").trim().to_string(), media_items)
+}
+
+fn outbound_media_type_slug(media_type: &MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "image",
+        MediaType::Video => "video",
+        MediaType::Audio => "audio",
+        MediaType::File => "file",
+    }
+}
+
+fn outbound_media_label(media_type: &MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "图片",
+        MediaType::Video => "视频",
+        MediaType::Audio => "语音",
+        MediaType::File => "文件",
+    }
+}
+
+fn persist_outbound_media_items(
+    agent_id: Option<&str>,
+    user_id: &str,
+    media_items: Vec<ParsedMediaItem>,
+) -> Vec<ParsedMediaItem> {
+    let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return media_items;
+    };
+
+    media_items
+        .into_iter()
+        .map(|item| {
+            let resolved_path = agent_workspace::resolve_agent_media_reference(
+                Some(agent_id),
+                &item.file_path,
+            )
+            .unwrap_or_else(|| PathBuf::from(&item.file_path));
+            let source_path = resolved_path.as_path();
+            match agent_workspace::persist_agent_outbound_artifact(
+                agent_id,
+                user_id,
+                &item.file_name,
+                source_path,
+            ) {
+                Ok(stable_path) => {
+                    let _ = agent_workspace::register_agent_outbound_artifact_source(
+                        agent_id,
+                        &item.file_name,
+                        &stable_path,
+                        None,
+                        Some(&format!("user={user_id} channel=lark")),
+                    );
+                    ParsedMediaItem {
+                        file_path: stable_path.display().to_string(),
+                        ..item
+                    }
+                }
+                Err(error) => {
+                    log::warn!("归档飞书出站媒体失败 {}: {}", item.file_path, error);
+                    item
+                }
+            }
+        })
+        .collect()
+}
+
+fn build_outbound_display_text(text_reply: &str, media_items: &[ParsedMediaItem]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if !text_reply.trim().is_empty() {
+        lines.push(text_reply.trim().to_string());
+    }
+    for item in media_items {
+        lines.push(build_media_directive_line(
+            outbound_media_type_slug(&item.media_type),
+            &item.file_path,
+            Some(&item.file_name),
+            Some(outbound_media_label(&item.media_type)),
+        ));
+    }
+    lines.join("\n")
+}
+
+fn clean_media_fallback_text(text_reply: &str, has_media: bool) -> String {
+    if !has_media {
+        return text_reply.trim().to_string();
+    }
+
+    let filtered = text_reply
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.contains("不能可靠地把本地原文件作为可下载附件送达")
+                && !trimmed.contains("不能稳定把本地文件作为可下载附件真正送达")
+                && !trimmed.contains("当前通道似乎不能稳定")
+                && !trimmed.contains("如果你要我继续“发文件”")
+                && !trimmed.contains("大概率还是会失败")
+                && !trimmed.contains("任选其一")
+                && !trimmed.contains("最推荐")
+                && !trimmed.contains("压缩到下载目录")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    filtered.trim().to_string()
 }
 
 fn inbound_media_label(media_type: &MediaType) -> &'static str {

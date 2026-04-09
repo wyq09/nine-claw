@@ -1,6 +1,7 @@
 export type PiStreamEventName =
   | 'start'
   | 'delta'
+  | 'final_text'
   | 'done'
   | 'error'
   | 'aborted'
@@ -189,6 +190,7 @@ export type HistoryItem = {
   updatedAt: number
   turns: ConversationTurn[]
   agent?: ConversationAgentSnapshot
+  botTarget?: BotConversationTarget
   /** 本会话单独指定的大模型（与全局默认无关，持久化） */
   sessionLlmProviderId?: ProviderId
   sessionLlmModel?: string
@@ -294,7 +296,7 @@ export type AgentBuilderDraft = {
 export type AgentWorkspaceFile = {
   key: string
   scope: 'agent' | 'shared'
-  section: 'private' | 'shared' | 'dailyLog'
+  section: 'private' | 'shared' | 'dailyLog' | 'memoryIndex' | 'categoryMemory' | 'wiki'
   name: string
   relativePath: string
   absolutePath: string
@@ -433,6 +435,70 @@ export type ProviderRuntimeConfig = {
   baseUrl: string
   apiKey: string
   model: string
+}
+
+export type ScheduledJobRecord = {
+  id: string
+  sourceKind: string
+  ownerAgentId: string
+  sourceScheduleId: string
+  sourceTaskId: string
+  kind: string
+  name: string
+  description: string
+  enabled: boolean
+  timezone: string
+  triggerType: string
+  triggerSpecJson: string
+  payloadJson: string
+  deliveryJson: string
+  nextRunAt?: number | null
+  lastRunAt?: number | null
+  lastSyncedAt: number
+  createdAt: number
+  updatedAt: number
+}
+
+export type ScheduledJobRunRecord = {
+  id: string
+  jobId: string
+  scheduledFor: number
+  claimedAt: number
+  startedAt?: number | null
+  finishedAt?: number | null
+  status: string
+  attempt: number
+  workerId?: string | null
+  summary?: string | null
+  details?: string | null
+  error?: string | null
+  outputPath?: string | null
+  createdAt: number
+  updatedAt: number
+}
+
+export type SchedulerServiceStatus = {
+  installed: boolean
+  platform: string
+  detail: string
+  launcherPath?: string | null
+}
+
+export type SchedulerRuntimeStatus = {
+  service: SchedulerServiceStatus
+  daemonActive: boolean
+  leaderOwnerId?: string | null
+  leaderLeasedUntil?: number | null
+  activeRunCount: number
+}
+
+export type SchedulerSyncResult = {
+  jobCount: number
+}
+
+export type BotConversationTarget = {
+  channelId: string
+  userId: string
 }
 
 /** Payload emitted from Rust via `bot://message` for history tracking. */

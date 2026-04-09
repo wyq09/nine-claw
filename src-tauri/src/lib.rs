@@ -4,10 +4,12 @@ mod channels;
 mod chat_attachments;
 mod dev_trace;
 mod heartbeat;
+mod media_directives;
 mod peer_gateway;
 mod pi_runtime;
 mod pi_timeouts;
 mod prompt_attachments;
+mod scheduler;
 mod skills;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as _};
@@ -25,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Build a reqwest client that auto-detects proxy availability.
 /// If proxy env vars are set and the proxy port is reachable, use proxy.
@@ -76,6 +78,7 @@ static PI_RUNTIME_HANDLES: OnceLock<Mutex<HashMap<String, PiRuntimeHandle>>> = O
 const HISTORY_DB_FILE: &str = "nineclaw.sqlite3";
 const LEGACY_HISTORY_DB_FILES: &[&str] = &["yqagent.sqlite3"];
 const PI_SESSION_FILE_PREFIX: &str = "nineclaw-pi-session-";
+const PI_SUMMARY_FILE_PREFIX: &str = "nineclaw-pi-summary-";
 const LEGACY_PI_SESSION_FILE_PREFIXES: &[&str] = &["yqagent-pi-session-"];
 const PI_RUNTIME_DIR_NAME: &str = "nineclaw-pi-runtime";
 const HISTORY_STATE_KEY: &str = "history_v1";
@@ -331,6 +334,13 @@ struct ChildExitOutcome {
     timed_out: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MultimodalSummaryEntry {
+    timestamp_ms: i64,
+    user_prompt: String,
+    assistant_response: String,
+}
+
 const CHILD_KILL_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn spawn_pi_stdout_logger<R>(
@@ -361,11 +371,277 @@ fn spawn_pi_stdout_logger<R>(
     });
 }
 
+#[derive(Clone, Debug)]
+struct DesktopParsedMediaItem {
+    media_type: MediaType,
+    file_name: String,
+    file_path: String,
+}
+
+fn desktop_media_reply_prompt(agent_home: Option<&Path>) -> String {
+    let mut prompt = String::from(
+        "当前回复目标是 NineClaw 桌面用户。如果你需要把本地生成的图片、文件或视频真正回复给用户，请单独输出一行 `::nc-media{type=\"image|file|video\" path=\"/absolute/path/to/file\"}`。该指令行不要附加解释文字；普通文本说明单独写在其他行。",
+    );
+    if let Some(agent_home) = agent_home {
+        let preferred_dir = agent_home.join("outbox");
+        prompt.push_str(" 生成给用户的正式产物时，不要只放在临时目录；优先写到 `");
+        prompt.push_str(&preferred_dir.display().to_string());
+        prompt.push_str("` 或其子目录，再在 `::nc-media` 里引用那个绝对路径。");
+    }
+    prompt
+}
+
+fn is_desktop_image_path(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg")
+    )
+}
+
+fn is_desktop_video_path(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v")
+    )
+}
+
+fn is_desktop_audio_path(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp3" | "wav" | "ogg" | "opus" | "m4a" | "aac" | "amr" | "silk")
+    )
+}
+
+fn parse_desktop_media_directive(line: &str) -> Option<DesktopParsedMediaItem> {
+    let directive = media_directives::parse_media_directive_fields(line)?;
+    if !Path::new(&directive.path).is_absolute() {
+        return None;
+    }
+
+    let media_type = match directive
+        .media_type
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image" => MediaType::Image,
+        "video" => MediaType::Video,
+        "audio" | "voice" => MediaType::Audio,
+        "file" => MediaType::File,
+        _ => {
+            if is_desktop_image_path(&directive.path) {
+                MediaType::Image
+            } else if is_desktop_video_path(&directive.path) {
+                MediaType::Video
+            } else if is_desktop_audio_path(&directive.path) {
+                MediaType::Audio
+            } else {
+                MediaType::File
+            }
+        }
+    };
+
+    let file_name = directive.name.unwrap_or_else(|| {
+        Path::new(&directive.path)
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "attachment".to_string())
+    });
+
+    Some(DesktopParsedMediaItem {
+        media_type,
+        file_name,
+        file_path: directive.path,
+    })
+}
+
+fn parse_desktop_markdown_media(line: &str) -> Option<DesktopParsedMediaItem> {
+    let reference = media_directives::parse_markdown_media_reference(line)?;
+    if !Path::new(&reference.path).is_absolute() {
+        return None;
+    }
+
+    let media_type = if line.trim().starts_with("![") || is_desktop_image_path(&reference.path) {
+        MediaType::Image
+    } else if is_desktop_video_path(&reference.path) {
+        MediaType::Video
+    } else if is_desktop_audio_path(&reference.path) {
+        MediaType::Audio
+    } else {
+        MediaType::File
+    };
+
+    let file_name = Path::new(&reference.path)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "attachment".to_string());
+
+    Some(DesktopParsedMediaItem {
+        media_type,
+        file_name,
+        file_path: reference.path,
+    })
+}
+
+fn parse_desktop_plain_path_media(line: &str) -> Option<DesktopParsedMediaItem> {
+    let reference = media_directives::parse_plain_media_path_reference(line)?;
+    let path = reference.path;
+
+    let media_type = if is_desktop_image_path(&path) {
+        MediaType::Image
+    } else if is_desktop_video_path(&path) {
+        MediaType::Video
+    } else if is_desktop_audio_path(&path) {
+        MediaType::Audio
+    } else {
+        MediaType::File
+    };
+
+    let file_name = Path::new(&path)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "attachment".to_string());
+
+    Some(DesktopParsedMediaItem {
+        media_type,
+        file_name,
+        file_path: path,
+    })
+}
+
+fn split_desktop_text_and_media(content: &str) -> (String, Vec<DesktopParsedMediaItem>) {
+    let mut text_lines = Vec::new();
+    let mut media_items = Vec::new();
+
+    for line in content.lines() {
+        if let Some(item) = parse_desktop_media_directive(line)
+            .or_else(|| parse_desktop_markdown_media(line))
+            .or_else(|| parse_desktop_plain_path_media(line))
+        {
+            media_items.push(item);
+        } else {
+            text_lines.push(line);
+        }
+    }
+
+    (text_lines.join("\n").trim().to_string(), media_items)
+}
+
+fn desktop_media_type_slug(media_type: &MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "image",
+        MediaType::Video => "video",
+        MediaType::Audio => "audio",
+        MediaType::File => "file",
+    }
+}
+
+fn desktop_media_label(media_type: &MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "图片",
+        MediaType::Video => "视频",
+        MediaType::Audio => "语音",
+        MediaType::File => "文件",
+    }
+}
+
+fn build_desktop_outbound_display_text(
+    text_reply: &str,
+    media_items: &[DesktopParsedMediaItem],
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if !text_reply.trim().is_empty() {
+        lines.push(text_reply.trim().to_string());
+    }
+    for item in media_items {
+        lines.push(media_directives::build_media_directive_line(
+            desktop_media_type_slug(&item.media_type),
+            &item.file_path,
+            Some(&item.file_name),
+            Some(desktop_media_label(&item.media_type)),
+        ));
+    }
+    lines.join("\n")
+}
+
+fn persist_desktop_outbound_media_items(
+    agent_id: Option<&str>,
+    media_items: Vec<DesktopParsedMediaItem>,
+) -> Vec<DesktopParsedMediaItem> {
+    let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return media_items;
+    };
+
+    media_items
+        .into_iter()
+        .map(|item| {
+            let resolved_path = agent_workspace::resolve_agent_media_reference(
+                Some(agent_id),
+                &item.file_path,
+            )
+            .unwrap_or_else(|| PathBuf::from(&item.file_path));
+            let source_path = resolved_path.as_path();
+            match agent_workspace::persist_agent_outbound_artifact(
+                agent_id,
+                "desktop-local",
+                &item.file_name,
+                source_path,
+            ) {
+                Ok(stable_path) => {
+                    let _ = agent_workspace::register_agent_outbound_artifact_source(
+                        agent_id,
+                        &item.file_name,
+                        &stable_path,
+                        None,
+                        Some("user=desktop-local channel=desktop"),
+                    );
+                    DesktopParsedMediaItem {
+                        file_path: stable_path.display().to_string(),
+                        ..item
+                    }
+                }
+                Err(error) => {
+                    log::warn!("归档桌面出站媒体失败 {}: {}", item.file_path, error);
+                    item
+                }
+            }
+        })
+        .collect()
+}
+
+fn finalize_desktop_outbound_reply(content: &str, agent_id: Option<&str>) -> String {
+    let (text_reply, media_items) = split_desktop_text_and_media(content);
+    if media_items.is_empty() {
+        return content.to_string();
+    }
+    let media_items = persist_desktop_outbound_media_items(agent_id, media_items);
+    build_desktop_outbound_display_text(&text_reply, &media_items)
+}
+
 #[cfg(test)]
 mod lib_tests {
-    use super::infer_media_mime_type;
+    use super::{
+        build_desktop_outbound_display_text, desktop_media_reply_prompt, infer_media_mime_type,
+        prepend_multimodal_summary_context, record_multimodal_summary,
+        render_multimodal_summary_context, summary_file_path, DesktopParsedMediaItem,
+    };
+    use crate::channels::types::MediaType;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
     fn write_temp_file(extension: &str, bytes: &[u8]) -> PathBuf {
@@ -392,6 +668,55 @@ mod lib_tests {
         let mime = infer_media_mime_type(&path, None);
         let _ = fs::remove_file(&path);
         assert_eq!(mime, "image/png");
+    }
+
+    #[test]
+    fn multimodal_summary_context_roundtrip() {
+        let key = format!("test-summary-{}", Uuid::new_v4());
+        let path = summary_file_path(&key);
+        let _ = fs::remove_file(&path);
+
+        record_multimodal_summary(&key, "第一张图里有什么", "这是封面页，标题是季度复盘")
+            .expect("record summary");
+        record_multimodal_summary(&key, "第二张图里有什么", "这是目录页，包含三部分")
+            .expect("record second summary");
+
+        let context = render_multimodal_summary_context(&key)
+            .expect("render summary context")
+            .expect("summary context exists");
+        assert!(context.contains("第一张图里有什么"));
+        assert!(context.contains("这是目录页"));
+
+        let prompt = prepend_multimodal_summary_context("继续看第三张图", &key)
+            .expect("prepend summary context");
+        assert!(prompt.contains("原始图片/视频已从主会话上下文移除"));
+        assert!(prompt.contains("继续看第三张图"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn desktop_media_reply_prompt_mentions_outbox_when_agent_home_exists() {
+        let prompt = desktop_media_reply_prompt(Some(Path::new("/tmp/agent-home")));
+        assert!(prompt.contains("::nc-media"));
+        assert!(prompt.contains("/tmp/agent-home/outbox"));
+    }
+
+    #[test]
+    fn desktop_outbound_display_text_rebuilds_media_directives() {
+        let display_text = build_desktop_outbound_display_text(
+            "这是文件",
+            &[DesktopParsedMediaItem {
+                media_type: MediaType::File,
+                file_name: "weekly report.pdf".to_string(),
+                file_path: "/tmp/weekly report.pdf".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            display_text,
+            "这是文件\n::nc-media{type=\"file\" path=\"/tmp/weekly%20report.pdf\" name=\"weekly%20report.pdf\" label=\"%E6%96%87%E4%BB%B6\"}"
+        );
     }
 }
 
@@ -498,12 +823,131 @@ fn hash_session_id(session_id: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+pub(crate) fn session_summary_key(session_id: &str) -> String {
+    hash_session_id(session_id)
+}
+
 fn session_file_path(session_id: Option<&str>) -> PathBuf {
     let key = session_id
         .filter(|value| !value.trim().is_empty())
         .map(hash_session_id)
         .unwrap_or_else(|| "default".to_string());
     std::env::temp_dir().join(format!("{PI_SESSION_FILE_PREFIX}{key}.jsonl"))
+}
+
+fn ephemeral_session_file_path(session_id: Option<&str>) -> PathBuf {
+    let key = session_id
+        .filter(|value| !value.trim().is_empty())
+        .map(hash_session_id)
+        .unwrap_or_else(|| "default".to_string());
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("{PI_SESSION_FILE_PREFIX}{key}-media-{nonce}.jsonl"))
+}
+
+fn summary_file_path(summary_key: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{PI_SUMMARY_FILE_PREFIX}{summary_key}.json"))
+}
+
+fn normalize_summary_text(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = compact.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let truncated = trimmed
+        .char_indices()
+        .nth(max_chars)
+        .map(|(index, _)| &trimmed[..index])
+        .unwrap_or(trimmed);
+    format!("{truncated}…")
+}
+
+fn load_multimodal_summary_entries(
+    summary_key: &str,
+) -> Result<Vec<MultimodalSummaryEntry>, String> {
+    let path = summary_file_path(summary_key);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("读取多模态摘要失败 {}: {error}", path.display()))?;
+    serde_json::from_str(&content)
+        .map_err(|error| format!("解析多模态摘要失败 {}: {error}", path.display()))
+}
+
+pub(crate) fn render_multimodal_summary_context(
+    summary_key: &str,
+) -> Result<Option<String>, String> {
+    let entries = load_multimodal_summary_entries(summary_key)?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let mut lines =
+        vec!["以下是此前多模态附件轮次的文字摘要，原始图片/视频已从主会话上下文移除：".to_string()];
+    for entry in entries
+        .iter()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        lines.push(format!("- 用户: {}", entry.user_prompt));
+        lines.push(format!("  结果: {}", entry.assistant_response));
+    }
+
+    Ok(Some(lines.join("\n")))
+}
+
+pub(crate) fn prepend_multimodal_summary_context(
+    prompt: &str,
+    summary_key: &str,
+) -> Result<String, String> {
+    let Some(summary_context) = render_multimodal_summary_context(summary_key)? else {
+        return Ok(prompt.to_string());
+    };
+
+    let trimmed_prompt = prompt.trim();
+    if trimmed_prompt.is_empty() {
+        Ok(summary_context)
+    } else {
+        Ok(format!("{summary_context}\n\n{trimmed_prompt}"))
+    }
+}
+
+pub(crate) fn record_multimodal_summary(
+    summary_key: &str,
+    user_prompt: &str,
+    assistant_response: &str,
+) -> Result<(), String> {
+    let user_prompt = normalize_summary_text(user_prompt, 240);
+    let assistant_response = normalize_summary_text(assistant_response, 1200);
+    if user_prompt.is_empty() || assistant_response.is_empty() {
+        return Ok(());
+    }
+
+    let mut entries = load_multimodal_summary_entries(summary_key)?;
+    entries.push(MultimodalSummaryEntry {
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        user_prompt,
+        assistant_response,
+    });
+
+    if entries.len() > 8 {
+        let keep_from = entries.len() - 8;
+        entries.drain(0..keep_from);
+    }
+
+    let path = summary_file_path(summary_key);
+    let content = serde_json::to_vec_pretty(&entries)
+        .map_err(|error| format!("序列化多模态摘要失败: {error}"))?;
+    fs::write(&path, content)
+        .map_err(|error| format!("写入多模态摘要失败 {}: {error}", path.display()))
 }
 
 fn session_cleanup_paths(session_id: Option<&str>) -> Vec<PathBuf> {
@@ -513,6 +957,7 @@ fn session_cleanup_paths(session_id: Option<&str>) -> Vec<PathBuf> {
         .unwrap_or_else(|| "default".to_string());
 
     let mut paths = vec![std::env::temp_dir().join(format!("{PI_SESSION_FILE_PREFIX}{key}.jsonl"))];
+    paths.push(summary_file_path(&key));
     for prefix in LEGACY_PI_SESSION_FILE_PREFIXES {
         paths.push(std::env::temp_dir().join(format!("{prefix}{key}.jsonl")));
     }
@@ -809,6 +1254,44 @@ fn write_agent_workspace_file(
     content: String,
 ) -> Result<AgentWorkspaceBundle, String> {
     agents::write_agent_workspace_file(&app, agent_id, relative_path, content)
+}
+
+#[tauri::command]
+fn list_scheduled_jobs(app: tauri::AppHandle) -> Result<Vec<scheduler::ScheduledJobRecord>, String> {
+    scheduler::list_jobs(&app)
+}
+
+#[tauri::command]
+fn list_scheduled_job_runs(
+    app: tauri::AppHandle,
+    limit: Option<u32>,
+) -> Result<Vec<scheduler::ScheduledJobRunRecord>, String> {
+    scheduler::list_job_runs(&app, limit)
+}
+
+#[tauri::command]
+fn sync_scheduler_jobs(app: tauri::AppHandle) -> Result<scheduler::SchedulerSyncResult, String> {
+    scheduler::sync_materialized_jobs(&app)
+}
+
+#[tauri::command]
+fn trigger_scheduler_job_now(app: tauri::AppHandle, job_id: String) -> Result<(), String> {
+    scheduler::trigger_job_now(&app, &job_id)
+}
+
+#[tauri::command]
+fn get_scheduler_status(app: tauri::AppHandle) -> Result<scheduler::SchedulerRuntimeStatus, String> {
+    scheduler::runtime_status(&app)
+}
+
+#[tauri::command]
+fn install_scheduler_service() -> Result<scheduler::SchedulerServiceStatus, String> {
+    scheduler::install_service()
+}
+
+#[tauri::command]
+fn uninstall_scheduler_service() -> Result<scheduler::SchedulerServiceStatus, String> {
+    scheduler::uninstall_service()
 }
 
 pub(crate) fn chrono_like_timestamp() -> i64 {
@@ -1415,14 +1898,16 @@ async fn stream_pi_prompt(
         return Err("prompt 不能为空".to_string());
     }
 
-    let prepared_input = prompt_attachments::prepare_prompt_input(&trimmed_prompt, &attachments)?;
-
     let normalized_session_id = session_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "default".to_string());
+    let summary_key = session_summary_key(&normalized_session_id);
+    let prompt_with_summary = prepend_multimodal_summary_context(&trimmed_prompt, &summary_key)?;
+    let prepared_input =
+        prompt_attachments::prepare_prompt_input(&prompt_with_summary, &attachments)?;
 
     tauri::async_runtime::spawn_blocking(move || {
         emit_stream_event(
@@ -1441,7 +1926,12 @@ async fn stream_pi_prompt(
             None,
         )?;
 
-        let session_path = session_file_path(Some(normalized_session_id.as_str()));
+        let fresh_multimodal_session = !prepared_input.images.is_empty();
+        let session_path = if fresh_multimodal_session {
+            ephemeral_session_file_path(Some(normalized_session_id.as_str()))
+        } else {
+            session_file_path(Some(normalized_session_id.as_str()))
+        };
         let session_path_string = session_path.to_string_lossy().to_string();
         let resolved_pi_path = pi_runtime::resolve_pi_executable(&app)
             .map(|location| location.executable.display().to_string())
@@ -1482,9 +1972,11 @@ async fn stream_pi_prompt(
         let mut system_prompt_chars = 0usize;
         let mut system_prompt_sections: Vec<(String, String)> = Vec::new();
         let mut skill_count = 0usize;
+        let mut desktop_agent_home: Option<PathBuf> = None;
         if let Some(agent_config) = agent_config.as_ref() {
             if let Ok(workspace_root) = agent_workspace::resolve_workspace_root() {
                 let agent_home = workspace_root.join("agents").join(&agent_config.id);
+                desktop_agent_home = Some(agent_home.clone());
                 command
                     .current_dir(&agent_home)
                     .env("NINECLAW_AGENT_ID", &agent_config.id)
@@ -1523,10 +2015,18 @@ async fn stream_pi_prompt(
             }
         }
 
+        let desktop_media_prompt = desktop_media_reply_prompt(desktop_agent_home.as_deref());
+        system_prompt_chars += desktop_media_prompt.chars().count();
+        system_prompt_sections.push((
+            "desktop_media".to_string(),
+            desktop_media_prompt.clone(),
+        ));
+        command.args(["--append-system-prompt", &desktop_media_prompt]);
+
         dev_trace(
             "desktop.stream",
             format!(
-                "准备启动 pi: session={} prompt_chars={} system_prompt_chars={} skill_count={} provider={} model={} agent={} pi_path={}",
+                "准备启动 pi: session={} prompt_chars={} system_prompt_chars={} skill_count={} provider={} model={} agent={} pi_path={} images={} fresh_multimodal_session={} runtime_session={}",
                 normalized_session_id,
                 prepared_input.message.chars().count(),
                 system_prompt_chars,
@@ -1544,6 +2044,9 @@ async fn stream_pi_prompt(
                     .map(|item| item.id.as_str())
                     .unwrap_or("(none)"),
                 resolved_pi_path,
+                prepared_input.images.len(),
+                fresh_multimodal_session,
+                session_path.display(),
             ),
         );
         for (label, content) in &system_prompt_sections {
@@ -2224,6 +2727,28 @@ async fn stream_pi_prompt(
             return Err(error_text);
         }
 
+        if saw_agent_end || saw_message_done {
+            emitted_assistant_text = finalize_desktop_outbound_reply(
+                &emitted_assistant_text,
+                agent_config.as_ref().map(|config| config.id.as_str()),
+            );
+            emit_stream_event(
+                &app,
+                "final_text",
+                Some(normalized_session_id.clone()),
+                Some(emitted_assistant_text.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+        }
+
         if let Some(agent_config) = agent_config.as_ref() {
             if (saw_agent_end || saw_message_done) && !emitted_assistant_text.trim().is_empty() {
                 // 桌面聊天也需要沉淀进统一的 agent wiki，避免记忆只在 Bot 通道生效。
@@ -2235,6 +2760,14 @@ async fn stream_pi_prompt(
                 ) {
                     eprintln!("NineClaw: 写入桌面聊天记忆失败: {error}");
                 }
+            }
+        }
+
+        if fresh_multimodal_session && (saw_agent_end || saw_message_done) {
+            if let Err(error) =
+                record_multimodal_summary(&summary_key, &trimmed_prompt, &emitted_assistant_text)
+            {
+                eprintln!("NineClaw: 记录多模态摘要失败: {error}");
             }
         }
 
@@ -2605,7 +3138,7 @@ async fn bot_stop_lark(channel_id: String) -> Result<(), String> {
     mgr.stop_channel(&channel_id)
 }
 
-fn auto_start_bound_im_services(app: &AppHandle) -> Result<(), String> {
+pub(crate) fn auto_start_bound_im_services(app: &AppHandle) -> Result<(), String> {
     let agent_records = agents::list_agents(app)?;
 
     for agent in agent_records {
@@ -2893,7 +3426,7 @@ pub fn run() {
             if let Err(error) = peer_gateway::restart_peer_gateway(&app.handle()) {
                 log::warn!("对等网关启动: {error}");
             }
-            heartbeat::start_heartbeat_scheduler(app.handle().clone());
+            scheduler::start_embedded_scheduler(app.handle().clone());
 
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -2926,6 +3459,13 @@ pub fn run() {
             set_default_agent,
             read_agent_workspace_bundle,
             write_agent_workspace_file,
+            list_scheduled_jobs,
+            list_scheduled_job_runs,
+            sync_scheduler_jobs,
+            trigger_scheduler_job_now,
+            get_scheduler_status,
+            install_scheduler_service,
+            uninstall_scheduler_service,
             stream_pi_prompt,
             abort_pi_stream,
             persist_chat_attachments,
@@ -2944,6 +3484,30 @@ pub fn run() {
             ensure_runtime_dependencies,
             test_llm_provider_connection
         ])
-        .run(tauri::generate_context!())
+        .run(app_context())
         .expect("error while running tauri application");
+}
+
+pub fn run_scheduler_daemon() -> Result<(), String> {
+    let app = tauri::Builder::default()
+        .build(app_context())
+        .map_err(|error| format!("初始化 scheduler daemon 失败: {error}"))?;
+    let app_handle = app.handle().clone();
+
+    let status = pi_runtime::ensure_runtime_dependencies_impl(&app_handle);
+    if !status.pi_available {
+        log::warn!(
+            "scheduler daemon runtime dependency check: {}",
+            status.messages.join(" | ")
+        );
+    }
+    if let Err(error) = auto_start_bound_im_services(&app_handle) {
+        log::warn!("scheduler daemon 自动启动 IM 服务失败: {}", error);
+    }
+
+    scheduler::run_daemon(app_handle)
+}
+
+fn app_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
 }

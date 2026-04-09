@@ -4,9 +4,13 @@ pub mod types;
 use crate::agent_workspace;
 use crate::agents::ConversationAgentConfig;
 use crate::dev_trace::dev_trace;
+use crate::media_directives::{
+    build_media_directive_line, parse_markdown_media_reference, parse_media_directive_fields,
+    parse_plain_media_path_reference,
+};
 use openssl::symm::Cipher;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -14,7 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as Base64Engine};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 
 use self::api::WeChatApi;
@@ -119,37 +123,13 @@ fn is_audio_path(path: &str) -> bool {
 }
 
 fn parse_media_directive(line: &str) -> Option<ParsedMediaItem> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with("::nc-media{") || !trimmed.ends_with('}') {
-        return None;
-    }
-
-    let body = &trimmed["::nc-media{".len()..trimmed.len() - 1];
-    let mut media_type = None;
-    let mut path = None;
-
-    for pair in body.split_whitespace() {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        let normalized = value
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
-        match key {
-            "type" => media_type = Some(normalized),
-            "path" => path = Some(normalized),
-            _ => {}
-        }
-    }
-
-    let path = path?;
+    let parsed = parse_media_directive_fields(line)?;
+    let path = parsed.path;
     if !Path::new(&path).is_absolute() {
         return None;
     }
 
-    let media_type = match media_type.as_deref() {
+    let media_type = match parsed.media_type.as_deref() {
         Some("image") => MediaType::Image,
         Some("video") => MediaType::Video,
         Some("audio") | Some("voice") => MediaType::Audio,
@@ -167,6 +147,37 @@ fn parse_media_directive(line: &str) -> Option<ParsedMediaItem> {
         }
     };
 
+    let file_name = parsed.name.unwrap_or_else(|| {
+        Path::new(&path)
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "attachment".to_string())
+    });
+
+    Some(ParsedMediaItem {
+        media_type,
+        file_name,
+        file_path: path,
+    })
+}
+
+fn parse_markdown_media(line: &str) -> Option<ParsedMediaItem> {
+    let reference = parse_markdown_media_reference(line)?;
+    let path = reference.path;
+    if !Path::new(&path).is_absolute() {
+        return None;
+    }
+
+    let media_type = if line.trim().starts_with("![") || is_image_path(&path) {
+        MediaType::Image
+    } else if is_video_path(&path) {
+        MediaType::Video
+    } else if is_audio_path(&path) {
+        MediaType::Audio
+    } else {
+        MediaType::File
+    };
+
     let file_name = Path::new(&path)
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
@@ -179,30 +190,21 @@ fn parse_media_directive(line: &str) -> Option<ParsedMediaItem> {
     })
 }
 
-fn parse_markdown_media(line: &str) -> Option<ParsedMediaItem> {
-    let trimmed = line.trim();
-    let start = trimmed.find('(')?;
-    let end = trimmed.rfind(')')?;
-    if end <= start + 1 {
-        return None;
-    }
+fn parse_plain_path_media(line: &str) -> Option<ParsedMediaItem> {
+    let reference = parse_plain_media_path_reference(line)?;
+    let path = reference.path;
 
-    let path = trimmed[start + 1..end].trim();
-    if !Path::new(path).is_absolute() {
-        return None;
-    }
-
-    let media_type = if trimmed.starts_with("![") || is_image_path(path) {
+    let media_type = if is_image_path(&path) {
         MediaType::Image
-    } else if is_video_path(path) {
+    } else if is_video_path(&path) {
         MediaType::Video
-    } else if is_audio_path(path) {
+    } else if is_audio_path(&path) {
         MediaType::Audio
     } else {
         MediaType::File
     };
 
-    let file_name = Path::new(path)
+    let file_name = Path::new(&path)
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or_else(|| "attachment".to_string());
@@ -210,7 +212,7 @@ fn parse_markdown_media(line: &str) -> Option<ParsedMediaItem> {
     Some(ParsedMediaItem {
         media_type,
         file_name,
-        file_path: path.to_string(),
+        file_path: path,
     })
 }
 
@@ -219,7 +221,10 @@ fn split_text_and_media(content: &str) -> (String, Vec<ParsedMediaItem>) {
     let mut media_items = Vec::new();
 
     for line in content.lines() {
-        if let Some(item) = parse_media_directive(line).or_else(|| parse_markdown_media(line)) {
+        if let Some(item) = parse_media_directive(line)
+            .or_else(|| parse_markdown_media(line))
+            .or_else(|| parse_plain_path_media(line))
+        {
             media_items.push(item);
         } else {
             text_lines.push(line);
@@ -227,6 +232,110 @@ fn split_text_and_media(content: &str) -> (String, Vec<ParsedMediaItem>) {
     }
 
     (text_lines.join("\n").trim().to_string(), media_items)
+}
+
+fn outbound_media_type_slug(media_type: &MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "image",
+        MediaType::Video => "video",
+        MediaType::Audio => "audio",
+        MediaType::File => "file",
+    }
+}
+
+fn outbound_media_label(media_type: &MediaType) -> &'static str {
+    match media_type {
+        MediaType::Image => "图片",
+        MediaType::Video => "视频",
+        MediaType::Audio => "语音",
+        MediaType::File => "文件",
+    }
+}
+
+fn persist_outbound_media_items(
+    agent_id: Option<&str>,
+    user_id: &str,
+    media_items: Vec<ParsedMediaItem>,
+) -> Vec<ParsedMediaItem> {
+    let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return media_items;
+    };
+
+    media_items
+        .into_iter()
+        .map(|item| {
+            let resolved_path = agent_workspace::resolve_agent_media_reference(
+                Some(agent_id),
+                &item.file_path,
+            )
+            .unwrap_or_else(|| PathBuf::from(&item.file_path));
+            let source_path = resolved_path.as_path();
+            match agent_workspace::persist_agent_outbound_artifact(
+                agent_id,
+                user_id,
+                &item.file_name,
+                source_path,
+            ) {
+                Ok(stable_path) => {
+                    let _ = agent_workspace::register_agent_outbound_artifact_source(
+                        agent_id,
+                        &item.file_name,
+                        &stable_path,
+                        None,
+                        Some(&format!("user={user_id} channel=wechat")),
+                    );
+                    ParsedMediaItem {
+                        file_path: stable_path.display().to_string(),
+                        ..item
+                    }
+                }
+                Err(error) => {
+                    log::warn!("归档微信出站媒体失败 {}: {}", item.file_path, error);
+                    item
+                }
+            }
+        })
+        .collect()
+}
+
+fn build_outbound_display_text(text_reply: &str, media_items: &[ParsedMediaItem]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if !text_reply.trim().is_empty() {
+        lines.push(text_reply.trim().to_string());
+    }
+    for item in media_items {
+        lines.push(build_media_directive_line(
+            outbound_media_type_slug(&item.media_type),
+            &item.file_path,
+            Some(&item.file_name),
+            Some(outbound_media_label(&item.media_type)),
+        ));
+    }
+    lines.join("\n")
+}
+
+fn clean_media_fallback_text(text_reply: &str, has_media: bool) -> String {
+    if !has_media {
+        return text_reply.trim().to_string();
+    }
+
+    let filtered = text_reply
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.contains("不能可靠地把本地原文件作为可下载附件送达")
+                && !trimmed.contains("不能稳定把本地文件作为可下载附件真正送达")
+                && !trimmed.contains("当前通道似乎不能稳定")
+                && !trimmed.contains("如果你要我继续“发文件”")
+                && !trimmed.contains("大概率还是会失败")
+                && !trimmed.contains("任选其一")
+                && !trimmed.contains("最推荐")
+                && !trimmed.contains("压缩到下载目录")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    filtered.trim().to_string()
 }
 
 fn inbound_media_label(media_type: &MediaType) -> &'static str {
@@ -1614,6 +1723,15 @@ impl Channel for WeChatChannel {
                                 }
 
                                 let (text_reply, media_items) = split_text_and_media(&full_text);
+                                let media_items = persist_outbound_media_items(
+                                    agent_config.as_ref().map(|config| config.id.as_str()),
+                                    &user_id,
+                                    media_items,
+                                );
+                                let cleaned_text_reply =
+                                    clean_media_fallback_text(&text_reply, !media_items.is_empty());
+                                let display_reply =
+                                    build_outbound_display_text(&cleaned_text_reply, &media_items);
 
                                 if text_reply.is_empty() && media_items.is_empty() {
                                     log::warn!("pi 返回空回复");
@@ -1663,24 +1781,24 @@ impl Channel for WeChatChannel {
                                         agent_id,
                                         &user_id,
                                         &prompt_text,
-                                        if text_reply.is_empty() {
+                                        if display_reply.is_empty() {
                                             &full_text
                                         } else {
-                                            &text_reply
+                                            &display_reply
                                         },
                                     );
                                 }
-                                if !text_reply.is_empty() {
-                                    let cards = resolve_reply_card_items(&text_reply, false);
+                                if !cleaned_text_reply.is_empty() {
+                                    let cards = resolve_reply_card_items(&cleaned_text_reply, false);
                                     for seg in wechat_im_text_segments(&cards) {
                                         if !seg.is_empty() {
                                             send_reply_chunks(&rt, &api, &user_id, &seg, ct_opt);
                                         }
                                     }
                                 }
-                                for media in media_items {
+                                for media in &media_items {
                                     if let Err(error) =
-                                        send_media_item(&rt, &api, &user_id, &media, ct_opt)
+                                        send_media_item(&rt, &api, &user_id, media, ct_opt)
                                     {
                                         log::error!("发送媒体消息失败: {error}");
                                     }
@@ -1690,7 +1808,7 @@ impl Channel for WeChatChannel {
                                     &channel_id,
                                     &user_id,
                                     "outbound_done",
-                                    &full_text,
+                                    &display_reply,
                                     agent_config.as_ref(),
                                 );
                                 cleanup_idle_user_state(&user_states, &user_id);
@@ -1786,28 +1904,19 @@ impl Channel for WeChatChannel {
     fn send_media(&self, user_id: &str, media: &MediaPayload) -> Result<(), String> {
         let api = WeChatApi::new(&self.base_url, &self.token, self.route_tag.as_deref());
         let ct = self.context_tokens.lock().unwrap().get(user_id).cloned();
-        let b64 = BASE64_ENGINE.encode(&media.data);
-
-        let (item_type, item_json) = match media.media_type {
-            MediaType::Image => (
-                MSG_ITEM_TYPE_IMAGE,
-                json!({ "image_item": { "image_base64": b64 } }),
-            ),
-            MediaType::Audio => (
-                MSG_ITEM_TYPE_FILE,
-                json!({ "file_item": { "file_base64": b64, "file_name": media.file_name } }),
-            ),
-            MediaType::File => (
-                MSG_ITEM_TYPE_FILE,
-                json!({ "file_item": { "file_base64": b64, "file_name": media.file_name } }),
-            ),
-            MediaType::Video => (
-                MSG_ITEM_TYPE_VIDEO,
-                json!({ "video_item": { "video_base64": b64 } }),
-            ),
+        let item_type = match media.media_type {
+            MediaType::Image => MSG_ITEM_TYPE_IMAGE,
+            MediaType::Video => MSG_ITEM_TYPE_VIDEO,
+            MediaType::Audio | MediaType::File => MSG_ITEM_TYPE_FILE,
         };
 
-        block_on_async(api.send_media_message(user_id, item_type, item_json, ct.as_deref()))
+        block_on_async(api.send_binary_media(
+            user_id,
+            item_type,
+            &media.file_name,
+            &media.data,
+            ct.as_deref(),
+        ))
     }
 
     fn status(&self) -> ChannelStatus {
@@ -1875,28 +1984,19 @@ fn send_media_item(
 ) -> Result<(), String> {
     let data = std::fs::read(&media.file_path)
         .map_err(|error| format!("读取媒体文件失败 {}: {error}", media.file_path))?;
-    let b64 = BASE64_ENGINE.encode(&data);
-
-    let (item_type, item_json) = match media.media_type {
-        MediaType::Image => (
-            MSG_ITEM_TYPE_IMAGE,
-            json!({ "image_item": { "image_base64": b64 } }),
-        ),
-        MediaType::Audio => (
-            MSG_ITEM_TYPE_FILE,
-            json!({ "file_item": { "file_base64": b64, "file_name": media.file_name } }),
-        ),
-        MediaType::Video => (
-            MSG_ITEM_TYPE_VIDEO,
-            json!({ "video_item": { "video_base64": b64 } }),
-        ),
-        MediaType::File => (
-            MSG_ITEM_TYPE_FILE,
-            json!({ "file_item": { "file_base64": b64, "file_name": media.file_name } }),
-        ),
+    let item_type = match media.media_type {
+        MediaType::Image => MSG_ITEM_TYPE_IMAGE,
+        MediaType::Video => MSG_ITEM_TYPE_VIDEO,
+        MediaType::Audio | MediaType::File => MSG_ITEM_TYPE_FILE,
     };
 
-    rt.block_on(api.send_media_message(user_id, item_type, item_json, context_token))
+    rt.block_on(api.send_binary_media(
+        user_id,
+        item_type,
+        &media.file_name,
+        &data,
+        context_token,
+    ))
 }
 
 /// Emit a `bot://status` event to the frontend for diagnostic display.
@@ -2021,5 +2121,64 @@ mod tests {
         let decoded_base64_hex =
             parse_wechat_aes_key(&base64_of_hex).expect("parse base64-encoded hex key");
         assert_eq!(decoded_base64_hex, decoded_hex);
+    }
+
+    #[test]
+    fn parses_media_directive_with_quoted_space_path() {
+        let item = parse_media_directive(
+            r#"::nc-media{type="file" path="/tmp/weekly report.pdf" name="weekly report.pdf"}"#,
+        )
+        .expect("media directive with spaces");
+
+        assert!(matches!(item.media_type, MediaType::File));
+        assert_eq!(item.file_path, "/tmp/weekly report.pdf");
+        assert_eq!(item.file_name, "weekly report.pdf");
+    }
+
+    #[test]
+    fn parses_percent_encoded_markdown_media_path() {
+        let item = parse_markdown_media("[日报](/tmp/weekly%20report.pdf)")
+            .expect("markdown media with encoded path");
+
+        assert!(matches!(item.media_type, MediaType::File));
+        assert_eq!(item.file_path, "/tmp/weekly report.pdf");
+        assert_eq!(item.file_name, "weekly report.pdf");
+    }
+
+    #[test]
+    fn parses_plain_bullet_media_path() {
+        let item = parse_plain_path_media("- /Users/demo/Desktop/wechat_login_screenshot.png")
+            .expect("plain path media");
+
+        assert!(matches!(item.media_type, MediaType::Image));
+        assert_eq!(item.file_path, "/Users/demo/Desktop/wechat_login_screenshot.png");
+        assert_eq!(item.file_name, "wechat_login_screenshot.png");
+    }
+
+    #[test]
+    fn parses_plain_file_name_media_path() {
+        let item = parse_plain_path_media("- wechat_login_screenshot.png")
+            .expect("plain file name media");
+
+        assert!(matches!(item.media_type, MediaType::Image));
+        assert_eq!(item.file_path, "wechat_login_screenshot.png");
+        assert_eq!(item.file_name, "wechat_login_screenshot.png");
+    }
+
+    #[test]
+    fn builds_outbound_display_text_with_encoded_media_directive() {
+        let text = build_outbound_display_text(
+            "请查收",
+            &[ParsedMediaItem {
+                media_type: MediaType::File,
+                file_name: "weekly report.pdf".to_string(),
+                file_path: "/tmp/weekly report.pdf".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            text,
+            "请查收\n::nc-media{type=\"file\" path=\"/tmp/weekly%20report.pdf\" name=\"weekly%20report.pdf\" label=\"%E6%96%87%E4%BB%B6\"}"
+        );
     }
 }

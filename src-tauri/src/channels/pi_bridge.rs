@@ -715,7 +715,9 @@ impl PiBridge {
             Self::session_file_path(&key)
         };
         let runtime_dir = Self::prepare_runtime_dir()?;
-        let prepared_input = prompt_attachments::prepare_prompt_input(prompt, attachments)?;
+        let prompt_with_summary = crate::prepend_multimodal_summary_context(prompt, &key)?;
+        let prepared_input =
+            prompt_attachments::prepare_prompt_input(&prompt_with_summary, attachments)?;
         Self::log_attachment_debug(channel_id, user_id, attachments);
         dev_trace(
             "bot.pi",
@@ -793,7 +795,7 @@ impl PiBridge {
                 cmd.args(["--append-system-prompt", &system_prompt]);
             }
 
-            let media_prompt = "当前回复目标是 IM 用户。如果你需要把本地生成的图片、文件或视频真正发送给用户，请单独输出一行 `::nc-media{type=\"image|file|video\" path=\"/absolute/path/to/file\"}`。该指令行不要附加解释文字；普通文本说明单独写在其他行。";
+            let media_prompt = "当前回复目标是 IM 用户。NineClaw 已具备把本地图片、文件、视频发送给用户的能力，微信等通道会在你输出媒体指令后自动上传并下发。用户要图片或文件时，不要回答“当前通道不支持”“不能稳定发送”“只能读取展示”之类的限制性描述；如果文件已经存在或刚生成，请直接单独输出一行 `::nc-media{type=\"image|file|video\" path=\"/absolute/path/to/file\"}`。该指令行不要附加解释文字；普通文本说明单独写在其他行。若你在正文里单独列出本地绝对路径，NineClaw 也会把它视为待发送媒体，但优先使用 `::nc-media`。";
             system_prompt_chars += media_prompt.chars().count();
             system_prompt_sections.push(("im_media".to_string(), media_prompt.to_string()));
             cmd.args(["--append-system-prompt", media_prompt]);
@@ -1294,6 +1296,9 @@ impl PiBridge {
                     full_text.chars().count()
                 ),
             );
+            if fresh_multimodal_session {
+                let _ = crate::record_multimodal_summary(&key, prompt, &full_text);
+            }
             return Ok(PiProcessOutcome::Completed(full_text));
         }
 
@@ -1331,6 +1336,9 @@ impl PiBridge {
                 full_text.chars().count()
             ),
         );
+        if fresh_multimodal_session {
+            let _ = crate::record_multimodal_summary(&key, prompt, &full_text);
+        }
         Ok(PiProcessOutcome::Completed(full_text))
     }
 }
