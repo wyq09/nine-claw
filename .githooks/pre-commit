@@ -4,22 +4,19 @@
 # The pi launcher must skip SCRIPT_DIR when searching PATH for node on macOS,
 # because the bundled thin node (68KB @loader_path wrapper) is killed by SIP/AMFI.
 # Code formatters and AI assistants routinely revert this file to the broken
-# "command -v node" version. This hook restores the correct content on every commit.
+# "command -v node" version. This hook ALWAYS restores the correct content
+# on every commit — it does NOT rely on detecting file changes.
 #
 # Setup (one-time):
 #   git config core.hooksPath .githooks
 
 PI_FILE="src-tauri/resources/pi-runtime/macos/pi"
 
-# Check if the file is modified (staged or unstaged)
-changed=$(git diff --cached --name-only; git diff --name-only) 2>/dev/null | grep -F "$PI_FILE" || true
-if [ -z "$changed" ]; then
-    exit 0
-fi
+# Always write the correct content — do not skip based on diff detection
+# (Codex may have modified the file but not yet committed it)
+echo "[pre-commit hook] Ensuring correct pi launcher (macOS SIP/AMFI workaround)..."
 
-echo "[pre-commit hook] Restoring correct pi launcher (macOS SIP/AMFI workaround)..."
-
-cat > "$PI_FILE" << 'EOF'
+cat > "$PI_FILE" << 'PIEOF'
 #!/bin/sh
 # Bundled pi launcher generated during build.
 set -eu
@@ -52,10 +49,9 @@ if [ -d "$SCRIPT_DIR/lib" ]; then
   export LD_LIBRARY_PATH="$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 exec "$NODE_BIN" "$SCRIPT_DIR/pi-package/dist/cli.js" "$@"
-EOF
+PIEOF
 
 chmod +x "$PI_FILE"
 git add "$PI_FILE"
 
 echo "[pre-commit hook] Done."
-exit 0
