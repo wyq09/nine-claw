@@ -71,10 +71,25 @@ use skills::{InstalledSkill, SystemSkillCatalog};
 struct PiRuntimeHandle {
     abort_requested: Arc<AtomicBool>,
     pid: u32,
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
 }
 
 static PI_RUNTIME_HANDLES: OnceLock<Mutex<HashMap<String, PiRuntimeHandle>>> = OnceLock::new();
+static DESKTOP_POOLED_PI: OnceLock<Mutex<HashMap<String, DesktopPooledPi>>> = OnceLock::new();
+/// 同一桌面 session 串行化 `stream_pi_prompt`，避免并发时池替换/双进程互相 kill 导致 SIGKILL、stdout 空读。
+static DESKTOP_STREAM_SESSION_MUTEXES: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    OnceLock::new();
+
+fn desktop_session_stream_mutex(session_id: &str) -> Arc<Mutex<()>> {
+    let map = DESKTOP_STREAM_SESSION_MUTEXES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map
+        .lock()
+        .expect("DESKTOP_STREAM_SESSION_MUTEXES poisoned");
+    guard
+        .entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
 const HISTORY_DB_FILE: &str = "nineclaw.sqlite3";
 const LEGACY_HISTORY_DB_FILES: &[&str] = &["yqagent.sqlite3"];
 const PI_SESSION_FILE_PREFIX: &str = "nineclaw-pi-session-";
@@ -84,6 +99,20 @@ const PI_RUNTIME_DIR_NAME: &str = "nineclaw-pi-runtime";
 const HISTORY_STATE_KEY: &str = "history_v1";
 const PROVIDER_CONFIGS_STATE_KEY: &str = "provider_configs_v1";
 const CUSTOM_PROVIDER_META_STATE_KEY: &str = "custom_provider_meta_v1";
+
+struct DesktopPooledPi {
+    child: Child,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    stdout_rx: mpsc::Receiver<Result<String, String>>,
+    stderr_buffer: Arc<Mutex<String>>,
+    fingerprint: String,
+}
+
+fn pi_reuse_desktop_enabled() -> bool {
+    std::env::var("NINECLAW_PI_REUSE_DESKTOP")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true)
+}
 
 fn open_path_in_default_app(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -112,6 +141,45 @@ fn open_path_in_default_app(path: &Path) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("打开文件失败: {error}"))
+}
+
+fn open_url_in_default_browser(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("链接不能为空".to_string());
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    if !(normalized.starts_with("http://") || normalized.starts_with("https://")) {
+        return Err("仅支持打开 http 或 https 链接".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut cmd = Command::new("open");
+        cmd.arg(trimmed);
+        cmd
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", ""]);
+        cmd.arg(trimmed);
+        cmd
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(trimmed);
+        cmd
+    };
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("打开链接失败: {error}"))
 }
 
 fn resolve_local_file_path(file_path: &str) -> Result<PathBuf, String> {
@@ -342,6 +410,8 @@ struct MultimodalSummaryEntry {
 }
 
 const CHILD_KILL_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
+/// stdout 已关闭后等待 pi 进程退出的上限；过短会 `Child::kill`（SIGKILL），易与「上游无输出」叠在一起误判。
+const DESKTOP_PI_AFTER_STDOUT_EOF_EXIT_WAIT: Duration = Duration::from_secs(30);
 
 fn spawn_pi_stdout_logger<R>(
     reader: R,
@@ -351,9 +421,11 @@ fn spawn_pi_stdout_logger<R>(
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
+        let mut line_count = 0usize;
         for line in BufReader::new(reader).lines() {
             match line {
                 Ok(line) => {
+                    line_count += 1;
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
                         dev_trace(scope, trimmed);
@@ -368,6 +440,7 @@ fn spawn_pi_stdout_logger<R>(
                 }
             }
         }
+        dev_trace(scope, format!("stdout_eof: lines={line_count}"));
     });
 }
 
@@ -632,12 +705,75 @@ fn finalize_desktop_outbound_reply(content: &str, agent_id: Option<&str>) -> Str
     build_desktop_outbound_display_text(&text_reply, &media_items)
 }
 
+fn desktop_incomplete_reply_error(
+    provider_config: Option<&ProviderRuntimeConfig>,
+    saw_prompt_response: bool,
+    saw_any_output: bool,
+    saw_assistant_activity: bool,
+) -> Option<String> {
+    if provider_config.is_none() {
+        return Some(
+            "当前会话没有传入 Provider 配置，NineClaw 只能依赖系统 pi 默认模型；这次默认配置没有返回 assistant 回复。请在设置中启用至少一个 Provider，或先在终端确认 `pi --mode rpc` 能独立工作。"
+                .to_string(),
+        );
+    }
+
+    if saw_assistant_activity {
+        return Some(
+            "pi 已输出部分 assistant 内容，但没有返回完成事件。请重试；若持续出现，请检查当前 pi 版本是否变更了 RPC 输出行为。"
+                .to_string(),
+        );
+    }
+
+    if !saw_prompt_response && !saw_any_output {
+        let provider_config = provider_config?;
+        if let Err(error) = validate_desktop_provider_config(provider_config) {
+            return Some(error);
+        }
+        return Some(format!(
+            "pi 已启动但没有产生任何输出（provider={}，model={}）。请检查该 Provider 的 Base URL、模型可用性，以及当前 pi 版本是否支持该 RPC 运行方式。",
+            provider_config.provider_id.trim(),
+            provider_config.model.trim()
+        ));
+    }
+
+    let provider_config = provider_config?;
+
+    if provider_config.provider_id.trim().is_empty()
+        || provider_config.base_url.trim().is_empty()
+        || provider_config.model.trim().is_empty()
+    {
+        return Some(
+            "pi 已接收消息，但当前桌面会话没有关联完整的 Provider 配置，因此没有返回 assistant 回复。请在设置中补全 Base URL、API Key 和模型后重试。"
+                .to_string(),
+        );
+    }
+
+    let provider_id = provider_config.provider_id.trim();
+    let provider_label = if provider_config.api_format.trim().is_empty() {
+        provider_id.to_string()
+    } else {
+        format!(
+            "{} ({})",
+            provider_id,
+            normalize_provider_api_format(&provider_config.api_format, provider_id)
+        )
+    };
+
+    Some(format!(
+        "pi 已接收消息，但没有返回 assistant 回复（provider={}，model={}）。请检查 Provider 配置或确认当前 pi 版本是否变更了 RPC 输出行为。",
+        provider_label,
+        provider_config.model.trim()
+    ))
+}
+
 #[cfg(test)]
 mod lib_tests {
     use super::{
-        build_desktop_outbound_display_text, desktop_media_reply_prompt, infer_media_mime_type,
-        prepend_multimodal_summary_context, record_multimodal_summary,
-        render_multimodal_summary_context, summary_file_path, DesktopParsedMediaItem,
+        build_desktop_outbound_display_text, desktop_incomplete_reply_error,
+        desktop_media_reply_prompt, infer_media_mime_type, prepend_multimodal_summary_context,
+        record_multimodal_summary, render_multimodal_summary_context, summary_file_path,
+        DesktopParsedMediaItem, ProviderRuntimeConfig,
     };
     use crate::channels::types::MediaType;
     use std::fs;
@@ -718,6 +854,28 @@ mod lib_tests {
             "这是文件\n::nc-media{type=\"file\" path=\"/tmp/weekly%20report.pdf\" name=\"weekly%20report.pdf\" label=\"%E6%96%87%E4%BB%B6\"}"
         );
     }
+
+    #[test]
+    fn desktop_incomplete_reply_error_prefers_partial_assistant_message() {
+        let reason =
+            desktop_incomplete_reply_error(None, true, true, true).expect("partial reply reason");
+        assert!(reason.contains("部分 assistant 内容"));
+    }
+
+    #[test]
+    fn desktop_incomplete_reply_error_reports_missing_provider_fields() {
+        let provider = ProviderRuntimeConfig {
+            provider_id: "openai".to_string(),
+            api_format: "openai".to_string(),
+            base_url: String::new(),
+            api_key: "secret".to_string(),
+            model: "gpt-4.1".to_string(),
+        };
+
+        let reason = desktop_incomplete_reply_error(Some(&provider), true, true, false)
+            .expect("missing provider reason");
+        assert!(reason.contains("没有关联完整的 Provider 配置"));
+    }
 }
 
 fn spawn_pi_stderr_logger<R>(reader: R, scope: &'static str, buffer: Arc<Mutex<String>>)
@@ -725,9 +883,11 @@ where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
+        let mut line_count = 0usize;
         for line in BufReader::new(reader).lines() {
             match line {
                 Ok(line) => {
+                    line_count += 1;
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
                         dev_trace(scope, trimmed);
@@ -748,11 +908,16 @@ where
                 }
             }
         }
+        dev_trace(scope, format!("stderr_eof: lines={line_count}"));
     });
 }
 
 fn runtime_handle_store() -> &'static Mutex<HashMap<String, PiRuntimeHandle>> {
     PI_RUNTIME_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn desktop_pi_pool() -> &'static Mutex<HashMap<String, DesktopPooledPi>> {
+    DESKTOP_POOLED_PI.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn insert_runtime_handle(session_id: &str, handle: PiRuntimeHandle) -> Result<(), String> {
@@ -778,7 +943,152 @@ fn remove_runtime_handle(session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn next_prompt_command_id(session_id: &str) -> String {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("prompt-{session_id}-{nonce}")
+}
+
+fn send_pi_prompt_command(
+    stdin: &Arc<Mutex<Option<ChildStdin>>>,
+    prompt_id: &str,
+    prepared_input: &prompt_attachments::PreparedPromptInput,
+) -> Result<(), String> {
+    let prompt_command = json!({
+      "id": prompt_id,
+      "type": "prompt",
+      "message": &prepared_input.message,
+      "images": &prepared_input.images,
+    })
+    .to_string();
+
+    let mut stdin_guard = stdin
+        .lock()
+        .map_err(|error| format!("无法锁定 prompt stdin: {error}"))?;
+    let stdin = stdin_guard
+        .as_mut()
+        .ok_or_else(|| "pi stdin 已关闭，无法写入 prompt".to_string())?;
+    writeln!(stdin, "{prompt_command}").map_err(|error| format!("写入 prompt 失败: {error}"))?;
+    stdin
+        .flush()
+        .map_err(|error| format!("刷新 stdin 失败: {error}"))?;
+    Ok(())
+}
+
+fn spawn_desktop_pi_child_fresh(
+    mut command: Command,
+    normalized_session_id: &str,
+    prepared_input: &prompt_attachments::PreparedPromptInput,
+) -> Result<
+    (
+        Child,
+        Arc<Mutex<Option<ChildStdin>>>,
+        mpsc::Receiver<Result<String, String>>,
+        Arc<Mutex<String>>,
+    ),
+    String,
+> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("调用 pi 失败，请确认已安装并在 PATH 中: {error}"))?;
+
+    // Give the kernel a moment to load the binary; detect immediate SIGKILL
+    // (common on macOS for unsigned/quarantined dylibs) before wiring up I/O.
+    thread::sleep(Duration::from_millis(50));
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|error| format!("检查 pi 进程状态失败: {error}"))?
+    {
+        let exit_info = describe_exit_status(status);
+        return Err(format!(
+            "pi 进程启动后立即退出 ({exit_info})，pid={}。\
+             这通常意味着动态库加载失败或系统安全策略阻止了执行。",
+            child.id(),
+        ));
+    }
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "无法获取 pi stdin".to_string())?;
+    let stdin = Arc::new(Mutex::new(Some(stdin)));
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法读取 pi 输出".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法读取 pi 错误输出".to_string())?;
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let stderr_buffer = Arc::new(Mutex::new(String::new()));
+    spawn_pi_stdout_logger(stdout, "desktop.stream.raw", stdout_tx);
+    spawn_pi_stderr_logger(stderr, "desktop.stream.stderr", stderr_buffer.clone());
+
+    if let Err(error) = send_pi_prompt_command(
+        &stdin,
+        &format!("prompt-{}", normalized_session_id),
+        prepared_input,
+    ) {
+        close_pi_stdin(&stdin);
+        kill_child_with_trace(
+            &mut child,
+            Some(normalized_session_id),
+            "spawn_desktop_pi_child_fresh:initial_prompt_write_failed",
+        );
+        let _ = wait_for_child_exit_with_trace(
+            &mut child,
+            CHILD_KILL_GRACE_TIMEOUT,
+            Some(normalized_session_id),
+            "spawn_desktop_pi_child_fresh:after_initial_prompt_write_failed_kill",
+        );
+        return Err(error);
+    }
+
+    Ok((child, stdin, stdout_rx, stderr_buffer))
+}
+
+fn kill_child_with_trace(child: &mut Child, session_id: Option<&str>, reason: &str) {
+    dev_trace(
+        "desktop.stream",
+        format!(
+            "kill pi: session={} pid={} reason={}",
+            session_id.unwrap_or("-"),
+            child.id(),
+            reason
+        ),
+    );
+    let _ = child.kill();
+}
+
 fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<ChildExitOutcome, String> {
+    wait_for_child_exit_with_trace(child, timeout, None, "wait_for_child_exit:default")
+}
+
+fn describe_exit_status(status: ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return format!("signal:{sig}");
+        }
+    }
+    if let Some(code) = status.code() {
+        format!("code:{code}")
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn wait_for_child_exit_with_trace(
+    child: &mut Child,
+    timeout: Duration,
+    session_id: Option<&str>,
+    reason: &str,
+) -> Result<ChildExitOutcome, String> {
     let started_at = Instant::now();
 
     loop {
@@ -786,6 +1096,17 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<ChildExit
             .try_wait()
             .map_err(|error| format!("等待 pi 进程状态失败: {error}"))?
         {
+            dev_trace(
+                "desktop.stream",
+                format!(
+                    "wait_for_child_exit done: session={} pid={} elapsed_ms={} status={} reason={}",
+                    session_id.unwrap_or("-"),
+                    child.id(),
+                    started_at.elapsed().as_millis(),
+                    describe_exit_status(status),
+                    reason
+                ),
+            );
             return Ok(ChildExitOutcome {
                 status: Some(status),
                 timed_out: false,
@@ -793,13 +1114,34 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<ChildExit
         }
 
         if started_at.elapsed() >= timeout {
-            let _ = child.kill();
+            dev_trace(
+                "desktop.stream",
+                format!(
+                    "wait_for_child_exit timeout: session={} pid={} timeout_ms={} reason={}",
+                    session_id.unwrap_or("-"),
+                    child.id(),
+                    timeout.as_millis(),
+                    reason
+                ),
+            );
+            kill_child_with_trace(child, session_id, "wait_for_child_exit:timeout_force_kill");
             let kill_started_at = Instant::now();
             while kill_started_at.elapsed() < CHILD_KILL_GRACE_TIMEOUT {
                 if let Some(status) = child
                     .try_wait()
                     .map_err(|error| format!("等待被终止的 pi 进程失败: {error}"))?
                 {
+                    dev_trace(
+                        "desktop.stream",
+                        format!(
+                            "wait_for_child_exit done-after-kill: session={} pid={} elapsed_ms={} status={} reason={}",
+                            session_id.unwrap_or("-"),
+                            child.id(),
+                            started_at.elapsed().as_millis(),
+                            describe_exit_status(status),
+                            reason
+                        ),
+                    );
                     return Ok(ChildExitOutcome {
                         status: Some(status),
                         timed_out: true,
@@ -807,6 +1149,16 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<ChildExit
                 }
                 thread::sleep(Duration::from_millis(25));
             }
+            dev_trace(
+                "desktop.stream",
+                format!(
+                    "wait_for_child_exit post-kill still no-exit: session={} pid={} grace_ms={} reason={}",
+                    session_id.unwrap_or("-"),
+                    child.id(),
+                    CHILD_KILL_GRACE_TIMEOUT.as_millis(),
+                    reason
+                ),
+            );
             return Ok(ChildExitOutcome {
                 status: None,
                 timed_out: true,
@@ -815,6 +1167,96 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<ChildExit
 
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn close_pi_stdin(stdin: &Arc<Mutex<Option<ChildStdin>>>) {
+    if let Ok(mut stdin_guard) = stdin.lock() {
+        let _ = stdin_guard.take();
+    }
+}
+
+fn kill_desktop_pooled_pi(mut pooled: DesktopPooledPi, session_id: Option<&str>, reason: &str) {
+    close_pi_stdin(&pooled.stdin);
+    kill_child_with_trace(
+        &mut pooled.child,
+        session_id,
+        &format!("kill_desktop_pooled_pi:{reason}"),
+    );
+    let _ = wait_for_child_exit_with_trace(
+        &mut pooled.child,
+        CHILD_KILL_GRACE_TIMEOUT,
+        session_id,
+        &format!("kill_desktop_pooled_pi:{reason}:post_kill"),
+    );
+}
+
+fn desktop_pi_fingerprint(
+    provider_config: Option<&ProviderRuntimeConfig>,
+    session_path: &str,
+    system_prompt_sections: &[(String, String)],
+    skill_paths: &[PathBuf],
+) -> String {
+    let mut blob: Vec<u8> = Vec::new();
+    let provider_id = provider_config
+        .map(|config| config.provider_id.trim())
+        .unwrap_or_default();
+    let api_format = provider_config
+        .map(|config| config.api_format.trim())
+        .unwrap_or_default();
+    let base_url = provider_config
+        .map(|config| config.base_url.trim())
+        .unwrap_or_default();
+    let api_key = provider_config
+        .map(|config| config.api_key.trim())
+        .unwrap_or_default();
+    let model = provider_config
+        .map(|config| config.model.trim())
+        .unwrap_or_default();
+
+    for value in [provider_id, api_format, base_url, api_key, model, session_path] {
+        blob.extend_from_slice(value.as_bytes());
+        blob.push(0);
+    }
+
+    for (label, content) in system_prompt_sections {
+        blob.extend_from_slice(label.as_bytes());
+        blob.push(1);
+        blob.extend_from_slice(content.as_bytes());
+        blob.push(2);
+    }
+
+    for path in skill_paths {
+        blob.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        blob.push(3);
+    }
+
+    format!("{:x}", Md5::digest(&blob))
+}
+
+fn take_pooled_desktop_pi(session_id: &str) -> Result<Option<DesktopPooledPi>, String> {
+    let mut guard = desktop_pi_pool()
+        .lock()
+        .map_err(|error| format!("无法锁定桌面 pi 进程池: {error}"))?;
+    Ok(guard.remove(session_id))
+}
+
+fn store_pooled_desktop_pi(session_id: &str, pooled: DesktopPooledPi) -> Result<(), String> {
+    let mut guard = desktop_pi_pool()
+        .lock()
+        .map_err(|error| format!("无法写入桌面 pi 进程池: {error}"))?;
+    let replaced = guard.insert(session_id.to_string(), pooled);
+    drop(guard);
+    if let Some(previous) = replaced {
+        kill_desktop_pooled_pi(previous, Some(session_id), "pool_replace_previous");
+    }
+    Ok(())
+}
+
+fn drain_pooled_desktop_pi() -> Result<Vec<DesktopPooledPi>, String> {
+    let mut guard = desktop_pi_pool()
+        .lock()
+        .map_err(|error| format!("无法清理桌面 pi 进程池: {error}"))?;
+    Ok(guard.drain().map(|(_, pooled)| pooled).collect())
 }
 
 fn hash_session_id(session_id: &str) -> String {
@@ -1343,6 +1785,26 @@ fn normalize_provider_api_format(value: &str, provider_id: &str) -> &'static str
     }
 }
 
+/// `pi-ai` OpenAI-compat：推理类模型需开启 `supportsReasoningEffort`，否则部分网关/模型组合下 RPC 可能无 stdout 事件。
+pub(crate) fn openai_pi_compat_supports_reasoning_effort(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.contains("gpt-5")
+        || m.contains("reasoning")
+        || m.contains("thinking")
+        || m.contains("-think")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        // 智谱 GLM-4/5 等：未开启时 OpenAI 兼容路径下常见「pi 已启动但无任何 stdout」
+        || m.contains("glm")
+        // DeepSeek 推理链
+        || m.contains("deepseek-r1")
+        || m.contains("deepseek-reasoner")
+        // Moonshot / Kimi（含 SiliconFlow 等聚合上的 Pro/moonshotai/...）：部分 OpenAI 兼容路径需 reasoning 标志才有 stdout 事件
+        || m.contains("kimi")
+        || m.contains("moonshot")
+}
+
 /// 微信/飞书 IM 必须使用绑定智能体的默认模型；Base URL / API Key 从应用全局 Provider 配置读取。
 pub(crate) fn resolve_im_llm_runtime(
     app: &AppHandle,
@@ -1422,6 +1884,564 @@ fn runtime_provider_id(provider_id: &str) -> String {
     format!("nineclaw-runtime-{}", &digest[..12])
 }
 
+#[derive(Clone, Debug)]
+struct PiAnthropicCompatExtension {
+    path: PathBuf,
+    provider_id: String,
+    api_key_env: String,
+}
+
+fn runtime_provider_suffix(provider_id: &str) -> String {
+    let trimmed = provider_id.trim();
+    if trimmed.is_empty() {
+        return "provider".to_string();
+    }
+
+    let digest = format!("{:x}", Md5::digest(trimmed.as_bytes()));
+    digest[..12].to_string()
+}
+
+fn anthropic_compat_provider_id(provider_id: &str) -> String {
+    format!("nineclaw-compat-{}", runtime_provider_suffix(provider_id))
+}
+
+fn anthropic_compat_api_key_env(provider_id: &str) -> String {
+    format!(
+        "NINECLAW_PI_COMPAT_API_KEY_{}",
+        runtime_provider_suffix(provider_id).to_ascii_uppercase()
+    )
+}
+
+fn should_use_desktop_anthropic_compat_extension(
+    provider_config: &ProviderRuntimeConfig,
+) -> bool {
+    let provider_id = provider_config.provider_id.trim();
+    normalize_provider_api_format(&provider_config.api_format, provider_id) == "anthropic"
+        && provider_id != "anthropic"
+}
+
+fn resolve_pi_ai_import_path(pi_executable: &Path) -> Option<PathBuf> {
+    let resolved = fs::canonicalize(pi_executable).unwrap_or_else(|_| pi_executable.to_path_buf());
+    let mut roots: Vec<PathBuf> = Vec::new();
+
+    if let Some(parent) = resolved.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    if let Some(parent) = pi_executable.parent() {
+        if !roots.iter().any(|entry| entry == parent) {
+            roots.push(parent.to_path_buf());
+        }
+    }
+
+    for root in roots {
+        for ancestor in root.ancestors() {
+            for candidate in [
+                ancestor
+                    .join("node_modules")
+                    .join("@mariozechner")
+                    .join("pi-ai")
+                    .join("dist")
+                    .join("index.js"),
+                ancestor
+                    .join("node_modules")
+                    .join("@mariozechner")
+                    .join("pi-coding-agent")
+                    .join("node_modules")
+                    .join("@mariozechner")
+                    .join("pi-ai")
+                    .join("dist")
+                    .join("index.js"),
+            ] {
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn js_string_literal(value: &str) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|error| format!("序列化 JS 字面量失败: {error}"))
+}
+
+fn build_desktop_anthropic_compat_extension_source(
+    pi_ai_import_path: &Path,
+    provider_id: &str,
+    api_key_env: &str,
+    base_url: &str,
+    model: &str,
+) -> Result<String, String> {
+    let import_path = js_string_literal(&pi_ai_import_path.to_string_lossy())?;
+    let provider_id = js_string_literal(provider_id)?;
+    let api_key_env = js_string_literal(api_key_env)?;
+    let base_url = js_string_literal(base_url)?;
+    let model = js_string_literal(model)?;
+
+    Ok(format!(
+        r#"import {{ createAssistantMessageEventStream, calculateCost, parseStreamingJson }} from {import_path};
+
+function sanitizeSurrogates(text) {{
+  return String(text ?? '').replace(/[\uD800-\uDFFF]/g, '\uFFFD');
+}}
+
+function anthropicMessagesUrl(baseUrl) {{
+  const trimmed = String(baseUrl ?? '').trim().replace(/\/+$/, '');
+  return trimmed.endsWith('/v1') ? trimmed + '/messages' : trimmed + '/v1/messages';
+}}
+
+function convertContentBlocks(content) {{
+  const hasImages = content.some((block) => block.type === 'image');
+  if (!hasImages) {{
+    return sanitizeSurrogates(content.map((block) => block.text).join('\n'));
+  }}
+
+  const blocks = content.map((block) => {{
+    if (block.type === 'text') {{
+      return {{ type: 'text', text: sanitizeSurrogates(block.text) }};
+    }}
+
+    return {{
+      type: 'image',
+      source: {{
+        type: 'base64',
+        media_type: block.mimeType,
+        data: block.data,
+      }},
+    }};
+  }});
+
+  if (!blocks.some((block) => block.type === 'text')) {{
+    blocks.unshift({{ type: 'text', text: '(see attached image)' }});
+  }}
+
+  return blocks;
+}}
+
+function convertMessages(messages) {{
+  const params = [];
+
+  for (let i = 0; i < messages.length; i += 1) {{
+    const message = messages[i];
+
+    if (message.role === 'user') {{
+      if (typeof message.content === 'string') {{
+        if (message.content.trim()) {{
+          params.push({{ role: 'user', content: sanitizeSurrogates(message.content) }});
+        }}
+      }} else {{
+        const blocks = message.content.map((item) =>
+          item.type === 'text'
+            ? {{ type: 'text', text: sanitizeSurrogates(item.text) }}
+            : {{
+                type: 'image',
+                source: {{
+                  type: 'base64',
+                  media_type: item.mimeType,
+                  data: item.data,
+                }},
+              }},
+        );
+        if (blocks.length > 0) {{
+          params.push({{ role: 'user', content: blocks }});
+        }}
+      }}
+      continue;
+    }}
+
+    if (message.role === 'assistant') {{
+      const blocks = [];
+      for (const block of message.content) {{
+        if (block.type === 'text' && block.text.trim()) {{
+          blocks.push({{ type: 'text', text: sanitizeSurrogates(block.text) }});
+        }} else if (block.type === 'thinking' && block.thinking.trim()) {{
+          blocks.push({{ type: 'text', text: sanitizeSurrogates(block.thinking) }});
+        }} else if (block.type === 'toolCall') {{
+          blocks.push({{
+            type: 'tool_use',
+            id: block.id,
+            name: block.name,
+            input: block.arguments,
+          }});
+        }}
+      }}
+      if (blocks.length > 0) {{
+        params.push({{ role: 'assistant', content: blocks }});
+      }}
+      continue;
+    }}
+
+    if (message.role === 'toolResult') {{
+      const toolResults = [{{
+        type: 'tool_result',
+        tool_use_id: message.toolCallId,
+        content: convertContentBlocks(message.content),
+        is_error: message.isError,
+      }}];
+
+      let nextIndex = i + 1;
+      while (nextIndex < messages.length && messages[nextIndex].role === 'toolResult') {{
+        const nextMessage = messages[nextIndex];
+        toolResults.push({{
+          type: 'tool_result',
+          tool_use_id: nextMessage.toolCallId,
+          content: convertContentBlocks(nextMessage.content),
+          is_error: nextMessage.isError,
+        }});
+        nextIndex += 1;
+      }}
+
+      i = nextIndex - 1;
+      params.push({{ role: 'user', content: toolResults }});
+    }}
+  }}
+
+  if (params.length > 0) {{
+    const last = params[params.length - 1];
+    if (last.role === 'user' && Array.isArray(last.content)) {{
+      const lastBlock = last.content[last.content.length - 1];
+      if (lastBlock) {{
+        lastBlock.cache_control = {{ type: 'ephemeral' }};
+      }}
+    }}
+  }}
+
+  return params;
+}}
+
+function convertTools(tools) {{
+  return tools.map((tool) => ({{
+    name: tool.name,
+    description: tool.description,
+    input_schema: {{
+      type: 'object',
+      properties: tool.parameters?.properties || {{}},
+      required: tool.parameters?.required || [],
+    }},
+  }}));
+}}
+
+function mapStopReason(reason) {{
+  switch (reason) {{
+    case 'end_turn':
+    case 'pause_turn':
+    case 'stop_sequence':
+      return 'stop';
+    case 'max_tokens':
+      return 'length';
+    case 'tool_use':
+      return 'toolUse';
+    default:
+      return 'error';
+  }}
+}}
+
+async function* parseSSE(response) {{
+  if (!response.body) {{
+    return;
+  }}
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {{
+    while (true) {{
+      const {{ done, value }} = await reader.read();
+      if (done) {{
+        break;
+      }}
+
+      buffer += decoder.decode(value, {{ stream: true }}).replace(/\r\n/g, '\n');
+      let splitIndex = buffer.indexOf('\n\n');
+      while (splitIndex !== -1) {{
+        const chunk = buffer.slice(0, splitIndex);
+        buffer = buffer.slice(splitIndex + 2);
+        const dataLines = chunk
+          .split('\n')
+          .filter((line) => line.startsWith('data:'))
+          .map((line) => line.slice(5).trim());
+        if (dataLines.length > 0) {{
+          const data = dataLines.join('\n').trim();
+          if (data && data !== '[DONE]') {{
+            try {{
+              yield JSON.parse(data);
+            }} catch {{}}
+          }}
+        }}
+        splitIndex = buffer.indexOf('\n\n');
+      }}
+    }}
+
+    buffer += decoder.decode().replace(/\r\n/g, '\n');
+    if (buffer.trim()) {{
+      const dataLines = buffer
+        .split('\n')
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trim());
+      if (dataLines.length > 0) {{
+        const data = dataLines.join('\n').trim();
+        if (data && data !== '[DONE]') {{
+          try {{
+            yield JSON.parse(data);
+          }} catch {{}}
+        }}
+      }}
+    }}
+  }} finally {{
+    try {{
+      await reader.cancel();
+    }} catch {{}}
+    try {{
+      reader.releaseLock();
+    }} catch {{}}
+  }}
+}}
+
+function streamNineclawAnthropicCompat(model, context, options) {{
+  const stream = createAssistantMessageEventStream();
+
+  (async () => {{
+    const output = {{
+      role: 'assistant',
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {{
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: {{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }},
+      }},
+      stopReason: 'stop',
+      timestamp: Date.now(),
+    }};
+
+    try {{
+      const apiKey = options?.apiKey ?? '';
+      const headers = Object.assign(
+        {{
+          'content-type': 'application/json',
+          accept: 'text/event-stream',
+          'anthropic-version': '2023-06-01',
+          'x-api-key': apiKey,
+          Authorization: 'Bearer ' + apiKey,
+        }},
+        model.headers || {{}},
+        options?.headers || {{}},
+      );
+
+      const payload = {{
+        model: model.id,
+        messages: convertMessages(context.messages),
+        max_tokens: options?.maxTokens || Math.floor(model.maxTokens / 3),
+        stream: true,
+      }};
+
+      if (context.systemPrompt) {{
+        payload.system = [{{
+          type: 'text',
+          text: sanitizeSurrogates(context.systemPrompt),
+          cache_control: {{ type: 'ephemeral' }},
+        }}];
+      }}
+
+      if (context.tools?.length) {{
+        payload.tools = convertTools(context.tools);
+      }}
+
+      const response = await fetch(anthropicMessagesUrl(model.baseUrl), {{
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        signal: options?.signal,
+      }});
+
+      if (!response.ok) {{
+        throw new Error(await response.text());
+      }}
+
+      stream.push({{ type: 'start', partial: output }});
+      const blocks = output.content;
+      let sawMessageStop = false;
+
+      for await (const event of parseSSE(response)) {{
+        if (event.type === 'message_start') {{
+          output.responseId = event.message?.id;
+          output.usage.input = event.message?.usage?.input_tokens || 0;
+          output.usage.output = event.message?.usage?.output_tokens || 0;
+          output.usage.cacheRead = event.message?.usage?.cache_read_input_tokens || 0;
+          output.usage.cacheWrite = event.message?.usage?.cache_creation_input_tokens || 0;
+          output.usage.totalTokens =
+            output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+          calculateCost(model, output.usage);
+        }} else if (event.type === 'content_block_start') {{
+          if (event.content_block?.type === 'text') {{
+            output.content.push({{ type: 'text', text: '', index: event.index }});
+            stream.push({{ type: 'text_start', contentIndex: output.content.length - 1, partial: output }});
+          }} else if (event.content_block?.type === 'tool_use') {{
+            output.content.push({{
+              type: 'toolCall',
+              id: event.content_block.id,
+              name: event.content_block.name,
+              arguments: event.content_block.input || {{}},
+              partialJson: '',
+              index: event.index,
+            }});
+            stream.push({{ type: 'toolcall_start', contentIndex: output.content.length - 1, partial: output }});
+          }}
+        }} else if (event.type === 'content_block_delta') {{
+          const contentIndex = blocks.findIndex((block) => block.index === event.index);
+          const block = blocks[contentIndex];
+          if (!block) {{
+            continue;
+          }}
+
+          if (event.delta?.type === 'text_delta' && block.type === 'text') {{
+            block.text += event.delta.text;
+            stream.push({{ type: 'text_delta', contentIndex, delta: event.delta.text, partial: output }});
+          }} else if (event.delta?.type === 'input_json_delta' && block.type === 'toolCall') {{
+            block.partialJson += event.delta.partial_json;
+            block.arguments = parseStreamingJson(block.partialJson);
+            stream.push({{
+              type: 'toolcall_delta',
+              contentIndex,
+              delta: event.delta.partial_json,
+              partial: output,
+            }});
+          }}
+        }} else if (event.type === 'content_block_stop') {{
+          const contentIndex = blocks.findIndex((block) => block.index === event.index);
+          const block = blocks[contentIndex];
+          if (!block) {{
+            continue;
+          }}
+
+          delete block.index;
+          if (block.type === 'text') {{
+            stream.push({{ type: 'text_end', contentIndex, content: block.text, partial: output }});
+          }} else if (block.type === 'toolCall') {{
+            block.arguments = parseStreamingJson(block.partialJson);
+            delete block.partialJson;
+            stream.push({{ type: 'toolcall_end', contentIndex, toolCall: block, partial: output }});
+          }}
+        }} else if (event.type === 'message_delta') {{
+          if (event.delta?.stop_reason) {{
+            output.stopReason = mapStopReason(event.delta.stop_reason);
+          }}
+          if (event.usage?.input_tokens != null) {{
+            output.usage.input = event.usage.input_tokens;
+          }}
+          if (event.usage?.output_tokens != null) {{
+            output.usage.output = event.usage.output_tokens;
+          }}
+          if (event.usage?.cache_read_input_tokens != null) {{
+            output.usage.cacheRead = event.usage.cache_read_input_tokens;
+          }}
+          if (event.usage?.cache_creation_input_tokens != null) {{
+            output.usage.cacheWrite = event.usage.cache_creation_input_tokens;
+          }}
+          output.usage.totalTokens =
+            output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+          calculateCost(model, output.usage);
+        }} else if (event.type === 'message_stop') {{
+          sawMessageStop = true;
+          break;
+        }}
+      }}
+
+      if (options?.signal?.aborted) {{
+        throw new Error('Request was aborted');
+      }}
+      if (!sawMessageStop) {{
+        throw new Error('Anthropic-compatible stream ended before message_stop');
+      }}
+      if (output.stopReason === 'aborted' || output.stopReason === 'error') {{
+        throw new Error('Anthropic-compatible stream ended without a valid stop reason');
+      }}
+
+      stream.push({{ type: 'done', reason: output.stopReason, message: output }});
+      stream.end();
+    }} catch (error) {{
+      for (const block of output.content) {{
+        delete block.index;
+      }}
+      output.stopReason = options?.signal?.aborted ? 'aborted' : 'error';
+      output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+      stream.push({{ type: 'error', reason: output.stopReason, error: output }});
+      stream.end();
+    }}
+  }})();
+
+  return stream;
+}}
+
+export default function(pi) {{
+  pi.registerProvider({provider_id}, {{
+    baseUrl: {base_url},
+    apiKey: {api_key_env},
+    api: 'nineclaw-anthropic-compat',
+    models: [{{
+      id: {model},
+      name: {model},
+      reasoning: false,
+      input: ['text', 'image'],
+      cost: {{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }},
+      contextWindow: 200000,
+      maxTokens: 16384,
+    }}],
+    streamSimple: streamNineclawAnthropicCompat,
+  }});
+}}
+"#,
+        import_path = import_path,
+        provider_id = provider_id,
+        api_key_env = api_key_env,
+        base_url = base_url,
+        model = model,
+    ))
+}
+
+fn prepare_desktop_anthropic_compat_extension(
+    runtime_dir: &Path,
+    pi_executable: &Path,
+    provider_config: &ProviderRuntimeConfig,
+) -> Result<PiAnthropicCompatExtension, String> {
+    let pi_ai_import_path = resolve_pi_ai_import_path(pi_executable).ok_or_else(|| {
+        format!(
+            "无法定位 pi-ai 运行库，无法为 Provider「{}」生成 Anthropic 兼容扩展。",
+            provider_config.provider_id.trim()
+        )
+    })?;
+    let compat_provider_id = anthropic_compat_provider_id(provider_config.provider_id.trim());
+    let compat_api_key_env = anthropic_compat_api_key_env(provider_config.provider_id.trim());
+    let compat_base_url = normalized_provider_runtime_base_url(
+        &provider_config.base_url,
+        &provider_config.api_format,
+        provider_config.provider_id.trim(),
+    );
+    let extension_source = build_desktop_anthropic_compat_extension_source(
+        &pi_ai_import_path,
+        &compat_provider_id,
+        &compat_api_key_env,
+        &compat_base_url,
+        provider_config.model.trim(),
+    )?;
+    let extension_path = runtime_dir.join(format!("{}.mjs", compat_provider_id));
+    fs::write(&extension_path, extension_source)
+        .map_err(|error| format!("写入 Anthropic 兼容扩展失败: {error}"))?;
+
+    Ok(PiAnthropicCompatExtension {
+        path: extension_path,
+        provider_id: compat_provider_id,
+        api_key_env: compat_api_key_env,
+    })
+}
+
 fn scrub_anthropic_process_env(command: &mut Command) {
     for key in [
         "ANTHROPIC_API_KEY",
@@ -1475,11 +2495,12 @@ fn custom_provider_object(
         }
         _ => {
             provider.insert("api".to_string(), json!("openai-completions"));
+            let reasoning = openai_pi_compat_supports_reasoning_effort(model);
             provider.insert(
                 "compat".to_string(),
                 json!({
                   "supportsDeveloperRole": false,
-                  "supportsReasoningEffort": false
+                  "supportsReasoningEffort": reasoning
                 }),
             );
             provider.insert(
@@ -1543,6 +2564,28 @@ fn prepare_pi_runtime_dir(provider_config: &ProviderRuntimeConfig) -> Result<Pat
     }
 
     Ok(runtime_dir)
+}
+
+fn validate_desktop_provider_config(provider_config: &ProviderRuntimeConfig) -> Result<(), String> {
+    if provider_config.provider_id.trim().is_empty() {
+        return Err("当前会话的 Provider ID 为空，请重新选择一个已配置模型。".to_string());
+    }
+
+    if provider_config.base_url.trim().is_empty() {
+        return Err(format!(
+            "当前会话使用的 Provider「{}」未填写 Base URL，无法启动 pi。请在设置中补全后重试。",
+            provider_config.provider_id.trim()
+        ));
+    }
+
+    if provider_config.model.trim().is_empty() {
+        return Err(format!(
+            "当前会话使用的 Provider「{}」未填写模型名，无法启动 pi。请在设置中补全后重试。",
+            provider_config.provider_id.trim()
+        ));
+    }
+
+    Ok(())
 }
 
 fn emit_stream_event(
@@ -1757,8 +2800,16 @@ async fn abort_pi_stream(session_id: Option<String>) -> Result<(), String> {
     };
 
     let Some(handle) = get_runtime_handle(&session_id)? else {
+        dev_trace(
+            "desktop.stream",
+            format!("abort_pi_stream ignored: session={} no_runtime_handle", session_id),
+        );
         return Ok(());
     };
+    dev_trace(
+        "desktop.stream",
+        format!("abort_pi_stream: session={} pid={}", session_id, handle.pid),
+    );
 
     handle.abort_requested.store(true, Ordering::SeqCst);
 
@@ -1773,12 +2824,16 @@ async fn abort_pi_stream(session_id: Option<String>) -> Result<(), String> {
             .stdin
             .lock()
             .map_err(|error| format!("无法锁定 abort stdin: {error}"))?;
-        writeln!(stdin, "{abort_command}")
-            .map_err(|error| format!("发送 abort 指令失败: {error}"))?;
-        stdin
-            .flush()
-            .map_err(|error| format!("刷新 abort 指令失败: {error}"))?;
-        true
+        if let Some(stdin) = stdin.as_mut() {
+            writeln!(stdin, "{abort_command}")
+                .map_err(|error| format!("发送 abort 指令失败: {error}"))?;
+            stdin
+                .flush()
+                .map_err(|error| format!("刷新 abort 指令失败: {error}"))?;
+            true
+        } else {
+            false
+        }
     };
 
     if !sent_abort {
@@ -1797,6 +2852,11 @@ async fn abort_pi_stream(session_id: Option<String>) -> Result<(), String> {
 
 #[tauri::command]
 async fn clear_pi_session() -> Result<(), String> {
+    dev_trace("desktop.stream", "clear_pi_session invoked".to_string());
+    for pooled in drain_pooled_desktop_pi()? {
+        kill_desktop_pooled_pi(pooled, None, "clear_pi_session");
+    }
+
     for entry in
         fs::read_dir(std::env::temp_dir()).map_err(|error| format!("读取临时目录失败: {error}"))?
     {
@@ -1822,6 +2882,14 @@ async fn clear_pi_session_for_id(session_id: String) -> Result<(), String> {
     let trimmed = session_id.trim();
     if trimmed.is_empty() {
         return Ok(());
+    }
+    dev_trace(
+        "desktop.stream",
+        format!("clear_pi_session_for_id invoked: session={}", trimmed),
+    );
+
+    if let Some(pooled) = take_pooled_desktop_pi(trimmed)? {
+        kill_desktop_pooled_pi(pooled, Some(trimmed), "clear_pi_session_for_id");
     }
 
     for path in session_cleanup_paths(Some(trimmed)) {
@@ -1855,6 +2923,13 @@ async fn open_local_file(file_path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || open_path_in_default_app(&resolved_path))
         .await
         .map_err(|error| format!("打开本地文件失败: {error}"))?
+}
+
+#[tauri::command]
+async fn open_external_url(url: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || open_url_in_default_browser(&url))
+        .await
+        .map_err(|error| format!("打开外部链接失败: {error}"))?
 }
 
 #[tauri::command]
@@ -1910,6 +2985,11 @@ async fn stream_pi_prompt(
         prompt_attachments::prepare_prompt_input(&prompt_with_summary, &attachments)?;
 
     tauri::async_runtime::spawn_blocking(move || {
+        let session_stream_mutex = desktop_session_stream_mutex(&normalized_session_id);
+        let _session_stream_guard = session_stream_mutex.try_lock().map_err(|_| {
+            "该会话已有进行中的生成，请等待完成或先中止后再发。".to_string()
+        })?;
+
         emit_stream_event(
             &app,
             "start",
@@ -1933,10 +3013,15 @@ async fn stream_pi_prompt(
             session_file_path(Some(normalized_session_id.as_str()))
         };
         let session_path_string = session_path.to_string_lossy().to_string();
-        let resolved_pi_path = pi_runtime::resolve_pi_executable(&app)
-            .map(|location| location.executable.display().to_string())
-            .unwrap_or_else(|| "(unresolved)".to_string());
-        let mut command = pi_runtime::create_pi_command(&app)?;
+        let pi_location = pi_runtime::require_pi_runtime_location(&app)?;
+        let resolved_pi_path = pi_location.executable.display().to_string();
+        if let Some(quarantine_msg) =
+            pi_runtime::clear_macos_quarantine_if_present(&pi_location.executable)
+        {
+            dev_trace("desktop.stream", quarantine_msg);
+        }
+        let mut command = Command::new(&pi_location.executable);
+        pi_runtime::apply_runtime_environment(&mut command, &pi_location);
         command
             .args(["--mode", "rpc", "--session", &session_path_string])
             .stdin(Stdio::piped())
@@ -1944,8 +3029,9 @@ async fn stream_pi_prompt(
             .stderr(Stdio::piped());
 
         if let Some(provider_config) = provider_config.as_ref() {
+            validate_desktop_provider_config(provider_config)?;
             let runtime_dir = prepare_pi_runtime_dir(provider_config)?;
-            command.env("PI_CODING_AGENT_DIR", runtime_dir);
+            command.env("PI_CODING_AGENT_DIR", &runtime_dir);
 
             if normalize_provider_api_format(
                 &provider_config.api_format,
@@ -1955,7 +3041,40 @@ async fn stream_pi_prompt(
                 scrub_anthropic_process_env(&mut command);
             }
 
-            let runtime_provider_id = runtime_provider_id(provider_config.provider_id.trim());
+            let compat_extension = if should_use_desktop_anthropic_compat_extension(provider_config)
+            {
+                Some(prepare_desktop_anthropic_compat_extension(
+                    &runtime_dir,
+                    &pi_location.executable,
+                    provider_config,
+                )?)
+            } else {
+                None
+            };
+
+            if let Some(compat_extension) = compat_extension.as_ref() {
+                command
+                    .env(&compat_extension.api_key_env, provider_config.api_key.trim())
+                    .args([
+                        "--extension",
+                        compat_extension.path.to_string_lossy().as_ref(),
+                    ]);
+                dev_trace(
+                    "desktop.stream",
+                    format!(
+                        "启用 Anthropic 兼容扩展: session={} provider={} compat_provider={} extension={}",
+                        normalized_session_id,
+                        provider_config.provider_id.trim(),
+                        compat_extension.provider_id,
+                        compat_extension.path.display(),
+                    ),
+                );
+            }
+
+            let runtime_provider_id = compat_extension
+                .as_ref()
+                .map(|item| item.provider_id.clone())
+                .unwrap_or_else(|| runtime_provider_id(provider_config.provider_id.trim()));
             if !runtime_provider_id.is_empty() {
                 command.args(["--provider", &runtime_provider_id]);
             }
@@ -1967,11 +3086,20 @@ async fn stream_pi_prompt(
             if !provider_config.api_key.trim().is_empty() {
                 command.args(["--api-key", provider_config.api_key.trim()]);
             }
+        } else {
+            dev_trace(
+                "desktop.stream",
+                format!(
+                    "未传入 provider_config，session={} 将依赖系统 pi 默认配置",
+                    normalized_session_id
+                ),
+            );
         }
 
         let mut system_prompt_chars = 0usize;
         let mut system_prompt_sections: Vec<(String, String)> = Vec::new();
         let mut skill_count = 0usize;
+        let mut skill_paths: Vec<PathBuf> = Vec::new();
         let mut desktop_agent_home: Option<PathBuf> = None;
         if let Some(agent_config) = agent_config.as_ref() {
             if let Ok(workspace_root) = agent_workspace::resolve_workspace_root() {
@@ -2010,6 +3138,7 @@ async fn stream_pi_prompt(
 
             for skill_path in skills::resolve_skill_directories(&agent_config.skill_ids)? {
                 skill_count += 1;
+                skill_paths.push(skill_path.clone());
                 let skill_path = skill_path.to_string_lossy().to_string();
                 command.args(["--skill", &skill_path]);
             }
@@ -2071,68 +3200,100 @@ async fn stream_pi_prompt(
             );
         }
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("调用 pi 失败，请确认已安装并在 PATH 中: {error}"))?;
-        dev_trace(
-            "desktop.stream",
-            format!("pi 已启动: session={} pid={}", normalized_session_id, child.id()),
+        let desktop_reuse_enabled = pi_reuse_desktop_enabled() && !fresh_multimodal_session;
+        let desktop_fingerprint = desktop_pi_fingerprint(
+            provider_config.as_ref(),
+            &session_path_string,
+            &system_prompt_sections,
+            &skill_paths,
         );
-
-        let abort_requested = Arc::new(AtomicBool::new(false));
-
-        {
-            let stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| "无法获取 pi stdin".to_string())?;
-            let stdin = Arc::new(Mutex::new(stdin));
-
-            insert_runtime_handle(
-                &normalized_session_id,
-                PiRuntimeHandle {
-                    abort_requested: abort_requested.clone(),
-                    pid: child.id(),
-                    stdin: stdin.clone(),
-                },
-            )?;
-
-            let prompt_command = json!({
-              "id": format!("prompt-{}", normalized_session_id),
-              "type": "prompt",
-              "message": prepared_input.message,
-              "images": prepared_input.images,
-            })
-            .to_string();
-
-            {
-                let mut stdin_guard = stdin
-                    .lock()
-                    .map_err(|error| format!("无法锁定 prompt stdin: {error}"))?;
-                writeln!(stdin_guard, "{prompt_command}")
-                    .map_err(|error| format!("写入 prompt 失败: {error}"))?;
-                stdin_guard
-                    .flush()
-                    .map_err(|error| format!("刷新 stdin 失败: {error}"))?;
+        if fresh_multimodal_session {
+            if let Some(pooled) = take_pooled_desktop_pi(&normalized_session_id)? {
+                kill_desktop_pooled_pi(
+                    pooled,
+                    Some(&normalized_session_id),
+                    "fresh_multimodal_session_reset_pool",
+                );
             }
         }
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "无法读取 pi 输出".to_string())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "无法读取 pi 错误输出".to_string())?;
-        let (stdout_tx, stdout_rx) = mpsc::channel();
-        let stderr_buffer = Arc::new(Mutex::new(String::new()));
-        spawn_pi_stdout_logger(stdout, "desktop.stream.raw", stdout_tx);
-        spawn_pi_stderr_logger(stderr, "desktop.stream.stderr", stderr_buffer.clone());
+        let (mut child, stdin, stdout_rx, stderr_buffer, reused_from_pool) =
+            if desktop_reuse_enabled {
+                if let Some(mut pooled) = take_pooled_desktop_pi(&normalized_session_id)? {
+                    let pooled_alive = pooled
+                        .child
+                        .try_wait()
+                        .map_err(|error| format!("检查桌面池化 pi 状态失败: {error}"))?
+                        .is_none();
+                    if pooled_alive && pooled.fingerprint == desktop_fingerprint {
+                        send_pi_prompt_command(
+                            &pooled.stdin,
+                            &next_prompt_command_id(&normalized_session_id),
+                            &prepared_input,
+                        )?;
+                        (
+                            pooled.child,
+                            pooled.stdin,
+                            pooled.stdout_rx,
+                            pooled.stderr_buffer,
+                            true,
+                        )
+                    } else {
+                        kill_desktop_pooled_pi(
+                            pooled,
+                            Some(&normalized_session_id),
+                            "pooled_pi_unusable_or_fingerprint_mismatch",
+                        );
+                        let (child, stdin, stdout_rx, stderr_buffer) =
+                            spawn_desktop_pi_child_fresh(
+                                command,
+                                &normalized_session_id,
+                                &prepared_input,
+                            )?;
+                        (child, stdin, stdout_rx, stderr_buffer, false)
+                    }
+                } else {
+                    let (child, stdin, stdout_rx, stderr_buffer) = spawn_desktop_pi_child_fresh(
+                        command,
+                        &normalized_session_id,
+                        &prepared_input,
+                    )?;
+                    (child, stdin, stdout_rx, stderr_buffer, false)
+                }
+            } else {
+                let (child, stdin, stdout_rx, stderr_buffer) = spawn_desktop_pi_child_fresh(
+                    command,
+                    &normalized_session_id,
+                    &prepared_input,
+                )?;
+                (child, stdin, stdout_rx, stderr_buffer, false)
+            };
+        dev_trace(
+            "desktop.stream",
+            format!(
+                "pi 已启动: session={} pid={} reused_pool={}",
+                normalized_session_id,
+                child.id(),
+                reused_from_pool
+            ),
+        );
+
+        let abort_requested = Arc::new(AtomicBool::new(false));
+        insert_runtime_handle(
+            &normalized_session_id,
+            PiRuntimeHandle {
+                abort_requested: abort_requested.clone(),
+                pid: child.id(),
+                stdin: stdin.clone(),
+            },
+        )?;
 
         let mut saw_agent_end = false;
         let mut saw_message_done = false;
         let mut saw_model_abort_event = false;
+        let mut _saw_prompt_response = false;
+        let mut _saw_assistant_activity = false;
+        let mut saw_assistant_terminal_message = false;
         let mut done_emitted = false;
         let mut final_usage: Option<PiTokenUsagePayload> = None;
         let mut emitted_assistant_text = String::new();
@@ -2153,8 +3314,17 @@ async fn stream_pi_prompt(
                     "desktop.stream",
                     format!("pi 超时: session={} error={}", normalized_session_id, timeout_error),
                 );
-                let _ = child.kill();
-                let _ = wait_for_child_exit(&mut child, CHILD_KILL_GRACE_TIMEOUT);
+                kill_child_with_trace(
+                    &mut child,
+                    Some(&normalized_session_id),
+                    "stream_pi_prompt:total_runtime_timeout",
+                );
+                let _ = wait_for_child_exit_with_trace(
+                    &mut child,
+                    CHILD_KILL_GRACE_TIMEOUT,
+                    Some(&normalized_session_id),
+                    "stream_pi_prompt:after_total_runtime_timeout_kill",
+                );
                 remove_runtime_handle(&normalized_session_id)?;
                 emit_stream_event(
                     &app,
@@ -2232,8 +3402,17 @@ async fn stream_pi_prompt(
                         "desktop.stream",
                         format!("pi 超时: session={} error={}", normalized_session_id, timeout_error),
                     );
-                    let _ = child.kill();
-                    let _ = wait_for_child_exit(&mut child, CHILD_KILL_GRACE_TIMEOUT);
+                    kill_child_with_trace(
+                        &mut child,
+                        Some(&normalized_session_id),
+                        "stream_pi_prompt:stdout_recv_timeout",
+                    );
+                    let _ = wait_for_child_exit_with_trace(
+                        &mut child,
+                        CHILD_KILL_GRACE_TIMEOUT,
+                        Some(&normalized_session_id),
+                        "stream_pi_prompt:after_stdout_recv_timeout_kill",
+                    );
                     remove_runtime_handle(&normalized_session_id)?;
                     emit_stream_event(
                         &app,
@@ -2299,6 +3478,10 @@ async fn stream_pi_prompt(
                     .and_then(|item| item.as_bool())
                     .unwrap_or(false);
 
+                if command == "prompt" && success {
+                    _saw_prompt_response = true;
+                }
+
                 if command == "prompt" && !success {
                     let error_text = value
                         .get("error")
@@ -2339,6 +3522,7 @@ async fn stream_pi_prompt(
                         .unwrap_or_default()
                         .to_string();
                     if !delta_text.is_empty() {
+                        _saw_assistant_activity = true;
                         emitted_assistant_text.push_str(&delta_text);
                         emit_stream_event(
                             &app,
@@ -2424,6 +3608,7 @@ async fn stream_pi_prompt(
                     let final_text =
                         extract_text_content(assistant_event.and_then(|item| item.get("message")));
                     if let Some(snapshot) = final_text {
+                        _saw_assistant_activity = true;
                         let missing_text =
                             assistant_text_fragment_to_append(&emitted_assistant_text, &snapshot);
                         if !missing_text.is_empty() {
@@ -2474,7 +3659,10 @@ async fn stream_pi_prompt(
                     == Some("assistant");
 
                 if is_assistant {
+                    let mut saw_snapshot = false;
                     if let Some(snapshot) = extract_text_content(message) {
+                        saw_snapshot = true;
+                        _saw_assistant_activity = true;
                         let missing_text =
                             assistant_text_fragment_to_append(&emitted_assistant_text, &snapshot);
                         if !missing_text.is_empty() {
@@ -2504,6 +3692,12 @@ async fn stream_pi_prompt(
                     final_usage = final_usage.or_else(|| {
                         extract_usage_payload(message.and_then(|item| item.get("usage")))
                     });
+
+                    if matches!(line_type, "message_end" | "turn_end")
+                        && (saw_snapshot || !emitted_assistant_text.trim().is_empty())
+                    {
+                        saw_assistant_terminal_message = true;
+                    }
                 }
             }
 
@@ -2656,7 +3850,102 @@ async fn stream_pi_prompt(
             }
         }
 
-        let exit_outcome = wait_for_child_exit(&mut child, Duration::from_secs(5))?;
+        let saw_terminal_completion =
+            saw_agent_end || saw_message_done || saw_assistant_terminal_message;
+
+        let should_pool_after_turn = desktop_reuse_enabled
+            && !abort_requested.load(Ordering::SeqCst)
+            && !saw_model_abort_event
+            && assistant_terminal_error.is_none()
+            && (saw_agent_end || saw_message_done)
+            && child
+                .try_wait()
+                .map_err(|error| format!("检查桌面 pi 退出状态失败: {error}"))?
+                .is_none();
+
+        if should_pool_after_turn {
+            remove_runtime_handle(&normalized_session_id)?;
+
+            if saw_agent_end || saw_message_done {
+                emitted_assistant_text = finalize_desktop_outbound_reply(
+                    &emitted_assistant_text,
+                    agent_config.as_ref().map(|config| config.id.as_str()),
+                );
+                emit_stream_event(
+                    &app,
+                    "final_text",
+                    Some(normalized_session_id.clone()),
+                    Some(emitted_assistant_text.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+            }
+
+            if let Some(agent_config) = agent_config.as_ref() {
+                if !emitted_assistant_text.trim().is_empty() {
+                    if let Err(error) = agent_workspace::append_agent_memory_entry(
+                        &agent_config.id,
+                        "desktop-local",
+                        &trimmed_prompt,
+                        &emitted_assistant_text,
+                    ) {
+                        eprintln!("NineClaw: 写入桌面聊天记忆失败: {error}");
+                    }
+                }
+            }
+
+            if !done_emitted {
+                emit_stream_event(
+                    &app,
+                    "done",
+                    Some(normalized_session_id.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    final_usage.clone(),
+                )?;
+            }
+
+            store_pooled_desktop_pi(
+                &normalized_session_id,
+                DesktopPooledPi {
+                    child,
+                    stdin,
+                    stdout_rx,
+                    stderr_buffer,
+                    fingerprint: desktop_fingerprint,
+                },
+            )?;
+            dev_trace(
+                "desktop.stream",
+                format!(
+                    "pi 完成(池化回收): session={} chars={}",
+                    normalized_session_id,
+                    emitted_assistant_text.chars().count()
+                ),
+            );
+            return Ok(());
+        }
+
+        let exit_outcome = wait_for_child_exit_with_trace(
+            &mut child,
+            DESKTOP_PI_AFTER_STDOUT_EOF_EXIT_WAIT,
+            Some(&normalized_session_id),
+            "stream_pi_prompt:post_stdout_eof_wait_exit",
+        )?;
         let status = exit_outcome.status;
 
         remove_runtime_handle(&normalized_session_id)?;
@@ -2727,7 +4016,7 @@ async fn stream_pi_prompt(
             return Err(error_text);
         }
 
-        if saw_agent_end || saw_message_done {
+        if saw_terminal_completion {
             emitted_assistant_text = finalize_desktop_outbound_reply(
                 &emitted_assistant_text,
                 agent_config.as_ref().map(|config| config.id.as_str()),
@@ -2750,7 +4039,7 @@ async fn stream_pi_prompt(
         }
 
         if let Some(agent_config) = agent_config.as_ref() {
-            if (saw_agent_end || saw_message_done) && !emitted_assistant_text.trim().is_empty() {
+            if saw_terminal_completion && !emitted_assistant_text.trim().is_empty() {
                 // 桌面聊天也需要沉淀进统一的 agent wiki，避免记忆只在 Bot 通道生效。
                 if let Err(error) = agent_workspace::append_agent_memory_entry(
                     &agent_config.id,
@@ -2763,7 +4052,7 @@ async fn stream_pi_prompt(
             }
         }
 
-        if fresh_multimodal_session && (saw_agent_end || saw_message_done) {
+        if fresh_multimodal_session && saw_terminal_completion {
             if let Err(error) =
                 record_multimodal_summary(&summary_key, &trimmed_prompt, &emitted_assistant_text)
             {
@@ -2771,12 +4060,70 @@ async fn stream_pi_prompt(
             }
         }
 
-        if !saw_agent_end && !saw_message_done {
-            let fallback_error = if !stderr_text.trim().is_empty() {
+        if !saw_terminal_completion {
+            let mut fallback_error = if !stderr_text.trim().is_empty() {
                 stderr_text.trim().to_string()
             } else {
                 "pi 未返回 agent_end 事件".to_string()
             };
+            if let Some(st) = status.as_ref() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(sig) = st.signal() {
+                        fallback_error =
+                            format!("{fallback_error}\npi 进程信号终止: {sig}");
+                        if sig == 9 && !saw_any_output && !exit_outcome.timed_out {
+                            fallback_error.push_str("\n\n诊断：pi 进程启动后立即被 SIGKILL (signal 9) 终止，无任何输出。");
+                            #[cfg(target_os = "macos")]
+                            {
+                                fallback_error.push_str(
+                                    "这通常由 macOS 安全机制（隔离属性或代码签名）引起。\n\n\
+                                     修复步骤：\n\
+                                     1. 在终端执行以下命令移除隔离属性：\n\
+                                     xattr -cr <pi路径>\n\
+                                     2. 或在 系统设置 > 隐私与安全性 中允许运行\n\
+                                     3. 确认 pi 二进制文件存在且可执行",
+                                );
+                            }
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                fallback_error.push_str(
+                                    "可能原因：\n\
+                                     1. OOM Killer 终止了进程（检查 dmesg / journalctl）\n\
+                                     2. 二进制文件损坏或缺少动态库\n\
+                                     3. 安全策略（AppArmor / SELinux）阻止了执行",
+                                );
+                            }
+                            fallback_error.push_str(&format!(
+                                "\n\npi 二进制路径: {}",
+                                resolved_pi_path,
+                            ));
+                            let mut session_path_display = session_path_string.clone();
+                            if session_path_display.len() > 80 {
+                                session_path_display.truncate(77);
+                                session_path_display.push_str("...");
+                            }
+                            fallback_error.push_str(&format!(
+                                "\n可手动测试: {} --mode rpc --session {}",
+                                resolved_pi_path, session_path_display,
+                            ));
+                        }
+                    } else if let Some(code) = st.code() {
+                        fallback_error =
+                            format!("{fallback_error}\npi 进程退出码: {code}");
+                    }
+                }
+                #[cfg(not(unix))]
+                if let Some(code) = st.code() {
+                    fallback_error = format!("{fallback_error}\npi 进程退出码: {code}");
+                }
+            }
+            if exit_outcome.timed_out {
+                fallback_error.push_str(
+                    "\n提示：stdout 已结束后等待 pi 退出超时，NineClaw 已结束子进程（信号 9 常由此产生，不一定是 SiliconFlow/模型映射错误）。请核对 OpenAI 兼容 Base URL（多需以 /v1 结尾）、模型 ID、API Key，并在终端用相同参数试跑 `pi --mode rpc`。",
+                );
+            }
             dev_trace(
                 "desktop.stream",
                 format!("pi 未正常结束: session={} error={}", normalized_session_id, fallback_error),
@@ -2800,12 +4147,12 @@ async fn stream_pi_prompt(
         }
 
         if status.map(|value| !value.success()).unwrap_or(true) {
-            if done_emitted && (saw_agent_end || saw_message_done) {
+            if done_emitted && saw_terminal_completion {
                 return Ok(());
             }
 
             if exit_outcome.timed_out
-                && (saw_agent_end || saw_message_done)
+                && saw_terminal_completion
                 && stderr_text.trim().is_empty()
             {
                 if !done_emitted {
@@ -2830,7 +4177,7 @@ async fn stream_pi_prompt(
 
             let fallback_error = if !stderr_text.trim().is_empty() {
                 stderr_text.trim().to_string()
-            } else if exit_outcome.timed_out && (saw_agent_end || saw_message_done) {
+            } else if exit_outcome.timed_out && saw_terminal_completion {
                 "pi 在返回完整结果后退出过慢，运行时已强制回收进程。".to_string()
             } else if exit_outcome.timed_out {
                 "pi 已被请求终止，但回收超时，运行时已主动脱离该卡死进程。".to_string()
@@ -3470,6 +4817,7 @@ pub fn run() {
             abort_pi_stream,
             persist_chat_attachments,
             open_local_file,
+            open_external_url,
             load_local_media_preview,
             clear_pi_session,
             clear_pi_session_for_id,

@@ -1,0 +1,32 @@
+#!/bin/sh
+# Bundled pi launcher generated during build.
+set -eu
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+NODE_BIN="$SCRIPT_DIR/node"
+if [ "$(uname -s)" = "Darwin" ]; then
+  # On macOS the bundled thin node launcher may be blocked by SIP / AMFI
+  # when its @loader_path dylibs are unsigned.  Prefer a system-installed
+  # node if one exists (search PATH *without* SCRIPT_DIR so the bundled
+  # node is not found ahead of the real one).
+  _saved_IFS="$IFS"
+  IFS=':'
+  _found=
+  for _dir in $PATH; do
+    case "$_dir" in
+      "$SCRIPT_DIR") continue ;;
+    esac
+    if [ -x "$_dir/node" ]; then
+      _found="$_dir/node"
+      break
+    fi
+  done
+  IFS="$_saved_IFS"
+  if [ -n "$_found" ]; then
+    NODE_BIN="$_found"
+  fi
+fi
+if [ -d "$SCRIPT_DIR/lib" ]; then
+  export DYLD_LIBRARY_PATH="$SCRIPT_DIR/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH}"
+fi
+exec "$NODE_BIN" "$SCRIPT_DIR/pi-package/dist/cli.js" "$@"

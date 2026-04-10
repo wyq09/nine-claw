@@ -242,17 +242,51 @@ pub(crate) fn resolve_pi_executable(app: &AppHandle) -> Option<PiRuntimeLocation
     })
 }
 
+/// On macOS, check whether the PI binary carries a quarantine extended-attribute
+/// and attempt to clear it automatically.  Returns a human-readable warning if
+/// the attribute was present (regardless of whether removal succeeded), or
+/// `None` if no quarantine was detected.
+#[cfg(target_os = "macos")]
+pub(crate) fn clear_macos_quarantine_if_present(executable: &Path) -> Option<String> {
+    let path_str = executable.to_string_lossy();
+    let xattr_output = Command::new("xattr")
+        .args(["-l", &*path_str])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&xattr_output.stdout);
+    if !stdout.contains("com.apple.quarantine") {
+        return None;
+    }
+
+    let removed = Command::new("xattr")
+        .args(["-cr", &*path_str])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if removed {
+        Some(format!(
+            "已自动移除 pi 二进制的 macOS 隔离属性: {}",
+            path_str
+        ))
+    } else {
+        Some(format!(
+            "检测到 macOS 隔离属性但自动移除失败，请手动执行: xattr -cr {}",
+            path_str
+        ))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn clear_macos_quarantine_if_present(_executable: &Path) -> Option<String> {
+    None
+}
+
 pub(crate) fn require_pi_runtime_location(app: &AppHandle) -> Result<PiRuntimeLocation, String> {
     resolve_pi_executable(app).ok_or_else(|| {
         "未找到 pi 运行时。请先执行 `npm install` 并运行 `npm run prepare:pi-runtime` 生成内置运行时，或者确认系统 `pi` 已在 PATH 中可用。".to_string()
     })
-}
-
-pub(crate) fn create_pi_command(app: &AppHandle) -> Result<Command, String> {
-    let location = require_pi_runtime_location(app)?;
-    let mut command = Command::new(&location.executable);
-    apply_runtime_environment(&mut command, &location);
-    Ok(command)
 }
 
 fn install_nodejs_with_winget(messages: &mut Vec<String>) -> bool {
