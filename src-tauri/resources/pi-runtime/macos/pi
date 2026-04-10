@@ -27,6 +27,6 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 if [ -d "$SCRIPT_DIR/lib" ]; then
   export DYLD_LIBRARY_PATH="$SCRIPT_DIR/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
-  export LD_LIBRARY_PATH="$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="$SCRIPT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 exec "$NODE_BIN" "$SCRIPT_DIR/pi-package/dist/cli.js" "$@"
