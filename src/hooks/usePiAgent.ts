@@ -325,10 +325,14 @@ function extractTokenUsage(raw: Record<string, unknown> | undefined): TokenUsage
     return undefined
   }
 
-  const inputTokens = parseOptionalNumber(raw.inputTokens ?? raw.input_tokens) ?? 0
-  const outputTokens = parseOptionalNumber(raw.outputTokens ?? raw.output_tokens) ?? 0
-  const cacheReadTokens = parseOptionalNumber(raw.cacheReadTokens ?? raw.cache_read_tokens) ?? 0
-  const cacheWriteTokens = parseOptionalNumber(raw.cacheWriteTokens ?? raw.cache_write_tokens) ?? 0
+  const inputTokens =
+    parseOptionalNumber(raw.inputTokens ?? raw.input_tokens ?? raw.input) ?? 0
+  const outputTokens =
+    parseOptionalNumber(raw.outputTokens ?? raw.output_tokens ?? raw.output) ?? 0
+  const cacheReadTokens =
+    parseOptionalNumber(raw.cacheReadTokens ?? raw.cache_read_tokens ?? raw.cacheRead) ?? 0
+  const cacheWriteTokens =
+    parseOptionalNumber(raw.cacheWriteTokens ?? raw.cache_write_tokens ?? raw.cacheWrite) ?? 0
   const totalTokens =
     parseOptionalNumber(raw.totalTokens ?? raw.total_tokens) ??
     inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
@@ -349,6 +353,16 @@ function extractTokenUsage(raw: Record<string, unknown> | undefined): TokenUsage
     cacheReadTokens,
     cacheWriteTokens,
     totalTokens,
+    api: typeof raw.api === 'string' ? raw.api : undefined,
+    provider: typeof raw.provider === 'string' ? raw.provider : undefined,
+    model: typeof raw.model === 'string' ? raw.model : undefined,
+    responseId:
+      typeof raw.responseId === 'string'
+        ? raw.responseId
+        : typeof raw.response_id === 'string'
+          ? raw.response_id
+          : undefined,
+    timestamp: parseOptionalNumber(raw.timestamp),
   }
 }
 
@@ -643,32 +657,7 @@ function buildToolCallEntry(payload: PiStreamPayload): ToolCallEntry {
 }
 
 function parseUsageFromPayload(payload: PiStreamPayload): TokenUsage | undefined {
-  const inputTokens = payload.inputTokens ?? payload.input_tokens ?? 0
-  const outputTokens = payload.outputTokens ?? payload.output_tokens ?? 0
-  const cacheReadTokens = payload.cacheReadTokens ?? payload.cache_read_tokens ?? 0
-  const cacheWriteTokens = payload.cacheWriteTokens ?? payload.cache_write_tokens ?? 0
-  const totalTokens =
-    payload.totalTokens ??
-    payload.total_tokens ??
-    inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
-
-  if (
-    inputTokens === 0 &&
-    outputTokens === 0 &&
-    cacheReadTokens === 0 &&
-    cacheWriteTokens === 0 &&
-    totalTokens === 0
-  ) {
-    return undefined
-  }
-
-  return {
-    inputTokens,
-    outputTokens,
-    cacheReadTokens,
-    cacheWriteTokens,
-    totalTokens,
-  }
+  return extractTokenUsage(payload as unknown as Record<string, unknown>)
 }
 
 export function getHistoryStatusLabel(status: HistoryStatus): string {
@@ -688,6 +677,8 @@ export function usePiAgent() {
   const [historyHydrated, setHistoryHydrated] = useState(false)
   const currentTurnIdsRef = useRef<Map<string, string>>(new Map())
   const receivedFirstDeltaRef = useRef<Map<string, boolean>>(new Map())
+  /** 同步防连点：同 session 并发 `streamPiPrompt` 会触发后端池化 SIGKILL；`runningHistoryIds` 的 setState 追不上双击。 */
+  const desktopStreamHoldRef = useRef<Set<string>>(new Set())
 
   const updateHistoryItem = (id: string, updater: (item: HistoryItem) => HistoryItem) => {
     setHistory((previous) => previous.map((item) => (item.id === id ? updater(item) : item)))
@@ -1164,6 +1155,7 @@ export function usePiAgent() {
     }
 
     if (msg.direction === 'outbound_done') {
+      const usage = extractTokenUsage(msg as unknown as Record<string, unknown>)
       // Final complete reply → set answer to full text, mark done
       updateHistoryItem(historyId, (item) => withBotAgentMetadata(item, msg))
       updateTurn(historyId, turnId, (turn) => ({
@@ -1172,6 +1164,7 @@ export function usePiAgent() {
         responseSegments: [{ type: 'text', text: msg.content }],
         status: 'done',
         completedAt: turn.completedAt ?? Date.now(),
+        usage: usage ?? turn.usage,
       }))
       updateSessionStatus(historyId, 'done')
       refreshHistoryTitle(historyId)
@@ -1233,92 +1226,101 @@ export function usePiAgent() {
 
     const turn = buildNewTurn(trimmedPrompt)
     const nextHistoryId = options?.forceNewSession ? createId() : (activeHistoryId || createId())
-    const hasActiveConversation =
-      !options?.forceNewSession && Boolean(activeHistoryId && history.some((item) => item.id === activeHistoryId))
+    if (desktopStreamHoldRef.current.has(nextHistoryId)) {
+      setError('当前会话正在生成中，请稍候或先中止后再发。')
+      return false
+    }
+    desktopStreamHoldRef.current.add(nextHistoryId)
+    try {
+      const hasActiveConversation =
+        !options?.forceNewSession && Boolean(activeHistoryId && history.some((item) => item.id === activeHistoryId))
 
-    currentTurnIdsRef.current.set(nextHistoryId, turn.id)
-    receivedFirstDeltaRef.current.set(nextHistoryId, false)
-    markSessionRunning(nextHistoryId)
-    setError('')
-    setDraft('')
-    setActiveHistoryId(nextHistoryId)
-    setHistory((previous) => {
-      if (!hasActiveConversation) {
-        const nextConversation: HistoryItem = {
-          id: nextHistoryId,
-          title: deriveConversationTitle(trimmedPrompt),
-          status: 'running',
-          createdAt: turn.createdAt,
-          updatedAt: turn.createdAt,
-          turns: [turn],
-          ...(context?.agent ? { agent: context.agent } : {}),
-          ...(context?.sessionLlm
-            ? {
-                sessionLlmProviderId: context.sessionLlm.providerId,
-                sessionLlmModel: context.sessionLlm.model,
-              }
-            : context?.providerConfig
-            ? {
-                sessionLlmProviderId: context.providerConfig.providerId,
-                sessionLlmModel: context.providerConfig.model,
-              }
-            : {}),
+      currentTurnIdsRef.current.set(nextHistoryId, turn.id)
+      receivedFirstDeltaRef.current.set(nextHistoryId, false)
+      markSessionRunning(nextHistoryId)
+      setError('')
+      setDraft('')
+      setActiveHistoryId(nextHistoryId)
+      setHistory((previous) => {
+        if (!hasActiveConversation) {
+          const nextConversation: HistoryItem = {
+            id: nextHistoryId,
+            title: deriveConversationTitle(trimmedPrompt),
+            status: 'running',
+            createdAt: turn.createdAt,
+            updatedAt: turn.createdAt,
+            turns: [turn],
+            ...(context?.agent ? { agent: context.agent } : {}),
+            ...(context?.sessionLlm
+              ? {
+                  sessionLlmProviderId: context.sessionLlm.providerId,
+                  sessionLlmModel: context.sessionLlm.model,
+                }
+              : context?.providerConfig
+              ? {
+                  sessionLlmProviderId: context.providerConfig.providerId,
+                  sessionLlmModel: context.providerConfig.model,
+                }
+              : {}),
+          }
+
+          return [nextConversation, ...previous].slice(0, MAX_HISTORY_ITEMS)
         }
 
-        return [nextConversation, ...previous].slice(0, MAX_HISTORY_ITEMS)
-      }
-
-      const updated = previous.map((item): HistoryItem =>
-        item.id === nextHistoryId
-          ? {
-              ...item,
-              status: 'running',
-              updatedAt: turn.createdAt,
-              turns: [...item.turns, turn],
-            }
-          : item,
-      )
-      const current = updated.find((item) => item.id === nextHistoryId)
-      const others = updated.filter((item) => item.id !== nextHistoryId)
-      return current ? [current, ...others].slice(0, MAX_HISTORY_ITEMS) : updated.slice(0, MAX_HISTORY_ITEMS)
-    })
-
-    try {
-      await streamPiPrompt(trimmedPrompt, {
-        sessionId: nextHistoryId,
-        providerConfig: context?.providerConfig,
-        agentConfig: context?.agent,
-        attachments: context?.attachments ?? [],
+        const updated = previous.map((item): HistoryItem =>
+          item.id === nextHistoryId
+            ? {
+                ...item,
+                status: 'running',
+                updatedAt: turn.createdAt,
+                turns: [...item.turns, turn],
+              }
+            : item,
+        )
+        const current = updated.find((item) => item.id === nextHistoryId)
+        const others = updated.filter((item) => item.id !== nextHistoryId)
+        return current ? [current, ...others].slice(0, MAX_HISTORY_ITEMS) : updated.slice(0, MAX_HISTORY_ITEMS)
       })
 
-      if (currentTurnIdsRef.current.get(nextHistoryId) === turn.id) {
-        setLatestActivityState(nextHistoryId, turn.id, '连接 pi 主脑', 'done')
-        setLatestActivityState(nextHistoryId, turn.id, '流式输出中', 'done')
-        setLatestActivityState(nextHistoryId, turn.id, '深度思考中', 'done')
-        appendActivity(nextHistoryId, turn.id, '回复完成', 'pi 已返回完整结果，本轮对话结束。', 'done')
+      try {
+        await streamPiPrompt(trimmedPrompt, {
+          sessionId: nextHistoryId,
+          providerConfig: context?.providerConfig,
+          agentConfig: context?.agent,
+          attachments: context?.attachments ?? [],
+        })
+
+        if (currentTurnIdsRef.current.get(nextHistoryId) === turn.id) {
+          setLatestActivityState(nextHistoryId, turn.id, '连接 pi 主脑', 'done')
+          setLatestActivityState(nextHistoryId, turn.id, '流式输出中', 'done')
+          setLatestActivityState(nextHistoryId, turn.id, '深度思考中', 'done')
+          appendActivity(nextHistoryId, turn.id, '回复完成', 'pi 已返回完整结果，本轮对话结束。', 'done')
+          updateTurn(nextHistoryId, turn.id, (current) => ({
+            ...current,
+            status: current.status === 'running' ? 'done' : current.status,
+            completedAt: current.completedAt ?? Date.now(),
+          }))
+          updateSessionStatus(nextHistoryId, 'done')
+          markSessionSettled(nextHistoryId)
+        }
+
+        return true
+      } catch (invokeError) {
+        const message = invokeError instanceof Error ? invokeError.message : String(invokeError)
+        setError(message)
+        appendActivity(nextHistoryId, turn.id, '启动失败', message, 'error')
         updateTurn(nextHistoryId, turn.id, (current) => ({
           ...current,
-          status: current.status === 'running' ? 'done' : current.status,
+          status: 'error',
+          answer: current.answer || message,
           completedAt: current.completedAt ?? Date.now(),
         }))
-        updateSessionStatus(nextHistoryId, 'done')
+        updateSessionStatus(nextHistoryId, 'error')
         markSessionSettled(nextHistoryId)
+        return false
       }
-
-      return true
-    } catch (invokeError) {
-      const message = invokeError instanceof Error ? invokeError.message : String(invokeError)
-      setError(message)
-      appendActivity(nextHistoryId, turn.id, '启动失败', message, 'error')
-      updateTurn(nextHistoryId, turn.id, (current) => ({
-        ...current,
-        status: 'error',
-        answer: current.answer || message,
-        completedAt: current.completedAt ?? Date.now(),
-      }))
-      updateSessionStatus(nextHistoryId, 'error')
-      markSessionSettled(nextHistoryId)
-      return false
+    } finally {
+      desktopStreamHoldRef.current.delete(nextHistoryId)
     }
   }
 

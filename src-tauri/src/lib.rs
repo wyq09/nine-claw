@@ -342,19 +342,27 @@ fn detect_media_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct PiTokenUsagePayload {
+    #[serde(alias = "inputTokens", alias = "input", default)]
     input_tokens: Option<u64>,
+    #[serde(alias = "outputTokens", alias = "output", default)]
     output_tokens: Option<u64>,
+    #[serde(alias = "cacheReadTokens", alias = "cacheRead", alias = "cache_read_tokens", default)]
     cache_read_tokens: Option<u64>,
+    #[serde(alias = "cacheWriteTokens", alias = "cacheWrite", alias = "cache_write_tokens", default)]
     cache_write_tokens: Option<u64>,
+    #[serde(alias = "totalTokens", alias = "total_tokens", default)]
     total_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct PiUsageMetadataPayload {
     api: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    #[serde(alias = "responseId", alias = "response_id", default)]
     response_id: Option<String>,
     timestamp: Option<i64>,
 }
@@ -3980,8 +3988,9 @@ async fn stream_pi_prompt(
                 }
 
                 if delta_type == "done" {
+                    let msg_in_assistant = assistant_event.and_then(|item| item.get("message"));
                     let final_text =
-                        extract_text_content(assistant_event.and_then(|item| item.get("message")));
+                        extract_text_content(msg_in_assistant);
                     if let Some(snapshot) = final_text {
                         _saw_assistant_activity = true;
                         let missing_text =
@@ -4068,7 +4077,8 @@ async fn stream_pi_prompt(
                     }
 
                     final_usage = final_usage.or_else(|| {
-                        extract_usage_payload(message.and_then(|item| item.get("usage")))
+                        let raw = message.and_then(|item| item.get("usage"));
+                        extract_usage_payload(raw)
                     });
                     final_usage_meta = final_usage_meta.or_else(|| extract_usage_metadata_payload(message));
 
@@ -4201,7 +4211,9 @@ async fn stream_pi_prompt(
                         }
 
                         final_usage = final_usage.or_else(|| {
-                            extract_usage_payload(last_assistant.get("usage"))
+                            let usage_val = last_assistant.get("usage");
+                            let result = extract_usage_payload(usage_val);
+                            result
                         });
                         final_usage_meta = final_usage_meta
                             .or_else(|| extract_usage_metadata_payload(Some(last_assistant)));
