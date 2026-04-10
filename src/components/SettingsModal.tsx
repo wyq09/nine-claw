@@ -5,6 +5,7 @@ import {
   savePeerGatewaySettings,
   testLlmProviderConnection,
 } from '../lib/piClient'
+import { THEME_OPTIONS } from '../theme/themePresets'
 import type {
   AppearanceSettings,
   GeneralSettings,
@@ -17,6 +18,7 @@ import type {
   SettingsTab,
 } from '../types'
 import { AppIcon, type IconName } from './AppIcon'
+import { UsageStatsPanel } from './UsageStatsPanel'
 
 type SettingsModalProps = {
   activeProviderBadge: string
@@ -120,6 +122,22 @@ function Toggle({ checked, onChange }: ToggleProps) {
   )
 }
 
+function getProviderFormatDefaults(apiFormat: ProviderApiFormat): { baseUrl: string; model: string; label: string } {
+  if (apiFormat === 'anthropic') {
+    return {
+      baseUrl: 'https://api.anthropic.com',
+      model: 'claude-sonnet-4-0',
+      label: 'Anthropic Messages',
+    }
+  }
+
+  return {
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini',
+    label: 'OpenAI Chat Completions',
+  }
+}
+
 export function SettingsModal({
   activeProviderBadge,
   allProviderDefinitions,
@@ -147,6 +165,7 @@ export function SettingsModal({
   const [providerTestLoading, setProviderTestLoading] = useState(false)
   const [providerTestNote, setProviderTestNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
   const [providerDeleteConfirmId, setProviderDeleteConfirmId] = useState<ProviderId | null>(null)
+  const [showApiKey, setShowApiKey] = useState(false)
 
   const [peerGatewayDraft, setPeerGatewayDraft] = useState<PeerGatewaySettings | null>(null)
   const [peerGatewayInfo, setPeerGatewayInfo] = useState<PeerGatewayInfo | null>(null)
@@ -211,6 +230,11 @@ export function SettingsModal({
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [providerDeleteConfirmId])
 
+  useEffect(() => {
+    setShowApiKey(false)
+    setProviderTestNote(null)
+  }, [selectedProviderId])
+
   const handleSubmitCustomProvider = () => {
     const name = customName.trim()
     if (!name) {
@@ -232,34 +256,60 @@ export function SettingsModal({
       return def && cfg ? providerDisplayName(def, cfg) : providerDeleteConfirmId
     })()
 
+  const currentTabTitle =
+    tab === 'general'
+      ? '常规'
+      : tab === 'appearance'
+        ? '外观与行为'
+        : tab === 'providers'
+          ? '模型提供方'
+          : tab === 'usage'
+            ? '用量统计'
+          : '快捷键'
+
+  const currentTabDescription =
+    tab === 'general'
+      ? '维护应用默认行为、语言偏好和对外接入配置。'
+      : tab === 'appearance'
+        ? '控制侧栏密度、执行轨迹和页面动态效果。'
+      : tab === 'providers'
+        ? '统一管理大模型接口、默认模型与连通性校验。'
+        : tab === 'usage'
+          ? '查看 SQLite 中累计保存的 token 使用记录与分布。'
+        : '配置发送方式与常用桌面快捷操作。'
+  const selectedProviderFormatDefaults = getProviderFormatDefaults(selectedProviderConfig.apiFormat)
+
   return (
     <>
       <div className="modal-backdrop">
         <div className="settings-dialog" role="dialog" aria-modal="true" aria-label="设置">
           <div className="settings-sidebar">
-            <header>
-              <h2>设置</h2>
+            <header className="settings-sidebar-head">
+              <button type="button" className="settings-back-button" onClick={onClose}>
+                <AppIcon name="arrow-left" size={18} />
+                <span>返回应用</span>
+              </button>
+              <div className="settings-sidebar-title">
+                <span className="settings-sidebar-kicker">系统偏好设置</span>
+                <h2>设置</h2>
+              </div>
             </header>
 
             <div className="settings-tab-list">
               <SettingsTabButton active={tab === 'general'} icon="settings" label="通用" onClick={() => onSelectTab('general')} />
               <SettingsTabButton active={tab === 'appearance'} icon="sparkles" label="个性化" onClick={() => onSelectTab('appearance')} />
               <SettingsTabButton active={tab === 'providers'} icon="provider" label="大模型 Provider" onClick={() => onSelectTab('providers')} />
+              <SettingsTabButton active={tab === 'usage'} icon="zap" label="用量统计" onClick={() => onSelectTab('usage')} />
               <SettingsTabButton active={tab === 'shortcuts'} icon="keyboard" label="快捷键" onClick={() => onSelectTab('shortcuts')} />
             </div>
           </div>
 
           <div className="settings-content">
             <div className="settings-content-head">
-              <h2>
-                {tab === 'general'
-                  ? '通用'
-                  : tab === 'appearance'
-                    ? '个性化'
-                    : tab === 'providers'
-                      ? '大模型 Provider'
-                      : '快捷键'}
-              </h2>
+              <div className="settings-content-head-copy">
+                <h2>{currentTabTitle}</h2>
+                <p>{currentTabDescription}</p>
+              </div>
               <button type="button" className="icon-button subtle" onClick={onClose} aria-label="关闭设置">
                 <AppIcon name="close" size={20} />
               </button>
@@ -472,6 +522,29 @@ export function SettingsModal({
 
             {tab === 'appearance' ? (
               <div className="settings-section-stack">
+                <div className="settings-row">
+                  <div>
+                    <strong>主题</strong>
+                    <p>统一切换主工作区、设置页和弹窗主题，后续新增主题也会走同一套 token 配置。</p>
+                  </div>
+                  <label className="select-field">
+                    <select
+                      value={appearanceSettings.themeMode}
+                      onChange={(event) =>
+                        setAppearanceSettings((previous) => ({
+                          ...previous,
+                          themeMode: event.target.value as AppearanceSettings['themeMode'],
+                        }))
+                      }
+                    >
+                      {THEME_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
                 <SettingSwitch
                   checked={appearanceSettings.compactSidebar}
                   description="压缩左侧导航宽度，适合更小的桌面窗口。"
@@ -669,8 +742,25 @@ export function SettingsModal({
 
                       <p className="settings-note provider-note">{selectedProviderDefinition.description}</p>
                       <p className="settings-note provider-note">
-                        当前接口格式：{selectedProviderConfig.apiFormat === 'anthropic' ? 'Anthropic Messages' : 'OpenAI Chat Completions'}
+                        当前接口格式：{selectedProviderFormatDefaults.label}
                       </p>
+
+                      <label className="input-field">
+                        <span>接口格式</span>
+                        <label className="select-field">
+                          <select
+                            value={selectedProviderConfig.apiFormat}
+                            onChange={(event) =>
+                              onProviderConfigChange(selectedProviderId, {
+                                apiFormat: event.target.value as ProviderApiFormat,
+                              })
+                            }
+                          >
+                            <option value="openai">OpenAI Chat Completions</option>
+                            <option value="anthropic">Anthropic Messages</option>
+                          </select>
+                        </label>
+                      </label>
 
                       <label className="input-field">
                         <span>显示名称</span>
@@ -686,18 +776,30 @@ export function SettingsModal({
                         <input
                           value={selectedProviderConfig.baseUrl}
                           onChange={(event) => onProviderConfigChange(selectedProviderId, { baseUrl: event.target.value })}
-                          placeholder={selectedProviderDefinition.defaultBaseUrl}
+                          placeholder={selectedProviderFormatDefaults.baseUrl}
                         />
                       </label>
 
                       <label className="input-field">
                         <span>API Key</span>
-                        <input
-                          type="password"
-                          value={selectedProviderConfig.apiKey}
-                          onChange={(event) => onProviderConfigChange(selectedProviderId, { apiKey: event.target.value })}
-                          placeholder="请输入 API Key"
-                        />
+                        <div className="input-action-field">
+                          <input
+                            type={showApiKey ? 'text' : 'password'}
+                            value={selectedProviderConfig.apiKey}
+                            onChange={(event) => onProviderConfigChange(selectedProviderId, { apiKey: event.target.value })}
+                            placeholder="请输入 API Key"
+                          />
+                          <button
+                            type="button"
+                            className="input-action-button"
+                            onClick={() => setShowApiKey((previous) => !previous)}
+                            aria-label={showApiKey ? '隐藏 API Key' : '显示 API Key'}
+                            aria-pressed={showApiKey}
+                            title={showApiKey ? '隐藏 API Key' : '显示 API Key'}
+                          >
+                            <AppIcon name={showApiKey ? 'eye-off' : 'eye'} size={16} />
+                          </button>
+                        </div>
                       </label>
 
                       <label className="input-field">
@@ -705,7 +807,7 @@ export function SettingsModal({
                         <input
                           value={selectedProviderConfig.model}
                           onChange={(event) => onProviderConfigChange(selectedProviderId, { model: event.target.value })}
-                          placeholder={selectedProviderDefinition.suggestedModel}
+                          placeholder={selectedProviderFormatDefaults.model}
                         />
                       </label>
 
@@ -767,7 +869,7 @@ export function SettingsModal({
                       ) : null}
 
                       <p className="settings-note">
-                        启用后的 Provider 会直接参与后续对话执行。为避免冲突，界面会保持单一启用项。
+                        接口格式会直接影响请求协议；切换后可以立即点「测试连通性」验证当前 Base URL、API Key 和模型是否匹配。
                       </p>
                     </>
                   )}
@@ -826,6 +928,8 @@ export function SettingsModal({
                 </div>
               </div>
             ) : null}
+
+            {tab === 'usage' ? <UsageStatsPanel /> : null}
 
             <div className="settings-footer">
               <button type="button" className="outline-button settings-footer-button" onClick={onClose}>

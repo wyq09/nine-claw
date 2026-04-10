@@ -78,7 +78,14 @@ fn echo_agent_field(s: &str) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
-fn correlation_from_body(body: &PeerInboundBody) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+fn correlation_from_body(
+    body: &PeerInboundBody,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     (
         echo_agent_field(&body.from_agent_id),
         echo_agent_field(&body.to_agent_id),
@@ -195,7 +202,12 @@ fn peer_v1_inbound_accepted(body: &PeerInboundBody) -> PeerV1Response {
     }
 }
 
-fn peer_v1_webhook(body: &PeerInboundBody, ok: bool, reply: &str, err: Option<PeerJsonError>) -> PeerV1Response {
+fn peer_v1_webhook(
+    body: &PeerInboundBody,
+    ok: bool,
+    reply: &str,
+    err: Option<PeerJsonError>,
+) -> PeerV1Response {
     let (reply_o, text_o) = if ok && !reply.trim().is_empty() {
         let s = reply.to_string();
         (Some(s.clone()), Some(s))
@@ -318,12 +330,16 @@ pub fn load_peer_gateway_settings(app: &AppHandle) -> Result<PeerGatewaySettings
         .map_err(|e| format!("解析对等网关设置失败: {e}"))
 }
 
-pub fn save_peer_gateway_settings(app: &AppHandle, settings: &PeerGatewaySettings) -> Result<(), String> {
+pub fn save_peer_gateway_settings(
+    app: &AppHandle,
+    settings: &PeerGatewaySettings,
+) -> Result<(), String> {
     if settings.port == 0 {
         return Err("端口必须在 1–65535 之间".into());
     }
     let normalized = normalize_peer_settings(settings.clone());
-    let json = serde_json::to_string(&normalized).map_err(|e| format!("序列化对等网关设置失败: {e}"))?;
+    let json =
+        serde_json::to_string(&normalized).map_err(|e| format!("序列化对等网关设置失败: {e}"))?;
     let connection = crate::open_history_db(app)?;
     let now = crate::chrono_like_timestamp();
     connection
@@ -385,7 +401,11 @@ fn resolve_public_base_url(app: &AppHandle, addr: SocketAddr) -> Option<String> 
         }
     }
     if let Ok(settings) = load_peer_gateway_settings(app) {
-        let t = settings.public_base.trim().trim_end_matches('/').to_string();
+        let t = settings
+            .public_base
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
         if !t.is_empty() {
             return Some(t);
         }
@@ -516,6 +536,8 @@ fn emit_peer_message(
     direction: &str,
     content: &str,
     agent: Option<&ConversationAgentConfig>,
+    usage: Option<crate::PiTokenUsagePayload>,
+    usage_meta: Option<crate::PiUsageMetadataPayload>,
 ) {
     let payload = BotMessage {
         channel_id: PEER_CHANNEL_ID.to_string(),
@@ -524,6 +546,8 @@ fn emit_peer_message(
         content: content.to_string(),
         timestamp: now_timestamp_ms(),
         agent: agent.cloned(),
+        usage,
+        usage_meta,
     };
     let app_emit = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
@@ -550,21 +574,20 @@ fn augment_prompt_for_peer(body: &PeerInboundBody) -> String {
     )
 }
 
-fn post_reply_webhook(url: &str, auth: Option<&str>, payload: &PeerV1Response) -> Result<(), String> {
+fn post_reply_webhook(
+    url: &str,
+    auth: Option<&str>,
+    payload: &PeerV1Response,
+) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| format!("HTTP 客户端: {e}"))?;
     let mut req = client.post(url).json(payload);
     if let Some(a) = auth.filter(|s| !s.trim().is_empty()) {
-        req = req.header(
-            header::AUTHORIZATION,
-            format!("Bearer {}", a.trim()),
-        );
+        req = req.header(header::AUTHORIZATION, format!("Bearer {}", a.trim()));
     }
-    let response = req
-        .send()
-        .map_err(|e| format!("webhook 请求失败: {e}"))?;
+    let response = req.send().map_err(|e| format!("webhook 请求失败: {e}"))?;
     let status = response.status();
     if !status.is_success() {
         let preview: String = response
@@ -628,7 +651,10 @@ fn run_peer_turn(app: &AppHandle, body: &PeerInboundBody) -> Result<String, Stri
         app,
         &session_user_id,
         "processing",
-        &format!("对等入站 → 智能体 {} ({})", agent_config.name, agent_config.id),
+        &format!(
+            "对等入站 → 智能体 {} ({})",
+            agent_config.name, agent_config.id
+        ),
     );
     emit_peer_message(
         app,
@@ -636,6 +662,8 @@ fn run_peer_turn(app: &AppHandle, body: &PeerInboundBody) -> Result<String, Stri
         "inbound",
         &prompt,
         Some(&agent_config),
+        None,
+        None,
     );
 
     let user_id_for_chunk = session_user_id.clone();
@@ -654,13 +682,16 @@ fn run_peer_turn(app: &AppHandle, body: &PeerInboundBody) -> Result<String, Stri
                 "outbound_chunk",
                 chunk,
                 Some(&agent_for_chunk),
+                None,
+                None,
             );
         },
         |_| {},
     );
 
     match outcome {
-        Ok(PiProcessOutcome::Completed(full_text)) => {
+        Ok(PiProcessOutcome::Completed(result)) => {
+            let full_text = result.full_text;
             let _ = crate::agent_workspace::append_agent_memory_entry(
                 agent_config.id.as_str(),
                 &session_user_id,
@@ -673,13 +704,15 @@ fn run_peer_turn(app: &AppHandle, body: &PeerInboundBody) -> Result<String, Stri
                 "outbound_done",
                 &full_text,
                 Some(&agent_config),
+                result.usage.clone(),
+                result.usage_meta.clone(),
             );
             emit_peer_status(app, &session_user_id, "done", "对等回复已完成");
             Ok(full_text)
         }
         Ok(PiProcessOutcome::Aborted) => Err("处理被中断".to_string()),
         Err(e) => {
-            emit_peer_message(app, &session_user_id, "error", &e, Some(&agent_config));
+            emit_peer_message(app, &session_user_id, "error", &e, Some(&agent_config), None, None);
             emit_peer_status(app, &session_user_id, "error", &e);
             Err(e)
         }
@@ -916,7 +949,9 @@ pub fn start_peer_gateway(app: &AppHandle, addr: SocketAddr) -> Result<(), Strin
                     return;
                 }
             };
-            log::info!("NineClaw 对等网关已监听 {addr}（多智能体请用 JSON 字段 toAgentId 指定目标）");
+            log::info!(
+                "NineClaw 对等网关已监听 {addr}（多智能体请用 JSON 字段 toAgentId 指定目标）"
+            );
             if let Err(e) = axum::serve(listener, router)
                 .with_graceful_shutdown(async move {
                     let _ = shutdown_rx.await;

@@ -20,6 +20,11 @@ export type TokenUsage = {
   cacheReadTokens: number
   cacheWriteTokens: number
   totalTokens: number
+  api?: string
+  provider?: string
+  model?: string
+  responseId?: string
+  timestamp?: number
 }
 
 export type PiStreamPayload = {
@@ -57,6 +62,12 @@ export type PiStreamPayload = {
   cache_write_tokens?: number
   totalTokens?: number
   total_tokens?: number
+  api?: string
+  provider?: string
+  model?: string
+  responseId?: string
+  response_id?: string
+  timestamp?: number
 }
 
 export type HistoryStatus = 'running' | 'done' | 'error' | 'aborted_user' | 'aborted_model'
@@ -198,7 +209,27 @@ export type HistoryItem = {
 
 export type ViewKey = 'chat' | 'skills' | 'resources' | 'agents'
 
-export type SettingsTab = 'general' | 'appearance' | 'providers' | 'shortcuts'
+export type SettingsTab = 'general' | 'appearance' | 'providers' | 'usage' | 'shortcuts'
+
+export type TokenUsageRecord = {
+  turnId: string
+  sessionId: string
+  turnCreatedAt: number
+  turnCompletedAt?: number | null
+  agentId?: string | null
+  agentName?: string | null
+  api?: string | null
+  provider?: string | null
+  model?: string | null
+  responseId?: string | null
+  usageTimestamp?: number | null
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  totalTokens: number
+  recordedAt: number
+}
 
 export type SkillLibraryTab = 'installed' | 'system'
 
@@ -423,8 +454,12 @@ export type GeneralSettings = {
   submitShortcut: SubmitShortcut
 }
 
+export type ThemeMode = 'dark' | 'light' | 'claude'
+
 export type AppearanceSettings = {
+  themeMode: ThemeMode
   compactSidebar: boolean
+  sidebarCollapsed: boolean
   showExecutionRail: boolean
   preferReducedMotion: boolean
 }

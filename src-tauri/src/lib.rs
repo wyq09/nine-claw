@@ -341,13 +341,22 @@ fn detect_media_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-#[derive(Clone, Serialize)]
-struct PiTokenUsagePayload {
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct PiTokenUsagePayload {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cache_read_tokens: Option<u64>,
     cache_write_tokens: Option<u64>,
     total_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct PiUsageMetadataPayload {
+    api: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    response_id: Option<String>,
+    timestamp: Option<i64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -365,6 +374,30 @@ struct PiStreamPayload {
     reason: Option<String>,
     #[serde(flatten)]
     usage: Option<PiTokenUsagePayload>,
+    #[serde(flatten)]
+    usage_meta: Option<PiUsageMetadataPayload>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenUsageRecordRow {
+    turn_id: String,
+    session_id: String,
+    turn_created_at: i64,
+    turn_completed_at: Option<i64>,
+    agent_id: Option<String>,
+    agent_name: Option<String>,
+    api: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    response_id: Option<String>,
+    usage_timestamp: Option<i64>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    total_tokens: u64,
+    recorded_at: i64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1505,12 +1538,217 @@ pub(crate) fn ensure_app_state_schema(connection: &Connection) -> Result<(), Str
     Ok(())
 }
 
+fn ensure_token_usage_schema(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS token_usage_records (
+              turn_id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL,
+              turn_created_at INTEGER NOT NULL,
+              turn_completed_at INTEGER,
+              agent_id TEXT,
+              agent_name TEXT,
+              api TEXT,
+              provider TEXT,
+              model TEXT,
+              response_id TEXT,
+              usage_timestamp INTEGER,
+              input_tokens INTEGER NOT NULL DEFAULT 0,
+              output_tokens INTEGER NOT NULL DEFAULT 0,
+              cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+              cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+              total_tokens INTEGER NOT NULL DEFAULT 0,
+              recorded_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_token_usage_records_turn_completed_at
+              ON token_usage_records(turn_completed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_records_model
+              ON token_usage_records(model);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_records_agent_name
+              ON token_usage_records(agent_name);",
+        )
+        .map_err(|error| format!("初始化用量数据库失败: {error}"))?;
+
+    Ok(())
+}
+
+fn json_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    value.and_then(|item| {
+        item.as_i64()
+            .or_else(|| item.as_u64().and_then(|number| i64::try_from(number).ok()))
+    })
+}
+
+fn json_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value.and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn upsert_usage_record_from_snapshot(
+    connection: &Connection,
+    session_id: &str,
+    agent_id: Option<&str>,
+    agent_name: Option<&str>,
+    session_model: Option<&str>,
+    turn: &serde_json::Value,
+    recorded_at: i64,
+) -> Result<(), String> {
+    let Some(turn_obj) = turn.as_object() else {
+        return Ok(());
+    };
+
+    let turn_id = json_string(turn_obj.get("id"))
+        .ok_or_else(|| "历史快照中的 turn 缺少 id".to_string())?;
+    let turn_created_at = json_i64(turn_obj.get("createdAt")).unwrap_or(recorded_at);
+    let turn_completed_at = json_i64(turn_obj.get("completedAt"));
+    let usage = turn_obj.get("usage");
+    let usage_payload = extract_usage_payload(usage);
+    let Some(usage_payload) = usage_payload else {
+        return Ok(());
+    };
+
+    let usage_meta = extract_usage_metadata_payload(usage);
+    let api = usage_meta
+        .as_ref()
+        .and_then(|item| item.api.clone());
+    let provider = usage_meta
+        .as_ref()
+        .and_then(|item| item.provider.clone());
+    let model = usage_meta
+        .as_ref()
+        .and_then(|item| item.model.clone())
+        .or_else(|| session_model.map(ToOwned::to_owned));
+    let response_id = usage_meta
+        .as_ref()
+        .and_then(|item| item.response_id.clone());
+    let usage_timestamp = usage_meta.as_ref().and_then(|item| item.timestamp);
+
+    connection
+        .execute(
+            "INSERT INTO token_usage_records (
+              turn_id,
+              session_id,
+              turn_created_at,
+              turn_completed_at,
+              agent_id,
+              agent_name,
+              api,
+              provider,
+              model,
+              response_id,
+              usage_timestamp,
+              input_tokens,
+              output_tokens,
+              cache_read_tokens,
+              cache_write_tokens,
+              total_tokens,
+              recorded_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            ON CONFLICT(turn_id) DO UPDATE SET
+              session_id = excluded.session_id,
+              turn_created_at = excluded.turn_created_at,
+              turn_completed_at = excluded.turn_completed_at,
+              agent_id = excluded.agent_id,
+              agent_name = excluded.agent_name,
+              api = COALESCE(excluded.api, token_usage_records.api),
+              provider = COALESCE(excluded.provider, token_usage_records.provider),
+              model = COALESCE(excluded.model, token_usage_records.model),
+              response_id = COALESCE(excluded.response_id, token_usage_records.response_id),
+              usage_timestamp = COALESCE(excluded.usage_timestamp, token_usage_records.usage_timestamp),
+              input_tokens = excluded.input_tokens,
+              output_tokens = excluded.output_tokens,
+              cache_read_tokens = excluded.cache_read_tokens,
+              cache_write_tokens = excluded.cache_write_tokens,
+              total_tokens = excluded.total_tokens,
+              recorded_at = excluded.recorded_at",
+            params![
+                turn_id,
+                session_id,
+                turn_created_at,
+                turn_completed_at,
+                agent_id,
+                agent_name,
+                api,
+                provider,
+                model,
+                response_id,
+                usage_timestamp,
+                usage_payload.input_tokens.unwrap_or(0),
+                usage_payload.output_tokens.unwrap_or(0),
+                usage_payload.cache_read_tokens.unwrap_or(0),
+                usage_payload.cache_write_tokens.unwrap_or(0),
+                usage_payload.total_tokens.unwrap_or(0),
+                recorded_at,
+            ],
+        )
+        .map_err(|error| format!("写入用量明细失败: {error}"))?;
+
+    Ok(())
+}
+
+fn sync_usage_records_from_history_payload(
+    connection: &mut Connection,
+    payload: &str,
+) -> Result<(), String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(payload).map_err(|error| format!("解析历史快照失败: {error}"))?;
+    let Some(history_items) = parsed.as_array() else {
+        return Ok(());
+    };
+
+    let recorded_at = chrono_like_timestamp();
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("开启用量事务失败: {error}"))?;
+
+    for item in history_items {
+        let Some(item_obj) = item.as_object() else {
+            continue;
+        };
+
+        let Some(session_id) = json_string(item_obj.get("id")) else {
+            continue;
+        };
+        let agent = item_obj.get("agent").and_then(|value| value.as_object());
+        let agent_id = agent.and_then(|value| json_string(value.get("id")));
+        let agent_name = agent.and_then(|value| json_string(value.get("name")));
+        let session_model = json_string(item_obj.get("sessionLlmModel")).or_else(|| {
+            agent.and_then(|value| json_string(value.get("defaultModel")))
+        });
+
+        let Some(turns) = item_obj.get("turns").and_then(|value| value.as_array()) else {
+            continue;
+        };
+
+        for turn in turns {
+            upsert_usage_record_from_snapshot(
+                &transaction,
+                &session_id,
+                agent_id.as_deref(),
+                agent_name.as_deref(),
+                session_model.as_deref(),
+                turn,
+                recorded_at,
+            )?;
+        }
+    }
+
+    transaction
+        .commit()
+        .map_err(|error| format!("提交用量事务失败: {error}"))?;
+
+    Ok(())
+}
+
 pub(crate) fn open_history_db(app: &tauri::AppHandle) -> Result<Connection, String> {
     let db_path = history_db_path(app)?;
     let connection =
         Connection::open(db_path).map_err(|error| format!("打开历史数据库失败: {error}"))?;
 
     ensure_app_state_schema(&connection)?;
+    ensure_token_usage_schema(&connection)?;
 
     Ok(connection)
 }
@@ -1530,7 +1768,7 @@ fn load_history_state(app: tauri::AppHandle) -> Result<Option<String>, String> {
 
 #[tauri::command]
 fn save_history_state(app: tauri::AppHandle, payload: String) -> Result<(), String> {
-    let connection = open_history_db(&app)?;
+    let mut connection = open_history_db(&app)?;
     let updated_at = chrono_like_timestamp();
 
     connection
@@ -1541,6 +1779,8 @@ fn save_history_state(app: tauri::AppHandle, payload: String) -> Result<(), Stri
             params![HISTORY_STATE_KEY, payload, updated_at],
         )
         .map_err(|error| format!("保存历史任务失败: {error}"))?;
+
+    sync_usage_records_from_history_payload(&mut connection, &payload)?;
 
     Ok(())
 }
@@ -1555,6 +1795,66 @@ fn clear_history_state(app: tauri::AppHandle) -> Result<(), String> {
         )
         .map_err(|error| format!("清空历史任务失败: {error}"))?;
     Ok(())
+}
+
+#[tauri::command]
+fn list_token_usage_records(app: tauri::AppHandle) -> Result<Vec<TokenUsageRecordRow>, String> {
+    let connection = open_history_db(&app)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT
+              turn_id,
+              session_id,
+              turn_created_at,
+              turn_completed_at,
+              agent_id,
+              agent_name,
+              api,
+              provider,
+              model,
+              response_id,
+              usage_timestamp,
+              input_tokens,
+              output_tokens,
+              cache_read_tokens,
+              cache_write_tokens,
+              total_tokens,
+              recorded_at
+            FROM token_usage_records
+            ORDER BY COALESCE(turn_completed_at, turn_created_at) DESC, recorded_at DESC",
+        )
+        .map_err(|error| format!("查询用量明细失败: {error}"))?;
+
+    let rows = statement
+        .query_map([], |row| {
+            Ok(TokenUsageRecordRow {
+                turn_id: row.get(0)?,
+                session_id: row.get(1)?,
+                turn_created_at: row.get(2)?,
+                turn_completed_at: row.get(3)?,
+                agent_id: row.get(4)?,
+                agent_name: row.get(5)?,
+                api: row.get(6)?,
+                provider: row.get(7)?,
+                model: row.get(8)?,
+                response_id: row.get(9)?,
+                usage_timestamp: row.get(10)?,
+                input_tokens: row.get(11)?,
+                output_tokens: row.get(12)?,
+                cache_read_tokens: row.get(13)?,
+                cache_write_tokens: row.get(14)?,
+                total_tokens: row.get(15)?,
+                recorded_at: row.get(16)?,
+            })
+        })
+        .map_err(|error| format!("遍历用量明细失败: {error}"))?;
+
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row.map_err(|error| format!("读取用量明细失败: {error}"))?);
+    }
+
+    Ok(records)
 }
 
 #[tauri::command]
@@ -2603,6 +2903,40 @@ fn emit_stream_event(
     reason: Option<String>,
     usage: Option<PiTokenUsagePayload>,
 ) -> Result<(), String> {
+    emit_stream_event_with_meta(
+        app,
+        event,
+        session_id,
+        text,
+        error,
+        aborted_by,
+        tool_call_id,
+        tool_name,
+        args_text,
+        result_text,
+        is_error,
+        reason,
+        usage,
+        None,
+    )
+}
+
+fn emit_stream_event_with_meta(
+    app: &tauri::AppHandle,
+    event: &str,
+    session_id: Option<String>,
+    text: Option<String>,
+    error: Option<String>,
+    aborted_by: Option<String>,
+    tool_call_id: Option<String>,
+    tool_name: Option<String>,
+    args_text: Option<String>,
+    result_text: Option<String>,
+    is_error: Option<bool>,
+    reason: Option<String>,
+    usage: Option<PiTokenUsagePayload>,
+    usage_meta: Option<PiUsageMetadataPayload>,
+) -> Result<(), String> {
     app.emit(
         "pi://stream",
         PiStreamPayload {
@@ -2618,6 +2952,7 @@ fn emit_stream_event(
             is_error,
             reason,
             usage,
+            usage_meta,
         },
     )
     .map_err(|emit_error| format!("发送事件失败: {emit_error}"))
@@ -2630,20 +2965,31 @@ fn extract_json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
     })
 }
 
-fn extract_usage_payload(value: Option<&serde_json::Value>) -> Option<PiTokenUsagePayload> {
+pub(crate) fn extract_usage_payload(value: Option<&serde_json::Value>) -> Option<PiTokenUsagePayload> {
     let usage = value?;
-    let input_tokens = extract_json_u64(usage.get("input").or_else(|| usage.get("input_tokens")));
-    let output_tokens =
-        extract_json_u64(usage.get("output").or_else(|| usage.get("output_tokens")));
+    let input_tokens = extract_json_u64(
+        usage
+            .get("input")
+            .or_else(|| usage.get("input_tokens"))
+            .or_else(|| usage.get("inputTokens")),
+    );
+    let output_tokens = extract_json_u64(
+        usage
+            .get("output")
+            .or_else(|| usage.get("output_tokens"))
+            .or_else(|| usage.get("outputTokens")),
+    );
     let cache_read_tokens = extract_json_u64(
         usage
             .get("cacheRead")
-            .or_else(|| usage.get("cache_read_tokens")),
+            .or_else(|| usage.get("cache_read_tokens"))
+            .or_else(|| usage.get("cacheReadTokens")),
     );
     let cache_write_tokens = extract_json_u64(
         usage
             .get("cacheWrite")
-            .or_else(|| usage.get("cache_write_tokens")),
+            .or_else(|| usage.get("cache_write_tokens"))
+            .or_else(|| usage.get("cacheWriteTokens")),
     );
     let total_tokens = extract_json_u64(
         usage
@@ -2674,6 +3020,34 @@ fn extract_usage_payload(value: Option<&serde_json::Value>) -> Option<PiTokenUsa
         cache_read_tokens,
         cache_write_tokens,
         total_tokens,
+    })
+}
+
+pub(crate) fn extract_usage_metadata_payload(
+    value: Option<&serde_json::Value>,
+) -> Option<PiUsageMetadataPayload> {
+    let payload = value?;
+    let api = json_string(payload.get("api"));
+    let provider = json_string(payload.get("provider"));
+    let model = json_string(payload.get("model"));
+    let response_id = json_string(payload.get("responseId").or_else(|| payload.get("response_id")));
+    let timestamp = json_i64(payload.get("timestamp"));
+
+    if api.is_none()
+        && provider.is_none()
+        && model.is_none()
+        && response_id.is_none()
+        && timestamp.is_none()
+    {
+        return None;
+    }
+
+    Some(PiUsageMetadataPayload {
+        api,
+        provider,
+        model,
+        response_id,
+        timestamp,
     })
 }
 
@@ -3296,6 +3670,7 @@ async fn stream_pi_prompt(
         let mut saw_assistant_terminal_message = false;
         let mut done_emitted = false;
         let mut final_usage: Option<PiTokenUsagePayload> = None;
+        let mut final_usage_meta: Option<PiUsageMetadataPayload> = None;
         let mut emitted_assistant_text = String::new();
         let mut assistant_terminal_error: Option<String> = None;
         let mut saw_any_output = false;
@@ -3636,6 +4011,9 @@ async fn stream_pi_prompt(
                             .and_then(|item| item.get("message"))
                             .and_then(|item| item.get("usage")),
                     );
+                    final_usage_meta = extract_usage_metadata_payload(
+                        assistant_event.and_then(|item| item.get("message")),
+                    );
                     saw_message_done = true;
                     break;
                 }
@@ -3692,6 +4070,7 @@ async fn stream_pi_prompt(
                     final_usage = final_usage.or_else(|| {
                         extract_usage_payload(message.and_then(|item| item.get("usage")))
                     });
+                    final_usage_meta = final_usage_meta.or_else(|| extract_usage_metadata_payload(message));
 
                     if matches!(line_type, "message_end" | "turn_end")
                         && (saw_snapshot || !emitted_assistant_text.trim().is_empty())
@@ -3824,12 +4203,14 @@ async fn stream_pi_prompt(
                         final_usage = final_usage.or_else(|| {
                             extract_usage_payload(last_assistant.get("usage"))
                         });
+                        final_usage_meta = final_usage_meta
+                            .or_else(|| extract_usage_metadata_payload(Some(last_assistant)));
                     }
                 }
 
                 saw_agent_end = true;
                 if assistant_terminal_error.is_none() {
-                    emit_stream_event(
+                    emit_stream_event_with_meta(
                         &app,
                         "done",
                         Some(normalized_session_id.clone()),
@@ -3843,6 +4224,7 @@ async fn stream_pi_prompt(
                         None,
                         None,
                         final_usage.clone(),
+                        final_usage_meta.clone(),
                     )?;
                     done_emitted = true;
                 }
@@ -3902,7 +4284,7 @@ async fn stream_pi_prompt(
             }
 
             if !done_emitted {
-                emit_stream_event(
+                emit_stream_event_with_meta(
                     &app,
                     "done",
                     Some(normalized_session_id.clone()),
@@ -3916,6 +4298,7 @@ async fn stream_pi_prompt(
                     None,
                     None,
                     final_usage.clone(),
+                    final_usage_meta.clone(),
                 )?;
             }
 
@@ -4156,7 +4539,7 @@ async fn stream_pi_prompt(
                 && stderr_text.trim().is_empty()
             {
                 if !done_emitted {
-                    emit_stream_event(
+                    emit_stream_event_with_meta(
                         &app,
                         "done",
                         Some(normalized_session_id.clone()),
@@ -4170,6 +4553,7 @@ async fn stream_pi_prompt(
                         None,
                         None,
                         final_usage,
+                        final_usage_meta.clone(),
                     )?;
                 }
                 return Ok(());
@@ -4210,7 +4594,7 @@ async fn stream_pi_prompt(
         }
 
         if !done_emitted {
-            emit_stream_event(
+            emit_stream_event_with_meta(
                 &app,
                 "done",
                 Some(normalized_session_id.clone()),
@@ -4224,6 +4608,7 @@ async fn stream_pi_prompt(
                 None,
                 None,
                 final_usage,
+                final_usage_meta,
             )?;
         }
         dev_trace(
@@ -4788,6 +5173,7 @@ pub fn run() {
             load_history_state,
             save_history_state,
             clear_history_state,
+            list_token_usage_records,
             load_provider_preferences,
             save_provider_preferences,
             list_installed_skills,

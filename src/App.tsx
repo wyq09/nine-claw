@@ -55,9 +55,11 @@ import type {
   ToolCallEntry,
   ViewKey,
 } from './types'
-import type { ChangeEvent, ClipboardEvent, KeyboardEvent, MouseEvent, RefObject } from 'react'
+import type { CSSProperties, ChangeEvent, ClipboardEvent, KeyboardEvent, MouseEvent, PointerEvent as ReactPointerEvent, RefObject } from 'react'
 import {
   deleteAgent,
+  botSendMedia,
+  botSendMessage,
   botLoginWechat,
   botStartLark,
   botStartWechat,
@@ -72,6 +74,7 @@ import {
   loadProviderPreferences,
   listSystemSkillCatalog,
   readAgentWorkspaceBundle,
+  openExternalUrl,
   rotateAgentPeerInboundSecret,
   saveProviderPreferences,
   setDefaultAgent,
@@ -84,6 +87,7 @@ import type { QrCodeEvent, BotStatusEvent } from './lib/piClient'
 import { buildPromptWithAttachments } from './lib/composerAttachments'
 import { extractInlineMediaAttachments, normalizeMarkdownImageSources } from './lib/inlineMedia'
 import { resolveReplyCardItems } from './lib/replyCardFormat'
+import { THEME_PRESETS, THEME_VARIABLE_KEYS } from './theme/themePresets'
 import ReplyCardStack from './components/ReplyCardStack'
 
 const ABSOLUTE_TIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
@@ -96,6 +100,9 @@ const ABSOLUTE_TIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
 })
 
 const STARTER_CHIPS = ['定时会话'] as const
+const DEFAULT_COMPOSER_HEIGHT = 128
+const MIN_COMPOSER_HEIGHT = 56
+const MAX_COMPOSER_HEIGHT = 360
 const GENERAL_SETTINGS_STORAGE_KEY = 'nineclaw.general-settings.v1'
 const APPEARANCE_SETTINGS_STORAGE_KEY = 'nineclaw.appearance-settings.v1'
 const PROVIDER_CONFIGS_STORAGE_KEY = 'nineclaw.provider-configs.v1'
@@ -132,6 +139,20 @@ function persistStoredStorageValue(storageKey: string, value: string, legacyKeys
   }
 }
 
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max)
+}
+
+function toBotSendMediaType(kind: PersistedChatAttachment['kind']): 'image' | 'file' | 'video' {
+  if (kind === 'image') {
+    return 'image'
+  }
+  if (kind === 'video') {
+    return 'video'
+  }
+  return 'file'
+}
+
 function loadStoredState<T extends object>(storageKey: string, defaults: T, legacyKeys: string[] = []): T {
   try {
     const raw = readStoredStorageValue(storageKey, legacyKeys)
@@ -155,14 +176,11 @@ function createInitialGeneralSettings() {
 }
 
 function createInitialAppearanceState() {
-  return {
-    ...loadStoredState(
-      APPEARANCE_SETTINGS_STORAGE_KEY,
-      defaultAppearanceSettings,
-      LEGACY_APPEARANCE_SETTINGS_STORAGE_KEYS,
-    ),
-    compactSidebar: false,
-  }
+  return loadStoredState(
+    APPEARANCE_SETTINGS_STORAGE_KEY,
+    defaultAppearanceSettings,
+    LEGACY_APPEARANCE_SETTINGS_STORAGE_KEYS,
+  )
 }
 
 function loadProviderConfigs(): Record<string, ProviderConfig> {
@@ -525,12 +543,36 @@ function createAgentDraftFromRecord(agent: AgentRecord): AgentInput {
   }
 }
 
+function normalizeInlineText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim()
+}
+
+const AUTO_AGENT_SUMMARY_MAX_CHARS = 36
+
+function buildAutoAgentSummary(description: string, fallbackName = ''): string {
+  const normalizedDescription = normalizeInlineText(description)
+  const normalizedFallback = normalizeInlineText(fallbackName)
+  const source = normalizedDescription || normalizedFallback
+  if (!source) {
+    return ''
+  }
+  const chars = Array.from(source)
+  if (chars.length <= AUTO_AGENT_SUMMARY_MAX_CHARS) {
+    return source
+  }
+  return `${chars.slice(0, AUTO_AGENT_SUMMARY_MAX_CHARS - 1).join('')}…`
+}
+
 function normalizeAgentDraft(input: AgentInput): AgentInput {
+  const name = input.name.trim()
+  const explicitSummary = input.summary.trim()
+  const description = input.description.trim() || explicitSummary
+  const summary = explicitSummary || buildAutoAgentSummary(description, name)
   return {
     ...input,
-    name: input.name.trim(),
-    summary: input.summary.trim(),
-    description: input.description.trim(),
+    name,
+    summary,
+    description,
     systemPrompt: input.systemPrompt.trim(),
     defaultProviderId: input.defaultProviderId.trim(),
     defaultModel: input.defaultModel.trim(),
@@ -544,11 +586,8 @@ function validateAgentDraft(input: AgentInput): string | null {
   if (!input.name.trim()) {
     return '请输入智能体名称。'
   }
-  if (!input.summary.trim()) {
-    return '请输入智能体简介。'
-  }
-  if (!input.description.trim()) {
-    return '请输入智能体介绍。'
+  if (!input.description.trim() && !input.summary.trim()) {
+    return '请输入智能体角色说明。'
   }
   if (!input.defaultProviderId.trim() || !input.defaultModel.trim()) {
     return '请为智能体配置默认模型。'
@@ -655,6 +694,15 @@ function formatWorkspaceFileSectionLabel(section: AgentWorkspaceFile['section'])
   if (section === 'private') {
     return '私有文件'
   }
+  if (section === 'memoryIndex') {
+    return '记忆入口'
+  }
+  if (section === 'categoryMemory') {
+    return '分类记忆'
+  }
+  if (section === 'wiki') {
+    return '知识 Wiki'
+  }
   if (section === 'dailyLog') {
     return '最近日志'
   }
@@ -719,6 +767,8 @@ function parseAgentBuilderDraft(content: string): AgentBuilderDraft | null {
     const name = typeof parsed.name === 'string' ? parsed.name.trim() : ''
     const summary = typeof parsed.summary === 'string' ? parsed.summary.trim() : ''
     const description = typeof parsed.description === 'string' ? parsed.description.trim() : ''
+    const normalizedDescription = description || summary
+    const normalizedSummary = summary || buildAutoAgentSummary(normalizedDescription, name)
     const systemPrompt = typeof parsed.systemPrompt === 'string' ? parsed.systemPrompt.trim() : ''
     const defaultProviderId =
       typeof parsed.defaultProviderId === 'string' ? parsed.defaultProviderId.trim() : ''
@@ -731,14 +781,14 @@ function parseAgentBuilderDraft(content: string): AgentBuilderDraft | null {
       ? Array.from(new Set(parsed.skillIds.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean)))
       : []
 
-    if (!name || !summary || !description) {
+    if (!name || !normalizedDescription) {
       return null
     }
 
     return {
       name,
-      summary,
-      description,
+      summary: normalizedSummary,
+      description: normalizedDescription,
       systemPrompt,
       skillIds,
       defaultProviderId,
@@ -853,6 +903,75 @@ function hasUsageMetrics(usage?: TokenUsage): boolean {
         usage.outputTokens > 0 ||
         usage.cacheReadTokens > 0 ||
         usage.cacheWriteTokens > 0),
+  )
+}
+
+function TokenUsageDetailPill({ usage }: { usage: TokenUsage }) {
+  const [open, setOpen] = useState(false)
+  const containerRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!open) {
+      return
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target
+      if (!(target instanceof Node)) {
+        return
+      }
+      if (!containerRef.current?.contains(target)) {
+        setOpen(false)
+      }
+    }
+
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+      }
+    }
+
+    window.addEventListener('pointerdown', handlePointerDown)
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown)
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [open])
+
+  return (
+    <div className="answer-result-meta-popover" ref={containerRef}>
+      <button
+        type="button"
+        className="answer-result-meta-item answer-result-meta-button"
+        onClick={() => setOpen((current) => !current)}
+        aria-expanded={open}
+      >
+        总 Token：{formatTokenCount(usage.totalTokens)}
+      </button>
+      {open ? (
+        <div className="answer-result-tooltip" role="dialog" aria-label="Token 详情">
+          <div className="answer-result-tooltip-head">
+            <strong>{usage.model?.trim() || '未标记模型'}</strong>
+            {usage.provider || usage.api ? (
+              <span>{[usage.provider, usage.api].filter(Boolean).join(' · ')}</span>
+            ) : null}
+          </div>
+          <div className="answer-result-tooltip-grid">
+            <span>model</span>
+            <span>{usage.model?.trim() || '--'}</span>
+            <span>input</span>
+            <span>{formatTokenCount(usage.inputTokens)}</span>
+            <span>output</span>
+            <span>{formatTokenCount(usage.outputTokens)}</span>
+            <span>cacheRead</span>
+            <span>{formatTokenCount(usage.cacheReadTokens)}</span>
+            <span>totalTokens</span>
+            <span>{formatTokenCount(usage.totalTokens)}</span>
+          </div>
+        </div>
+      ) : null}
+    </div>
   )
 }
 
@@ -1306,17 +1425,20 @@ function App() {
   const deferredHistorySearch = useDeferredValue(historySearch.trim().toLowerCase())
 
   const mergedProviderDefinitions = useMemo((): ProviderDefinition[] => {
-    const custom = customProviderMeta.map((meta) => ({
-      id: meta.id,
-      name: meta.name,
-      defaultBaseUrl: meta.apiFormat === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1',
-      suggestedModel: meta.apiFormat === 'anthropic' ? 'claude-sonnet-4-0' : 'gpt-4o-mini',
-      description: meta.description || `自定义 ${meta.apiFormat === 'anthropic' ? 'Anthropic' : 'OpenAI'} 兼容接口。`,
-      apiFormat: meta.apiFormat,
-      isCustom: true,
-    }))
+    const custom = customProviderMeta.map((meta) => {
+      const effectiveApiFormat = providerConfigs[meta.id]?.apiFormat ?? meta.apiFormat
+      return {
+        id: meta.id,
+        name: meta.name,
+        defaultBaseUrl: effectiveApiFormat === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1',
+        suggestedModel: effectiveApiFormat === 'anthropic' ? 'claude-sonnet-4-0' : 'gpt-4o-mini',
+        description: meta.description || `自定义 ${effectiveApiFormat === 'anthropic' ? 'Anthropic' : 'OpenAI'} 兼容接口。`,
+        apiFormat: effectiveApiFormat,
+        isCustom: true,
+      }
+    })
     return [...providerDefinitions, ...custom]
-  }, [customProviderMeta])
+  }, [customProviderMeta, providerConfigs])
   const allProviderIds = useMemo(() => mergedProviderDefinitions.map((p) => p.id), [mergedProviderDefinitions])
   const firstAddedProviderId = useMemo(
     () => mergedProviderDefinitions.find((item) => providerConfigs[item.id]?.added)?.id ?? '',
@@ -1419,7 +1541,7 @@ function App() {
   })
   const workspaceTitle = activeHistoryItem?.title ?? '新会话'
   const shouldHideSidebar = viewportWidth < 1180
-  const effectiveSidebarCollapsed = false
+  const effectiveSidebarCollapsed = !shouldHideSidebar && appearanceSettings.sidebarCollapsed
   const isSidebarVisible = !shouldHideSidebar || sidebarOverlayOpen
   const effectiveChatRuntime = useMemo(
     () =>
@@ -1552,6 +1674,8 @@ function App() {
   const runtimeResolutionError =
     !effectiveChatRuntime && requiresConfiguredSessionModel
       ? '当前会话绑定的模型尚未在设置里完成配置，请先补全对应供应商的 Base URL、API Key 和模型，或切换到已配置模型。'
+      : !effectiveChatRuntime
+      ? '当前没有已启用的 Provider。请在设置中启用至少一个 Provider，或为当前会话/智能体绑定一个已配置模型。'
       : ''
   const chatProviderLabel =
     chatProviderDefinition && effectiveChatRuntime
@@ -1568,32 +1692,6 @@ function App() {
           providerConfigs[activeProviderConfig.providerId],
         )}`
       : '当前使用 · pi 默认'
-
-
-  useEffect(() => {
-    if (customProviderMeta.length === 0) {
-      return
-    }
-
-    setProviderConfigs((previous) => {
-      let changed = false
-      const next = { ...previous }
-
-      for (const meta of customProviderMeta) {
-        const current = previous[meta.id]
-        if (!current || current.apiFormat === meta.apiFormat) {
-          continue
-        }
-        next[meta.id] = {
-          ...current,
-          apiFormat: meta.apiFormat,
-        }
-        changed = true
-      }
-
-      return changed ? next : previous
-    })
-  }, [customProviderMeta])
 
   useEffect(() => {
     if (mergedProviderDefinitions.length === 0) {
@@ -1746,6 +1844,25 @@ function App() {
       LEGACY_APPEARANCE_SETTINGS_STORAGE_KEYS,
     )
   }, [appearanceSettings])
+
+  useEffect(() => {
+    const root = document.documentElement
+    const preset = THEME_PRESETS[appearanceSettings.themeMode] ?? THEME_PRESETS.dark
+
+    root.dataset.uiTheme = appearanceSettings.themeMode
+    document.body.dataset.uiTheme = appearanceSettings.themeMode
+    root.style.setProperty('color-scheme', preset.colorScheme)
+
+    for (const variableName of THEME_VARIABLE_KEYS) {
+      const variableValue = preset.variables[variableName]
+
+      if (variableValue) {
+        root.style.setProperty(variableName, variableValue)
+      } else {
+        root.style.removeProperty(variableName)
+      }
+    }
+  }, [appearanceSettings.themeMode])
 
   useEffect(() => {
     let cancelled = false
@@ -2076,12 +2193,45 @@ function App() {
   }
 
   const handleSubmit = async () => {
-    if (runtimeResolutionError) {
-      setChatGateError(runtimeResolutionError)
-      return
-    }
     if (composerAttachmentUploading) {
       setChatGateError('附件仍在导入中，请稍等片刻再发送。')
+      return
+    }
+
+    const botTarget = activeHistoryItem?.botTarget ?? null
+    const hasDirectBotAttachments = Boolean(botTarget && composerAttachments.length > 0)
+
+    if (hasDirectBotAttachments && botTarget) {
+      if (chatGateError) {
+        setChatGateError('')
+      }
+
+      try {
+        const trimmedDraft = draft.trim()
+        if (trimmedDraft) {
+          await botSendMessage(botTarget.channelId, botTarget.userId, trimmedDraft)
+        }
+
+        for (const attachment of composerAttachments) {
+          await botSendMedia(
+            botTarget.channelId,
+            botTarget.userId,
+            toBotSendMediaType(attachment.kind),
+            attachment.filePath,
+          )
+        }
+
+        setDraft('')
+        clearComposerAttachments()
+      } catch (sendError) {
+        const message = sendError instanceof Error ? sendError.message : String(sendError)
+        setChatGateError(message)
+      }
+      return
+    }
+
+    if (runtimeResolutionError) {
+      setChatGateError(runtimeResolutionError)
       return
     }
     if (chatGateError) {
@@ -2577,6 +2727,36 @@ function App() {
     handleViewChange('chat')
   }
 
+  const handleStartChatWithAgent = (agentId: string) => {
+    const targetAgent = agents.find((item) => item.id === agentId)
+    if (!targetAgent) {
+      return
+    }
+
+    if (chatGateError) {
+      setChatGateError('')
+    }
+
+    const nextSessionLlm = isValidConfiguredModelReference(
+      targetAgent.defaultProviderId,
+      targetAgent.defaultModel,
+      mergedProviderDefinitions,
+      providerConfigs,
+    )
+      ? {
+          providerId: targetAgent.defaultProviderId,
+          model: targetAgent.defaultModel,
+        }
+      : pickFallbackSessionLlm(mergedProviderDefinitions, providerConfigs, targetAgent.defaultProviderId)
+
+    resetSessionDraft()
+    setComposerAgent(buildConversationAgentSnapshot(targetAgent))
+    setComposerSessionLlm(nextSessionLlm)
+    setNewSessionDialogOpen(false)
+    setAgentEditorOpen(false)
+    handleViewChange('chat')
+  }
+
   const updateAgentBotConfig = (channelId: BotChannelId, updates: Partial<BotConfig>) => {
     setAgentEditorDraft((current) => {
       if (!current) {
@@ -2915,7 +3095,6 @@ function App() {
     if (view === 'chat') {
       return (
         <ChatView
-          key={activeHistoryItem?.id ?? 'empty-chat'}
           activeProviderLabel={chatProviderLabel}
           agentBuilderActionBusyId={agentBuilderActionBusyId}
           agentBuilderActionError={agentBuilderActionError}
@@ -3047,6 +3226,7 @@ function App() {
         onWechatStart={handleWechatStart}
         onWechatStop={handleWechatStop}
         onRotatePeerSecret={handleRotatePeerSecret}
+        onStartChatWithAgent={handleStartChatWithAgent}
         searchValue={agentSearch}
         selectedAgent={selectedManagedAgent}
         selectedBotConfig={selectedManagedBotConfig}
@@ -3071,7 +3251,9 @@ function App() {
       <main
         className={[
           'app-shell',
+          `theme-${appearanceSettings.themeMode}`,
           appearanceSettings.compactSidebar ? 'compact-sidebar' : '',
+          effectiveSidebarCollapsed ? 'sidebar-is-collapsed' : '',
           shouldHideSidebar ? 'sidebar-hidden-mode' : '',
           sidebarOverlayOpen ? 'sidebar-overlay-open' : '',
           appearanceSettings.preferReducedMotion ? 'reduce-motion' : '',
@@ -3089,8 +3271,36 @@ function App() {
         ) : null}
 
         <aside className={`sidebar ${effectiveSidebarCollapsed ? 'collapsed' : ''} ${isSidebarVisible ? 'visible' : ''}`}>
+          <div className="sidebar-window">
+            {!shouldHideSidebar ? (
+              <button
+                type="button"
+                className={`collapse-button ${effectiveSidebarCollapsed ? 'collapsed' : ''}`}
+                aria-label={effectiveSidebarCollapsed ? '展开侧栏' : '折叠侧栏'}
+                onClick={() =>
+                  setAppearanceSettings((previous) => ({
+                    ...previous,
+                    sidebarCollapsed: !previous.sidebarCollapsed,
+                  }))
+                }
+              >
+                <AppIcon name="panel" size={18} />
+              </button>
+            ) : null}
+          </div>
+
+          <div className="sidebar-brand">
+            <div className="sidebar-brand-main">
+              <div className="sidebar-brand-mark">9</div>
+              <div className="sidebar-brand-copy">
+                <strong>NineClaw</strong>
+                <span>多智能体工作台</span>
+              </div>
+            </div>
+          </div>
+
           <div className="sidebar-section">
-            <div className="sidebar-section-title">工作台</div>
+            <div className="sidebar-section-title">导航</div>
             <div className="primary-nav">
               <SidebarButton
                 active={view === 'chat'}
@@ -3437,8 +3647,14 @@ function ChatView({
   const [copiedTurnId, setCopiedTurnId] = useState('')
   const [copiedPromptTurnId, setCopiedPromptTurnId] = useState('')
   const [previewImage, setPreviewImage] = useState<{ src: string; alt: string } | null>(null)
+  const [composerHeight, setComposerHeight] = useState(DEFAULT_COMPOSER_HEIGHT)
+  const [isComposerResizing, setIsComposerResizing] = useState(false)
+  const [showScrollToLatest, setShowScrollToLatest] = useState(false)
+  const resizeStateRef = useRef<{ startHeight: number; startY: number } | null>(null)
+  const workspaceScrollRef = useRef<HTMLElement | null>(null)
   const turns = activeHistoryItem?.turns ?? []
   const activeTurnId = turns.at(-1)?.id ?? ''
+  const isHomeState = !activeHistoryItem
   const sessionRunning = Boolean(activeHistoryItem && runningHistoryIds.includes(activeHistoryItem.id))
   const sessionStreaming = sessionRunning
   const workspaceStatusNote = activeHistoryItem
@@ -3450,6 +3666,12 @@ function ChatView({
     : '输入内容后将由 pi 开始执行。'
 
   useEffect(() => {
+    setCopiedTurnId('')
+    setCopiedPromptTurnId('')
+    setPreviewImage(null)
+  }, [activeHistoryId])
+
+  useEffect(() => {
     if (!activeTurnId) {
       return
     }
@@ -3459,6 +3681,60 @@ function ChatView({
       behavior: 'smooth',
     })
   }, [activeHistoryId, activeTurnId, sessionRunning, turns.length])
+
+  useEffect(() => {
+    const handlePointerMove = (event: PointerEvent) => {
+      const resizeState = resizeStateRef.current
+      if (!resizeState) {
+        return
+      }
+
+      const nextHeight = clampNumber(
+        resizeState.startHeight + (resizeState.startY - event.clientY),
+        MIN_COMPOSER_HEIGHT,
+        MAX_COMPOSER_HEIGHT,
+      )
+      setComposerHeight(nextHeight)
+    }
+
+    const stopResize = () => {
+      resizeStateRef.current = null
+      setIsComposerResizing(false)
+    }
+
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', stopResize)
+    window.addEventListener('pointercancel', stopResize)
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', stopResize)
+      window.removeEventListener('pointercancel', stopResize)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!isHomeState) {
+      return
+    }
+
+    workspaceScrollRef.current?.scrollTo({ top: 0, behavior: 'auto' })
+  }, [isHomeState])
+
+  const syncScrollToLatestVisibility = useCallback(() => {
+    const viewport = workspaceScrollRef.current
+    if (!viewport || isHomeState) {
+      setShowScrollToLatest(false)
+      return
+    }
+
+    const distanceToBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight
+    setShowScrollToLatest(distanceToBottom > 180)
+  }, [isHomeState])
+
+  useEffect(() => {
+    syncScrollToLatestVisibility()
+  }, [syncScrollToLatestVisibility, activeHistoryId, activeTurnId, turns.length])
 
   const handleCopyAnswer = async (turnId: string, answer: string) => {
     if (!answer) {
@@ -3493,17 +3769,44 @@ function ChatView({
     setPreviewImage({ src, alt })
   }
 
+  const handleScrollToLatest = () => {
+    const viewport = workspaceScrollRef.current
+    if (!viewport) {
+      return
+    }
+
+    if (activeTurnId) {
+      document.getElementById(`chat-turn-${activeTurnId}`)?.scrollIntoView({
+        block: 'end',
+        behavior: 'smooth',
+      })
+    } else {
+      viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'smooth' })
+    }
+  }
+
+  const handleComposerResizeStart = (event: ReactPointerEvent<HTMLDivElement>) => {
+    resizeStateRef.current = {
+      startHeight: composerHeight,
+      startY: event.clientY,
+    }
+    setIsComposerResizing(true)
+  }
+
   const composerPlaceholder = activeHistoryItem ? '继续对话…' : "描述您的需求，或输入 '/' 唤起技能…"
+  const composerInlineStyle = {
+    '--composer-textarea-height': `${composerHeight}px`,
+  } as CSSProperties
 
   return (
-    <div className="workspace">
+    <div className={`workspace ${isHomeState ? 'workspace-home-state' : 'workspace-thread-state'}`}>
       <header className="workspace-topbar">
         <div className="workspace-topbar-left">
           {activeHistoryItem ? <h1 title={workspaceTitle}>{workspaceTitle}</h1> : null}
         </div>
       </header>
 
-      <section className="workspace-scroll">
+      <section ref={workspaceScrollRef} className="workspace-scroll" onScroll={syncScrollToLatestVisibility}>
         {activeHistoryItem ? (
           <>
             <div className="status-strip">
@@ -3601,27 +3904,32 @@ function ChatView({
         ) : (
           <section className="new-task-home">
             <div className="home-brand-block">
-              <div className="home-brand-mark">NineClaw</div>
-            </div>
-
-            <div className="home-composer-shell">
-              <div className="starter-chip-row">
-                {STARTER_CHIPS.map((chip) => (
-                  <button key={chip} type="button" className="starter-chip" onClick={() => setDraft(chip)}>
-                    {chip}
-                  </button>
-                ))}
-              </div>
+              <span className="home-brand-kicker">NineClaw Workspace</span>
+              <div className="home-brand-mark">今天想让 NineClaw 帮你处理什么？</div>
+              <p>输入需求、上传素材，直接开始一条新会话。</p>
             </div>
           </section>
         )}
       </section>
 
-      {error ? <div className="error-banner">{error}</div> : null}
+      {activeHistoryItem && showScrollToLatest ? (
+        <button
+          type="button"
+          className="scroll-to-latest-button"
+          onClick={handleScrollToLatest}
+          aria-label="滚动到最新消息"
+          title="滚动到最新消息"
+        >
+          <AppIcon name="arrow-down" size={22} />
+        </button>
+      ) : null}
 
-      <div className="workspace-composer-shell">
+      {error && activeHistoryItem ? <div className="error-banner">{error}</div> : null}
+
+      <div className={`workspace-composer-shell ${isComposerResizing ? 'is-resizing' : ''}`}>
         <form
           className="composer-card"
+          style={composerInlineStyle}
           onSubmit={(event) => {
             event.preventDefault()
             void onSubmit()
@@ -3634,6 +3942,15 @@ function ChatView({
             multiple
             onChange={onComposerAttachmentInputChange}
           />
+          <div
+            className="composer-resize-handle"
+            role="separator"
+            aria-label="拖动调整输入框高度"
+            aria-orientation="horizontal"
+            onPointerDown={handleComposerResizeStart}
+          >
+            <span />
+          </div>
           <textarea
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
@@ -3683,28 +4000,31 @@ function ChatView({
                 <label className="visually-hidden" htmlFor="session-llm-combined">
                   本会话使用的模型
                 </label>
-                <select
-                  id="session-llm-combined"
-                  className="session-llm-select"
-                  value={
-                    sessionLlmSelectOptions.some((o) => o.value === sessionLlmSelectValue)
-                      ? sessionLlmSelectValue
-                      : sessionLlmSelectOptions[0]?.value ?? ''
-                  }
-                  disabled={sessionStreaming || sessionLlmSelectOptions.length === 0}
-                  onChange={(event) => onSessionLlmSelectChange(event.target.value)}
-                  aria-label="本会话使用的供应商与模型"
-                >
-                  {sessionLlmSelectOptions.length === 0 ? (
-                    <option value="">暂无已配置的模型，请先在设置中填写供应商</option>
-                  ) : (
-                    sessionLlmSelectOptions.map((opt) => (
-                      <option key={opt.value} value={opt.value}>
-                        {opt.label}
-                      </option>
-                    ))
-                  )}
-                </select>
+                <label className="select-field composer-model-field">
+                  <AppIcon name="zap" size={13} />
+                  <select
+                    id="session-llm-combined"
+                    className="session-llm-select"
+                    value={
+                      sessionLlmSelectOptions.some((o) => o.value === sessionLlmSelectValue)
+                        ? sessionLlmSelectValue
+                        : sessionLlmSelectOptions[0]?.value ?? ''
+                    }
+                    disabled={sessionStreaming || sessionLlmSelectOptions.length === 0}
+                    onChange={(event) => onSessionLlmSelectChange(event.target.value)}
+                    aria-label="本会话使用的供应商与模型"
+                  >
+                    {sessionLlmSelectOptions.length === 0 ? (
+                      <option value="">暂无已配置的模型，请先在设置中填写供应商</option>
+                    ) : (
+                      sessionLlmSelectOptions.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </label>
               </div>
             </div>
             <div className="composer-toolbar-right">
@@ -3720,6 +4040,15 @@ function ChatView({
             </div>
           </div>
         </form>
+        {isHomeState ? (
+          <div className="starter-chip-row">
+            {STARTER_CHIPS.map((chip) => (
+              <button key={chip} type="button" className="starter-chip" onClick={() => setDraft(chip)}>
+                {chip}
+              </button>
+            ))}
+          </div>
+        ) : null}
         {attachmentError ? <div className="composer-attachment-error">{attachmentError}</div> : null}
         <div className="composer-footnote">
           {globalBusy && !sessionStreaming
@@ -3765,49 +4094,112 @@ function TurnResponseBody({
   const toolById = new Map(turn.toolCalls.map((t) => [t.toolCallId, t]))
   const segments = turn.responseSegments
   const isActiveStreamingTurn = loading && turn.id === activeTurnId
+  const runningToolCount = turn.toolCalls.filter((toolCall) => toolCall.state === 'running').length
 
   if (segments && segments.length > 0) {
+    const renderBlocks: Array<
+      | { type: 'text'; text: string; index: number }
+      | { type: 'tools'; toolCalls: ToolCallEntry[]; index: number }
+    > = []
+    let groupedToolCalls: ToolCallEntry[] = []
+    let groupedToolStartIndex = -1
+
+    const flushGroupedToolCalls = () => {
+      if (groupedToolCalls.length === 0) {
+        return
+      }
+      renderBlocks.push({
+        type: 'tools',
+        toolCalls: groupedToolCalls,
+        index: groupedToolStartIndex,
+      })
+      groupedToolCalls = []
+      groupedToolStartIndex = -1
+    }
+
+    segments.forEach((segment, index) => {
+      if (segment.type === 'text') {
+        flushGroupedToolCalls()
+        renderBlocks.push({ type: 'text', text: segment.text, index })
+        return
+      }
+
+      if (!showExecutionRail) {
+        return
+      }
+
+      const toolCall = toolById.get(segment.toolCallId)
+      if (!toolCall) {
+        flushGroupedToolCalls()
+        return
+      }
+
+      if (groupedToolCalls.length === 0) {
+        groupedToolStartIndex = index
+      }
+      groupedToolCalls.push(toolCall)
+    })
+
+    flushGroupedToolCalls()
+
     let lastTextSegmentIndex = -1
-    for (let i = segments.length - 1; i >= 0; i -= 1) {
-      if (segments[i]?.type === 'text') {
-        lastTextSegmentIndex = i
+    for (let i = renderBlocks.length - 1; i >= 0; i -= 1) {
+      if (renderBlocks[i]?.type === 'text') {
+        lastTextSegmentIndex = renderBlocks[i].index
         break
       }
     }
 
     return (
       <div className="turn-response-blocks">
-        {segments.map((seg, index) => {
-          if (seg.type === 'text') {
+        {renderBlocks.map((block) => {
+          if (block.type === 'text') {
             const isStreaming = Boolean(
-              isActiveStreamingTurn && index === lastTextSegmentIndex,
+              isActiveStreamingTurn && block.index === lastTextSegmentIndex,
             )
-            if (!seg.text.trim() && !isStreaming) {
+            if (!block.text.trim() && !isStreaming) {
               return null
             }
             return (
               <MarkdownBlock
-                key={`${turn.id}-t-${index}`}
-                actionId={`${turn.id}-t-${index}`}
+                key={`${turn.id}-t-${block.index}`}
+                actionId={`${turn.id}-t-${block.index}`}
                 actionBusyId={agentBuilderActionBusyId}
                 actionError={agentBuilderActionError}
                 actionNotice={agentBuilderActionNotice}
                 actionTargetId={agentBuilderActionTargetId}
-                content={seg.text}
+                content={block.text}
                 isStreaming={isStreaming}
                 onCreateAgentDraft={onCreateAgentDraft}
                 onImageClick={onImageClick}
               />
             )
           }
-          if (!showExecutionRail) {
+
+          if (block.toolCalls.length === 0) {
             return null
           }
-          const toolCall = toolById.get(seg.toolCallId)
-          if (!toolCall) {
-            return null
+
+          if (block.toolCalls.length === 1) {
+            const toolCall = block.toolCalls[0]
+            return (
+              <ToolCallCard
+                key={toolCall.id}
+                toolCall={toolCall}
+                runningToolCount={runningToolCount}
+                onImageClick={onImageClick}
+              />
+            )
           }
-          return <ToolCallCard key={toolCall.id} toolCall={toolCall} onImageClick={onImageClick} />
+
+          return (
+            <ToolCallGroup
+              key={`${turn.id}-tools-${block.index}`}
+              toolCalls={block.toolCalls}
+              runningToolCount={runningToolCount}
+              onImageClick={onImageClick}
+            />
+          )
         })}
       </div>
     )
@@ -3831,7 +4223,13 @@ function TurnResponseBody({
           onImageClick={onImageClick}
         />
       ) : null}
-      {hasLegacyTools ? <ToolCallList toolCalls={legacyTools} onImageClick={onImageClick} /> : null}
+      {hasLegacyTools ? (
+        <ToolCallList
+          toolCalls={legacyTools}
+          runningToolCount={runningToolCount}
+          onImageClick={onImageClick}
+        />
+      ) : null}
       {!turn.answer && !hasLegacyTools ? (
         isActiveStreamingTurn ? (
           <TurnWaitingIndicator startedAt={turn.createdAt} />
@@ -3976,6 +4374,16 @@ function getToolCallStateLabel(state: ToolCallEntry['state']): string {
   return '失败'
 }
 
+function getToolGroupState(toolCalls: ToolCallEntry[]): ToolCallEntry['state'] {
+  if (toolCalls.some((toolCall) => toolCall.state === 'running')) {
+    return 'running'
+  }
+  if (toolCalls.some((toolCall) => toolCall.state === 'error')) {
+    return 'error'
+  }
+  return 'done'
+}
+
 function formatToolCallText(text: string, fallback: string, pretty = true): string {
   const trimmed = text.trim()
   if (!trimmed) {
@@ -4031,12 +4439,20 @@ function ToolCallContentBlock({
   )
 
   const handleClick = (event: MouseEvent<HTMLDivElement>) => {
-    if (!onImageClick) {
+    const target = event.target
+    if (!(target instanceof HTMLElement)) {
       return
     }
 
-    const target = event.target
-    if (!(target instanceof HTMLElement)) {
+    const anchor = target.closest('a[href]')
+    if (anchor instanceof HTMLAnchorElement && anchor.href) {
+      event.preventDefault()
+      event.stopPropagation()
+      void openExternalUrl(anchor.href)
+      return
+    }
+
+    if (!onImageClick) {
       return
     }
 
@@ -4065,12 +4481,15 @@ function ToolCallContentBlock({
 
 function ToolCallCard({
   toolCall,
+  runningToolCount,
   onImageClick,
 }: {
   toolCall: ToolCallEntry
+  runningToolCount: number
   onImageClick?: (src: string, alt: string) => void
 }) {
   const isStreaming = toolCall.state === 'running'
+  const isParallelRunning = isStreaming && runningToolCount > 1
   const [detailsOpen, setDetailsOpen] = useState(false)
 
   const argsLive = formatToolCallText(toolCall.argsText, '无参数', false)
@@ -4080,7 +4499,7 @@ function ToolCallCard({
 
   return (
     <details
-      className={`tool-call-card ${toolCall.state}`}
+      className={`tool-call-card ${toolCall.state} ${isParallelRunning ? 'parallel-running' : ''}`}
       open={detailsOpen}
       onToggle={(event) => setDetailsOpen(event.currentTarget.open)}
     >
@@ -4094,6 +4513,7 @@ function ToolCallCard({
             {isStreaming ? (
               <span className={`status-pill ${toolCall.state}`}>{getToolCallStateLabel(toolCall.state)}</span>
             ) : null}
+            {isParallelRunning ? <span className="tool-parallel-pill">并行 {runningToolCount}</span> : null}
             <AppIcon name="chevron-down" size={16} />
           </div>
         </div>
@@ -4121,17 +4541,91 @@ function ToolCallCard({
   )
 }
 
-function ToolCallList({
+function ToolCallGroup({
   toolCalls,
+  runningToolCount,
   onImageClick,
 }: {
   toolCalls: ToolCallEntry[]
+  runningToolCount: number
   onImageClick?: (src: string, alt: string) => void
 }) {
+  const groupState = getToolGroupState(toolCalls)
+  const runningInGroup = toolCalls.filter((toolCall) => toolCall.state === 'running').length
+  const toolNamePreview = toolCalls
+    .slice(0, 3)
+    .map((toolCall) => toolCall.toolName)
+    .join('、')
+
+  return (
+    <details className={`tool-call-card tool-call-group-card ${groupState}`}>
+      <summary className="tool-call-summary tool-call-group-summary">
+        <div className="tool-call-head">
+          <div className="tool-call-title-row tool-call-group-title">
+            <AppIcon name="wrench" size={15} />
+            <div className="tool-call-group-copy">
+              <strong>{toolCalls.length} 个工具调用</strong>
+              <span title={toolCalls.map((toolCall) => toolCall.toolName).join('、')}>
+                {toolNamePreview}
+                {toolCalls.length > 3 ? ' 等' : ''}
+              </span>
+            </div>
+          </div>
+          <div className="tool-call-summary-right">
+            {runningInGroup > 0 ? <span className={`status-pill ${groupState}`}>{getToolCallStateLabel(groupState)}</span> : null}
+            {runningInGroup > 1 ? <span className="tool-parallel-pill">并行 {runningInGroup}</span> : null}
+            <span className="tool-group-count-pill">共 {toolCalls.length} 次</span>
+            <AppIcon name="chevron-down" size={16} />
+          </div>
+        </div>
+      </summary>
+
+      <div className="tool-call-group-list">
+        <ToolCallList
+          toolCalls={toolCalls}
+          runningToolCount={runningToolCount}
+          onImageClick={onImageClick}
+          groupMultiple={false}
+        />
+      </div>
+    </details>
+  )
+}
+
+function ToolCallList({
+  toolCalls,
+  runningToolCount,
+  onImageClick,
+  groupMultiple = true,
+}: {
+  toolCalls: ToolCallEntry[]
+  runningToolCount: number
+  onImageClick?: (src: string, alt: string) => void
+  groupMultiple?: boolean
+}) {
+  if (toolCalls.length === 0) {
+    return null
+  }
+
+  if (groupMultiple && toolCalls.length > 1) {
+    return (
+      <ToolCallGroup
+        toolCalls={toolCalls}
+        runningToolCount={runningToolCount}
+        onImageClick={onImageClick}
+      />
+    )
+  }
+
   return (
     <div className="tool-call-list">
       {toolCalls.map((toolCall) => (
-        <ToolCallCard key={toolCall.id} toolCall={toolCall} onImageClick={onImageClick} />
+        <ToolCallCard
+          key={toolCall.id}
+          toolCall={toolCall}
+          runningToolCount={runningToolCount}
+          onImageClick={onImageClick}
+        />
       ))}
     </div>
   )
@@ -4151,9 +4645,7 @@ function TurnExecutionDetails({ turn, isStreaming }: { turn: ConversationTurn; i
       {typeof totalDuration === 'number' ? (
         <span className="answer-result-meta-item">总耗时：{formatDurationLabel(totalDuration)}</span>
       ) : null}
-      {hasUsageMetrics(usage) ? (
-        <span className="answer-result-meta-item">总 Token：{formatTokenCount(usage?.totalTokens)}</span>
-      ) : null}
+      {hasUsageMetrics(usage) && usage ? <TokenUsageDetailPill usage={usage} /> : null}
     </div>
   )
 }
@@ -4495,24 +4987,27 @@ function NewSessionDialog({
           )}
         </div>
 
-        <label className="input-field skill-install-field">
+        <div className="input-field skill-install-field new-session-model-block">
           <span>本会话模型</span>
-          <select
-            value={selectedModelValue}
-            onChange={(event) => onChangeModel(event.target.value)}
-            disabled={modelOptions.length === 0}
-          >
-            {modelOptions.length === 0 ? (
-              <option value="">暂无已配置模型</option>
-            ) : (
-              modelOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))
-            )}
-          </select>
-        </label>
+          <label className="select-field dialog-select-field">
+            <AppIcon name="zap" size={14} />
+            <select
+              value={selectedModelValue}
+              onChange={(event) => onChangeModel(event.target.value)}
+              disabled={modelOptions.length === 0}
+            >
+              {modelOptions.length === 0 ? (
+                <option value="">暂无已配置模型</option>
+              ) : (
+                modelOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))
+              )}
+            </select>
+          </label>
+        </div>
 
         {selectedAgent ? (
           <div className="new-session-tip">
@@ -4818,6 +5313,8 @@ function AgentEditorDialog({
   const [peerGatewayInfo, setPeerGatewayInfo] = useState<PeerGatewayInfo | null>(null)
   const [peerGatewayLoadError, setPeerGatewayLoadError] = useState('')
   const [peerSnippetCopied, setPeerSnippetCopied] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(mode === 'edit')
+  const advancedPresetKeyRef = useRef('')
 
   useEffect(() => {
     let cancelled = false
@@ -4838,11 +5335,7 @@ function AgentEditorDialog({
     }
   }, [managedAgentId])
 
-  if (!agentDraft) {
-    return null
-  }
-
-  const peerDraftConfigs = createAgentBotConfigState(agentDraft.botConfigs)
+  const peerDraftConfigs = createAgentBotConfigState(agentDraft?.botConfigs)
   const peerDraftSecret =
     peerDraftConfigs.peer?.peerSharedSecret?.trim() || peerDraftConfigs.peer?.clientSecret?.trim() || ''
   const savedAgentIdForPeer = managedAgentId.trim() || null
@@ -4852,19 +5345,22 @@ function AgentEditorDialog({
       : ''
 
   const selectedModelValue =
-    agentDraft.defaultProviderId.trim() && agentDraft.defaultModel.trim()
+    agentDraft?.defaultProviderId.trim() && agentDraft?.defaultModel.trim()
       ? sessionLlmEncode(agentDraft.defaultProviderId, agentDraft.defaultModel)
       : ''
-  const missingSkillIds = agentDraft.skillIds.filter((skillId) => !allSkills.some((skill) => skill.id === skillId))
-  const mountedSkills = allSkills.filter((skill) => agentDraft.skillIds.includes(skill.id))
+  const generatedSummary = buildAutoAgentSummary(agentDraft?.description ?? '', agentDraft?.name ?? '')
+  const summaryOverride = agentDraft?.summary.trim() ?? ''
+  const hasSummaryOverride = Boolean(summaryOverride) && summaryOverride !== generatedSummary
+  const missingSkillIds = (agentDraft?.skillIds ?? []).filter((skillId) => !allSkills.some((skill) => skill.id === skillId))
+  const mountedSkills = allSkills.filter((skill) => agentDraft?.skillIds.includes(skill.id) ?? false)
   const editorAccent = getAgentColor(
-    selectedAgent ?? { id: 'draft', name: agentDraft.name || '智能体', accentColor: agentDraft.accentColor },
+    selectedAgent ?? { id: 'draft', name: agentDraft?.name || '智能体', accentColor: agentDraft?.accentColor },
   )
-  const heartbeatConfig = normalizeHeartbeatConfig(agentDraft.heartbeatConfig)
+  const heartbeatConfig = normalizeHeartbeatConfig(agentDraft?.heartbeatConfig)
   const heartbeatTasks = heartbeatConfig.tasks
   const heartbeatSchedules = heartbeatConfig.schedules
   const updateHeartbeatConfig = (updater: (current: AgentHeartbeatConfig) => AgentHeartbeatConfig) => {
-    onDraftChange({ heartbeatConfig: updater(normalizeHeartbeatConfig(agentDraft.heartbeatConfig)) })
+    onDraftChange({ heartbeatConfig: updater(normalizeHeartbeatConfig(agentDraft?.heartbeatConfig)) })
   }
   const updateHeartbeatTask = (taskId: string, updates: Partial<AgentHeartbeatTask>) => {
     updateHeartbeatConfig((current) => ({
@@ -4911,6 +5407,38 @@ function AgentEditorDialog({
       ],
     }))
   }
+  const hasAdvancedSettings =
+    hasSummaryOverride ||
+    (agentDraft ? agentDraft.executionMode !== 'single' : false) ||
+    Boolean(agentDraft?.systemPrompt.trim()) ||
+    heartbeatTasks.length > 0 ||
+    heartbeatSchedules.length > 0 ||
+    Boolean(peerDraftSecret)
+
+  useEffect(() => {
+    const nextKey = `${mode}:${managedAgentId || 'draft'}`
+    if (advancedPresetKeyRef.current === nextKey) {
+      return
+    }
+    advancedPresetKeyRef.current = nextKey
+    setAdvancedOpen(mode === 'edit' && hasAdvancedSettings)
+  }, [hasAdvancedSettings, managedAgentId, mode])
+
+  useEffect(() => {
+    if (
+      agentFormError &&
+      (agentFormError.includes('任务') ||
+        agentFormError.includes('规则') ||
+        agentFormError.includes('接收用户') ||
+        agentFormError.includes('时区'))
+    ) {
+      setAdvancedOpen(true)
+    }
+  }, [agentFormError])
+
+  if (!agentDraft) {
+    return null
+  }
 
   return (
     <div className="confirm-dialog-overlay" role="presentation" onClick={onClose}>
@@ -4950,73 +5478,6 @@ function AgentEditorDialog({
         </div>
 
         <div className="agent-editor-dialog-scroll">
-          <div className="agent-peer-integration-card">
-            <div className="agent-peer-integration-head">
-              <strong>对等 HTTP（虾）对接</strong>
-              <span>全应用共用一个监听端口；下列地址与「可复制说明」会包含本智能体的密钥与 ID。</span>
-            </div>
-            {peerGatewayLoadError ? (
-              <div className="skills-feedback error agent-feedback inline">
-                <span>读取网关信息失败：{peerGatewayLoadError}</span>
-              </div>
-            ) : null}
-            {peerGatewayInfo ? (
-              <>
-                <div className="agent-peer-api-grid">
-                  <label className="input-field">
-                    <span>监听地址（NINECLAW_PEER_BIND）</span>
-                    <input
-                      readOnly
-                      value={
-                        peerGatewayInfo.enabled && peerGatewayInfo.listenAddress
-                          ? peerGatewayInfo.listenAddress
-                          : '未配置（未监听）'
-                      }
-                    />
-                  </label>
-                  <label className="input-field">
-                    <span>入站 API（POST）</span>
-                    <input readOnly value={peerGatewayInfo.inboundUrl ?? '—'} />
-                  </label>
-                  <label className="input-field">
-                    <span>健康检查（GET）</span>
-                    <input readOnly value={peerGatewayInfo.healthUrl ?? '—'} />
-                  </label>
-                </div>
-                <div className="agent-peer-snippet-toolbar">
-                  <span className="agent-peer-snippet-label">给对方的一键说明（含密钥）</span>
-                  <button
-                    type="button"
-                    className="outline-button"
-                    onClick={() => {
-                      void navigator.clipboard.writeText(peerSnippetText).then(() => {
-                        setPeerSnippetCopied(true)
-                        window.setTimeout(() => setPeerSnippetCopied(false), 2000)
-                      })
-                    }}
-                  >
-                    {peerSnippetCopied ? (
-                      <>
-                        <Check size={16} />
-                        <span>已复制</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy size={16} />
-                        <span>复制全文</span>
-                      </>
-                    )}
-                  </button>
-                </div>
-                <pre className="agent-peer-snippet-pre">{peerSnippetText}</pre>
-              </>
-            ) : (
-              <div className="agent-workspace-hint">
-                <span>正在读取对等网关信息…</span>
-              </div>
-            )}
-          </div>
-
           <div className="agent-detail-card agent-editor-card">
             <div className="agent-detail-hero" style={{ borderColor: `${editorAccent}1f` }}>
               <div className="agent-detail-hero-main">
@@ -5025,21 +5486,23 @@ function AgentEditorDialog({
                 </span>
                 <div className="agent-detail-copy">
                   <span className="agent-page-kicker">{mode === 'create' ? 'Create Agent' : 'Agent Editor'}</span>
-                  <h2>{mode === 'create' ? '新建智能体' : selectedAgent?.name ?? '编辑智能体'}</h2>
-                  <p>
-                    {mode === 'create'
-                      ? '填写名字、简介、介绍和默认模型，构建一个可直接在会话里使用的智能体。保存后会自动生成它自己的 markdown 工作区。'
-                      : selectedAgent?.summary ?? '修改这个智能体的角色说明、挂载技能和默认运行配置。NineClaw 会补齐它自己的 markdown 工作区文件。'}
-                  </p>
-                </div>
-              </div>
+	                  <h2>{mode === 'create' ? '新建智能体' : selectedAgent?.name ?? '编辑智能体'}</h2>
+	                  <p>
+	                    {mode === 'create'
+	                      ? '先填名字、角色说明、默认模型和挂载技能，就能建出一个可直接使用的智能体。更细的运行参数都放在高级设置里。'
+	                      : selectedAgent?.summary ?? '先改角色说明、模型和技能；需要时再展开高级设置，调整运行参数和自动化能力。'}
+	                  </p>
+	                </div>
+	              </div>
 
-              <div className="agent-hero-pills">
-                <span className="agent-hero-pill">{mode === 'create' ? '未保存' : '用户智能体'}</span>
-                <span className="agent-hero-pill">{formatAgentExecutionModeLabel(agentDraft.executionMode)}</span>
-                <span className="agent-hero-pill">{agentDraft.skillIds.length} 个挂载技能</span>
-                {selectedAgent ? <span className="agent-hero-pill">ID: {selectedAgent.id}</span> : null}
-                {selectedAgent?.id === defaultAgentId ? <span className="agent-hero-pill accent">当前默认</span> : null}
+	              <div className="agent-hero-pills">
+	                <span className="agent-hero-pill">{mode === 'create' ? '未保存' : '用户智能体'}</span>
+	                {agentDraft.executionMode !== 'single' ? (
+	                  <span className="agent-hero-pill">{formatAgentExecutionModeLabel(agentDraft.executionMode)}</span>
+	                ) : null}
+	                <span className="agent-hero-pill">{agentDraft.skillIds.length} 个挂载技能</span>
+	                {selectedAgent ? <span className="agent-hero-pill">ID: {selectedAgent.id}</span> : null}
+	                {selectedAgent?.id === defaultAgentId ? <span className="agent-hero-pill accent">当前默认</span> : null}
               </div>
             </div>
 
@@ -5057,107 +5520,68 @@ function AgentEditorDialog({
               </div>
             ) : null}
 
-            <div className="agent-section">
-              <div className="agent-section-header">
-                <div>
-                  <strong>基础信息</strong>
-                  <p>名字用于识别，简介用于列表扫读，介绍用于补足能力边界和擅长场景。</p>
-                </div>
-              </div>
+	            <div className="agent-section">
+	              <div className="agent-section-header">
+	                <div>
+	                  <strong>快速创建</strong>
+	                  <p>常用配置只保留名字、角色说明、默认模型和技能。列表摘要会自动从角色说明提炼，避免重复填写。</p>
+	                </div>
+	              </div>
 
-              <div className="agent-form-grid">
-                <label className="input-field">
+	              <div className="agent-form-grid">
+	                <label className="input-field">
                   <span>名字</span>
                   <input
                     value={agentDraft.name}
                     onChange={(event) => onDraftChange({ name: event.target.value })}
                     placeholder="例如：诉讼项目助理"
                   />
-                </label>
+	                </label>
 
-                <label className="input-field">
-                  <span>简介</span>
-                  <input
-                    value={agentDraft.summary}
-                    onChange={(event) => onDraftChange({ summary: event.target.value })}
-                    placeholder="列表里展示的一句话能力简介"
-                  />
-                </label>
-              </div>
+	                <label className="input-field">
+	                  <span>默认模型</span>
+	                  <select
+	                    value={selectedModelValue}
+	                    onChange={(event) => {
+	                      const parsed = sessionLlmDecode(event.target.value)
+	                      if (parsed) {
+	                        onDraftChange({
+	                          defaultProviderId: parsed.providerId,
+	                          defaultModel: parsed.model,
+	                        })
+	                      }
+	                    }}
+	                  >
+	                    {modelOptions.length === 0 ? (
+	                      <option value="">暂无已配置模型</option>
+	                    ) : (
+	                      modelOptions.map((option) => (
+	                        <option key={option.value} value={option.value}>
+	                          {option.label}
+	                        </option>
+	                      ))
+	                    )}
+	                  </select>
+	                </label>
+	              </div>
 
-              <label className="input-field agent-field-full">
-                <span>介绍</span>
-                <textarea
-                  value={agentDraft.description}
-                  onChange={(event) => onDraftChange({ description: event.target.value })}
-                  rows={5}
-                  placeholder="详细说明这个智能体负责什么、擅长什么、回答风格和约束是什么"
-                />
-              </label>
-            </div>
+	              <label className="input-field agent-field-full">
+	                <span>角色说明</span>
+	                <textarea
+	                  value={agentDraft.description}
+	                  onChange={(event) => onDraftChange({ description: event.target.value })}
+	                  rows={5}
+	                  placeholder="说明这个智能体负责什么、擅长什么、回答风格和边界。"
+	                />
+	              </label>
 
-            <div className="agent-section">
-              <div className="agent-section-header">
-                <div>
-                  <strong>运行配置</strong>
-                  <p>新会话会默认带出这里的模型和模式；进入聊天后，模型仍允许按会话单独切换。</p>
-                </div>
-              </div>
-
-              <div className="agent-form-grid">
-                <label className="input-field">
-                  <span>默认模型</span>
-                  <select
-                    value={selectedModelValue}
-                    onChange={(event) => {
-                      const parsed = sessionLlmDecode(event.target.value)
-                      if (parsed) {
-                        onDraftChange({
-                          defaultProviderId: parsed.providerId,
-                          defaultModel: parsed.model,
-                        })
-                      }
-                    }}
-                  >
-                    {modelOptions.length === 0 ? (
-                      <option value="">暂无已配置模型</option>
-                    ) : (
-                      modelOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                </label>
-
-                <label className="input-field">
-                  <span>执行模式</span>
-                  <select
-                    value={agentDraft.executionMode}
-                    onChange={(event) =>
-                      onDraftChange({
-                        executionMode: (event.target.value as AgentExecutionMode) || 'single',
-                      })
-                    }
-                  >
-                    <option value="single">单智能体</option>
-                    <option value="supervisor">协调者（预留）</option>
-                    <option value="worker">执行者（预留）</option>
-                  </select>
-                </label>
-              </div>
-
-              <label className="input-field agent-field-full">
-                <span>高级指令（可选）</span>
-                <textarea
-                  value={agentDraft.systemPrompt}
-                  onChange={(event) => onDraftChange({ systemPrompt: event.target.value })}
-                  rows={6}
-                  placeholder="可补充这个智能体的额外执行约束、回答方式或边界要求。留空时会根据名字、简介和介绍自动生成角色上下文。"
-                />
-              </label>
-            </div>
+	              <div className="agent-helper-copy">
+	                <strong>列表摘要将自动生成</strong>
+	                <span>
+	                  当前预览：{generatedSummary || '输入角色说明后会自动生成'}。如果你想手动改写，可以在高级设置里覆盖。
+	                </span>
+	              </div>
+	            </div>
 
             <div className="agent-section">
               <div className="agent-section-header">
@@ -5238,316 +5662,447 @@ function AgentEditorDialog({
               ) : null}
             </div>
 
-            <div className="agent-section">
-              <div className="agent-section-header">
-                <div>
-                  <strong>会话行为</strong>
-                  <p>默认模型来自智能体配置，但聊天窗口里仍支持用户按当前会话临时切换，不会回写智能体默认值。</p>
-                </div>
-              </div>
-            </div>
+	            <div className="agent-section">
+	              <button
+	                type="button"
+	                className={`agent-advanced-toggle ${advancedOpen ? 'open' : ''}`}
+	                onClick={() => setAdvancedOpen((current) => !current)}
+	                aria-expanded={advancedOpen}
+	              >
+	                <div className="agent-advanced-toggle-copy">
+	                  <strong>高级设置</strong>
+	                  <span>摘要覆盖、执行模式、高级指令、对等 HTTP 对接、心跳任务都收在这里。</span>
+	                </div>
+	                <div className="agent-advanced-toggle-meta">
+	                  <span>{hasAdvancedSettings ? '已配置' : '可选'}</span>
+	                  <AppIcon name="chevron-down" size={18} />
+	                </div>
+	              </button>
 
-            <div className="agent-section">
-              <div className="agent-section-header">
-                <div>
-                  <strong>心跳与任务</strong>
-                  <p>给这个智能体配置定时提醒和可执行任务。规则到点后会自动通过绑定的 IM 通道给目标用户发消息，shell 任务会先执行程序，再推送结果。</p>
-                </div>
+	              {advancedOpen ? (
+	                <div className="agent-advanced-stack">
+	                  <div className="agent-subsection">
+	                    <div className="agent-subsection-header">
+	                      <div>
+	                        <strong>运行与路由</strong>
+	                        <p>默认模型来自智能体配置，但聊天窗口里仍支持用户按当前会话临时切换，不会回写智能体默认值。</p>
+	                      </div>
+	                    </div>
 
-                <div className="agent-inline-actions">
-                  <button type="button" className="outline-button" onClick={addHeartbeatTask}>
-                    <AppIcon name="plus" size={16} />
-                    <span>添加任务</span>
-                  </button>
-                  <button type="button" className="outline-button" onClick={addHeartbeatSchedule}>
-                    <AppIcon name="clock" size={16} />
-                    <span>添加规则</span>
-                  </button>
-                </div>
-              </div>
+	                    <div className="agent-form-grid">
+	                      <label className="input-field">
+	                        <span>列表摘要覆盖（可选）</span>
+	                        <input
+	                          value={agentDraft.summary}
+	                          onChange={(event) => onDraftChange({ summary: event.target.value })}
+	                          placeholder={generatedSummary || '留空时自动生成'}
+	                        />
+	                      </label>
 
-              <div className="agent-form-grid">
-                <label className="input-field">
-                  <span>时区</span>
-                  <input
-                    value={heartbeatConfig.timezone}
-                    onChange={(event) =>
-                      updateHeartbeatConfig((current) => ({
-                        ...current,
-                        timezone: event.target.value,
-                      }))
-                    }
-                    placeholder="Asia/Shanghai"
-                  />
-                </label>
-              </div>
+	                      <label className="input-field">
+	                        <span>执行模式</span>
+	                        <select
+	                          value={agentDraft.executionMode}
+	                          onChange={(event) =>
+	                            onDraftChange({
+	                              executionMode: (event.target.value as AgentExecutionMode) || 'single',
+	                            })
+	                          }
+	                        >
+	                          <option value="single">单智能体</option>
+	                          <option value="supervisor">协调者（预留）</option>
+	                          <option value="worker">执行者（预留）</option>
+	                        </select>
+	                      </label>
+	                    </div>
 
-              <div className="agent-subsection">
-                <div className="agent-subsection-header">
-                  <div>
-                    <strong>任务</strong>
-                    <p>`notify` 只负责提醒，`shell` 会执行命令后把结果发给用户。</p>
-                  </div>
-                </div>
+	                    <div className="agent-helper-copy subtle">
+	                      <strong>自动摘要预览</strong>
+	                      <span>{generatedSummary || '输入角色说明后生成摘要。'}</span>
+	                    </div>
 
-                {heartbeatTasks.length > 0 ? (
-                  <div className="agent-automation-list">
-                    {heartbeatTasks.map((task, index) => (
-                      <div key={task.id} className="agent-automation-card">
-                        <div className="agent-automation-card-header">
-                          <div>
-                            <strong>{task.name || `任务 ${index + 1}`}</strong>
-                            <span>{task.taskType === 'shell' ? '执行程序并回推结果' : '纯文本提醒'}</span>
-                          </div>
-                          <button type="button" className="icon-button subtle" onClick={() => removeHeartbeatTask(task.id)}>
-                            <AppIcon name="trash" size={16} />
-                          </button>
-                        </div>
+	                    <label className="input-field agent-field-full">
+	                      <span>高级指令（可选）</span>
+	                      <textarea
+	                        value={agentDraft.systemPrompt}
+	                        onChange={(event) => onDraftChange({ systemPrompt: event.target.value })}
+	                        rows={6}
+	                        placeholder="补充额外执行约束、回答方式或边界要求。留空时会根据名字和角色说明自动生成角色上下文。"
+	                      />
+	                    </label>
+	                  </div>
 
-                        <div className="agent-form-grid">
-                          <label className="input-field">
-                            <span>任务名称</span>
-                            <input
-                              value={task.name}
-                              onChange={(event) => updateHeartbeatTask(task.id, { name: event.target.value })}
-                              placeholder="例如：早间播报"
-                            />
-                          </label>
+	                  <div className="agent-peer-integration-card">
+	                    <div className="agent-peer-integration-head">
+	                      <strong>对等 HTTP（虾）对接</strong>
+	                      <span>全应用共用一个监听端口；下列地址与一键说明会包含本智能体的密钥与 ID。</span>
+	                    </div>
+	                    {peerGatewayLoadError ? (
+	                      <div className="skills-feedback error agent-feedback inline">
+	                        <span>读取网关信息失败：{peerGatewayLoadError}</span>
+	                      </div>
+	                    ) : null}
+	                    {peerGatewayInfo ? (
+	                      <>
+	                        <div className="agent-peer-api-grid">
+	                          <label className="input-field">
+	                            <span>监听地址（NINECLAW_PEER_BIND）</span>
+	                            <input
+	                              readOnly
+	                              value={
+	                                peerGatewayInfo.enabled && peerGatewayInfo.listenAddress
+	                                  ? peerGatewayInfo.listenAddress
+	                                  : '未配置（未监听）'
+	                              }
+	                            />
+	                          </label>
+	                          <label className="input-field">
+	                            <span>入站 API（POST）</span>
+	                            <input readOnly value={peerGatewayInfo.inboundUrl ?? '—'} />
+	                          </label>
+	                          <label className="input-field">
+	                            <span>健康检查（GET）</span>
+	                            <input readOnly value={peerGatewayInfo.healthUrl ?? '—'} />
+	                          </label>
+	                        </div>
+	                        <div className="agent-peer-snippet-toolbar">
+	                          <span className="agent-peer-snippet-label">给对方的一键说明（含密钥）</span>
+	                          <button
+	                            type="button"
+	                            className="outline-button"
+	                            onClick={() => {
+	                              void navigator.clipboard.writeText(peerSnippetText).then(() => {
+	                                setPeerSnippetCopied(true)
+	                                window.setTimeout(() => setPeerSnippetCopied(false), 2000)
+	                              })
+	                            }}
+	                          >
+	                            {peerSnippetCopied ? (
+	                              <>
+	                                <Check size={16} />
+	                                <span>已复制</span>
+	                              </>
+	                            ) : (
+	                              <>
+	                                <Copy size={16} />
+	                                <span>复制全文</span>
+	                              </>
+	                            )}
+	                          </button>
+	                        </div>
+	                        <pre className="agent-peer-snippet-pre">{peerSnippetText}</pre>
+	                      </>
+	                    ) : (
+	                      <div className="agent-workspace-hint">
+	                        <span>正在读取对等网关信息…</span>
+	                      </div>
+	                    )}
+	                  </div>
 
-                          <label className="input-field">
-                            <span>任务类型</span>
-                            <select
-                              value={task.taskType}
-                              onChange={(event) =>
-                                updateHeartbeatTask(task.id, {
-                                  taskType: event.target.value === 'shell' ? 'shell' : 'notify',
-                                })
-                              }
-                            >
-                              <option value="notify">notify · 纯提醒</option>
-                              <option value="shell">shell · 先执行程序</option>
-                            </select>
-                          </label>
-                        </div>
+	                  <div className="agent-subsection">
+	                    <div className="agent-subsection-header">
+	                      <div>
+	                        <strong>心跳与任务</strong>
+	                        <p>给这个智能体配置定时提醒和可执行任务。规则到点后会自动通过绑定的 IM 通道给目标用户发消息，shell 任务会先执行程序，再推送结果。</p>
+	                      </div>
 
-                        <label className="input-field agent-field-full">
-                          <span>任务说明</span>
-                          <textarea
-                            value={task.description}
-                            onChange={(event) => updateHeartbeatTask(task.id, { description: event.target.value })}
-                            rows={3}
-                            placeholder="说明这个任务在做什么，例如：每天 8 点推送昨晚抓取的数据摘要"
-                          />
-                        </label>
+	                      <div className="agent-inline-actions">
+	                        <button type="button" className="outline-button" onClick={addHeartbeatTask}>
+	                          <AppIcon name="plus" size={16} />
+	                          <span>添加任务</span>
+	                        </button>
+	                        <button type="button" className="outline-button" onClick={addHeartbeatSchedule}>
+	                          <AppIcon name="clock" size={16} />
+	                          <span>添加规则</span>
+	                        </button>
+	                      </div>
+	                    </div>
 
-                        {task.taskType === 'shell' ? (
-                          <>
-                            <label className="input-field agent-field-full">
-                              <span>执行命令</span>
-                              <input
-                                value={task.command}
-                                onChange={(event) => updateHeartbeatTask(task.id, { command: event.target.value })}
-                                placeholder="例如：python3 scripts/fetch_daily_report.py"
-                              />
-                            </label>
+	                    <div className="agent-form-grid">
+	                      <label className="input-field">
+	                        <span>时区</span>
+	                        <input
+	                          value={heartbeatConfig.timezone}
+	                          onChange={(event) =>
+	                            updateHeartbeatConfig((current) => ({
+	                              ...current,
+	                              timezone: event.target.value,
+	                            }))
+	                          }
+	                          placeholder="Asia/Shanghai"
+	                        />
+	                      </label>
+	                    </div>
 
-                            <div className="agent-form-grid">
-                              <label className="input-field">
-                                <span>工作目录</span>
-                                <input
-                                  value={task.workingDirectory}
-                                  onChange={(event) => updateHeartbeatTask(task.id, { workingDirectory: event.target.value })}
-                                  placeholder="留空时使用 agents/<agent-id>/"
-                                />
-                              </label>
+	                    <div className="agent-subsection">
+	                      <div className="agent-subsection-header">
+	                        <div>
+	                          <strong>任务</strong>
+	                          <p>`notify` 只负责提醒，`shell` 会执行命令后把结果发给用户。</p>
+	                        </div>
+	                      </div>
 
-                              <label className="input-field">
-                                <span>超时秒数</span>
-                                <input
-                                  type="number"
-                                  min={10}
-                                  step={10}
-                                  value={task.timeoutSec}
-                                  onChange={(event) =>
-                                    updateHeartbeatTask(task.id, {
-                                      timeoutSec: Number.parseInt(event.target.value || '180', 10) || 180,
-                                    })
-                                  }
-                                />
-                              </label>
-                            </div>
-                          </>
-                        ) : null}
+	                      {heartbeatTasks.length > 0 ? (
+	                        <div className="agent-automation-list">
+	                          {heartbeatTasks.map((task, index) => (
+	                            <div key={task.id} className="agent-automation-card">
+	                              <div className="agent-automation-card-header">
+	                                <div>
+	                                  <strong>{task.name || `任务 ${index + 1}`}</strong>
+	                                  <span>{task.taskType === 'shell' ? '执行程序并回推结果' : '纯文本提醒'}</span>
+	                                </div>
+	                                <button type="button" className="icon-button subtle" onClick={() => removeHeartbeatTask(task.id)}>
+	                                  <AppIcon name="trash" size={16} />
+	                                </button>
+	                              </div>
 
-                        <label className="input-field agent-field-full">
-                          <span>消息模板</span>
-                          <textarea
-                            value={task.messageTemplate}
-                            onChange={(event) => updateHeartbeatTask(task.id, { messageTemplate: event.target.value })}
-                            rows={4}
-                            placeholder={'留空时使用系统默认文案。可用变量：{{agent_name}} {{task_name}} {{schedule_name}} {{now}} {{stdout}} {{stderr}} {{exit_code}}'}
-                          />
-                        </label>
+	                              <div className="agent-form-grid">
+	                                <label className="input-field">
+	                                  <span>任务名称</span>
+	                                  <input
+	                                    value={task.name}
+	                                    onChange={(event) => updateHeartbeatTask(task.id, { name: event.target.value })}
+	                                    placeholder="例如：早间播报"
+	                                  />
+	                                </label>
 
-                        <div className="agent-toggle-row">
-                          <label className="agent-check">
-                            <input
-                              type="checkbox"
-                              checked={task.enabled}
-                              onChange={(event) => updateHeartbeatTask(task.id, { enabled: event.target.checked })}
-                            />
-                            <span>启用任务</span>
-                          </label>
+	                                <label className="input-field">
+	                                  <span>任务类型</span>
+	                                  <select
+	                                    value={task.taskType}
+	                                    onChange={(event) =>
+	                                      updateHeartbeatTask(task.id, {
+	                                        taskType: event.target.value === 'shell' ? 'shell' : 'notify',
+	                                      })
+	                                    }
+	                                  >
+	                                    <option value="notify">notify · 纯提醒</option>
+	                                    <option value="shell">shell · 先执行程序</option>
+	                                  </select>
+	                                </label>
+	                              </div>
 
-                          {task.taskType === 'shell' ? (
-                            <>
-                              <label className="agent-check">
-                                <input
-                                  type="checkbox"
-                                  checked={task.notifyOnSuccess}
-                                  onChange={(event) => updateHeartbeatTask(task.id, { notifyOnSuccess: event.target.checked })}
-                                />
-                                <span>成功后发消息</span>
-                              </label>
+	                              <label className="input-field agent-field-full">
+	                                <span>任务说明</span>
+	                                <textarea
+	                                  value={task.description}
+	                                  onChange={(event) => updateHeartbeatTask(task.id, { description: event.target.value })}
+	                                  rows={3}
+	                                  placeholder="说明这个任务在做什么，例如：每天 8 点推送昨晚抓取的数据摘要"
+	                                />
+	                              </label>
 
-                              <label className="agent-check">
-                                <input
-                                  type="checkbox"
-                                  checked={task.notifyOnFailure}
-                                  onChange={(event) => updateHeartbeatTask(task.id, { notifyOnFailure: event.target.checked })}
-                                />
-                                <span>失败后发消息</span>
-                              </label>
-                            </>
-                          ) : null}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="agent-empty-block">
-                    <strong>还没有任务</strong>
-                    <span>先添加一个 `notify` 或 `shell` 任务，再给它配置定时规则。</span>
-                  </div>
-                )}
-              </div>
+	                              {task.taskType === 'shell' ? (
+	                                <>
+	                                  <label className="input-field agent-field-full">
+	                                    <span>执行命令</span>
+	                                    <input
+	                                      value={task.command}
+	                                      onChange={(event) => updateHeartbeatTask(task.id, { command: event.target.value })}
+	                                      placeholder="例如：python3 scripts/fetch_daily_report.py"
+	                                    />
+	                                  </label>
 
-              <div className="agent-subsection">
-                <div className="agent-subsection-header">
-                  <div>
-                    <strong>规则</strong>
-                    <p>规则决定什么时候触发、触发哪个任务，以及把结果发给谁。当前 MVP 先支持每日固定时刻。</p>
-                  </div>
-                </div>
+	                                  <div className="agent-form-grid">
+	                                    <label className="input-field">
+	                                      <span>工作目录</span>
+	                                      <input
+	                                        value={task.workingDirectory}
+	                                        onChange={(event) => updateHeartbeatTask(task.id, { workingDirectory: event.target.value })}
+	                                        placeholder="留空时使用 agents/<agent-id>/"
+	                                      />
+	                                    </label>
 
-                {heartbeatSchedules.length > 0 ? (
-                  <div className="agent-automation-list">
-                    {heartbeatSchedules.map((schedule, index) => (
-                      <div key={schedule.id} className="agent-automation-card">
-                        <div className="agent-automation-card-header">
-                          <div>
-                            <strong>{schedule.name || `规则 ${index + 1}`}</strong>
-                            <span>{schedule.times.join('、') || '未设置时间'} · {schedule.channelId || 'wechat'}</span>
-                          </div>
-                          <button type="button" className="icon-button subtle" onClick={() => removeHeartbeatSchedule(schedule.id)}>
-                            <AppIcon name="trash" size={16} />
-                          </button>
-                        </div>
+	                                    <label className="input-field">
+	                                      <span>超时秒数</span>
+	                                      <input
+	                                        type="number"
+	                                        min={10}
+	                                        step={10}
+	                                        value={task.timeoutSec}
+	                                        onChange={(event) =>
+	                                          updateHeartbeatTask(task.id, {
+	                                            timeoutSec: Number.parseInt(event.target.value || '180', 10) || 180,
+	                                          })
+	                                        }
+	                                      />
+	                                    </label>
+	                                  </div>
+	                                </>
+	                              ) : null}
 
-                        <div className="agent-form-grid">
-                          <label className="input-field">
-                            <span>规则名称</span>
-                            <input
-                              value={schedule.name}
-                              onChange={(event) => updateHeartbeatSchedule(schedule.id, { name: event.target.value })}
-                              placeholder="例如：工作日晚间复盘"
-                            />
-                          </label>
+	                              <label className="input-field agent-field-full">
+	                                <span>消息模板</span>
+	                                <textarea
+	                                  value={task.messageTemplate}
+	                                  onChange={(event) => updateHeartbeatTask(task.id, { messageTemplate: event.target.value })}
+	                                  rows={4}
+	                                  placeholder={'留空时使用系统默认文案。可用变量：{{agent_name}} {{task_name}} {{schedule_name}} {{now}} {{stdout}} {{stderr}} {{exit_code}}'}
+	                                />
+	                              </label>
 
-                          <label className="input-field">
-                            <span>绑定任务</span>
-                            <select
-                              value={schedule.taskId}
-                              onChange={(event) => updateHeartbeatSchedule(schedule.id, { taskId: event.target.value })}
-                            >
-                              <option value="">请选择任务</option>
-                              {heartbeatTasks.map((task) => (
-                                <option key={task.id} value={task.id}>
-                                  {task.name || task.id}
-                                </option>
-                              ))}
-                            </select>
-                          </label>
-                        </div>
+	                              <div className="agent-toggle-row">
+	                                <label className="agent-check">
+	                                  <input
+	                                    type="checkbox"
+	                                    checked={task.enabled}
+	                                    onChange={(event) => updateHeartbeatTask(task.id, { enabled: event.target.checked })}
+	                                  />
+	                                  <span>启用任务</span>
+	                                </label>
 
-                        <div className="agent-form-grid">
-                          <label className="input-field">
-                            <span>触发时间</span>
-                            <input
-                              value={schedule.times.join(', ')}
-                              onChange={(event) =>
-                                updateHeartbeatSchedule(schedule.id, {
-                                  times: event.target.value
-                                    .split(',')
-                                    .map((value) => value.trim())
-                                    .filter(Boolean),
-                                })
-                              }
-                              placeholder="例如：08:00, 17:00"
-                            />
-                          </label>
+	                                {task.taskType === 'shell' ? (
+	                                  <>
+	                                    <label className="agent-check">
+	                                      <input
+	                                        type="checkbox"
+	                                        checked={task.notifyOnSuccess}
+	                                        onChange={(event) => updateHeartbeatTask(task.id, { notifyOnSuccess: event.target.checked })}
+	                                      />
+	                                      <span>成功后发消息</span>
+	                                    </label>
 
-                          <label className="input-field">
-                            <span>通道 ID</span>
-                            <input
-                              value={schedule.channelId}
-                              onChange={(event) => updateHeartbeatSchedule(schedule.id, { channelId: event.target.value })}
-                              placeholder="wechat"
-                            />
-                          </label>
-                        </div>
+	                                    <label className="agent-check">
+	                                      <input
+	                                        type="checkbox"
+	                                        checked={task.notifyOnFailure}
+	                                        onChange={(event) => updateHeartbeatTask(task.id, { notifyOnFailure: event.target.checked })}
+	                                      />
+	                                      <span>失败后发消息</span>
+	                                    </label>
+	                                  </>
+	                                ) : null}
+	                              </div>
+	                            </div>
+	                          ))}
+	                        </div>
+	                      ) : (
+	                        <div className="agent-empty-block">
+	                          <strong>还没有任务</strong>
+	                          <span>先添加一个 `notify` 或 `shell` 任务，再给它配置定时规则。</span>
+	                        </div>
+	                      )}
+	                    </div>
 
-                        <div className="agent-form-grid">
-                          <label className="input-field">
-                            <span>接收用户 ID</span>
-                            <input
-                              value={schedule.targetUserId}
-                              onChange={(event) => updateHeartbeatSchedule(schedule.id, { targetUserId: event.target.value })}
-                              placeholder="例如：wxid_xxx"
-                            />
-                          </label>
+	                    <div className="agent-subsection">
+	                      <div className="agent-subsection-header">
+	                        <div>
+	                          <strong>规则</strong>
+	                          <p>规则决定什么时候触发、触发哪个任务，以及把结果发给谁。当前 MVP 先支持每日固定时刻。</p>
+	                        </div>
+	                      </div>
 
-                          <label className="input-field">
-                            <span>接收人备注</span>
-                            <input
-                              value={schedule.targetLabel}
-                              onChange={(event) => updateHeartbeatSchedule(schedule.id, { targetLabel: event.target.value })}
-                              placeholder="例如：老板 / 自己 / 数据群"
-                            />
-                          </label>
-                        </div>
+	                      {heartbeatSchedules.length > 0 ? (
+	                        <div className="agent-automation-list">
+	                          {heartbeatSchedules.map((schedule, index) => (
+	                            <div key={schedule.id} className="agent-automation-card">
+	                              <div className="agent-automation-card-header">
+	                                <div>
+	                                  <strong>{schedule.name || `规则 ${index + 1}`}</strong>
+	                                  <span>{schedule.times.join('、') || '未设置时间'} · {schedule.channelId || 'wechat'}</span>
+	                                </div>
+	                                <button type="button" className="icon-button subtle" onClick={() => removeHeartbeatSchedule(schedule.id)}>
+	                                  <AppIcon name="trash" size={16} />
+	                                </button>
+	                              </div>
 
-                        <div className="agent-toggle-row">
-                          <label className="agent-check">
-                            <input
-                              type="checkbox"
-                              checked={schedule.enabled}
-                              onChange={(event) => updateHeartbeatSchedule(schedule.id, { enabled: event.target.checked })}
-                            />
-                            <span>启用规则</span>
-                          </label>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="agent-empty-block">
-                    <strong>还没有规则</strong>
-                    <span>规则决定执行时机和接收对象。添加后，应用启动时会自动加载并在后台定时检查。</span>
-                  </div>
-                )}
-              </div>
-            </div>
+	                              <div className="agent-form-grid">
+	                                <label className="input-field">
+	                                  <span>规则名称</span>
+	                                  <input
+	                                    value={schedule.name}
+	                                    onChange={(event) => updateHeartbeatSchedule(schedule.id, { name: event.target.value })}
+	                                    placeholder="例如：工作日晚间复盘"
+	                                  />
+	                                </label>
+
+	                                <label className="input-field">
+	                                  <span>绑定任务</span>
+	                                  <select
+	                                    value={schedule.taskId}
+	                                    onChange={(event) => updateHeartbeatSchedule(schedule.id, { taskId: event.target.value })}
+	                                  >
+	                                    <option value="">请选择任务</option>
+	                                    {heartbeatTasks.map((task) => (
+	                                      <option key={task.id} value={task.id}>
+	                                        {task.name || task.id}
+	                                      </option>
+	                                    ))}
+	                                  </select>
+	                                </label>
+	                              </div>
+
+	                              <div className="agent-form-grid">
+	                                <label className="input-field">
+	                                  <span>触发时间</span>
+	                                  <input
+	                                    value={schedule.times.join(', ')}
+	                                    onChange={(event) =>
+	                                      updateHeartbeatSchedule(schedule.id, {
+	                                        times: event.target.value
+	                                          .split(',')
+	                                          .map((value) => value.trim())
+	                                          .filter(Boolean),
+	                                      })
+	                                    }
+	                                    placeholder="例如：08:00, 17:00"
+	                                  />
+	                                </label>
+
+	                                <label className="input-field">
+	                                  <span>通道 ID</span>
+	                                  <input
+	                                    value={schedule.channelId}
+	                                    onChange={(event) => updateHeartbeatSchedule(schedule.id, { channelId: event.target.value })}
+	                                    placeholder="wechat"
+	                                  />
+	                                </label>
+	                              </div>
+
+	                              <div className="agent-form-grid">
+	                                <label className="input-field">
+	                                  <span>接收用户 ID</span>
+	                                  <input
+	                                    value={schedule.targetUserId}
+	                                    onChange={(event) => updateHeartbeatSchedule(schedule.id, { targetUserId: event.target.value })}
+	                                    placeholder="例如：wxid_xxx"
+	                                  />
+	                                </label>
+
+	                                <label className="input-field">
+	                                  <span>接收人备注</span>
+	                                  <input
+	                                    value={schedule.targetLabel}
+	                                    onChange={(event) => updateHeartbeatSchedule(schedule.id, { targetLabel: event.target.value })}
+	                                    placeholder="例如：老板 / 自己 / 数据群"
+	                                  />
+	                                </label>
+	                              </div>
+
+	                              <div className="agent-toggle-row">
+	                                <label className="agent-check">
+	                                  <input
+	                                    type="checkbox"
+	                                    checked={schedule.enabled}
+	                                    onChange={(event) => updateHeartbeatSchedule(schedule.id, { enabled: event.target.checked })}
+	                                  />
+	                                  <span>启用规则</span>
+	                                </label>
+	                              </div>
+	                            </div>
+	                          ))}
+	                        </div>
+	                      ) : (
+	                        <div className="agent-empty-block">
+	                          <strong>还没有规则</strong>
+	                          <span>规则决定执行时机和接收对象。添加后，应用启动时会自动加载并在后台定时检查。</span>
+	                        </div>
+	                      )}
+	                    </div>
+	                  </div>
+	                </div>
+	              ) : null}
+	            </div>
 
             <div className="agent-section">
               <div className="agent-section-header">
@@ -6237,6 +6792,7 @@ type AgentsViewProps = {
   onWechatStart: () => void
   onWechatStop: () => void
   onRotatePeerSecret: () => void
+  onStartChatWithAgent: (id: string) => void
   setQrDialogOpen: (open: boolean) => void
   searchValue: string
   selectedAgent: AgentRecord | null
@@ -6310,6 +6866,7 @@ function AgentsView({
   onWechatStart,
   onWechatStop,
   onRotatePeerSecret,
+  onStartChatWithAgent,
   setQrDialogOpen,
   searchValue,
   selectedAgent,
@@ -6399,6 +6956,16 @@ function AgentsView({
                         {agent.defaultProviderId} · {agent.defaultModel}
                       </span>
                       <span className="agent-list-meta-pill">{agent.skillIds.length} 个技能</span>
+                      <button
+                        type="button"
+                        className="agent-row-action"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          onStartChatWithAgent(agent.id)
+                        }}
+                      >
+                        直接聊天
+                      </button>
                       <button
                         type="button"
                         className="agent-row-action"

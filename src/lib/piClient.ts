@@ -13,7 +13,13 @@ import type {
   PiStreamPayload,
   ProviderRuntimeConfig,
   RuntimeDependencyStatus,
+  ScheduledJobRecord,
+  ScheduledJobRunRecord,
+  SchedulerRuntimeStatus,
+  SchedulerServiceStatus,
+  SchedulerSyncResult,
   SystemSkillCatalog,
+  TokenUsageRecord,
 } from '../types'
 
 export type PiStreamUnsubscribe = () => void
@@ -64,6 +70,20 @@ export async function openLocalFile(filePath: string): Promise<void> {
   await invoke('open_local_file', { filePath })
 }
 
+export async function openExternalUrl(url: string): Promise<void> {
+  const trimmed = url.trim()
+  if (!trimmed) {
+    return
+  }
+
+  try {
+    await invoke('open_external_url', { url: trimmed })
+    return
+  } catch {
+    window.open(trimmed, '_blank', 'noopener,noreferrer')
+  }
+}
+
 export async function loadLocalMediaPreview(filePath: string, mimeType?: string | null): Promise<string> {
   return invoke<string>('load_local_media_preview', {
     filePath,
@@ -95,6 +115,10 @@ export async function saveHistoryState(payload: string): Promise<void> {
 
 export async function clearHistoryState(): Promise<void> {
   await invoke('clear_history_state')
+}
+
+export async function listTokenUsageRecords(): Promise<TokenUsageRecord[]> {
+  return invoke<TokenUsageRecord[]>('list_token_usage_records')
 }
 
 export type ProviderPreferencesPayload = {
@@ -185,6 +209,36 @@ export async function writeAgentWorkspaceFile(payload: {
   content: string
 }): Promise<AgentWorkspaceBundle> {
   return invoke<AgentWorkspaceBundle>('write_agent_workspace_file', payload)
+}
+
+export async function listScheduledJobs(): Promise<ScheduledJobRecord[]> {
+  return invoke<ScheduledJobRecord[]>('list_scheduled_jobs')
+}
+
+export async function listScheduledJobRuns(limit?: number): Promise<ScheduledJobRunRecord[]> {
+  return invoke<ScheduledJobRunRecord[]>('list_scheduled_job_runs', {
+    limit: limit ?? null,
+  })
+}
+
+export async function syncSchedulerJobs(): Promise<SchedulerSyncResult> {
+  return invoke<SchedulerSyncResult>('sync_scheduler_jobs')
+}
+
+export async function triggerSchedulerJobNow(jobId: string): Promise<void> {
+  await invoke('trigger_scheduler_job_now', { jobId })
+}
+
+export async function getSchedulerStatus(): Promise<SchedulerRuntimeStatus> {
+  return invoke<SchedulerRuntimeStatus>('get_scheduler_status')
+}
+
+export async function installSchedulerService(): Promise<SchedulerServiceStatus> {
+  return invoke<SchedulerServiceStatus>('install_scheduler_service')
+}
+
+export async function uninstallSchedulerService(): Promise<SchedulerServiceStatus> {
+  return invoke<SchedulerServiceStatus>('uninstall_scheduler_service')
 }
 
 export async function subscribePiStream(
@@ -305,6 +359,21 @@ export type BotMessageEvent = {
   content: string
   timestamp: number
   agent?: ConversationAgentSnapshot
+  inputTokens?: number
+  input_tokens?: number
+  outputTokens?: number
+  output_tokens?: number
+  cacheReadTokens?: number
+  cache_read_tokens?: number
+  cacheWriteTokens?: number
+  cache_write_tokens?: number
+  totalTokens?: number
+  total_tokens?: number
+  api?: string
+  provider?: string
+  model?: string
+  responseId?: string
+  response_id?: string
 }
 
 export async function subscribeBotMessage(
