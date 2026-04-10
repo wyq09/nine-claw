@@ -23,6 +23,8 @@ dist-ssr
 *.sln
 *.sw?
 .*/*
+!.githooks/
+!.githooks/*
 skills/*
 src-tauri/resources/pi-runtime/windows/*
 !src-tauri/resources/pi-runtime/windows/.gitkeep
