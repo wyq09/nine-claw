@@ -11,7 +11,9 @@
     "prepare:deps-and-pi": "npm install && npm run prepare:pi-runtime",
     "lint": "eslint .",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build:macos": "bash scripts/build-macos.sh",
+    "build:macos:dmg": "bash scripts/build-macos.sh --bundles dmg"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.60.0",
