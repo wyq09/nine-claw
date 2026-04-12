@@ -1,5 +1,8 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as Base64Engine};
+use md5::{Digest, Md5};
+use openssl::symm::Cipher;
 use rand::Rng;
+use serde::Deserialize;
 use serde_json::json;
 use std::net::TcpStream;
 use std::time::Duration;
@@ -10,6 +13,28 @@ use super::types::*;
 /// Timeout for each getUpdates request. Keep short for reliable periodic polling.
 const GET_UPDATES_TIMEOUT_MS: u64 = 8_000;
 const API_TIMEOUT_MS: u64 = 15_000;
+const CDN_UPLOAD_TIMEOUT_MS: u64 = 30_000;
+const CDN_UPLOAD_MAX_RETRIES: usize = 3;
+const WECHAT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+const ILINK_APP_ID: &str = "bot";
+const ILINK_APP_CLIENT_VERSION: &str = "131335";
+const UPLOAD_MEDIA_TYPE_IMAGE: i32 = 1;
+const UPLOAD_MEDIA_TYPE_VIDEO: i32 = 2;
+const UPLOAD_MEDIA_TYPE_FILE: i32 = 3;
+
+#[derive(Debug, Deserialize)]
+struct UploadUrlResponse {
+    upload_param: Option<String>,
+    upload_full_url: Option<String>,
+}
+
+#[derive(Debug)]
+struct UploadedMediaInfo {
+    encrypt_query_param: String,
+    aeskey_hex: String,
+    file_size: usize,
+    file_size_ciphertext: usize,
+}
 
 /// Build a reqwest client that auto-detects proxy availability.
 fn build_http_client() -> reqwest::Client {
@@ -61,6 +86,11 @@ impl WeChatApi {
 
     fn build_auth_headers(&self) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("iLink-App-Id", ILINK_APP_ID.parse().unwrap());
+        headers.insert(
+            "iLink-App-ClientVersion",
+            ILINK_APP_CLIENT_VERSION.parse().unwrap(),
+        );
         headers.insert("AuthorizationType", "ilink_bot_token".parse().unwrap());
         if !self.token.is_empty() {
             headers.insert(
@@ -73,6 +103,23 @@ impl WeChatApi {
             headers.insert("SKRouteTag", tag.parse().unwrap());
         }
         headers
+    }
+
+    fn build_cdn_upload_url(upload_param: &str, filekey: &str) -> String {
+        format!(
+            "{WECHAT_CDN_BASE_URL}/upload?encrypted_query_param={}&filekey={}",
+            urlencoding::encode(upload_param),
+            urlencoding::encode(filekey)
+        )
+    }
+
+    fn aeskey_message_value(aeskey_hex: &str) -> String {
+        BASE64_ENGINE.encode(aeskey_hex.as_bytes())
+    }
+
+    fn encrypt_cdn_payload(data: &[u8], aes_key: &[u8]) -> Result<Vec<u8>, String> {
+        openssl::symm::encrypt(Cipher::aes_128_ecb(), aes_key, None, data)
+            .map_err(|error| format!("AES-128-ECB 加密失败: {error}"))
     }
 
     fn build_headers(&self, body_len: usize) -> reqwest::header::HeaderMap {
@@ -130,6 +177,261 @@ impl WeChatApi {
 
     pub async fn download_public_attachment(&self, url: &str) -> Result<Vec<u8>, String> {
         self.download_url(url, false).await
+    }
+
+    async fn get_upload_url(
+        &self,
+        filekey: &str,
+        to_user_id: &str,
+        upload_media_type: i32,
+        raw_size: usize,
+        raw_md5: &str,
+        encrypted_size: usize,
+        aeskey_hex: &str,
+    ) -> Result<UploadUrlResponse, String> {
+        let url = format!("{}/ilink/bot/getuploadurl", self.base_url);
+        let body = json!({
+            "filekey": filekey,
+            "media_type": upload_media_type,
+            "to_user_id": to_user_id,
+            "rawsize": raw_size,
+            "rawfilemd5": raw_md5,
+            "filesize": encrypted_size,
+            "no_need_thumb": true,
+            "aeskey": aeskey_hex,
+            "base_info": { "channel_version": CHANNEL_VERSION }
+        });
+        let body_str =
+            serde_json::to_string(&body).map_err(|error| format!("序列化上传请求失败: {error}"))?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(self.build_headers(body_str.len()))
+            .body(body_str)
+            .timeout(Duration::from_millis(API_TIMEOUT_MS))
+            .send()
+            .await
+            .map_err(|error| format!("getUploadUrl 请求失败: {error}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("getUploadUrl HTTP {status}: {text}"));
+        }
+
+        response
+            .json::<UploadUrlResponse>()
+            .await
+            .map_err(|error| format!("解析 getUploadUrl 响应失败: {error}"))
+    }
+
+    async fn upload_encrypted_media_to_cdn(
+        &self,
+        ciphertext: &[u8],
+        upload_full_url: Option<&str>,
+        upload_param: Option<&str>,
+        filekey: &str,
+    ) -> Result<String, String> {
+        let resolved_url = if let Some(full_url) = upload_full_url
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            full_url.to_string()
+        } else if let Some(upload_param) = upload_param
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Self::build_cdn_upload_url(upload_param, filekey)
+        } else {
+            return Err("微信 CDN 上传地址为空".to_string());
+        };
+
+        let mut last_error = None;
+        for attempt in 1..=CDN_UPLOAD_MAX_RETRIES {
+            match self
+                .client
+                .post(&resolved_url)
+                .header("Content-Type", "application/octet-stream")
+                .body(ciphertext.to_vec())
+                .timeout(Duration::from_millis(CDN_UPLOAD_TIMEOUT_MS))
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if response.status().is_client_error() {
+                        let status = response.status();
+                        let err = response
+                            .headers()
+                            .get("x-error-message")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("HTTP {status}"));
+                        return Err(format!("微信 CDN 上传失败: {err}"));
+                    }
+
+                    if response.status() != reqwest::StatusCode::OK {
+                        let status = response.status();
+                        let err = response
+                            .headers()
+                            .get("x-error-message")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("HTTP {status}"));
+                        last_error = Some(format!("微信 CDN 上传失败: {err}"));
+                    } else if let Some(download_param) = response
+                        .headers()
+                        .get("x-encrypted-param")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        return Ok(download_param.to_string());
+                    } else {
+                        last_error = Some("微信 CDN 上传成功但缺少 x-encrypted-param".to_string());
+                    }
+                }
+                Err(error) => {
+                    last_error = Some(format!("微信 CDN 上传请求失败: {error}"));
+                }
+            }
+
+            if attempt < CDN_UPLOAD_MAX_RETRIES {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| "微信 CDN 上传失败".to_string()))
+    }
+
+    async fn upload_media(
+        &self,
+        to_user_id: &str,
+        upload_media_type: i32,
+        data: &[u8],
+    ) -> Result<UploadedMediaInfo, String> {
+        let mut md5 = Md5::new();
+        md5.update(data);
+        let raw_md5 = format!("{:x}", md5.finalize());
+
+        let aes_key = Uuid::new_v4().as_bytes().to_vec();
+        let aeskey_hex = aes_key
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let ciphertext = Self::encrypt_cdn_payload(data, &aes_key)?;
+        let filekey = Uuid::new_v4().simple().to_string();
+
+        let upload_url = self
+            .get_upload_url(
+                &filekey,
+                to_user_id,
+                upload_media_type,
+                data.len(),
+                &raw_md5,
+                ciphertext.len(),
+                &aeskey_hex,
+            )
+            .await?;
+
+        let encrypt_query_param = self
+            .upload_encrypted_media_to_cdn(
+                &ciphertext,
+                upload_url.upload_full_url.as_deref(),
+                upload_url.upload_param.as_deref(),
+                &filekey,
+            )
+            .await?;
+
+        Ok(UploadedMediaInfo {
+            encrypt_query_param,
+            aeskey_hex,
+            file_size: data.len(),
+            file_size_ciphertext: ciphertext.len(),
+        })
+    }
+
+    pub async fn send_binary_media(
+        &self,
+        to_user_id: &str,
+        media_type: i32,
+        file_name: &str,
+        data: &[u8],
+        context_token: Option<&str>,
+    ) -> Result<(), String> {
+        let (upload_media_type, item_type, item_json) = match media_type {
+            MSG_ITEM_TYPE_IMAGE => {
+                let uploaded = self
+                    .upload_media(to_user_id, UPLOAD_MEDIA_TYPE_IMAGE, data)
+                    .await?;
+                (
+                    UPLOAD_MEDIA_TYPE_IMAGE,
+                    MSG_ITEM_TYPE_IMAGE,
+                    json!({
+                        "image_item": {
+                            "media": {
+                                "encrypt_query_param": uploaded.encrypt_query_param,
+                                "aes_key": Self::aeskey_message_value(&uploaded.aeskey_hex),
+                                "encrypt_type": 1
+                            },
+                            "mid_size": uploaded.file_size_ciphertext
+                        }
+                    }),
+                )
+            }
+            MSG_ITEM_TYPE_VIDEO => {
+                let uploaded = self
+                    .upload_media(to_user_id, UPLOAD_MEDIA_TYPE_VIDEO, data)
+                    .await?;
+                (
+                    UPLOAD_MEDIA_TYPE_VIDEO,
+                    MSG_ITEM_TYPE_VIDEO,
+                    json!({
+                        "video_item": {
+                            "media": {
+                                "encrypt_query_param": uploaded.encrypt_query_param,
+                                "aes_key": Self::aeskey_message_value(&uploaded.aeskey_hex),
+                                "encrypt_type": 1
+                            },
+                            "video_size": uploaded.file_size_ciphertext
+                        }
+                    }),
+                )
+            }
+            MSG_ITEM_TYPE_FILE | MSG_ITEM_TYPE_VOICE => {
+                let uploaded = self
+                    .upload_media(to_user_id, UPLOAD_MEDIA_TYPE_FILE, data)
+                    .await?;
+                (
+                    UPLOAD_MEDIA_TYPE_FILE,
+                    MSG_ITEM_TYPE_FILE,
+                    json!({
+                        "file_item": {
+                            "media": {
+                                "encrypt_query_param": uploaded.encrypt_query_param,
+                                "aes_key": Self::aeskey_message_value(&uploaded.aeskey_hex),
+                                "encrypt_type": 1
+                            },
+                            "file_name": file_name,
+                            "len": uploaded.file_size.to_string()
+                        }
+                    }),
+                )
+            }
+            other => {
+                return Err(format!("不支持的微信媒体类型: {other}"));
+            }
+        };
+
+        log::info!(
+            "微信上传媒体完成: to_user_id={} upload_media_type={} item_type={} file_name={}",
+            to_user_id,
+            upload_media_type,
+            item_type,
+            file_name
+        );
+        self.send_media_message(to_user_id, item_type, item_json, context_token)
+            .await
     }
 
     /// Long-poll for new messages.
@@ -340,5 +642,128 @@ impl WeChatApi {
             .json::<QRCodeStatusResponse>()
             .await
             .map_err(|e| format!("解析扫码状态响应失败: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct TestState {
+        base_url: String,
+        get_upload_bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+        upload_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+        send_message_bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    async fn get_upload_url_handler(
+        State(state): State<TestState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        state.get_upload_bodies.lock().unwrap().push(body);
+        Json(json!({
+            "upload_full_url": format!("{}/upload", state.base_url),
+        }))
+    }
+
+    async fn upload_handler(State(state): State<TestState>, body: Bytes) -> impl IntoResponse {
+        state.upload_bodies.lock().unwrap().push(body.to_vec());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-encrypted-param",
+            HeaderValue::from_static("download-token"),
+        );
+        (StatusCode::OK, headers)
+    }
+
+    async fn send_message_handler(
+        State(state): State<TestState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        state.send_message_bodies.lock().unwrap().push(body);
+        Json(json!({}))
+    }
+
+    #[tokio::test]
+    async fn send_binary_media_posts_uploaded_file_message() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let base_url = format!("http://{addr}");
+        let state = TestState {
+            base_url: base_url.clone(),
+            get_upload_bodies: Arc::new(Mutex::new(Vec::new())),
+            upload_bodies: Arc::new(Mutex::new(Vec::new())),
+            send_message_bodies: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let router = Router::new()
+            .route("/ilink/bot/getuploadurl", post(get_upload_url_handler))
+            .route("/upload", post(upload_handler))
+            .route("/ilink/bot/sendmessage", post(send_message_handler))
+            .with_state(state.clone());
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve test router");
+        });
+
+        let api = WeChatApi::new(&base_url, "test-token", None);
+        api.send_binary_media(
+            "wxid-test-user",
+            MSG_ITEM_TYPE_FILE,
+            "report.pdf",
+            b"hello",
+            Some("ctx-token"),
+        )
+        .await
+        .expect("send file media");
+
+        let get_upload_bodies = state.get_upload_bodies.lock().unwrap().clone();
+        assert_eq!(get_upload_bodies.len(), 1);
+        assert_eq!(get_upload_bodies[0]["to_user_id"], "wxid-test-user");
+        assert_eq!(get_upload_bodies[0]["media_type"], UPLOAD_MEDIA_TYPE_FILE);
+        assert_eq!(get_upload_bodies[0]["rawsize"], 5);
+        assert_eq!(get_upload_bodies[0]["filesize"], 16);
+
+        let upload_bodies = state.upload_bodies.lock().unwrap().clone();
+        assert_eq!(upload_bodies.len(), 1);
+        assert_eq!(upload_bodies[0].len(), 16);
+
+        let send_message_bodies = state.send_message_bodies.lock().unwrap().clone();
+        assert_eq!(send_message_bodies.len(), 1);
+        let body = &send_message_bodies[0];
+        assert_eq!(body["msg"]["to_user_id"], "wxid-test-user");
+        assert_eq!(body["msg"]["context_token"], "ctx-token");
+        assert_eq!(body["msg"]["item_list"][0]["type"], MSG_ITEM_TYPE_FILE);
+        assert_eq!(
+            body["msg"]["item_list"][0]["file_item"]["media"]["encrypt_query_param"],
+            "download-token"
+        );
+        assert_eq!(
+            body["msg"]["item_list"][0]["file_item"]["file_name"],
+            "report.pdf"
+        );
+        assert_eq!(body["msg"]["item_list"][0]["file_item"]["len"], "5");
+        assert_eq!(
+            body["msg"]["item_list"][0]["file_item"]["media"]["encrypt_type"],
+            1
+        );
+        assert!(body["msg"]["item_list"][0]["file_item"]["media"]["aes_key"]
+            .as_str()
+            .map(|value| !value.is_empty())
+            .unwrap_or(false));
+
+        server.abort();
     }
 }

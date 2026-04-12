@@ -47,8 +47,7 @@
 
 1. 写入数据库
 2. 创建 `agents/<agent-id>/`
-3. 生成初始 `IDENTITY.md`、`ROLE.md`、`MEMORY.md`、`TOOLS.md`
-4. 为新 agent 生成 `BOOTSTRAP.md`
+3. 从 `agents/_template/` 生成初始 `IDENTITY.md`、`ROLE.md`、`MEMORY.md`、`USER_MODEL.md`、`RELATIONSHIP_MAP.md`、`PITFALLS.md`、`TOOLS.md`、`WORKING.md`、`DECISIONS.md`、`memory/INDEX.md`、`memory/REVIEW_QUEUE.md`、`wiki/INDEX.md`
 5. 更新 `AGENT_REGISTRY.md` 生成索引
 
 这一步的目标是“先出生”。
@@ -75,8 +74,10 @@
 - `ROLE.md`
 - `PUBLIC_CONTEXT.md`
 - `MEMORY.md`
-
-然后删除 `BOOTSTRAP.md`。
+- `USER_MODEL.md`
+- `RELATIONSHIP_MAP.md`
+- `PITFALLS.md`
+- `memory/categories/*.md` 或 `DECISIONS.md`（如果内容已经稳定）
 
 ### Step 5: First Real Task
 
@@ -87,6 +88,7 @@ onboarding 完成后，立刻给用户一个过渡句：
 第一件真实任务的上下文写入：
 
 - `WORKING.md`
+- `WORKING.md` 的 `OPEN_LOOPS`
 - `memory/YYYY-MM-DD.md`
 
 ## UI Recommendation

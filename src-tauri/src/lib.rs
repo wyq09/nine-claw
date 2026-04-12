@@ -1,3 +1,4 @@
+mod agent_tasks;
 mod agent_workspace;
 mod agents;
 mod channels;
@@ -56,6 +57,9 @@ fn build_http_client() -> reqwest::Client {
 }
 use tauri::{AppHandle, Emitter, Manager, PhysicalSize, Size};
 
+use agent_tasks::{
+    AgentTaskDeliveryRecord, AgentTaskListItem, AgentTaskPromptResult, AgentTaskUpdateInput,
+};
 use agent_workspace::AgentWorkspaceBundle;
 use agents::{AgentInput, AgentRecord, ConversationAgentConfig};
 use channels::factory::ChannelConfig;
@@ -82,9 +86,7 @@ static DESKTOP_STREAM_SESSION_MUTEXES: OnceLock<Mutex<HashMap<String, Arc<Mutex<
 
 fn desktop_session_stream_mutex(session_id: &str) -> Arc<Mutex<()>> {
     let map = DESKTOP_STREAM_SESSION_MUTEXES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map
-        .lock()
-        .expect("DESKTOP_STREAM_SESSION_MUTEXES poisoned");
+    let mut guard = map.lock().expect("DESKTOP_STREAM_SESSION_MUTEXES poisoned");
     guard
         .entry(session_id.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -348,9 +350,19 @@ pub(crate) struct PiTokenUsagePayload {
     input_tokens: Option<u64>,
     #[serde(alias = "outputTokens", alias = "output", default)]
     output_tokens: Option<u64>,
-    #[serde(alias = "cacheReadTokens", alias = "cacheRead", alias = "cache_read_tokens", default)]
+    #[serde(
+        alias = "cacheReadTokens",
+        alias = "cacheRead",
+        alias = "cache_read_tokens",
+        default
+    )]
     cache_read_tokens: Option<u64>,
-    #[serde(alias = "cacheWriteTokens", alias = "cacheWrite", alias = "cache_write_tokens", default)]
+    #[serde(
+        alias = "cacheWriteTokens",
+        alias = "cacheWrite",
+        alias = "cache_write_tokens",
+        default
+    )]
     cache_write_tokens: Option<u64>,
     #[serde(alias = "totalTokens", alias = "total_tokens", default)]
     total_tokens: Option<u64>,
@@ -703,11 +715,9 @@ fn persist_desktop_outbound_media_items(
     media_items
         .into_iter()
         .map(|item| {
-            let resolved_path = agent_workspace::resolve_agent_media_reference(
-                Some(agent_id),
-                &item.file_path,
-            )
-            .unwrap_or_else(|| PathBuf::from(&item.file_path));
+            let resolved_path =
+                agent_workspace::resolve_agent_media_reference(Some(agent_id), &item.file_path)
+                    .unwrap_or_else(|| PathBuf::from(&item.file_path));
             let source_path = resolved_path.as_path();
             match agent_workspace::persist_agent_outbound_artifact(
                 agent_id,
@@ -746,6 +756,7 @@ fn finalize_desktop_outbound_reply(content: &str, agent_id: Option<&str>) -> Str
     build_desktop_outbound_display_text(&text_reply, &media_items)
 }
 
+#[cfg(test)]
 fn desktop_incomplete_reply_error(
     provider_config: Option<&ProviderRuntimeConfig>,
     saw_prompt_response: bool,
@@ -898,8 +909,15 @@ mod lib_tests {
 
     #[test]
     fn desktop_incomplete_reply_error_prefers_partial_assistant_message() {
+        let provider = ProviderRuntimeConfig {
+            provider_id: "openai".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "gpt-4.1".to_string(),
+        };
         let reason =
-            desktop_incomplete_reply_error(None, true, true, true).expect("partial reply reason");
+            desktop_incomplete_reply_error(Some(&provider), true, true, true).expect("partial reply reason");
         assert!(reason.contains("部分 assistant 内容"));
     }
 
@@ -1018,6 +1036,41 @@ fn send_pi_prompt_command(
     Ok(())
 }
 
+fn maybe_repair_pi_runtime_from_command(command: &mut Command) -> bool {
+    let runtime_root = command.get_envs().find_map(|(key, value)| {
+        if key.to_string_lossy() == "NINECLAW_PI_RUNTIME_ROOT" {
+            value.map(PathBuf::from)
+        } else {
+            None
+        }
+    });
+
+    let Some(runtime_root) = runtime_root else {
+        return false;
+    };
+
+    if let Err(error) = pi_runtime::repair_runtime_directory(&runtime_root) {
+        dev_trace(
+            "desktop.stream",
+            format!(
+                "pi 启动前自动修复 runtime 失败: root={} error={}",
+                runtime_root.display(),
+                error
+            ),
+        );
+        return false;
+    }
+
+    dev_trace(
+        "desktop.stream",
+        format!(
+            "pi 启动前已自动修复 runtime 目录，将重试一次: {}",
+            runtime_root.display()
+        ),
+    );
+    true
+}
+
 fn spawn_desktop_pi_child_fresh(
     mut command: Command,
     normalized_session_id: &str,
@@ -1031,24 +1084,35 @@ fn spawn_desktop_pi_child_fresh(
     ),
     String,
 > {
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("调用 pi 失败，请确认已安装并在 PATH 中: {error}"))?;
+    let mut child = loop {
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("调用 pi 失败，请确认已安装并在 PATH 中: {error}"))?;
 
-    // Give the kernel a moment to load the binary; detect immediate SIGKILL
-    // (common on macOS for unsigned/quarantined dylibs) before wiring up I/O.
-    thread::sleep(Duration::from_millis(50));
-    if let Some(status) = child
-        .try_wait()
-        .map_err(|error| format!("检查 pi 进程状态失败: {error}"))?
-    {
-        let exit_info = describe_exit_status(status);
-        return Err(format!(
-            "pi 进程启动后立即退出 ({exit_info})，pid={}。\
-             这通常意味着动态库加载失败或系统安全策略阻止了执行。",
-            child.id(),
-        ));
-    }
+        // Give the kernel a moment to load the binary; detect immediate exit
+        // before wiring up I/O.
+        thread::sleep(Duration::from_millis(50));
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("检查 pi 进程状态失败: {error}"))?
+        {
+            let exit_info = describe_exit_status(status);
+            let repaired = maybe_repair_pi_runtime_from_command(&mut command);
+            if repaired {
+                thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+
+            return Err(format!(
+                "pi 进程启动后立即退出 ({exit_info})，pid={}。\
+                 NineClaw 已自动检查运行时目录；这通常意味着动态库加载失败，\
+                 或系统安全策略仍阻止了执行。",
+                child.id(),
+            ));
+        }
+
+        break child;
+    };
 
     let stdin = child
         .stdin
@@ -1103,10 +1167,6 @@ fn kill_child_with_trace(child: &mut Child, session_id: Option<&str>, reason: &s
         ),
     );
     let _ = child.kill();
-}
-
-fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<ChildExitOutcome, String> {
-    wait_for_child_exit_with_trace(child, timeout, None, "wait_for_child_exit:default")
 }
 
 fn describe_exit_status(status: ExitStatus) -> String {
@@ -1254,7 +1314,14 @@ fn desktop_pi_fingerprint(
         .map(|config| config.model.trim())
         .unwrap_or_default();
 
-    for value in [provider_id, api_format, base_url, api_key, model, session_path] {
+    for value in [
+        provider_id,
+        api_format,
+        base_url,
+        api_key,
+        model,
+        session_path,
+    ] {
         blob.extend_from_slice(value.as_bytes());
         blob.push(0);
     }
@@ -1588,7 +1655,8 @@ fn json_i64(value: Option<&serde_json::Value>) -> Option<i64> {
 }
 
 fn json_string(value: Option<&serde_json::Value>) -> Option<String> {
-    value.and_then(|item| item.as_str())
+    value
+        .and_then(|item| item.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
@@ -1607,8 +1675,8 @@ fn upsert_usage_record_from_snapshot(
         return Ok(());
     };
 
-    let turn_id = json_string(turn_obj.get("id"))
-        .ok_or_else(|| "历史快照中的 turn 缺少 id".to_string())?;
+    let turn_id =
+        json_string(turn_obj.get("id")).ok_or_else(|| "历史快照中的 turn 缺少 id".to_string())?;
     let turn_created_at = json_i64(turn_obj.get("createdAt")).unwrap_or(recorded_at);
     let turn_completed_at = json_i64(turn_obj.get("completedAt"));
     let usage = turn_obj.get("usage");
@@ -1618,12 +1686,8 @@ fn upsert_usage_record_from_snapshot(
     };
 
     let usage_meta = extract_usage_metadata_payload(usage);
-    let api = usage_meta
-        .as_ref()
-        .and_then(|item| item.api.clone());
-    let provider = usage_meta
-        .as_ref()
-        .and_then(|item| item.provider.clone());
+    let api = usage_meta.as_ref().and_then(|item| item.api.clone());
+    let provider = usage_meta.as_ref().and_then(|item| item.provider.clone());
     let model = usage_meta
         .as_ref()
         .and_then(|item| item.model.clone())
@@ -1722,9 +1786,8 @@ fn sync_usage_records_from_history_payload(
         let agent = item_obj.get("agent").and_then(|value| value.as_object());
         let agent_id = agent.and_then(|value| json_string(value.get("id")));
         let agent_name = agent.and_then(|value| json_string(value.get("name")));
-        let session_model = json_string(item_obj.get("sessionLlmModel")).or_else(|| {
-            agent.and_then(|value| json_string(value.get("defaultModel")))
-        });
+        let session_model = json_string(item_obj.get("sessionLlmModel"))
+            .or_else(|| agent.and_then(|value| json_string(value.get("defaultModel"))));
 
         let Some(turns) = item_obj.get("turns").and_then(|value| value.as_array()) else {
             continue;
@@ -2007,7 +2070,9 @@ fn write_agent_workspace_file(
 }
 
 #[tauri::command]
-fn list_scheduled_jobs(app: tauri::AppHandle) -> Result<Vec<scheduler::ScheduledJobRecord>, String> {
+fn list_scheduled_jobs(
+    app: tauri::AppHandle,
+) -> Result<Vec<scheduler::ScheduledJobRecord>, String> {
     scheduler::list_jobs(&app)
 }
 
@@ -2030,7 +2095,9 @@ fn trigger_scheduler_job_now(app: tauri::AppHandle, job_id: String) -> Result<()
 }
 
 #[tauri::command]
-fn get_scheduler_status(app: tauri::AppHandle) -> Result<scheduler::SchedulerRuntimeStatus, String> {
+fn get_scheduler_status(
+    app: tauri::AppHandle,
+) -> Result<scheduler::SchedulerRuntimeStatus, String> {
     scheduler::runtime_status(&app)
 }
 
@@ -2042,6 +2109,61 @@ fn install_scheduler_service() -> Result<scheduler::SchedulerServiceStatus, Stri
 #[tauri::command]
 fn uninstall_scheduler_service() -> Result<scheduler::SchedulerServiceStatus, String> {
     scheduler::uninstall_service()
+}
+
+#[tauri::command]
+fn handle_agent_task_prompt(
+    app: tauri::AppHandle,
+    prompt: String,
+    session_id: String,
+    agent_id: String,
+) -> Result<AgentTaskPromptResult, String> {
+    agent_tasks::handle_prompt(&app, &prompt, &session_id, &agent_id)
+}
+
+#[tauri::command]
+fn list_agent_task_deliveries(
+    app: tauri::AppHandle,
+    session_ids: Vec<String>,
+) -> Result<Vec<AgentTaskDeliveryRecord>, String> {
+    agent_tasks::list_delivery_records(&app, &session_ids)
+}
+
+#[tauri::command]
+fn list_agent_tasks(
+    app: tauri::AppHandle,
+    agent_id: Option<String>,
+) -> Result<Vec<AgentTaskListItem>, String> {
+    agent_tasks::list_tasks(&app, agent_id.as_deref())
+}
+
+#[tauri::command]
+fn pause_agent_task(app: tauri::AppHandle, task_id: String) -> Result<(), String> {
+    agent_tasks::pause_task(&app, &task_id)
+}
+
+#[tauri::command]
+fn resume_agent_task(app: tauri::AppHandle, task_id: String) -> Result<(), String> {
+    agent_tasks::resume_task(&app, &task_id)
+}
+
+#[tauri::command]
+fn delete_agent_task(app: tauri::AppHandle, task_id: String) -> Result<(), String> {
+    agent_tasks::delete_task(&app, &task_id)
+}
+
+#[tauri::command]
+fn update_agent_task(
+    app: tauri::AppHandle,
+    task_id: String,
+    payload: AgentTaskUpdateInput,
+) -> Result<(), String> {
+    agent_tasks::update_task(&app, &task_id, &payload)
+}
+
+#[tauri::command]
+fn run_agent_task_now(app: tauri::AppHandle, task_id: String) -> Result<(), String> {
+    scheduler::trigger_agent_task_now(&app, &task_id)
 }
 
 pub(crate) fn chrono_like_timestamp() -> i64 {
@@ -2220,9 +2342,7 @@ fn anthropic_compat_api_key_env(provider_id: &str) -> String {
     )
 }
 
-fn should_use_desktop_anthropic_compat_extension(
-    provider_config: &ProviderRuntimeConfig,
-) -> bool {
+fn should_use_desktop_anthropic_compat_extension(provider_config: &ProviderRuntimeConfig) -> bool {
     let provider_id = provider_config.provider_id.trim();
     normalize_provider_api_format(&provider_config.api_format, provider_id) == "anthropic"
         && provider_id != "anthropic"
@@ -2244,6 +2364,13 @@ fn resolve_pi_ai_import_path(pi_executable: &Path) -> Option<PathBuf> {
     for root in roots {
         for ancestor in root.ancestors() {
             for candidate in [
+                ancestor
+                    .join("pi-package")
+                    .join("node_modules")
+                    .join("@mariozechner")
+                    .join("pi-ai")
+                    .join("dist")
+                    .join("index.js"),
                 ancestor
                     .join("node_modules")
                     .join("@mariozechner")
@@ -2291,7 +2418,11 @@ fn build_desktop_anthropic_compat_extension_source(
         r#"import {{ createAssistantMessageEventStream, calculateCost, parseStreamingJson }} from {import_path};
 
 function sanitizeSurrogates(text) {{
-  return String(text ?? '').replace(/[\uD800-\uDFFF]/g, '\uFFFD');
+  // 仅替换未成对的 UTF-16 代理项。旧实现会误伤所有 BMP 外字符（emoji 等），全部变成 U+FFFD。
+  return String(text ?? '').replace(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+    '\uFFFD',
+  );
 }}
 
 function anthropicMessagesUrl(baseUrl) {{
@@ -2973,7 +3104,9 @@ fn extract_json_u64(value: Option<&serde_json::Value>) -> Option<u64> {
     })
 }
 
-pub(crate) fn extract_usage_payload(value: Option<&serde_json::Value>) -> Option<PiTokenUsagePayload> {
+pub(crate) fn extract_usage_payload(
+    value: Option<&serde_json::Value>,
+) -> Option<PiTokenUsagePayload> {
     let usage = value?;
     let input_tokens = extract_json_u64(
         usage
@@ -3038,7 +3171,11 @@ pub(crate) fn extract_usage_metadata_payload(
     let api = json_string(payload.get("api"));
     let provider = json_string(payload.get("provider"));
     let model = json_string(payload.get("model"));
-    let response_id = json_string(payload.get("responseId").or_else(|| payload.get("response_id")));
+    let response_id = json_string(
+        payload
+            .get("responseId")
+            .or_else(|| payload.get("response_id")),
+    );
     let timestamp = json_i64(payload.get("timestamp"));
 
     if api.is_none()
@@ -3184,7 +3321,10 @@ async fn abort_pi_stream(session_id: Option<String>) -> Result<(), String> {
     let Some(handle) = get_runtime_handle(&session_id)? else {
         dev_trace(
             "desktop.stream",
-            format!("abort_pi_stream ignored: session={} no_runtime_handle", session_id),
+            format!(
+                "abort_pi_stream ignored: session={} no_runtime_handle",
+                session_id
+            ),
         );
         return Ok(());
     };
@@ -3397,10 +3537,8 @@ async fn stream_pi_prompt(
         let session_path_string = session_path.to_string_lossy().to_string();
         let pi_location = pi_runtime::require_pi_runtime_location(&app)?;
         let resolved_pi_path = pi_location.executable.display().to_string();
-        if let Some(quarantine_msg) =
-            pi_runtime::clear_macos_quarantine_if_present(&pi_location.executable)
-        {
-            dev_trace("desktop.stream", quarantine_msg);
+        if let Some(runtime_repair_msg) = pi_runtime::repair_runtime_and_report(&pi_location) {
+            dev_trace("desktop.stream", runtime_repair_msg);
         }
         let mut command = Command::new(&pi_location.executable);
         pi_runtime::apply_runtime_environment(&mut command, &pi_location);
@@ -4212,8 +4350,7 @@ async fn stream_pi_prompt(
 
                         final_usage = final_usage.or_else(|| {
                             let usage_val = last_assistant.get("usage");
-                            let result = extract_usage_payload(usage_val);
-                            result
+                            extract_usage_payload(usage_val)
                         });
                         final_usage_meta = final_usage_meta
                             .or_else(|| extract_usage_metadata_payload(Some(last_assistant)));
@@ -4469,40 +4606,14 @@ async fn stream_pi_prompt(
                         fallback_error =
                             format!("{fallback_error}\npi 进程信号终止: {sig}");
                         if sig == 9 && !saw_any_output && !exit_outcome.timed_out {
-                            fallback_error.push_str("\n\n诊断：pi 进程启动后立即被 SIGKILL (signal 9) 终止，无任何输出。");
-                            #[cfg(target_os = "macos")]
-                            {
-                                fallback_error.push_str(
-                                    "这通常由 macOS 安全机制（隔离属性或代码签名）引起。\n\n\
-                                     修复步骤：\n\
-                                     1. 在终端执行以下命令移除隔离属性：\n\
-                                     xattr -cr <pi路径>\n\
-                                     2. 或在 系统设置 > 隐私与安全性 中允许运行\n\
-                                     3. 确认 pi 二进制文件存在且可执行",
-                                );
-                            }
-                            #[cfg(not(target_os = "macos"))]
-                            {
-                                fallback_error.push_str(
-                                    "可能原因：\n\
-                                     1. OOM Killer 终止了进程（检查 dmesg / journalctl）\n\
-                                     2. 二进制文件损坏或缺少动态库\n\
-                                     3. 安全策略（AppArmor / SELinux）阻止了执行",
-                                );
-                            }
-                            fallback_error.push_str(&format!(
-                                "\n\npi 二进制路径: {}",
-                                resolved_pi_path,
-                            ));
-                            let mut session_path_display = session_path_string.clone();
-                            if session_path_display.len() > 80 {
-                                session_path_display.truncate(77);
-                                session_path_display.push_str("...");
-                            }
-                            fallback_error.push_str(&format!(
-                                "\n可手动测试: {} --mode rpc --session {}",
-                                resolved_pi_path, session_path_display,
-                            ));
+                            fallback_error.push_str(
+                                "\n\n诊断：pi 进程启动后立即被系统终止且没有任何输出。\
+                                 NineClaw 已自动校验并修复 runtime 目录权限、扩展属性，\
+                                 并在启动前尝试重新修复；如果你刚刚拒绝过 macOS 的安全放行，\
+                                 请到“系统设置 > 隐私与安全性”里允许 NineClaw 或 pi 继续运行，\
+                                 然后直接重新发送这条消息。",
+                            );
+                            fallback_error.push_str(&format!("\n当前 pi 路径: {}", resolved_pi_path));
                         }
                     } else if let Some(code) = st.code() {
                         fallback_error =
@@ -5151,26 +5262,40 @@ pub fn run() {
         .setup(|app| {
             dev_trace("app", "NineClaw 启动");
             resize_main_window_to_screen(&app.handle());
-            let status = pi_runtime::ensure_runtime_dependencies_impl(&app.handle());
-            if !status.pi_available {
-                log::warn!("runtime dependency check: {}", status.messages.join(" | "));
-            }
-            if let Err(error) = auto_start_bound_im_services(&app.handle()) {
-                log::warn!("应用启动时自动检测 IM 机器人绑定失败: {}", error);
-            }
-            match agents::backfill_peer_inbound_secrets(&app.handle()) {
-                Ok(count) if count > 0 => {
-                    log::info!("已为 {count} 个智能体补全对等入站独立密钥");
+
+            // Defer heavy runtime initialization to a background thread so the
+            // window renders immediately.  The frontend listens for the
+            // "pi://runtime-ready" event to know when PI features are available.
+            let app_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                dev_trace("app", "后台 runtime 初始化开始");
+                let status = pi_runtime::ensure_runtime_dependencies_impl(&app_handle);
+                if !status.pi_available {
+                    log::warn!("runtime dependency check: {}", status.messages.join(" | "));
                 }
-                Ok(_) => {}
-                Err(error) => {
-                    log::warn!("对等入站密钥补全未执行: {error}");
+                dev_trace("app", "后台 runtime 初始化完成");
+
+                // Notify frontend that the PI runtime is ready
+                let _ = app_handle.emit("pi://runtime-ready", status.pi_available);
+
+                // Start IM services after runtime is ready
+                if let Err(error) = auto_start_bound_im_services(&app_handle) {
+                    log::warn!("应用启动时自动检测 IM 机器人绑定失败: {}", error);
                 }
-            }
-            if let Err(error) = peer_gateway::restart_peer_gateway(&app.handle()) {
-                log::warn!("对等网关启动: {error}");
-            }
-            scheduler::start_embedded_scheduler(app.handle().clone());
+                match agents::backfill_peer_inbound_secrets(&app_handle) {
+                    Ok(count) if count > 0 => {
+                        log::info!("已为 {count} 个智能体补全对等入站独立密钥");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::warn!("对等入站密钥补全未执行: {error}");
+                    }
+                }
+                if let Err(error) = peer_gateway::restart_peer_gateway(&app_handle) {
+                    log::warn!("对等网关启动: {error}");
+                }
+                scheduler::start_embedded_scheduler(app_handle);
+            });
 
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -5211,6 +5336,14 @@ pub fn run() {
             get_scheduler_status,
             install_scheduler_service,
             uninstall_scheduler_service,
+            handle_agent_task_prompt,
+            list_agent_task_deliveries,
+            list_agent_tasks,
+            pause_agent_task,
+            resume_agent_task,
+            delete_agent_task,
+            update_agent_task,
+            run_agent_task_now,
             stream_pi_prompt,
             abort_pi_stream,
             persist_chat_attachments,

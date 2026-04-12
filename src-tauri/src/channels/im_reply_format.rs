@@ -174,7 +174,9 @@ fn split_content_by_markdown_h2(content: &str) -> Vec<ReplyCardItem> {
     let mut current_title: Option<String> = None;
     let mut buf: Vec<&str> = Vec::new();
 
-    let flush = |current_title: &mut Option<String>, buf: &mut Vec<&str>, cards: &mut Vec<ReplyCardItem>| {
+    let flush = |current_title: &mut Option<String>,
+                 buf: &mut Vec<&str>,
+                 cards: &mut Vec<ReplyCardItem>| {
         let body = buf.join("\n").trim().to_string();
         buf.clear();
         let title = current_title.take();

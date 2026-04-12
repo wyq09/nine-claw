@@ -1,4 +1,7 @@
 export type IconName =
+  | 'arrow-down'
+  | 'arrow-left'
+  | 'arrow-up'
   | 'attachment'
   | 'bag'
   | 'book'
@@ -7,6 +10,7 @@ export type IconName =
   | 'chevron-down'
   | 'clock'
   | 'close'
+  | 'download'
   | 'folder'
   | 'keyboard'
   | 'message'
@@ -26,9 +30,12 @@ export type IconName =
   | 'stop'
   | 'trash'
   | 'wrench'
+  | 'zap'
   | 'upload'
   | 'qr'
   | 'check'
+  | 'eye'
+  | 'eye-off'
 
 export function AppIcon({ name, size = 20 }: { name: IconName; size?: number }) {
   const stroke = 1.8
@@ -43,9 +50,27 @@ export function AppIcon({ name, size = 20 }: { name: IconName; size?: number }) 
       width={size}
       xmlns="http://www.w3.org/2000/svg"
     >
+      {name === 'arrow-left' ? (
+        <path d="M15 6 9 12l6 6M9 12h10" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
+      ) : null}
+      {name === 'arrow-down' ? (
+        <path d="M12 5v14M6 13l6 6 6-6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
+      ) : null}
+      {name === 'arrow-up' ? (
+        <path
+          d="M12 19V5M5 12l7-7 7 7"
+          stroke="currentColor"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={stroke}
+        />
+      ) : null}
       {name === 'plus' ? <path d="M12 5v14M5 12h14" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} /> : null}
       {name === 'spark' ? (
         <path d="m12 3 1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z" stroke="currentColor" strokeLinejoin="round" strokeWidth={stroke} />
+      ) : null}
+      {name === 'zap' ? (
+        <path d="M13.5 3 6.8 12h4.4L10.5 21l6.7-9h-4.4L13.5 3Z" fill="currentColor" />
       ) : null}
       {name === 'book' ? (
         <>
@@ -100,7 +125,7 @@ export function AppIcon({ name, size = 20 }: { name: IconName; size?: number }) 
       ) : null}
       {name === 'attachment' ? <path d="M8.5 12.5 14 7a3 3 0 1 1 4.2 4.2l-6.8 6.8a5 5 0 1 1-7.1-7.1l7.1-7.1" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} /> : null}
       {name === 'send' ? <path d="m5 12 14-7-3 14-4.2-5.2L5 12Z" fill="currentColor" /> : null}
-      {name === 'stop' ? <rect x="7" y="7" width="10" height="10" rx="2.4" fill="currentColor" /> : null}
+      {name === 'stop' ? <rect x="8" y="8" width="8" height="8" rx="1.2" fill="currentColor" /> : null}
       {name === 'search' ? (
         <>
           <circle cx="11" cy="11" r="5.5" stroke="currentColor" strokeWidth={stroke} />
@@ -126,6 +151,12 @@ export function AppIcon({ name, size = 20 }: { name: IconName; size?: number }) 
         <>
           <path d="M12 16V6M8 10l4-4 4 4" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
           <path d="M5 18h14" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} />
+        </>
+      ) : null}
+      {name === 'download' ? (
+        <>
+          <path d="M12 8v10M8 14l4 4 4-4" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
+          <path d="M5 20h14" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} />
         </>
       ) : null}
       {name === 'folder' ? (
@@ -190,6 +221,29 @@ export function AppIcon({ name, size = 20 }: { name: IconName; size?: number }) 
       ) : null}
       {name === 'check' ? (
         <path d="M5 13 9 17 19 7" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
+      ) : null}
+      {name === 'eye' ? (
+        <>
+          <path
+            d="M2.5 12s3.4-6 9.5-6 9.5 6 9.5 6-3.4 6-9.5 6-9.5-6-9.5-6Z"
+            stroke="currentColor"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth={stroke}
+          />
+          <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth={stroke} />
+        </>
+      ) : null}
+      {name === 'eye-off' ? (
+        <>
+          <path
+            d="M3 3l18 18M10.7 6.2A10.6 10.6 0 0 1 12 6c6.1 0 9.5 6 9.5 6a16.4 16.4 0 0 1-4.1 4.6M6.2 6.7A15.3 15.3 0 0 0 2.5 12s3.4 6 9.5 6c1.5 0 2.8-.3 4-.8M10.2 10.2A3 3 0 0 0 12 15a3 3 0 0 0 1.8-.6"
+            stroke="currentColor"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth={stroke}
+          />
+        </>
       ) : null}
     </svg>
   )

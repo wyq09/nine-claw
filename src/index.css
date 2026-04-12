@@ -1,13 +1,23 @@
 @import 'tailwindcss';
 @source '../node_modules/streamdown/dist/*.js';
 
-/* Streamdown 使用 shadcn/Tailwind 语义色；未配置时 border / sidebar 等工具类不生效 */
+/* Streamdown 使用 shadcn/Tailwind 语义色；这里把它接到运行时主题变量上。 */
 @theme inline {
-  --color-border: #dbe1ec;
-  --color-sidebar: #f5f7fb;
-  --color-sidebar-border: #dbe1ec;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-border: var(--sidebar-border);
 }
 
+/* 这里仅保留首屏回退值，真正的主题变量由 src/theme/themePresets.ts 统一注入。 */
 :root {
   font-family:
     'SF Pro Display',
@@ -18,24 +28,24 @@
     sans-serif;
   line-height: 1.5;
   font-weight: 400;
-  color: #171c28;
-  background: #ffffff;
+  color: var(--foreground, rgba(255, 255, 255, 0.94));
+  background: var(--background, #151619);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  --background: #ffffff;
-  --foreground: #171c28;
-  --card: #ffffff;
-  --card-foreground: #171c28;
-  --muted: #f5f7fb;
-  --muted-foreground: #6f7b91;
-  --border: #dbe1ec;
-  --sidebar: #f5f7fb;
-  --sidebar-border: #dbe1ec;
-  --input: #dbe1ec;
-  --primary: #171c28;
-  --primary-foreground: #ffffff;
+  --background: var(--app-bg, #151619);
+  --foreground: var(--text, rgba(255, 255, 255, 0.94));
+  --card: var(--panel, #1b1c20);
+  --card-foreground: var(--text, rgba(255, 255, 255, 0.94));
+  --muted: var(--panel-muted, #2a2c31);
+  --muted-foreground: var(--text-muted, rgba(255, 255, 255, 0.62));
+  --border: var(--chrome-border, rgba(255, 255, 255, 0.12));
+  --sidebar: var(--chrome-sidebar, #27282d);
+  --sidebar-border: var(--chrome-border, rgba(255, 255, 255, 0.12));
+  --input: var(--surface-input, rgba(255, 255, 255, 0.12));
+  --primary: var(--blue, #4f7cff);
+  --primary-foreground: var(--primary-button-fg, #111114);
   --radius: 0.875rem;
 }
 
@@ -49,7 +59,8 @@ body,
 body {
   margin: 0;
   overflow: hidden;
-  background: #ffffff;
+  background: var(--app-bg, #151619);
+  color: var(--text, rgba(255, 255, 255, 0.94));
 }
 
 #root {

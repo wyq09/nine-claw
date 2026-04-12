@@ -2,6 +2,10 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type {
   AgentInput,
+  AgentTaskDeliveryRecord,
+  AgentTaskListItem,
+  AgentTaskPromptResult,
+  AgentTaskUpdateInput,
   AgentRecord,
   AgentWorkspaceBundle,
   PeerGatewayInfo,
@@ -40,6 +44,52 @@ export async function streamPiPrompt(
     agentConfig: options?.agentConfig ?? null,
     attachments: options?.attachments ?? [],
   })
+}
+
+export async function handleAgentTaskPrompt(payload: {
+  prompt: string
+  sessionId: string
+  agentId: string
+}): Promise<AgentTaskPromptResult> {
+  return invoke<AgentTaskPromptResult>('handle_agent_task_prompt', {
+    prompt: payload.prompt,
+    sessionId: payload.sessionId,
+    agentId: payload.agentId,
+  })
+}
+
+export async function listAgentTaskDeliveries(
+  sessionIds: string[],
+): Promise<AgentTaskDeliveryRecord[]> {
+  return invoke<AgentTaskDeliveryRecord[]>('list_agent_task_deliveries', {
+    sessionIds,
+  })
+}
+
+export async function listAgentTasks(agentId?: string | null): Promise<AgentTaskListItem[]> {
+  return invoke<AgentTaskListItem[]>('list_agent_tasks', {
+    agentId: agentId ?? null,
+  })
+}
+
+export async function pauseAgentTask(taskId: string): Promise<void> {
+  await invoke('pause_agent_task', { taskId })
+}
+
+export async function resumeAgentTask(taskId: string): Promise<void> {
+  await invoke('resume_agent_task', { taskId })
+}
+
+export async function deleteAgentTask(taskId: string): Promise<void> {
+  await invoke('delete_agent_task', { taskId })
+}
+
+export async function updateAgentTask(taskId: string, payload: AgentTaskUpdateInput): Promise<void> {
+  await invoke('update_agent_task', { taskId, payload })
+}
+
+export async function runAgentTaskNow(taskId: string): Promise<void> {
+  await invoke('run_agent_task_now', { taskId })
 }
 
 export async function abortPiStream(sessionId?: string | null): Promise<void> {

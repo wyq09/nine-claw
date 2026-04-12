@@ -244,7 +244,10 @@ export const defaultGeneralSettings: GeneralSettings = {
 }
 
 export const defaultAppearanceSettings: AppearanceSettings = {
+  themeMode: 'dark',
   compactSidebar: false,
+  sidebarCollapsed: false,
+  showThinkingProcess: true,
   showExecutionRail: true,
   preferReducedMotion: false,
 }

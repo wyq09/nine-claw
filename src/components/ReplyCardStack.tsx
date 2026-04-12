@@ -1,4 +1,5 @@
 import { lazy, Suspense, type MouseEvent } from 'react'
+import { openExternalUrl } from '../lib/piClient'
 import type { ReplyCardItem } from '../lib/replyCardFormat'
 
 const MarkdownRenderer = lazy(() => import('./MarkdownRenderer'))
@@ -17,13 +18,23 @@ export default function ReplyCardStack({ items, isStreaming, onImageClick }: Rep
   const lastStreamingIndex = isStreaming ? Math.max(0, items.length - 1) : -1
 
   const handleClick = (event: MouseEvent<HTMLDivElement>) => {
-    if (!onImageClick) {
-      return
-    }
     const target = event.target
     if (!(target instanceof HTMLElement)) {
       return
     }
+
+    const anchor = target.closest('a[href]')
+    if (anchor instanceof HTMLAnchorElement && anchor.href) {
+      event.preventDefault()
+      event.stopPropagation()
+      void openExternalUrl(anchor.href)
+      return
+    }
+
+    if (!onImageClick) {
+      return
+    }
+
     const image = target.closest('img')
     if (!(image instanceof HTMLImageElement) || !image.src) {
       return

@@ -15,6 +15,7 @@ const repoOnlyMonoPackageNames = ['@mariozechner/pi-pods']
 const projectRoot = process.cwd()
 const localNodeModulesRoot = path.resolve(projectRoot, 'node_modules')
 const resourceRoot = path.resolve(projectRoot, 'src-tauri', 'resources', 'pi-runtime')
+const archiveRoot = path.resolve(projectRoot, 'src-tauri', 'resources', 'pi-runtime-bundles')
 const readmePath = path.join(resourceRoot, 'README.md')
 let cachedGlobalNpmRoot = null
 
@@ -351,6 +352,54 @@ function cleanPlatformDir(platformDir) {
   return targetDir
 }
 
+function ensureArchiveRoot() {
+  fs.mkdirSync(archiveRoot, { recursive: true })
+}
+
+function removeMacExtendedAttributes(targetPath) {
+  if (process.platform !== 'darwin') return
+  spawnSync('xattr', ['-cr', targetPath], { stdio: 'ignore' })
+}
+
+function createRuntimeArchiveWithPython(platformDir, archivePath) {
+  const script = `
+import os
+import tarfile
+
+resource_root = ${JSON.stringify(resourceRoot)}
+archive_path = ${JSON.stringify(archivePath)}
+platform_dir = ${JSON.stringify(platformDir)}
+source_path = os.path.join(resource_root, platform_dir)
+
+with tarfile.open(archive_path, "w:gz", dereference=True) as archive:
+    archive.add(source_path, arcname=platform_dir, recursive=True)
+`
+  const result = spawnSync('python3', ['-c', script], { encoding: 'utf8' })
+  if (result.status !== 0) {
+    const detail = result.stderr?.trim() || result.stdout?.trim() || `exit ${result.status ?? 'unknown'}`
+    throw new Error(`python3 tarfile fallback failed: ${detail}`)
+  }
+}
+
+function createRuntimeArchive(platformDir) {
+  ensureArchiveRoot()
+  const archivePath = path.join(archiveRoot, `${platformDir}.tar.gz`)
+  fs.rmSync(archivePath, { force: true })
+  let result = spawnSync(
+    'tar',
+    ['-czf', archivePath, '-C', resourceRoot, platformDir],
+    { encoding: 'utf8' },
+  )
+  if (result.status !== 0) {
+    const detail = result.stderr?.trim() || result.stdout?.trim() || `exit ${result.status ?? 'unknown'}`
+    console.warn(`[prepare-pi-runtime] system tar failed, falling back to python3 tarfile: ${detail}`)
+    fs.rmSync(archivePath, { force: true })
+    createRuntimeArchiveWithPython(platformDir, archivePath)
+  }
+  removeMacExtendedAttributes(archivePath)
+  return archivePath
+}
+
 function resolveRuntimePackageDir() {
   const envPath = process.env.PI_RUNTIME_PACKAGE_DIR?.trim()
   if (envPath) {
@@ -370,13 +419,246 @@ function resolveRuntimePackageDir() {
   return candidate
 }
 
-function resolveNodeExecutable() {
+function resolveNodeExecutable(platformDir) {
   const envPath = process.env.PI_RUNTIME_NODE_PATH?.trim()
-  const executable = envPath ? path.resolve(envPath) : fs.realpathSync(process.execPath)
+  if (envPath) {
+    const executable = path.resolve(envPath)
+    if (!fs.existsSync(executable)) {
+      throw new Error(`Node executable not found: ${executable}`)
+    }
+    return executable
+  }
+
+  // Try to download an official, properly-signed Node.js binary.
+  // On macOS the bundled thin node (68KB @loader_path wrapper) gets SIGKILL'd
+  // by SIP/AMFI, so we need a real node from nodejs.org.
+  const officialNode = downloadOfficialNode(platformDir)
+  if (officialNode) return officialNode
+
+  // Fallback: use the node running this build script
+  console.warn('[prepare-pi-runtime] Falling back to current process node (may not work on macOS)')
+  const executable = fs.realpathSync(process.execPath)
   if (!fs.existsSync(executable)) {
     throw new Error(`Node executable not found: ${executable}`)
   }
   return executable
+}
+
+// ---------------------------------------------------------------------------
+// Official Node.js binary download
+// ---------------------------------------------------------------------------
+
+const NODE_DIST_BASE = 'https://nodejs.org/dist'
+
+function getNodePlatformTriplet(platformDir) {
+  if (platformDir === 'macos') return `darwin-${process.arch}`
+  if (platformDir === 'windows') return 'win-x64'
+  return `linux-${process.arch}`
+}
+
+function getNodeVersion() {
+  return process.version.replace(/^v/, '') // e.g. "22.18.0"
+}
+
+function officialNodeCacheDir() {
+  return path.join(projectRoot, '.cache', 'node-binaries')
+}
+
+function downloadOfficialNode(platformDir) {
+  const version = getNodeVersion()
+  const triplet = getNodePlatformTriplet(platformDir)
+  const nodeExeName = platformDir === 'windows' ? 'node.exe' : 'node'
+  const cacheKey = `node-v${version}-${triplet}`
+  const cachedExePath = path.join(officialNodeCacheDir(), cacheKey, 'bin', nodeExeName)
+  // Windows zip layout: node-v22.x.x-win-x64/node.exe
+  const cachedWinExePath = path.join(officialNodeCacheDir(), cacheKey, nodeExeName)
+
+  if (fs.existsSync(cachedExePath)) {
+    console.log(`[prepare-pi-runtime] Using cached official Node.js v${version} (${triplet})`)
+    return cachedExePath
+  }
+  if (platformDir === 'windows' && fs.existsSync(cachedWinExePath)) {
+    console.log(`[prepare-pi-runtime] Using cached official Node.js v${version} (${triplet})`)
+    return cachedWinExePath
+  }
+
+  const archiveExt = platformDir === 'windows' ? 'zip' : 'tar.gz'
+  const archiveName = `${cacheKey}.${archiveExt}`
+  const url = `${NODE_DIST_BASE}/v${version}/${archiveName}`
+
+  console.log(`[prepare-pi-runtime] Downloading official Node.js v${version} (${triplet})...`)
+  console.log(`[prepare-pi-runtime] URL: ${url}`)
+
+  const tmpDir = path.join(officialNodeCacheDir(), '.tmp', cacheKey)
+  fs.rmSync(tmpDir, { recursive: true, force: true })
+  fs.mkdirSync(tmpDir, { recursive: true })
+
+  const archivePath = path.join(tmpDir, archiveName)
+
+  // Download (retry up to 3 times)
+  let curlResult = null
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    // Remove stale partial download before retry
+    if (fs.existsSync(archivePath)) fs.rmSync(archivePath, { force: true })
+    curlResult = spawnSync('curl', [
+      '--fail', '--location', '--progress-bar',
+      '--output', archivePath,
+      '--retry', '2',
+      '--connect-timeout', '30',
+      url,
+    ], { encoding: 'utf8', stdio: ['pipe', 'inherit', 'inherit'] })
+    if (curlResult.status === 0) break
+    console.warn(`[prepare-pi-runtime] Download attempt ${attempt} failed (exit ${curlResult.status})`)
+  }
+
+  if (curlResult.status !== 0 || !fs.existsSync(archivePath)) {
+    console.warn(`[prepare-pi-runtime] Failed to download official Node.js: curl exit ${curlResult.status}`)
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+    return null
+  }
+
+  // Extract
+  const extractDir = path.join(officialNodeCacheDir(), cacheKey)
+  fs.rmSync(extractDir, { recursive: true, force: true })
+  fs.mkdirSync(extractDir, { recursive: true })
+
+  if (platformDir === 'windows') {
+    // Use python to extract zip (available on macOS/Linux for cross-build)
+    const script = `
+import zipfile, sys
+with zipfile.ZipFile(${JSON.stringify(archivePath)}) as zf:
+    zf.extractall(${JSON.stringify(extractDir)})
+`
+    const pyResult = spawnSync('python3', ['-c', script], { encoding: 'utf8' })
+    if (pyResult.status !== 0) {
+      console.warn('[prepare-pi-runtime] Failed to extract Node.js zip')
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+      return null
+    }
+  } else {
+    const tarResult = spawnSync('tar', ['-xzf', archivePath, '-C', extractDir], { encoding: 'utf8' })
+    if (tarResult.status !== 0) {
+      console.warn('[prepare-pi-runtime] Failed to extract Node.js tarball')
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+      return null
+    }
+  }
+
+  // Cleanup temp download
+  fs.rmSync(tmpDir, { recursive: true, force: true })
+
+  // Verify extraction — tar creates a versioned subdirectory
+  let exePath = platformDir === 'windows' ? cachedWinExePath : cachedExePath
+  if (!fs.existsSync(exePath)) {
+    // tar archives contain a top-level versioned directory, e.g. node-v22.18.0-darwin-arm64/
+    const versionedDir = path.join(extractDir, cacheKey)
+    const altPath = path.join(versionedDir, 'bin', nodeExeName)
+    const altWinPath = path.join(versionedDir, nodeExeName)
+    if (fs.existsSync(altPath)) {
+      exePath = altPath
+    } else if (platformDir === 'windows' && fs.existsSync(altWinPath)) {
+      exePath = altWinPath
+    } else {
+      console.warn(`[prepare-pi-runtime] Extracted node binary not found at ${exePath}`)
+      return null
+    }
+  }
+
+  // macOS: ad-hoc sign the binary so SIP/AMFI doesn't kill it
+  if (platformDir === 'macos') {
+    try {
+      signMacBinary(exePath)
+    } catch (error) {
+      console.warn(`[prepare-pi-runtime] Warning: could not sign downloaded node: ${error.message}`)
+    }
+  }
+
+  console.log(`[prepare-pi-runtime] Official Node.js v${version} (${triplet}) ready at ${exePath}`)
+  return exePath
+}
+
+/**
+ * npm hoists most dependencies to the top-level node_modules/, leaving only
+ * a subset in the package's own node_modules/.  When we copy the package
+ * directory, hoisted deps are missing.  This function reads the package's
+ * declared dependencies and copies any that exist in the top-level
+ * node_modules/ but are absent from the target bundle.
+ */
+/**
+ * Recursively copy all dependencies (including transitive) that are hoisted
+ * to the top-level node_modules/ and missing from the target bundle.
+ *
+ * npm hoists most packages to the project root node_modules/. When we copy
+ * just the package directory, hoisted deps (and their deps, etc.) are missing.
+ * This walks the full dependency graph and copies anything not yet present.
+ */
+function copyHoistedDependencies(sourcePackageDir, targetPackageDir) {
+  const targetNodeModules = path.join(targetPackageDir, 'node_modules')
+  fs.mkdirSync(targetNodeModules, { recursive: true })
+
+  const copied = new Set()
+  const queue = []
+
+  // Seed: direct dependencies of the root package
+  const rootPkgJson = readPackageJson(sourcePackageDir)
+  if (rootPkgJson) {
+    enqueueDeps(queue, rootPkgJson, sourcePackageDir)
+  }
+
+  while (queue.length > 0) {
+    const { depName, contextDir } = queue.shift()
+    if (copied.has(depName)) continue
+
+    const targetDepPath = path.join(targetNodeModules, depName)
+    if (fs.existsSync(targetDepPath)) {
+      // Already present (came with the package or copied earlier) — still
+      // need to process its dependencies in case they're also hoisted.
+      const existingPkgJson = readPackageJson(targetDepPath)
+      if (existingPkgJson) {
+        enqueueDeps(queue, existingPkgJson, targetDepPath)
+      }
+      copied.add(depName)
+      continue
+    }
+
+    // Find the dep in the build machine's node_modules hierarchy
+    const sourceDepPath = resolveInstalledPackageDir(depName, { localFirst: true, includeGlobal: false })
+    if (!sourceDepPath) {
+      // Some deps are optional or platform-specific — don't fail the build
+      continue
+    }
+
+    copyRecursive(sourceDepPath, targetDepPath)
+    rewritePackageSymlinks(targetDepPath, sourceDepPath)
+    copied.add(depName)
+
+    // Enqueue this package's own dependencies for processing
+    const depPkgJson = readPackageJson(sourceDepPath)
+    if (depPkgJson) {
+      enqueueDeps(queue, depPkgJson, sourceDepPath)
+    }
+  }
+
+  if (copied.size > 0) {
+    console.log(`[prepare-pi-runtime] Copied ${copied.size} deps (including transitive)`)
+  }
+}
+
+function readPackageJson(pkgDir) {
+  const p = path.join(pkgDir, 'package.json')
+  if (!fs.existsSync(p)) return null
+  return JSON.parse(fs.readFileSync(p, 'utf8'))
+}
+
+function enqueueDeps(queue, pkgJson, contextDir) {
+  const depFields = ['dependencies', 'optionalDependencies']
+  for (const field of depFields) {
+    const deps = pkgJson[field]
+    if (!deps) continue
+    for (const depName of Object.keys(deps)) {
+      queue.push({ depName, contextDir })
+    }
+  }
 }
 
 function writeLauncher(platformDir, targetDir) {
@@ -394,14 +676,34 @@ function writeLauncher(platformDir, targetDir) {
   }
 
   const launcherPath = path.join(targetDir, 'pi')
+  // IMPORTANT: On macOS, the bundled thin node (68KB @loader_path wrapper) is
+  // killed by SIP/AMFI because its dylibs are ad-hoc signed.  We MUST skip
+  // SCRIPT_DIR when searching PATH for node, so the system-installed node is
+  // preferred.  Do NOT simplify this to `command -v node` — see AGENTS.md.
   const content = [
     '#!/bin/sh',
     '# Bundled pi launcher generated during build.',
     'set -eu',
     'SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"',
     'NODE_BIN="$SCRIPT_DIR/node"',
-    'if [ "$(uname -s)" = "Darwin" ] && command -v node >/dev/null 2>&1; then',
-    '  NODE_BIN="$(command -v node)"',
+    'if [ "$(uname -s)" = "Darwin" ]; then',
+    '  _saved_IFS="$IFS"',
+    '  IFS=\'=\'',
+    '  IFS=\':\'',
+    '  _found=',
+    '  for _dir in $PATH; do',
+    '    case "$_dir" in',
+    '      "$SCRIPT_DIR") continue ;;',
+    '    esac',
+    '    if [ -x "$_dir/node" ]; then',
+    '      _found="$_dir/node"',
+    '      break',
+    '    fi',
+    '  done',
+    '  IFS="$_saved_IFS"',
+    '  if [ -n "$_found" ]; then',
+    '    NODE_BIN="$_found"',
+    '  fi',
     'fi',
     'if [ -d "$SCRIPT_DIR/lib" ]; then',
     '  export DYLD_LIBRARY_PATH="$SCRIPT_DIR/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"',
@@ -574,7 +876,7 @@ function main() {
   const platformDir = resolvePlatformDir(process.argv[2] ?? process.env.PI_RUNTIME_PLATFORM)
   const targetDir = cleanPlatformDir(platformDir)
   const packageDir = resolveRuntimePackageDir()
-  const nodeExecutable = resolveNodeExecutable()
+  const nodeExecutable = resolveNodeExecutable(platformDir)
   const nodeTargetName = platformDir === 'windows' ? 'node.exe' : 'node'
   const nodeTargetPath = path.join(targetDir, nodeTargetName)
   const packageTargetPath = path.join(targetDir, 'pi-package')
@@ -590,6 +892,7 @@ function main() {
 
   copyRecursive(packageDir, packageTargetPath)
   rewritePackageSymlinks(packageTargetPath, packageDir)
+  copyHoistedDependencies(packageDir, packageTargetPath)
   const launcherPath = writeLauncher(platformDir, targetDir)
   const monoBundle = stageMonoBundle(targetDir)
 
@@ -608,7 +911,11 @@ function main() {
     fs.copyFileSync(readmePath, path.join(targetDir, 'README.md'))
   }
 
+  removeMacExtendedAttributes(targetDir)
+  const archivePath = createRuntimeArchive(platformDir)
+
   console.log(`Bundled pi runtime prepared for ${platformDir}: ${targetDir}`)
+  console.log(`Bundled pi runtime archive prepared: ${archivePath}`)
 }
 
 main()

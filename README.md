@@ -60,6 +60,29 @@ npm run tauri dev
   - `clear_pi_session`（清理会话文件）
 - `src-tauri/tauri.conf.json`：Tauri 2.0 配置
 - `src-tauri/src/pi_runtime.rs`：统一的 `pi` 运行时解析与打包入口
+- `src-tauri/src/scheduler/`：定时任务 materialization、调度循环、运行记录与 service 安装逻辑
+
+## Scheduler
+
+NineClaw 现在包含一套新的 scheduler core：
+
+- `scheduled_jobs` / `scheduled_job_runs` / `scheduler_leases` 三张表
+- 应用内嵌 scheduler 线程作为 fallback
+- 同一二进制支持后台 daemon 模式：
+
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml -- --scheduler-daemon
+```
+
+如只想跑一轮扫描用于验证：
+
+```bash
+NINECLAW_SCHEDULER_RUN_ONCE=1 cargo run --manifest-path src-tauri/Cargo.toml -- --scheduler-daemon
+```
+
+架构说明见：
+
+- `docs/SCHEDULER_ARCHITECTURE.md`
 
 ## Agent Workspace
 

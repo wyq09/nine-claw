@@ -183,17 +183,22 @@ pub(crate) fn parse_plain_media_path_reference(line: &str) -> Option<PlainMediaP
         return None;
     }
 
+    let has_reasonable_extension = Path::new(&path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|extension| !extension.is_empty() && extension.len() <= 10)
+        .unwrap_or(false);
     let looks_absolute = path.starts_with('/')
         || (path.len() >= 3
             && path.as_bytes()[1] == b':'
             && matches!(path.as_bytes()[2], b'/' | b'\\')
             && path.as_bytes()[0].is_ascii_alphabetic());
-    let looks_relative_path = path.contains('/') || path.contains('\\');
-    let looks_file_name = Path::new(&path)
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|extension| !extension.is_empty() && extension.len() <= 10)
-        .unwrap_or(false)
+    let looks_relative_path = has_reasonable_extension
+        && (path.starts_with("./")
+            || path.starts_with("../")
+            || path.contains('/')
+            || path.contains('\\'));
+    let looks_file_name = has_reasonable_extension
         && path.chars().all(|char| {
             char.is_ascii_alphanumeric()
                 || matches!(char, '.' | '_' | '-' | ' ' | '(' | ')' | '[' | ']')
@@ -290,5 +295,10 @@ mod tests {
         let parsed =
             parse_plain_media_path_reference("`/Users/demo/Desktop/test image.png`").expect("path");
         assert_eq!(parsed.path, "/Users/demo/Desktop/test image.png");
+    }
+
+    #[test]
+    fn does_not_parse_plain_instruction_text_with_slash_as_path() {
+        assert!(parse_plain_media_path_reference("压缩/裁剪这张").is_none());
     }
 }

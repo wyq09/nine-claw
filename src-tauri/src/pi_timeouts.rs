@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 const DEFAULT_TOTAL_SECS: u64 = 1800;
-const DEFAULT_IO_SECS: u64 = 60;
+const DEFAULT_IO_SECS: u64 = 1800;
 const MIN_TOTAL_SECS: u64 = 30;
 const MAX_TOTAL_SECS: u64 = 30 * 24 * 3600;
 const MIN_IO_SECS: u64 = 10;

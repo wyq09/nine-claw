@@ -357,10 +357,7 @@ pub fn build_agent_system_prompt_for_prompt(
         } else {
             String::new()
         };
-        sections.push(format!(
-            "已挂载技能：{}{}",
-            listed, suffix
-        ));
+        sections.push(format!("已挂载技能：{}{}", listed, suffix));
     }
 
     let system_prompt = agent.system_prompt.trim();
@@ -1191,7 +1188,10 @@ pub fn backfill_peer_inbound_secrets(app: &AppHandle) -> Result<u32, String> {
 }
 
 /// 轮换某智能体的对等入站密钥并立即落库。
-pub fn rotate_agent_peer_inbound_secret(app: &AppHandle, agent_id: &str) -> Result<AgentRecord, String> {
+pub fn rotate_agent_peer_inbound_secret(
+    app: &AppHandle,
+    agent_id: &str,
+) -> Result<AgentRecord, String> {
     let mut connection = crate::open_history_db(app)?;
     ensure_agents_ready(&connection)?;
     let Some(record) = get_active_agent_by_id(&connection, agent_id)? else {
@@ -1212,8 +1212,7 @@ pub fn rotate_agent_peer_inbound_secret(app: &AppHandle, agent_id: &str) -> Resu
     transaction
         .commit()
         .map_err(|error| format!("轮换对等密钥提交失败: {error}"))?;
-    get_active_agent_by_id(&connection, agent_id)?
-        .ok_or_else(|| "轮换后读取智能体失败".to_string())
+    get_active_agent_by_id(&connection, agent_id)?.ok_or_else(|| "轮换后读取智能体失败".to_string())
 }
 
 fn replace_agent_bot_bindings(
@@ -1251,8 +1250,20 @@ fn replace_agent_bot_bindings(
 
 fn normalize_agent_input(payload: AgentInput) -> Result<NormalizedAgentInput, String> {
     let name = trim_required(payload.name, "智能体名称")?;
-    let summary = trim_required(payload.summary, "智能体简介")?;
-    let description = trim_required(payload.description, "智能体介绍")?;
+    let explicit_summary = payload.summary.trim().to_string();
+    let explicit_description = payload.description.trim().to_string();
+    let description = if !explicit_description.is_empty() {
+        explicit_description
+    } else if !explicit_summary.is_empty() {
+        explicit_summary.clone()
+    } else {
+        return Err("智能体角色说明不能为空".to_string());
+    };
+    let summary = if !explicit_summary.is_empty() {
+        explicit_summary
+    } else {
+        build_auto_agent_summary(&description, &name)
+    };
     let default_provider_id = trim_required(payload.default_provider_id, "默认模型供应商")?;
     let default_model = trim_required(payload.default_model, "默认模型")?;
 
@@ -1283,6 +1294,33 @@ fn trim_required(value: String, field_name: &str) -> Result<String, String> {
         return Err(format!("{field_name}不能为空"));
     }
     Ok(trimmed)
+}
+
+fn normalize_inline_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn build_auto_agent_summary(description: &str, fallback_name: &str) -> String {
+    const AUTO_AGENT_SUMMARY_MAX_CHARS: usize = 36;
+
+    let normalized_description = normalize_inline_text(description);
+    let source = if normalized_description.is_empty() {
+        normalize_inline_text(fallback_name)
+    } else {
+        normalized_description
+    };
+    if source.is_empty() {
+        return String::new();
+    }
+    let total_chars = source.chars().count();
+    if total_chars <= AUTO_AGENT_SUMMARY_MAX_CHARS {
+        return source;
+    }
+    let truncated: String = source
+        .chars()
+        .take(AUTO_AGENT_SUMMARY_MAX_CHARS.saturating_sub(1))
+        .collect();
+    format!("{truncated}…")
 }
 
 fn dedupe_skill_ids(skill_ids: Vec<String>) -> Vec<String> {
@@ -1892,6 +1930,39 @@ mod tests {
                 .as_ref()
                 .map(|item| item.shared_context_policy.as_str()),
             Some("summary")
+        );
+    }
+
+    #[test]
+    fn create_agent_generates_summary_from_description_when_missing() {
+        let mut connection = connection();
+
+        let created = create_agent_with_connection(
+            &mut connection,
+            AgentInput {
+                name: "项目推进助理".to_string(),
+                summary: "".to_string(),
+                description: "负责把复杂需求拆解成可执行步骤，并持续推进收尾。".to_string(),
+                system_prompt: "".to_string(),
+                skill_ids: vec![],
+                default_provider_id: "openai".to_string(),
+                default_model: "gpt-4.1".to_string(),
+                execution_mode: Some("single".to_string()),
+                collaboration_config: None,
+                accent_color: None,
+                bot_configs: HashMap::new(),
+                heartbeat_config: AgentHeartbeatConfig::default(),
+            },
+        )
+        .expect("create agent");
+
+        assert_eq!(
+            created.summary,
+            "负责把复杂需求拆解成可执行步骤，并持续推进收尾。"
+        );
+        assert_eq!(
+            created.description,
+            "负责把复杂需求拆解成可执行步骤，并持续推进收尾。"
         );
     }
 

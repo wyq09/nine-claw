@@ -1,3 +1,4 @@
+import type { Dispatch, SetStateAction } from 'react'
 import { lazy, Suspense, startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { Check, Copy } from 'lucide-react'
 import './App.css'
@@ -21,6 +22,8 @@ import { usePiAgent } from './hooks/usePiAgent'
 import type {
   AgentExecutionMode,
   AgentBuilderDraft,
+  AgentTaskListItem,
+  AgentTaskUpdateInput,
   AgentHeartbeatConfig,
   AgentHeartbeatSchedule,
   AgentHeartbeatTask,
@@ -66,9 +69,11 @@ import {
   botStopLark,
   botStopWechat,
   createAgent,
+  deleteAgentTask,
   getDefaultAgent,
   getPeerGatewayInfo,
   installSystemSkill,
+  listAgentTasks,
   listInstalledSkills,
   listAgents,
   loadProviderPreferences,
@@ -76,8 +81,12 @@ import {
   readAgentWorkspaceBundle,
   openExternalUrl,
   rotateAgentPeerInboundSecret,
+  runAgentTaskNow,
+  resumeAgentTask,
   saveProviderPreferences,
   setDefaultAgent,
+  pauseAgentTask,
+  updateAgentTask,
   subscribeQrCode,
   subscribeBotStatus,
   updateAgent,
@@ -100,7 +109,7 @@ const ABSOLUTE_TIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
 })
 
 const STARTER_CHIPS = ['定时会话'] as const
-const DEFAULT_COMPOSER_HEIGHT = 128
+const DEFAULT_COMPOSER_HEIGHT = 96
 const MIN_COMPOSER_HEIGHT = 56
 const MAX_COMPOSER_HEIGHT = 360
 const GENERAL_SETTINGS_STORAGE_KEY = 'nineclaw.general-settings.v1'
@@ -111,6 +120,8 @@ const LEGACY_GENERAL_SETTINGS_STORAGE_KEYS = ['yqagent.general-settings.v1']
 const LEGACY_APPEARANCE_SETTINGS_STORAGE_KEYS = ['yqagent.appearance-settings.v1']
 const LEGACY_PROVIDER_CONFIGS_STORAGE_KEYS = ['yqagent.provider-configs.v1']
 const LEGACY_CUSTOM_PROVIDERS_META_KEYS = ['yqagent.custom-providers-meta.v1']
+/** 与 TurnResponseBody 空闲占位一致；不应作为一条「回复」展示在列表中。 */
+const TURN_PLACEHOLDER_NO_OUTPUT = '当前轮次还没有输出内容。'
 const MarkdownRenderer = lazy(() => import('./components/MarkdownRenderer'))
 
 function readStoredStorageValue(storageKey: string, legacyKeys: string[] = []): string | null {
@@ -320,6 +331,92 @@ function formatAbsoluteTime(createdAt: number): string {
 
 function formatOptionalAbsoluteTime(createdAt?: number | null): string {
   return typeof createdAt === 'number' && createdAt > 0 ? formatAbsoluteTime(createdAt) : '时间未知'
+}
+
+function formatAgentTaskStatus(status: string): string {
+  switch (status) {
+    case 'active':
+      return '运行中'
+    case 'paused':
+      return '已暂停'
+    case 'deleted':
+      return '已删除'
+    case 'draft':
+      return '待补充'
+    default:
+      return status || '未知'
+  }
+}
+
+function formatAgentTaskSchedule(task: AgentTaskListItem): string {
+  if (task.scheduleType === 'interval') {
+    return task.nextRunAt
+      ? `间隔任务 · 下次 ${formatOptionalAbsoluteTime(task.nextRunAt)}`
+      : '间隔任务'
+  }
+  return task.nextRunAt
+    ? `每日定时 · 下次 ${formatOptionalAbsoluteTime(task.nextRunAt)}`
+    : '每日定时'
+}
+
+function formatAgentTaskScheduleShort(task: AgentTaskListItem): string {
+  if (task.scheduleType === 'interval') {
+    const m = task.intervalMinutes
+    if (typeof m === 'number' && m > 0) {
+      return `每 ${m} 分钟`
+    }
+    return '间隔执行'
+  }
+  if (task.dailyTimes.length > 0) {
+    return `每日 ${task.dailyTimes.join('、')}`
+  }
+  return '每日定时'
+}
+
+const TASK_STATUS_GROUP_ORDER = ['active', 'paused', 'draft', 'deleted'] as const
+
+const TASK_STATUS_GROUP_SET = new Set<string>(TASK_STATUS_GROUP_ORDER)
+
+function groupAgentTasksByStatus(taskItems: AgentTaskListItem[]) {
+  const bucket = new Map<string, AgentTaskListItem[]>()
+  for (const key of TASK_STATUS_GROUP_ORDER) {
+    bucket.set(key, [])
+  }
+  bucket.set('other', [])
+  for (const task of taskItems) {
+    const k = TASK_STATUS_GROUP_SET.has(task.status) ? task.status : 'other'
+    bucket.get(k)?.push(task)
+  }
+  const sections: { key: string; label: string; items: AgentTaskListItem[] }[] = []
+  for (const key of TASK_STATUS_GROUP_ORDER) {
+    const items = bucket.get(key) ?? []
+    if (items.length > 0) {
+      sections.push({
+        key,
+        label:
+          key === 'active'
+            ? '运行中'
+            : key === 'paused'
+              ? '已暂停'
+              : key === 'draft'
+                ? '待补充'
+                : '已删除',
+        items,
+      })
+    }
+  }
+  const other = bucket.get('other') ?? []
+  if (other.length > 0) {
+    sections.push({ key: 'other', label: '其他', items: other })
+  }
+  return sections
+}
+
+function parseDailyTimesInput(value: string): string[] {
+  return value
+    .split(/[\s,，、]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
 }
 
 function createEmptySystemSkillCatalog(): SystemSkillCatalog {
@@ -906,7 +1003,7 @@ function hasUsageMetrics(usage?: TokenUsage): boolean {
   )
 }
 
-function TokenUsageDetailPill({ usage }: { usage: TokenUsage }) {
+function TokenUsageDetailPill({ usage, variant = 'pill' }: { usage: TokenUsage; variant?: 'pill' | 'inline' }) {
   const [open, setOpen] = useState(false)
   const containerRef = useRef<HTMLDivElement | null>(null)
 
@@ -939,11 +1036,13 @@ function TokenUsageDetailPill({ usage }: { usage: TokenUsage }) {
     }
   }, [open])
 
+  const isInline = variant === 'inline'
+
   return (
-    <div className="answer-result-meta-popover" ref={containerRef}>
+    <div className={`answer-result-meta-popover${isInline ? ' answer-result-meta-popover-inline' : ''}`} ref={containerRef}>
       <button
         type="button"
-        className="answer-result-meta-item answer-result-meta-button"
+        className={isInline ? 'answer-result-meta-button-inline' : 'answer-result-meta-item answer-result-meta-button'}
         onClick={() => setOpen((current) => !current)}
         aria-expanded={open}
       >
@@ -1325,6 +1424,7 @@ function App() {
     setDraft,
     error,
     loading,
+    runtimeReady,
     runningHistoryIds,
     history,
     activeHistoryId,
@@ -3103,6 +3203,7 @@ function App() {
           draft={draft}
           error={chatGateError || error}
           showExecutionRail={appearanceSettings.showExecutionRail}
+          showThinkingProcess={appearanceSettings.showThinkingProcess}
           globalBusy={loading}
           runningHistoryIds={runningHistoryIds}
           activeHistoryId={activeHistoryId}
@@ -3127,6 +3228,7 @@ function App() {
           sessionLlmSelectOptions={sessionLlmSelectOptionsWithFallback}
           sessionLlmSelectValue={sessionLlmEncodedCurrent}
           onSessionLlmSelectChange={handleSessionLlmSelectChange}
+          runtimeReady={runtimeReady}
         />
       )
     }
@@ -3165,6 +3267,10 @@ function App() {
           visibleResources={visibleResources}
         />
       )
+    }
+
+    if (view === 'tasks') {
+      return <TasksView agents={editableAgents} onOpenAgent={handleOpenAgentEditor} />
     }
 
     return (
@@ -3325,6 +3431,12 @@ function App() {
                 icon="book"
                 label="资源库"
                 onClick={() => handleViewChange('resources')}
+              />
+              <SidebarButton
+                active={view === 'tasks'}
+                icon="clock"
+                label="任务中心"
+                onClick={() => handleViewChange('tasks')}
               />
             </div>
           </div>
@@ -3603,11 +3715,13 @@ type ChatViewProps = {
   selectedAgent: ConversationAgentSnapshot | null
   setDraft: (value: string) => void
   showExecutionRail: boolean
+  showThinkingProcess: boolean
   submitShortcut: SubmitShortcut
   workspaceTitle: string
   sessionLlmSelectOptions: { value: string; label: string }[]
   sessionLlmSelectValue: string
   onSessionLlmSelectChange: (value: string) => void
+  runtimeReady: boolean
 }
 
 function ChatView({
@@ -3638,11 +3752,13 @@ function ChatView({
   selectedAgent,
   setDraft,
   showExecutionRail,
+  showThinkingProcess,
   submitShortcut,
   workspaceTitle,
   sessionLlmSelectOptions,
   sessionLlmSelectValue,
   onSessionLlmSelectChange,
+  runtimeReady,
 }: ChatViewProps) {
   const [copiedTurnId, setCopiedTurnId] = useState('')
   const [copiedPromptTurnId, setCopiedPromptTurnId] = useState('')
@@ -3825,7 +3941,7 @@ function ChatView({
               {turns.map((item) => (
                 (() => {
                   const isStreamingTurn = sessionRunning && item.id === activeTurnId
-                  const isWaitingOnly = isTurnWaitingOnly(item, isStreamingTurn, showExecutionRail)
+                  const isWaitingOnly = isTurnWaitingOnly(item, isStreamingTurn, showExecutionRail, showThinkingProcess)
                   const shouldShowActions =
                     !isWaitingOnly &&
                     Boolean(
@@ -3856,45 +3972,74 @@ function ChatView({
                         </div>
                       </div>
 
-                      <div className="chat-response">
-                        <div className="chat-response-head">
-                          <div className="answer-panel-title">
-                            <AppIcon name="bot" size={18} />
-                            <span>回复内容</span>
-                          </div>
-                        </div>
-                        <div className={`answer-result-card${isWaitingOnly ? ' answer-result-card-waiting' : ''}`}>
-                          <div className="chat-response-body">
-                            <TurnResponseBody
-                              turn={item}
-                              agentBuilderActionBusyId={agentBuilderActionBusyId}
-                              agentBuilderActionError={agentBuilderActionError}
-                              agentBuilderActionNotice={agentBuilderActionNotice}
-                              agentBuilderActionTargetId={agentBuilderActionTargetId}
-                              loading={sessionRunning}
-                              activeTurnId={activeTurnId}
-                              onCreateAgentDraft={onCreateAgentDraft}
-                              showExecutionRail={showExecutionRail}
-                              onImageClick={handleMarkdownImageClick}
-                            />
-                          </div>
-                          {shouldShowActions ? (
-                            <div className="answer-result-actions">
-                              <TurnExecutionDetails turn={item} isStreaming={isStreamingTurn} />
-                              <button
-                                type="button"
-                                className={`answer-copy-icon-button ${copiedTurnId === item.id ? 'copied' : ''}`}
-                                onClick={() => void handleCopyAnswer(item.id, item.answer)}
-                                aria-label={copiedTurnId === item.id ? '已复制结果' : '复制结果'}
-                                title={copiedTurnId === item.id ? '已复制结果' : '复制结果'}
-                                disabled={!item.answer}
-                              >
-                                {copiedTurnId === item.id ? <Check size={18} /> : <Copy size={18} />}
-                              </button>
+                      {shouldRenderAssistantColumn(item, showExecutionRail, showThinkingProcess, isStreamingTurn) ? (
+                        <div className="chat-response">
+                          <div className="assistant-message-shell">
+                            <div
+                              className="assistant-avatar"
+                              style={
+                                selectedAgent?.accentColor
+                                  ? {
+                                      borderColor: `${selectedAgent.accentColor}55`,
+                                      background: `${selectedAgent.accentColor}22`,
+                                      color: selectedAgent.accentColor,
+                                    }
+                                  : undefined
+                              }
+                              aria-hidden
+                            >
+                              <AppIcon name="bot" size={20} />
                             </div>
-                          ) : null}
+                            <div className="assistant-message-stack">
+                              {shouldShowActions ? (
+                                <div className="assistant-message-toolbar">
+                                  <div className="assistant-message-toolbar-meta">
+                                    <TurnExecutionDetails turn={item} isStreaming={isStreamingTurn} variant="inline" />
+                                  </div>
+                                </div>
+                              ) : null}
+                              <div
+                                className={`answer-result-card answer-result-card-chat${
+                                  isWaitingOnly ? ' answer-result-card-waiting' : ''
+                                }`}
+                              >
+                                <div className="chat-response-body">
+                                  <TurnResponseBody
+                                    turn={item}
+                                    agentBuilderActionBusyId={agentBuilderActionBusyId}
+                                    agentBuilderActionError={agentBuilderActionError}
+                                    agentBuilderActionNotice={agentBuilderActionNotice}
+                                    agentBuilderActionTargetId={agentBuilderActionTargetId}
+                                    loading={sessionRunning}
+                                    activeTurnId={activeTurnId}
+                                    onCreateAgentDraft={onCreateAgentDraft}
+                                    showExecutionRail={showExecutionRail}
+                                    showThinkingProcess={showThinkingProcess}
+                                    onImageClick={handleMarkdownImageClick}
+                                  />
+                                </div>
+                              </div>
+                              {shouldShowActions ? (
+                                <div className="assistant-message-answer-footer">
+                                  <button
+                                    type="button"
+                                    className={`answer-copy-control ${copiedTurnId === item.id ? 'copied' : ''}`}
+                                    onClick={() => void handleCopyAnswer(item.id, item.answer)}
+                                    aria-label={copiedTurnId === item.id ? '已复制结果' : '复制结果'}
+                                    title={copiedTurnId === item.id ? '已复制结果' : '复制结果'}
+                                    disabled={!item.answer}
+                                  >
+                                    {copiedTurnId === item.id ? <Check size={16} /> : <Copy size={16} />}
+                                    <span className="answer-copy-control-label">
+                                      {copiedTurnId === item.id ? '已复制' : '复制'}
+                                    </span>
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          </div>
                         </div>
-                      </div>
+                      ) : null}
                     </article>
                   )
                 })()
@@ -3912,21 +4057,22 @@ function ChatView({
         )}
       </section>
 
-      {activeHistoryItem && showScrollToLatest ? (
-        <button
-          type="button"
-          className="scroll-to-latest-button"
-          onClick={handleScrollToLatest}
-          aria-label="滚动到最新消息"
-          title="滚动到最新消息"
-        >
-          <AppIcon name="arrow-down" size={22} />
-        </button>
-      ) : null}
+      <div className="workspace-footer-stack">
+        {activeHistoryItem && showScrollToLatest ? (
+          <button
+            type="button"
+            className="scroll-to-latest-button"
+            onClick={handleScrollToLatest}
+            aria-label="滚动到最新消息"
+            title="滚动到最新消息"
+          >
+            <AppIcon name="arrow-down" size={22} />
+          </button>
+        ) : null}
 
-      {error && activeHistoryItem ? <div className="error-banner">{error}</div> : null}
+        {error && activeHistoryItem ? <div className="error-banner">{error}</div> : null}
 
-      <div className={`workspace-composer-shell ${isComposerResizing ? 'is-resizing' : ''}`}>
+        <div className={`workspace-composer-shell ${isComposerResizing ? 'is-resizing' : ''}`}>
         <form
           className="composer-card"
           style={composerInlineStyle}
@@ -4030,11 +4176,11 @@ function ChatView({
             <div className="composer-toolbar-right">
               {sessionStreaming ? (
                 <button type="button" className="stop-button" onClick={onAbort}>
-                  <AppIcon name="stop" size={18} />
+                  <AppIcon name="stop" size={16} />
                 </button>
               ) : (
-                <button type="submit" className="submit-button" disabled={sessionStreaming}>
-                  <AppIcon name="send" size={18} />
+                <button type="submit" className="submit-button" disabled={sessionStreaming || !runtimeReady}>
+                  {runtimeReady ? <AppIcon name="arrow-up" size={17} /> : <span className="composer-runtime-loading">⏳</span>}
                 </button>
               )}
             </div>
@@ -4051,10 +4197,13 @@ function ChatView({
         ) : null}
         {attachmentError ? <div className="composer-attachment-error">{attachmentError}</div> : null}
         <div className="composer-footnote">
-          {globalBusy && !sessionStreaming
-            ? '其他会话也在执行中；当前会话仍可继续发送。'
-            : `发送快捷键：${getSubmitShortcutLabel(submitShortcut)}。Shift + Enter 可换行。`}
+          {!runtimeReady
+            ? 'PI 运行时正在初始化，请稍候...'
+            : globalBusy && !sessionStreaming
+              ? '其他会话也在执行中；当前会话仍可继续发送。'
+              : `发送快捷键：${getSubmitShortcutLabel(submitShortcut)}。Shift + Enter 可换行。`}
         </div>
+      </div>
       </div>
 
       {previewImage ? (
@@ -4078,6 +4227,7 @@ function TurnResponseBody({
   activeTurnId,
   onCreateAgentDraft,
   showExecutionRail,
+  showThinkingProcess,
   onImageClick,
 }: {
   turn: ConversationTurn
@@ -4089,6 +4239,7 @@ function TurnResponseBody({
   activeTurnId: string
   onCreateAgentDraft: (draft: AgentBuilderDraft, actionId: string) => Promise<void> | void
   showExecutionRail: boolean
+  showThinkingProcess: boolean
   onImageClick: (src: string, alt: string) => void
 }) {
   const toolById = new Map(turn.toolCalls.map((t) => [t.toolCallId, t]))
@@ -4150,14 +4301,23 @@ function TurnResponseBody({
       }
     }
 
+    const firstToolsBlockIndex = renderBlocks.findIndex(
+      (b) => b.type === 'tools' && b.toolCalls.length > 0,
+    )
+    const thinkingEmbeddedInRail =
+      showThinkingProcess && turn.thinking.trim() && firstToolsBlockIndex >= 0
+
     return (
       <div className="turn-response-blocks">
-        {renderBlocks.map((block) => {
+        {showThinkingProcess && turn.thinking.trim() && !thinkingEmbeddedInRail ? (
+          <TurnThinkingBlock isStreaming={isActiveStreamingTurn} thinking={turn.thinking} />
+        ) : null}
+        {renderBlocks.map((block, blockIndex) => {
           if (block.type === 'text') {
             const isStreaming = Boolean(
               isActiveStreamingTurn && block.index === lastTextSegmentIndex,
             )
-            if (!block.text.trim() && !isStreaming) {
+            if ((!block.text.trim() && !isStreaming) || isTurnPlaceholderNoOutputText(block.text)) {
               return null
             }
             return (
@@ -4180,22 +4340,12 @@ function TurnResponseBody({
             return null
           }
 
-          if (block.toolCalls.length === 1) {
-            const toolCall = block.toolCalls[0]
-            return (
-              <ToolCallCard
-                key={toolCall.id}
-                toolCall={toolCall}
-                runningToolCount={runningToolCount}
-                onImageClick={onImageClick}
-              />
-            )
-          }
-
           return (
-            <ToolCallGroup
+            <TurnExecutionRail
               key={`${turn.id}-tools-${block.index}`}
               toolCalls={block.toolCalls}
+              thinking={blockIndex === firstToolsBlockIndex ? turn.thinking : ''}
+              showThinkingProcess={showThinkingProcess}
               runningToolCount={runningToolCount}
               onImageClick={onImageClick}
             />
@@ -4207,10 +4357,14 @@ function TurnResponseBody({
 
   const legacyTools = [...turn.toolCalls].sort((a, b) => a.createdAt - b.createdAt)
   const hasLegacyTools = showExecutionRail && legacyTools.length > 0
+  const legacyThinkingInRail = showThinkingProcess && turn.thinking.trim() && hasLegacyTools
 
   return (
     <>
-      {turn.answer ? (
+      {showThinkingProcess && turn.thinking.trim() && !legacyThinkingInRail ? (
+        <TurnThinkingBlock isStreaming={isActiveStreamingTurn} thinking={turn.thinking} />
+      ) : null}
+      {turn.answer && !isTurnPlaceholderNoOutputText(turn.answer) ? (
         <MarkdownBlock
           actionId={`${turn.id}-legacy`}
           actionBusyId={agentBuilderActionBusyId}
@@ -4224,8 +4378,10 @@ function TurnResponseBody({
         />
       ) : null}
       {hasLegacyTools ? (
-        <ToolCallList
+        <TurnExecutionRail
           toolCalls={legacyTools}
+          thinking={turn.thinking}
+          showThinkingProcess={showThinkingProcess}
           runningToolCount={runningToolCount}
           onImageClick={onImageClick}
         />
@@ -4233,19 +4389,37 @@ function TurnResponseBody({
       {!turn.answer && !hasLegacyTools ? (
         isActiveStreamingTurn ? (
           <TurnWaitingIndicator startedAt={turn.createdAt} />
-        ) : (
-          <p className="placeholder-copy">
-            {turn.status === 'done'
-              ? '本轮已结束，但模型没有返回任何可渲染内容。'
-              : turn.status === 'error'
-                ? '本轮执行失败，未产出可渲染内容。'
-                : legacyTools.length > 0
-                  ? '本轮主要产出了工具调用结果。'
-                  : '当前轮次还没有输出内容。'}
-          </p>
-        )
+        ) : turn.status === 'done' ? (
+          <p className="placeholder-copy">本轮已结束，但模型没有返回任何可渲染内容。</p>
+        ) : turn.status === 'error' ? (
+          <p className="placeholder-copy">本轮执行失败，未产出可渲染内容。</p>
+        ) : legacyTools.length > 0 ? (
+          <p className="placeholder-copy">本轮主要产出了工具调用结果。</p>
+        ) : null
       ) : null}
     </>
+  )
+}
+
+function TurnThinkingBlock({ thinking, isStreaming }: { thinking: string; isStreaming: boolean }) {
+  const [expanded, setExpanded] = useState(true)
+
+  useEffect(() => {
+    if (isStreaming) {
+      setExpanded(true)
+    }
+  }, [isStreaming])
+
+  return (
+    <details
+      className="turn-thinking-block"
+      open={expanded}
+      onToggle={(event) => setExpanded(event.currentTarget.open)}
+      data-streaming={isStreaming ? '' : undefined}
+    >
+      <summary className="turn-thinking-summary">思考过程</summary>
+      <pre className="turn-thinking-pre">{thinking}</pre>
+    </details>
   )
 }
 
@@ -4399,15 +4573,59 @@ function formatToolCallText(text: string, fallback: string, pretty = true): stri
   }
 }
 
-function hasRenderableTurnContent(turn: ConversationTurn, showExecutionRail: boolean): boolean {
-  if (turn.answer.trim()) {
+/** 按空行将 thinking 粗分为每轮工具前一段 + 末尾纯思考段（与参考 UI 对齐） */
+function computeExecThoughtSlices(raw: string, toolCount: number): { perRound: string[]; tailOnly: string } {
+  const perRound = Array.from({ length: toolCount }, () => '')
+  let tailOnly = ''
+  const t = raw.trim()
+  if (!t || toolCount === 0) {
+    return { perRound, tailOnly }
+  }
+
+  const parts = t
+    .split(/\n{2,}/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  if (parts.length === 0) {
+    return { perRound, tailOnly }
+  }
+
+  if (parts.length <= toolCount) {
+    for (let i = 0; i < parts.length; i += 1) {
+      perRound[i] = parts[i] ?? ''
+    }
+  } else {
+    for (let i = 0; i < toolCount; i += 1) {
+      perRound[i] = parts[i] ?? ''
+    }
+    tailOnly = parts.slice(toolCount).join('\n\n')
+  }
+
+  return { perRound, tailOnly }
+}
+
+function isTurnPlaceholderNoOutputText(text: string): boolean {
+  return text.trim() === TURN_PLACEHOLDER_NO_OUTPUT
+}
+
+function hasRenderableTurnContent(
+  turn: ConversationTurn,
+  showExecutionRail: boolean,
+  showThinkingProcess: boolean,
+): boolean {
+  if (showThinkingProcess && turn.thinking.trim()) {
+    return true
+  }
+
+  if (turn.answer.trim() && !isTurnPlaceholderNoOutputText(turn.answer)) {
     return true
   }
 
   if (turn.responseSegments?.length) {
     return turn.responseSegments.some((segment) => {
       if (segment.type === 'text') {
-        return segment.text.trim().length > 0
+        const t = segment.text.trim()
+        return t.length > 0 && !isTurnPlaceholderNoOutputText(t)
       }
       return showExecutionRail && turn.toolCalls.some((toolCall) => toolCall.toolCallId === segment.toolCallId)
     })
@@ -4416,8 +4634,43 @@ function hasRenderableTurnContent(turn: ConversationTurn, showExecutionRail: boo
   return showExecutionRail && turn.toolCalls.length > 0
 }
 
-function isTurnWaitingOnly(turn: ConversationTurn, isStreaming: boolean, showExecutionRail: boolean): boolean {
-  return isStreaming && !hasRenderableTurnContent(turn, showExecutionRail)
+function shouldRenderAssistantColumn(
+  turn: ConversationTurn,
+  showExecutionRail: boolean,
+  showThinkingProcess: boolean,
+  isActiveStreamingTurn: boolean,
+): boolean {
+  if (isActiveStreamingTurn && !hasRenderableTurnContent(turn, showExecutionRail, showThinkingProcess)) {
+    return true
+  }
+  if (hasRenderableTurnContent(turn, showExecutionRail, showThinkingProcess)) {
+    return true
+  }
+  if (showExecutionRail && turn.toolCalls.length > 0) {
+    return true
+  }
+  if (isTurnPlaceholderNoOutputText(turn.answer)) {
+    return false
+  }
+  if (!turn.answer.trim()) {
+    if (turn.status === 'done' || turn.status === 'error') {
+      return true
+    }
+    if (turn.toolCalls.length > 0) {
+      return true
+    }
+    return false
+  }
+  return true
+}
+
+function isTurnWaitingOnly(
+  turn: ConversationTurn,
+  isStreaming: boolean,
+  showExecutionRail: boolean,
+  showThinkingProcess: boolean,
+): boolean {
+  return isStreaming && !hasRenderableTurnContent(turn, showExecutionRail, showThinkingProcess)
 }
 
 function ToolCallContentBlock({
@@ -4479,57 +4732,63 @@ function ToolCallContentBlock({
   )
 }
 
-function ToolCallCard({
+function ToolRoundIoPanels({
   toolCall,
-  runningToolCount,
   onImageClick,
 }: {
   toolCall: ToolCallEntry
-  runningToolCount: number
   onImageClick?: (src: string, alt: string) => void
 }) {
   const isStreaming = toolCall.state === 'running'
-  const isParallelRunning = isStreaming && runningToolCount > 1
-  const [detailsOpen, setDetailsOpen] = useState(false)
-
   const argsLive = formatToolCallText(toolCall.argsText, '无参数', false)
   const resultLive = formatToolCallText(toolCall.resultText, '暂无输出', false)
   const argsPretty = formatToolCallText(toolCall.argsText, '无参数')
   const resultPretty = formatToolCallText(toolCall.resultText, '暂无输出')
+  const [copiedKey, setCopiedKey] = useState<'input' | 'output' | ''>('')
+
+  const handleCopy = async (key: 'input' | 'output', text: string) => {
+    await navigator.clipboard.writeText(text)
+    setCopiedKey(key)
+    window.setTimeout(() => setCopiedKey((current) => (current === key ? '' : current)), 1600)
+  }
 
   return (
-    <details
-      className={`tool-call-card ${toolCall.state} ${isParallelRunning ? 'parallel-running' : ''}`}
-      open={detailsOpen}
-      onToggle={(event) => setDetailsOpen(event.currentTarget.open)}
-    >
-      <summary className="tool-call-summary">
-        <div className="tool-call-head">
-          <div className="tool-call-title-row">
-            <AppIcon name="wrench" size={15} />
-            <strong title={toolCall.toolName}>{toolCall.toolName}</strong>
-          </div>
-          <div className="tool-call-summary-right">
-            {isStreaming ? (
-              <span className={`status-pill ${toolCall.state}`}>{getToolCallStateLabel(toolCall.state)}</span>
-            ) : null}
-            {isParallelRunning ? <span className="tool-parallel-pill">并行 {runningToolCount}</span> : null}
-            <AppIcon name="chevron-down" size={16} />
-          </div>
+    <div className="tool-exec-io-stack">
+      <div className="tool-io-panel tool-io-panel-input">
+        <div className="tool-io-panel-head">
+          <span className="tool-io-label">INPUT</span>
+          <button
+            type="button"
+            className={`tool-io-copy-button ${copiedKey === 'input' ? 'copied' : ''}`}
+            onClick={() => void handleCopy('input', argsPretty)}
+            aria-label={copiedKey === 'input' ? '已复制' : '复制 INPUT'}
+            title={copiedKey === 'input' ? '已复制' : '复制'}
+          >
+            {copiedKey === 'input' ? <Check size={14} /> : <Copy size={14} />}
+          </button>
         </div>
-      </summary>
-
-      <div className="tool-call-grid">
-        <div className="tool-call-panel tool-call-panel-args">
-          <span className="tool-call-panel-label">调用 / 参数</span>
+        <div className="tool-io-panel-body">
           <ToolCallContentBlock
             content={isStreaming ? argsLive : argsPretty}
             isStreaming={isStreaming}
             onImageClick={onImageClick}
           />
         </div>
-        <div className="tool-call-panel tool-call-panel-result">
-          <span className="tool-call-panel-label">输出结果</span>
+      </div>
+      <div className="tool-io-panel tool-io-panel-output">
+        <div className="tool-io-panel-head">
+          <span className="tool-io-label">RESULT</span>
+          <button
+            type="button"
+            className={`tool-io-copy-button ${copiedKey === 'output' ? 'copied' : ''}`}
+            onClick={() => void handleCopy('output', resultPretty)}
+            aria-label={copiedKey === 'output' ? '已复制' : '复制 RESULT'}
+            title={copiedKey === 'output' ? '已复制' : '复制'}
+          >
+            {copiedKey === 'output' ? <Check size={14} /> : <Copy size={14} />}
+          </button>
+        </div>
+        <div className="tool-io-panel-body">
           <ToolCallContentBlock
             content={isStreaming ? resultLive : resultPretty}
             isStreaming={isStreaming}
@@ -4537,107 +4796,149 @@ function ToolCallCard({
           />
         </div>
       </div>
-    </details>
+    </div>
   )
 }
 
-function ToolCallGroup({
+function TurnExecutionRail({
   toolCalls,
+  thinking,
+  showThinkingProcess,
   runningToolCount,
   onImageClick,
 }: {
   toolCalls: ToolCallEntry[]
+  thinking: string
+  showThinkingProcess: boolean
   runningToolCount: number
   onImageClick?: (src: string, alt: string) => void
 }) {
-  const groupState = getToolGroupState(toolCalls)
-  const runningInGroup = toolCalls.filter((toolCall) => toolCall.state === 'running').length
-  const toolNamePreview = toolCalls
-    .slice(0, 3)
-    .map((toolCall) => toolCall.toolName)
-    .join('、')
+  const sorted = useMemo(() => [...toolCalls].sort((a, b) => a.createdAt - b.createdAt), [toolCalls])
+  const n = sorted.length
+  const thinkingRaw = showThinkingProcess ? thinking : ''
+  const { perRound, tailOnly } = useMemo(
+    () => computeExecThoughtSlices(thinkingRaw, n),
+    [thinkingRaw, n],
+  )
+  const hasThinkingText = Boolean(thinkingRaw.trim())
+  const thinkingRoundCount = n + (tailOnly.trim() ? 1 : 0)
+  const groupState = getToolGroupState(sorted)
+  const runningInSorted = sorted.filter((t) => t.state === 'running').length
+  const [railOpen, setRailOpen] = useState(false)
+
+  useEffect(() => {
+    if (runningInSorted > 0) {
+      setRailOpen(true)
+    }
+  }, [runningInSorted])
+
+  if (n === 0) {
+    return null
+  }
+
+  const parallelRunning = runningInSorted > 1
 
   return (
-    <details className={`tool-call-card tool-call-group-card ${groupState}`}>
-      <summary className="tool-call-summary tool-call-group-summary">
-        <div className="tool-call-head">
-          <div className="tool-call-title-row tool-call-group-title">
+    <details
+      className={`assistant-exec-rail tool-call-card ${groupState}${parallelRunning ? ' parallel-running' : ''}`}
+      open={railOpen}
+      onToggle={(event) => setRailOpen(event.currentTarget.open)}
+    >
+      <summary className="assistant-exec-rail-summary">
+        <div className="assistant-exec-rail-summary-main">
+          <span className="assistant-exec-rail-wrench" aria-hidden>
             <AppIcon name="wrench" size={15} />
-            <div className="tool-call-group-copy">
-              <strong>{toolCalls.length} 个工具调用</strong>
-              <span title={toolCalls.map((toolCall) => toolCall.toolName).join('、')}>
-                {toolNamePreview}
-                {toolCalls.length > 3 ? ' 等' : ''}
-              </span>
-            </div>
-          </div>
-          <div className="tool-call-summary-right">
-            {runningInGroup > 0 ? <span className={`status-pill ${groupState}`}>{getToolCallStateLabel(groupState)}</span> : null}
-            {runningInGroup > 1 ? <span className="tool-parallel-pill">并行 {runningInGroup}</span> : null}
-            <span className="tool-group-count-pill">共 {toolCalls.length} 次</span>
-            <AppIcon name="chevron-down" size={16} />
-          </div>
+          </span>
+          <span className="assistant-exec-rail-title">
+            {hasThinkingText ? `${n} 次工具调用 · 思考 ${thinkingRoundCount} 轮` : `${n} 次工具调用`}
+          </span>
         </div>
+        <span className="assistant-exec-rail-chevron" aria-hidden>
+          <AppIcon name="chevron-down" size={16} />
+        </span>
       </summary>
-
-      <div className="tool-call-group-list">
-        <ToolCallList
-          toolCalls={toolCalls}
-          runningToolCount={runningToolCount}
-          onImageClick={onImageClick}
-          groupMultiple={false}
-        />
+      <div className="assistant-exec-rail-body">
+        <div className="assistant-exec-rounds">
+          {sorted.map((tool, i) => {
+            const thought = perRound[i]?.trim() ?? ''
+            const isStreaming = tool.state === 'running'
+            const isParallelRunning = isStreaming && runningToolCount > 1
+            return (
+              <details key={tool.id} className={`tool-exec-round ${tool.state}`}>
+                <summary className="tool-exec-round-summary">
+                  <span className="tool-exec-round-summary-text">
+                    第 {i + 1} 轮
+                    {hasThinkingText ? ' · 已思考' : ''}
+                    {' · '}
+                    <code>{tool.toolName}</code>
+                  </span>
+                  <span className="tool-exec-round-summary-meta">
+                    {isStreaming ? (
+                      <span className={`status-pill ${tool.state}`}>{getToolCallStateLabel(tool.state)}</span>
+                    ) : null}
+                    {isParallelRunning ? (
+                      <span className="tool-parallel-pill">并行 {runningToolCount}</span>
+                    ) : null}
+                    <span className="tool-exec-round-chevron">
+                      <AppIcon name="chevron-down" size={14} />
+                    </span>
+                  </span>
+                </summary>
+                <div className="tool-exec-round-body">
+                  {thought ? <blockquote className="tool-exec-thought">{thought}</blockquote> : null}
+                  <ToolRoundIoPanels toolCall={tool} onImageClick={onImageClick} />
+                </div>
+              </details>
+            )
+          })}
+          {hasThinkingText && tailOnly.trim() ? (
+            <details className="tool-exec-round tool-exec-round-tail done">
+              <summary className="tool-exec-round-summary">
+                <span className="tool-exec-round-summary-text">第 {n + 1} 轮 · 已思考</span>
+                <span className="tool-exec-round-chevron">
+                  <AppIcon name="chevron-down" size={14} />
+                </span>
+              </summary>
+              <div className="tool-exec-round-body">
+                <blockquote className="tool-exec-thought">{tailOnly}</blockquote>
+              </div>
+            </details>
+          ) : null}
+        </div>
       </div>
     </details>
   )
 }
 
-function ToolCallList({
-  toolCalls,
-  runningToolCount,
-  onImageClick,
-  groupMultiple = true,
+function TurnExecutionDetails({
+  turn,
+  isStreaming,
+  variant = 'pills',
 }: {
-  toolCalls: ToolCallEntry[]
-  runningToolCount: number
-  onImageClick?: (src: string, alt: string) => void
-  groupMultiple?: boolean
+  turn: ConversationTurn
+  isStreaming: boolean
+  variant?: 'pills' | 'inline'
 }) {
-  if (toolCalls.length === 0) {
-    return null
-  }
-
-  if (groupMultiple && toolCalls.length > 1) {
-    return (
-      <ToolCallGroup
-        toolCalls={toolCalls}
-        runningToolCount={runningToolCount}
-        onImageClick={onImageClick}
-      />
-    )
-  }
-
-  return (
-    <div className="tool-call-list">
-      {toolCalls.map((toolCall) => (
-        <ToolCallCard
-          key={toolCall.id}
-          toolCall={toolCall}
-          runningToolCount={runningToolCount}
-          onImageClick={onImageClick}
-        />
-      ))}
-    </div>
-  )
-}
-
-function TurnExecutionDetails({ turn, isStreaming }: { turn: ConversationTurn; isStreaming: boolean }) {
   useLiveNow(isStreaming, 500)
   const totalDuration = getElapsedMs(turn.createdAt, turn.completedAt, isStreaming)
   const usage = turn.usage
 
   if (typeof totalDuration !== 'number' && !hasUsageMetrics(usage)) {
     return null
+  }
+
+  if (variant === 'inline') {
+    return (
+      <div className="assistant-turn-meta answer-result-meta-inline">
+        {typeof totalDuration === 'number' ? <span>已思考 {formatDurationLabel(totalDuration)}</span> : null}
+        {typeof totalDuration === 'number' && hasUsageMetrics(usage) && usage ? (
+          <span className="assistant-turn-meta-sep" aria-hidden>
+            ·
+          </span>
+        ) : null}
+        {hasUsageMetrics(usage) && usage ? <TokenUsageDetailPill usage={usage} variant="inline" /> : null}
+      </div>
+    )
   }
 
   return (
@@ -5078,6 +5379,510 @@ function ResourcesView({ onSearch, resourceSearch, visibleResources }: Resources
   )
 }
 
+type TaskCenterEditPageProps = {
+  task: AgentTaskListItem
+  editDraft: AgentTaskUpdateInput
+  setEditDraft: Dispatch<SetStateAction<AgentTaskUpdateInput | null>>
+  actionBusy: boolean
+  onBack: () => void
+  onOpenAgent: (agentId: string) => void
+  onSave: () => void
+  onRunNow: () => void
+  onPause: () => void
+  onResume: () => void
+  onDelete: () => void
+}
+
+function TaskCenterEditPage({
+  task,
+  editDraft,
+  setEditDraft,
+  actionBusy,
+  onBack,
+  onOpenAgent,
+  onSave,
+  onRunNow,
+  onPause,
+  onResume,
+  onDelete,
+}: TaskCenterEditPageProps) {
+  return (
+    <div className="page-shell task-center-page task-edit-page">
+      <header className="task-edit-page-header">
+        <button type="button" className="task-edit-back" onClick={onBack} aria-label="返回任务列表">
+          <AppIcon name="arrow-left" size={18} />
+          <span>返回</span>
+        </button>
+        <div className="task-edit-page-header-main">
+          <h1 className="task-edit-page-title">{task.title.trim() || '未命名任务'}</h1>
+          <p className="task-edit-page-kicker">
+            {formatAgentTaskStatus(task.status)} · {formatAgentTaskScheduleShort(task)}
+            {task.nextRunAt ? ` · 下次 ${formatOptionalAbsoluteTime(task.nextRunAt)}` : ''}
+          </p>
+        </div>
+      </header>
+
+      <div className="task-center-body task-edit-body">
+        <div className="task-edit-toolbar">
+          <button
+            type="button"
+            className="outline-button task-edit-toolbar-btn"
+            disabled={actionBusy || task.status === 'deleted'}
+            onClick={onRunNow}
+          >
+            {actionBusy ? '处理中…' : '立即执行'}
+          </button>
+          {task.status === 'active' ? (
+            <button type="button" className="outline-button task-edit-toolbar-btn" disabled={actionBusy} onClick={onPause}>
+              {actionBusy ? '处理中…' : '暂停'}
+            </button>
+          ) : null}
+          {task.status === 'paused' ? (
+            <button type="button" className="outline-button task-edit-toolbar-btn" disabled={actionBusy} onClick={onResume}>
+              {actionBusy ? '处理中…' : '恢复'}
+            </button>
+          ) : null}
+          {task.status !== 'deleted' ? (
+            <button type="button" className="outline-button task-edit-toolbar-btn danger" disabled={actionBusy} onClick={onDelete}>
+              删除
+            </button>
+          ) : null}
+          <button type="button" className="link-button task-edit-toolbar-link" onClick={() => onOpenAgent(task.agentId)}>
+            打开智能体
+          </button>
+        </div>
+
+        <section className="task-edit-section">
+          <h2 className="task-edit-section-title">上下文</h2>
+          <dl className="task-edit-dl">
+            <div className="task-edit-dl-row">
+              <dt>智能体</dt>
+              <dd>{task.agentName}</dd>
+            </div>
+            <div className="task-edit-dl-row">
+              <dt>类型</dt>
+              <dd>{task.taskType === 'agent_prompt' ? 'agent_prompt（到点唤起智能体）' : 'reminder（直接提醒）'}</dd>
+            </div>
+            <div className="task-edit-dl-row">
+              <dt>来源会话</dt>
+              <dd className="task-edit-dl-mono">{task.sourceSessionId}</dd>
+            </div>
+            <div className="task-edit-dl-row">
+              <dt>投递</dt>
+              <dd>
+                {task.deliveryKind} → {task.deliveryTarget}
+              </dd>
+            </div>
+            <div className="task-edit-dl-row">
+              <dt>上次执行</dt>
+              <dd>{formatOptionalAbsoluteTime(task.lastRunAt)}</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section className="task-edit-section">
+          <h2 className="task-edit-section-title">调度与内容</h2>
+          <div className="task-edit-form">
+            <label className="task-edit-field">
+              <span className="task-edit-label">任务标题</span>
+              <input
+                className="task-edit-control"
+                value={editDraft.title}
+                onChange={(event) =>
+                  setEditDraft((current) => (current ? { ...current, title: event.target.value } : current))
+                }
+              />
+            </label>
+            <label className="task-edit-field">
+              <span className="task-edit-label">触发方式</span>
+              <select
+                className="task-edit-control"
+                value={editDraft.scheduleType}
+                onChange={(event) =>
+                  setEditDraft((current) =>
+                    current
+                      ? {
+                          ...current,
+                          scheduleType: event.target.value,
+                          intervalMinutes: event.target.value === 'interval' ? current.intervalMinutes || 10 : null,
+                          dailyTimes: event.target.value === 'daily_time' ? current.dailyTimes : [],
+                        }
+                      : current,
+                  )
+                }
+              >
+                <option value="interval">每隔若干分钟</option>
+                <option value="daily_time">每天固定时间</option>
+              </select>
+            </label>
+            {editDraft.scheduleType === 'interval' ? (
+              <label className="task-edit-field">
+                <span className="task-edit-label">间隔（分钟）</span>
+                <input
+                  className="task-edit-control"
+                  type="number"
+                  min={1}
+                  value={editDraft.intervalMinutes ?? 10}
+                  onChange={(event) =>
+                    setEditDraft((current) =>
+                      current
+                        ? {
+                            ...current,
+                            intervalMinutes: Number.parseInt(event.target.value || '0', 10) || 0,
+                          }
+                        : current,
+                    )
+                  }
+                />
+              </label>
+            ) : (
+              <label className="task-edit-field">
+                <span className="task-edit-label">每日时间</span>
+                <input
+                  className="task-edit-control"
+                  value={editDraft.dailyTimes.join(', ')}
+                  onChange={(event) =>
+                    setEditDraft((current) =>
+                      current ? { ...current, dailyTimes: parseDailyTimesInput(event.target.value) } : current,
+                    )
+                  }
+                  placeholder="09:00, 18:30"
+                />
+              </label>
+            )}
+            <label className="task-edit-field">
+              <span className="task-edit-label">时区</span>
+              <input
+                className="task-edit-control"
+                value={editDraft.timezone}
+                onChange={(event) =>
+                  setEditDraft((current) => (current ? { ...current, timezone: event.target.value } : current))
+                }
+                placeholder="Asia/Shanghai"
+              />
+            </label>
+            <label className="task-edit-field task-edit-field-grow">
+              <span className="task-edit-label">任务内容</span>
+              <textarea
+                className="task-edit-control task-edit-textarea"
+                rows={4}
+                value={editDraft.goal}
+                onChange={(event) =>
+                  setEditDraft((current) => (current ? { ...current, goal: event.target.value } : current))
+                }
+              />
+            </label>
+          </div>
+        </section>
+
+        <div className="task-edit-footer">
+          <button type="button" className="primary-cta task-edit-save" disabled={actionBusy} onClick={onSave}>
+            {actionBusy ? '保存中…' : '保存'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+type TasksViewProps = {
+  agents: AgentRecord[]
+  onOpenAgent: (agentId: string) => void
+}
+
+function TasksView({ agents, onOpenAgent }: TasksViewProps) {
+  const [tasks, setTasks] = useState<AgentTaskListItem[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [actionTaskId, setActionTaskId] = useState('')
+  const [search, setSearch] = useState('')
+  const [agentFilter, setAgentFilter] = useState('')
+  const [detailTaskId, setDetailTaskId] = useState('')
+  const [editDraft, setEditDraft] = useState<AgentTaskUpdateInput | null>(null)
+
+  const refreshTasks = useCallback(async () => {
+    setLoading(true)
+    setError('')
+    try {
+      const items = await listAgentTasks(agentFilter.trim() || null)
+      setTasks(items)
+    } catch (fetchError) {
+      setError(fetchError instanceof Error ? fetchError.message : String(fetchError))
+    } finally {
+      setLoading(false)
+    }
+  }, [agentFilter])
+
+  useEffect(() => {
+    void refreshTasks()
+  }, [refreshTasks])
+
+  const visibleTasks = useMemo(() => {
+    const keyword = search.trim().toLowerCase()
+    if (!keyword) {
+      return tasks
+    }
+    return tasks.filter((task) =>
+      [
+        task.title,
+        task.goal,
+        task.intentSummary,
+        task.agentName,
+        task.agentId,
+        task.sourceSessionId,
+      ]
+        .join(' ')
+        .toLowerCase()
+        .includes(keyword),
+    )
+  }, [search, tasks])
+
+  const openTaskDetail = useCallback((task: AgentTaskListItem) => {
+    setDetailTaskId(task.id)
+    setEditDraft({
+      title: task.title,
+      goal: task.goal || task.intentSummary,
+      scheduleType: task.scheduleType,
+      timezone: task.timezone || 'Asia/Shanghai',
+      intervalMinutes: task.intervalMinutes ?? null,
+      dailyTimes: task.dailyTimes ?? [],
+    })
+  }, [])
+
+  const closeTaskDetail = useCallback(() => {
+    setDetailTaskId('')
+    setEditDraft(null)
+  }, [])
+
+  useEffect(() => {
+    if (!detailTaskId) {
+      return
+    }
+    const onKeyDown = (event: Event) => {
+      if (event instanceof KeyboardEvent && event.key === 'Escape') {
+        closeTaskDetail()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [detailTaskId, closeTaskDetail])
+
+  const detailTask = detailTaskId ? tasks.find((t) => t.id === detailTaskId) : undefined
+  const taskSections = useMemo(() => groupAgentTasksByStatus(visibleTasks), [visibleTasks])
+
+  if (detailTaskId) {
+    if (!detailTask || !editDraft) {
+      return (
+        <div className="page-shell task-center-page task-edit-page">
+          <header className="task-edit-page-header">
+            <button type="button" className="task-edit-back" onClick={closeTaskDetail} aria-label="返回">
+              <AppIcon name="arrow-left" size={18} />
+              <span>返回</span>
+            </button>
+            <h1 className="task-edit-page-title">任务不可用</h1>
+          </header>
+          <div className="task-center-body task-edit-body">
+            <p className="task-linear-empty-hint">该任务可能已被删除或不在当前筛选结果中。</p>
+            <button type="button" className="outline-button" onClick={closeTaskDetail}>
+              返回列表
+            </button>
+          </div>
+        </div>
+      )
+    }
+
+    const actionBusy = actionTaskId === detailTask.id
+
+    return (
+      <TaskCenterEditPage
+        task={detailTask}
+        editDraft={editDraft}
+        setEditDraft={setEditDraft}
+        actionBusy={actionBusy}
+        onBack={closeTaskDetail}
+        onOpenAgent={onOpenAgent}
+        onSave={() => {
+          setActionTaskId(detailTask.id)
+          void updateAgentTask(detailTask.id, editDraft)
+            .then(() => refreshTasks())
+            .catch((taskError: unknown) => {
+              setError(taskError instanceof Error ? taskError.message : String(taskError))
+            })
+            .finally(() => setActionTaskId(''))
+        }}
+        onRunNow={() => {
+          setActionTaskId(detailTask.id)
+          void runAgentTaskNow(detailTask.id)
+            .then(refreshTasks)
+            .catch((runError: unknown) => {
+              setError(runError instanceof Error ? runError.message : String(runError))
+            })
+            .finally(() => setActionTaskId(''))
+        }}
+        onPause={() => {
+          setActionTaskId(detailTask.id)
+          void pauseAgentTask(detailTask.id)
+            .then(refreshTasks)
+            .catch((taskError: unknown) => {
+              setError(taskError instanceof Error ? taskError.message : String(taskError))
+            })
+            .finally(() => setActionTaskId(''))
+        }}
+        onResume={() => {
+          setActionTaskId(detailTask.id)
+          void resumeAgentTask(detailTask.id)
+            .then(refreshTasks)
+            .catch((taskError: unknown) => {
+              setError(taskError instanceof Error ? taskError.message : String(taskError))
+            })
+            .finally(() => setActionTaskId(''))
+        }}
+        onDelete={() => {
+          setActionTaskId(detailTask.id)
+          void deleteAgentTask(detailTask.id)
+            .then(async () => {
+              closeTaskDetail()
+              await refreshTasks()
+            })
+            .catch((taskError: unknown) => {
+              setError(taskError instanceof Error ? taskError.message : String(taskError))
+            })
+            .finally(() => setActionTaskId(''))
+        }}
+      />
+    )
+  }
+
+  return (
+    <div className="page-shell task-center-page task-linear-page">
+      <header className="page-header task-linear-page-toolbar">
+        <div className="task-linear-page-toolbar-text">
+          <h1>任务中心</h1>
+          <p className="task-linear-page-sub">由智能体在对话中创建的定时任务，按状态分组；点按一行进入编辑。</p>
+          {!loading && visibleTasks.length === 0 ? <p className="task-center-header-hint">还没有定时任务</p> : null}
+        </div>
+        <button
+          type="button"
+          className="primary-cta task-linear-toolbar-cta"
+          onClick={() => void refreshTasks()}
+          disabled={loading}
+        >
+          <AppIcon name="refresh" size={16} />
+          <span>{loading ? '刷新中…' : '刷新'}</span>
+        </button>
+      </header>
+
+      <div className="task-center-body task-linear-body">
+        <div className="task-linear-filters">
+          <label className="search-field task-linear-filter-search">
+            <AppIcon name="search" size={18} />
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="按标题、内容、会话、智能体筛选…"
+            />
+          </label>
+          <div className="task-linear-filter-select-wrap">
+            <select
+              className="task-edit-control task-linear-filter-select"
+              value={agentFilter}
+              onChange={(event) => setAgentFilter(event.target.value)}
+              aria-label="按智能体筛选"
+            >
+              <option value="">全部智能体</option>
+              {agents.map((agent) => (
+                <option key={agent.id} value={agent.id}>
+                  {agent.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {error ? (
+          <div className="skills-feedback error agent-feedback inline task-center-error">
+            <span>{error}</span>
+          </div>
+        ) : null}
+
+        {visibleTasks.length > 0 ? (
+          <div className="task-linear-table-outer">
+            {taskSections.map((section) => (
+              <section key={section.key} className="task-linear-group">
+                <div className="task-linear-group-bar">
+                  <span className="task-linear-group-title">{section.label}</span>
+                  <span className="task-linear-group-count">{section.items.length}</span>
+                </div>
+                <div className="task-linear-table-wrap" role="grid" aria-label={`${section.label}任务`}>
+                  <div className="task-linear-thead" role="row">
+                    <div className="task-linear-th task-linear-col-name" role="columnheader">
+                      任务
+                    </div>
+                    <div className="task-linear-th task-linear-col-schedule" role="columnheader">
+                      调度
+                    </div>
+                    <div className="task-linear-th task-linear-col-status" role="columnheader">
+                      状态
+                    </div>
+                    <div className="task-linear-th task-linear-col-agent" role="columnheader">
+                      智能体
+                    </div>
+                    <div className="task-linear-th task-linear-col-last" role="columnheader">
+                      上次执行
+                    </div>
+                  </div>
+                  {section.items.map((task) => {
+                    const subtitle = (task.goal || task.intentSummary || '').trim()
+                    const subtitleShort = subtitle.length > 72 ? `${subtitle.slice(0, 72)}…` : subtitle
+                    return (
+                      <button
+                        key={task.id}
+                        type="button"
+                        className="task-linear-row"
+                        onClick={() => openTaskDetail(task)}
+                      >
+                        <div className="task-linear-col task-linear-col-name">
+                          <span className="task-linear-row-title">{task.title.trim() || '未命名任务'}</span>
+                          {subtitleShort ? <span className="task-linear-row-sub">{subtitleShort}</span> : null}
+                        </div>
+                        <div className="task-linear-col task-linear-col-schedule">
+                          <span className="task-linear-row-primary">{formatAgentTaskScheduleShort(task)}</span>
+                          {task.nextRunAt ? (
+                            <span className="task-linear-row-sub">下次 {formatOptionalAbsoluteTime(task.nextRunAt)}</span>
+                          ) : null}
+                        </div>
+                        <div className="task-linear-col task-linear-col-status">
+                          <span className="task-linear-status-pill">{formatAgentTaskStatus(task.status)}</span>
+                        </div>
+                        <div className="task-linear-col task-linear-col-agent">
+                          <span className="task-linear-row-primary">{task.agentName}</span>
+                        </div>
+                        <div className="task-linear-col task-linear-col-last">
+                          <span className="task-linear-row-primary">{formatOptionalAbsoluteTime(task.lastRunAt)}</span>
+                        </div>
+                      </button>
+                    )
+                  })}
+                </div>
+              </section>
+            ))}
+          </div>
+        ) : (
+          <section className="task-center-panel task-center-panel-empty task-linear-empty">
+            {loading ? (
+              <p className="task-center-empty-title">正在读取任务…</p>
+            ) : (
+              <p className="task-center-empty-desc">
+                先在聊天里对智能体说「每 10 分钟…」或「每天 9 点…」，保存后这里会出现记录。
+              </p>
+            )}
+          </section>
+        )}
+      </div>
+    </div>
+  )
+}
+
 type AgentSkillPickerDialogProps = {
   allSkillCount: number
   searchValue: string
@@ -5313,6 +6118,10 @@ function AgentEditorDialog({
   const [peerGatewayInfo, setPeerGatewayInfo] = useState<PeerGatewayInfo | null>(null)
   const [peerGatewayLoadError, setPeerGatewayLoadError] = useState('')
   const [peerSnippetCopied, setPeerSnippetCopied] = useState(false)
+  const [agentTasks, setAgentTasks] = useState<AgentTaskListItem[]>([])
+  const [agentTasksLoading, setAgentTasksLoading] = useState(false)
+  const [agentTasksError, setAgentTasksError] = useState('')
+  const [agentTaskActionId, setAgentTaskActionId] = useState('')
   const [advancedOpen, setAdvancedOpen] = useState(mode === 'edit')
   const advancedPresetKeyRef = useRef('')
 
@@ -5334,6 +6143,58 @@ function AgentEditorDialog({
       cancelled = true
     }
   }, [managedAgentId])
+
+  useEffect(() => {
+    const targetAgentId = selectedAgent?.id?.trim()
+    if (!targetAgentId || mode !== 'edit') {
+      setAgentTasks([])
+      setAgentTasksError('')
+      setAgentTasksLoading(false)
+      return
+    }
+
+    let cancelled = false
+    setAgentTasksLoading(true)
+    setAgentTasksError('')
+    void listAgentTasks(targetAgentId)
+      .then((items) => {
+        if (!cancelled) {
+          setAgentTasks(items)
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setAgentTasksError(error instanceof Error ? error.message : String(error))
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setAgentTasksLoading(false)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [mode, selectedAgent?.id])
+
+  const refreshAgentTasks = useCallback(async () => {
+    const targetAgentId = selectedAgent?.id?.trim()
+    if (!targetAgentId || mode !== 'edit') {
+      setAgentTasks([])
+      return
+    }
+    setAgentTasksLoading(true)
+    setAgentTasksError('')
+    try {
+      const items = await listAgentTasks(targetAgentId)
+      setAgentTasks(items)
+    } catch (error) {
+      setAgentTasksError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setAgentTasksLoading(false)
+    }
+  }, [mode, selectedAgent?.id])
 
   const peerDraftConfigs = createAgentBotConfigState(agentDraft?.botConfigs)
   const peerDraftSecret =
@@ -5795,6 +6656,135 @@ function AgentEditorDialog({
 	                    ) : (
 	                      <div className="agent-workspace-hint">
 	                        <span>正在读取对等网关信息…</span>
+	                      </div>
+	                    )}
+	                  </div>
+
+	                  <div className="agent-subsection">
+	                    <div className="agent-subsection-header">
+	                      <div>
+	                        <strong>自然语言定时任务</strong>
+	                        <p>这里展示用户在聊天里直接对这个智能体创建的真实任务。它们会带上当前智能体 ID，并由 scheduler 定时触发。</p>
+	                      </div>
+
+	                      <div className="agent-inline-actions">
+	                        <button type="button" className="outline-button" onClick={() => void refreshAgentTasks()} disabled={agentTasksLoading}>
+	                          <AppIcon name="refresh" size={16} />
+	                          <span>{agentTasksLoading ? '刷新中…' : '刷新列表'}</span>
+	                        </button>
+	                      </div>
+	                    </div>
+
+	                    {agentTasksError ? (
+	                      <div className="skills-feedback error agent-feedback inline">
+	                        <span>读取定时任务失败：{agentTasksError}</span>
+	                      </div>
+	                    ) : null}
+
+	                    {agentTasks.length > 0 ? (
+	                      <div className="agent-automation-list">
+	                        {agentTasks.map((task) => {
+	                          const actionBusy = agentTaskActionId === task.id
+	                          return (
+	                            <div key={task.id} className="agent-automation-card">
+	                              <div className="agent-automation-card-header">
+	                                <div>
+	                                  <strong>{task.title}</strong>
+	                                  <span>{formatAgentTaskSchedule(task)} · {formatAgentTaskStatus(task.status)}</span>
+	                                </div>
+	                                <div className="agent-inline-actions">
+                                  <button
+                                    type="button"
+                                    className="outline-button"
+                                    disabled={actionBusy || task.status === 'deleted'}
+                                    onClick={() => {
+                                      setAgentTaskActionId(task.id)
+                                      void runAgentTaskNow(task.id)
+                                        .then(refreshAgentTasks)
+                                        .catch((error: unknown) => {
+                                          setAgentTasksError(error instanceof Error ? error.message : String(error))
+                                        })
+                                        .finally(() => setAgentTaskActionId(''))
+                                    }}
+                                  >
+                                    <span>{actionBusy ? '处理中…' : '立即执行'}</span>
+                                  </button>
+	                                  {task.status === 'active' ? (
+	                                    <button
+	                                      type="button"
+	                                      className="outline-button"
+	                                      disabled={actionBusy}
+	                                      onClick={() => {
+	                                        setAgentTaskActionId(task.id)
+	                                        void pauseAgentTask(task.id)
+	                                          .then(refreshAgentTasks)
+	                                          .catch((error: unknown) => {
+	                                            setAgentTasksError(error instanceof Error ? error.message : String(error))
+	                                          })
+	                                          .finally(() => setAgentTaskActionId(''))
+	                                      }}
+	                                    >
+	                                      <span>{actionBusy ? '处理中…' : '暂停'}</span>
+	                                    </button>
+	                                  ) : task.status === 'paused' ? (
+	                                    <button
+	                                      type="button"
+	                                      className="outline-button"
+	                                      disabled={actionBusy}
+	                                      onClick={() => {
+	                                        setAgentTaskActionId(task.id)
+	                                        void resumeAgentTask(task.id)
+	                                          .then(refreshAgentTasks)
+	                                          .catch((error: unknown) => {
+	                                            setAgentTasksError(error instanceof Error ? error.message : String(error))
+	                                          })
+	                                          .finally(() => setAgentTaskActionId(''))
+	                                      }}
+	                                    >
+	                                      <span>{actionBusy ? '处理中…' : '恢复'}</span>
+	                                    </button>
+	                                  ) : null}
+	                                  {task.status !== 'deleted' ? (
+	                                    <button
+	                                      type="button"
+	                                      className="icon-button subtle"
+	                                      disabled={actionBusy}
+	                                      onClick={() => {
+	                                        setAgentTaskActionId(task.id)
+	                                        void deleteAgentTask(task.id)
+	                                          .then(refreshAgentTasks)
+	                                          .catch((error: unknown) => {
+	                                            setAgentTasksError(error instanceof Error ? error.message : String(error))
+	                                          })
+	                                          .finally(() => setAgentTaskActionId(''))
+	                                      }}
+	                                    >
+	                                      <AppIcon name="trash" size={16} />
+	                                    </button>
+	                                  ) : null}
+	                                </div>
+	                              </div>
+
+	                              <div className="agent-workspace-hint">
+	                                <span>创建智能体：{task.agentName} ({task.agentId})</span>
+	                                <span>类型：{task.taskType === 'agent_prompt' ? 'agent_prompt · 到点后再唤起智能体' : 'reminder · 直接提醒'}</span>
+	                                <span>来源会话：{task.sourceSessionId}</span>
+	                                <span>投递：{task.deliveryKind} → {task.deliveryTarget}</span>
+	                                <span>上次执行：{formatOptionalAbsoluteTime(task.lastRunAt)}</span>
+	                              </div>
+
+	                              <label className="input-field agent-field-full">
+	                                <span>任务内容</span>
+	                                <textarea value={task.goal || task.intentSummary} readOnly rows={3} />
+	                              </label>
+	                            </div>
+	                          )
+	                        })}
+	                      </div>
+	                    ) : (
+	                      <div className="agent-empty-block">
+	                        <strong>{agentTasksLoading ? '正在读取任务…' : '还没有自然语言创建的任务'}</strong>
+	                        <span>先在聊天里对这个智能体说“每 10 分钟…”或“每天 9 点…”，这里就会出现对应记录。</span>
 	                      </div>
 	                    )}
 	                  </div>

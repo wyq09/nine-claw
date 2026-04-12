@@ -578,7 +578,8 @@ fn parse_skill_manifest(content: &str) -> SkillManifest {
             if let Some((key, value)) = trimmed.split_once(':') {
                 let key = key.trim();
                 let value = value.trim();
-                let (normalized, consumed) = parse_frontmatter_value(&frontmatter_lines, index, line, value);
+                let (normalized, consumed) =
+                    parse_frontmatter_value(&frontmatter_lines, index, line, value);
                 match key {
                     "name" if manifest.name.is_none() => {
                         manifest.name = Some(normalized);
@@ -642,7 +643,10 @@ fn parse_frontmatter_value(
         return (strip_wrapping_quotes(raw_value).to_string(), 1);
     }
 
-    let key_indent = original_line.chars().take_while(|char| char.is_whitespace()).count();
+    let key_indent = original_line
+        .chars()
+        .take_while(|char| char.is_whitespace())
+        .count();
     let mut block_lines = Vec::new();
     let mut index = start_index + 1;
     let mut block_indent: Option<usize> = None;
@@ -650,7 +654,10 @@ fn parse_frontmatter_value(
     while index < lines.len() {
         let candidate = &lines[index];
         let trimmed = candidate.trim();
-        let indent = candidate.chars().take_while(|char| char.is_whitespace()).count();
+        let indent = candidate
+            .chars()
+            .take_while(|char| char.is_whitespace())
+            .count();
 
         if trimmed.is_empty() {
             if block_indent.is_some() {
@@ -687,7 +694,10 @@ fn parse_frontmatter_value(
 }
 
 fn trim_frontmatter_block_lines(lines: Vec<String>) -> Vec<String> {
-    let start = lines.iter().position(|line| !line.trim().is_empty()).unwrap_or(lines.len());
+    let start = lines
+        .iter()
+        .position(|line| !line.trim().is_empty())
+        .unwrap_or(lines.len());
     let end = lines
         .iter()
         .rposition(|line| !line.trim().is_empty())

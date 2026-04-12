@@ -1,10 +1,18 @@
 use serde::Serialize;
 use std::env;
+use std::fs;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Manager};
 
 const PI_RUNTIME_RESOURCE_DIR: &str = "pi-runtime";
+const PI_RUNTIME_BUNDLE_DIR: &str = "pi-runtime-bundles";
+const PI_RUNTIME_EXTRACT_DIR: &str = "pi-runtime-extracted";
+
+/// Global flag: repair_runtime_directory() should only run once per process.
+static REPAIR_DONE: AtomicBool = AtomicBool::new(false);
 
 fn platform_dir_name() -> &'static str {
     if cfg!(target_os = "windows") {
@@ -38,6 +46,17 @@ fn development_runtime_candidates() -> Vec<PathBuf> {
         .iter()
         .map(|executable_name| root.join(executable_name))
         .collect()
+}
+
+fn development_runtime_archive_candidates() -> Vec<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return Vec::new();
+    }
+
+    vec![PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join(PI_RUNTIME_BUNDLE_DIR)
+        .join(format!("{}.tar.gz", platform_dir_name()))]
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -209,9 +228,163 @@ fn bundled_runtime_candidates(app: &AppHandle) -> Vec<PathBuf> {
     candidates
 }
 
-pub(crate) fn resolve_bundled_pi_executable(app: &AppHandle) -> Option<PathBuf> {
-    bundled_runtime_candidates(app)
+fn bundled_runtime_archive_candidates(app: &AppHandle) -> Vec<PathBuf> {
+    let Ok(resource_dir) = app.path().resource_dir() else {
+        return development_runtime_archive_candidates();
+    };
+
+    let archive_name = format!("{}.tar.gz", platform_dir_name());
+    let search_roots: Vec<PathBuf> = vec![resource_dir.join("resources"), resource_dir.clone()];
+    let mut candidates = Vec::new();
+    for search_root in &search_roots {
+        candidates.push(search_root.join(PI_RUNTIME_BUNDLE_DIR).join(&archive_name));
+    }
+    candidates.extend(development_runtime_archive_candidates());
+    candidates
+}
+
+fn extraction_state_path(root: &Path) -> PathBuf {
+    root.join(".bundle-source")
+}
+
+fn desired_runtime_extract_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .or_else(|_| app.path().app_data_dir())
+        .map_err(|error| format!("解析本地 pi runtime 目录失败: {error}"))?;
+    Ok(base.join(PI_RUNTIME_EXTRACT_DIR).join(platform_dir_name()))
+}
+
+pub(crate) fn repair_runtime_directory(root: &Path) -> Result<(), String> {
+    if !root.exists() {
+        return Ok(());
+    }
+    // Only run once per process — the repair is expensive (walks entire tree,
+    // sets permissions on every file, runs xattr -cr on macOS).
+    if REPAIR_DONE.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("xattr")
+            .args(["-cr", root.to_string_lossy().as_ref()])
+            .status();
+    }
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("读取 pi runtime 路径失败 {}: {error}", path.display()))?;
+        if metadata.is_dir() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&path, PermissionsExt::from_mode(0o755));
+            }
+            for entry in fs::read_dir(&path)
+                .map_err(|error| format!("遍历 pi runtime 目录失败 {}: {error}", path.display()))?
+            {
+                let entry =
+                    entry.map_err(|error| format!("读取 pi runtime 目录项失败: {error}"))?;
+                stack.push(entry.path());
+            }
+            continue;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            let executable = file_name == "pi"
+                || file_name == "node"
+                || file_name.ends_with(".dylib")
+                || file_name.ends_with(".so")
+                || file_name.ends_with(".dll");
+            let mode = if executable { 0o755 } else { 0o644 };
+            let _ = fs::set_permissions(&path, PermissionsExt::from_mode(mode));
+        }
+    }
+
+    REPAIR_DONE.store(true, Ordering::Release);
+    Ok(())
+}
+
+fn ensure_extracted_runtime(app: &AppHandle) -> Result<PathBuf, String> {
+    let Some(archive_path) = bundled_runtime_archive_candidates(app)
         .into_iter()
+        .find(|candidate| candidate.is_file())
+    else {
+        return Err("未找到内置 pi runtime 归档".to_string());
+    };
+
+    let archive_real = fs::canonicalize(&archive_path).unwrap_or(archive_path.clone());
+    let extract_root = desired_runtime_extract_root(app)?;
+    let state_path = extraction_state_path(&extract_root);
+    let expected_state = archive_real.to_string_lossy().to_string();
+    let needs_extract = !extract_root.is_dir()
+        || !platform_executable_names()
+            .iter()
+            .any(|name| extract_root.join(name).is_file())
+        || fs::read_to_string(&state_path)
+            .ok()
+            .map(|value| value.trim().to_string())
+            != Some(expected_state.clone());
+
+    if needs_extract {
+        if extract_root.exists() {
+            fs::remove_dir_all(&extract_root)
+                .map_err(|error| format!("清理旧 pi runtime 解包目录失败: {error}"))?;
+        }
+        fs::create_dir_all(
+            extract_root
+                .parent()
+                .ok_or_else(|| "pi runtime 解包目录无父目录".to_string())?,
+        )
+        .map_err(|error| format!("创建 pi runtime 解包父目录失败: {error}"))?;
+
+        let file = fs::File::open(&archive_real).map_err(|error| {
+            format!(
+                "打开 pi runtime 归档失败 {}: {error}",
+                archive_real.display()
+            )
+        })?;
+        let decoder = flate2::read::GzDecoder::new(BufReader::new(file));
+        let mut archive = tar::Archive::new(decoder);
+        archive
+            .unpack(
+                extract_root
+                    .parent()
+                    .ok_or_else(|| "pi runtime 解包目录无父目录".to_string())?,
+            )
+            .map_err(|error| format!("解包 pi runtime 归档失败: {error}"))?;
+        fs::write(&state_path, expected_state)
+            .map_err(|error| format!("写入 pi runtime 解包状态失败: {error}"))?;
+    }
+
+    repair_runtime_directory(&extract_root)?;
+    Ok(extract_root)
+}
+
+pub(crate) fn resolve_bundled_pi_executable(app: &AppHandle) -> Option<PathBuf> {
+    if let Some(candidate) = bundled_runtime_candidates(app)
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+    {
+        if let Some(root) = candidate.parent() {
+            let _ = repair_runtime_directory(root);
+        }
+        return Some(candidate);
+    }
+
+    let extracted_root = ensure_extracted_runtime(app).ok()?;
+    platform_executable_names()
+        .iter()
+        .map(|executable_name| extracted_root.join(executable_name))
         .find(|candidate| candidate.is_file())
 }
 
@@ -221,6 +394,7 @@ pub(crate) fn resolve_pi_executable(app: &AppHandle) -> Option<PiRuntimeLocation
     if let Some(executable) = resolve_bundled_pi_executable(app) {
         if let Some(parent) = executable.parent() {
             prepend_to_path(parent);
+            let _ = repair_runtime_directory(parent);
         }
         let resource_root = executable.parent().map(Path::to_path_buf);
         return Some(PiRuntimeLocation {
@@ -272,7 +446,7 @@ pub(crate) fn clear_macos_quarantine_if_present(executable: &Path) -> Option<Str
         ))
     } else {
         Some(format!(
-            "检测到 macOS 隔离属性但自动移除失败，请手动执行: xattr -cr {}",
+            "检测到 macOS 隔离属性，但自动修复未完成: {}",
             path_str
         ))
     }
@@ -280,6 +454,35 @@ pub(crate) fn clear_macos_quarantine_if_present(executable: &Path) -> Option<Str
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn clear_macos_quarantine_if_present(_executable: &Path) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn repair_runtime_and_report(location: &PiRuntimeLocation) -> Option<String> {
+    let mut notes = Vec::new();
+    if let Some(root) = location.resource_root.as_ref() {
+        if repair_runtime_directory(root).is_ok() {
+            notes.push(format!(
+                "已校验并修复 pi runtime 目录权限: {}",
+                root.display()
+            ));
+        }
+    }
+    if let Some(note) = clear_macos_quarantine_if_present(&location.executable) {
+        notes.push(note);
+    }
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join(" | "))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn repair_runtime_and_report(location: &PiRuntimeLocation) -> Option<String> {
+    if let Some(root) = location.resource_root.as_ref() {
+        let _ = repair_runtime_directory(root);
+    }
     None
 }
 

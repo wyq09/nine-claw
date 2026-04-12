@@ -111,8 +111,8 @@ function parseStandaloneMarkdownMediaLine(line: string): InlineMediaAttachment |
   }
 }
 
-function parseDirectiveMediaLine(line: string): InlineMediaAttachment | null {
-  const trimmed = line.trim()
+function parseDirectiveMediaToken(token: string): InlineMediaAttachment | null {
+  const trimmed = token.trim()
   if (!trimmed.startsWith('::nc-media{') || !trimmed.endsWith('}')) {
     return null
   }
@@ -159,6 +159,10 @@ function parseDirectiveMediaLine(line: string): InlineMediaAttachment | null {
     src: normalizeLocalAssetSource(rawPath),
     fileName,
   }
+}
+
+function parseDirectiveMediaLine(line: string): InlineMediaAttachment | null {
+  return parseDirectiveMediaToken(line)
 }
 
 function parseInboundAttachmentLine(line: string): InlineMediaAttachment | null {
@@ -245,21 +249,39 @@ export function extractInlineMediaAttachments(content: string): {
   const seen = new Set<string>()
   const textLines: string[] = []
 
-  for (const line of content.split('\n')) {
-    const attachment =
-      parseInboundAttachmentLine(line) ??
-      parseDirectiveMediaLine(line) ??
-      parseStandaloneMarkdownMediaLine(line)
-    if (attachment) {
-      if (!attachment.path || !seen.has(attachment.path)) {
-        if (attachment.path) {
-          seen.add(attachment.path)
-        }
-        attachments.push(attachment)
+  const pushAttachment = (attachment: InlineMediaAttachment) => {
+    if (!attachment.path || !seen.has(attachment.path)) {
+      if (attachment.path) {
+        seen.add(attachment.path)
       }
+      attachments.push(attachment)
+    }
+  }
+
+  for (const line of content.split('\n')) {
+    const lineWithoutInlineDirectives = line.replace(/::nc-media\{[^}]*\}/g, (match) => {
+      const attachment = parseDirectiveMediaToken(match)
+      if (attachment) {
+        pushAttachment(attachment)
+        return ' '
+      }
+      return match
+    })
+
+    const attachment =
+      parseInboundAttachmentLine(lineWithoutInlineDirectives) ??
+      parseDirectiveMediaLine(lineWithoutInlineDirectives) ??
+      parseStandaloneMarkdownMediaLine(lineWithoutInlineDirectives)
+    if (attachment) {
+      pushAttachment(attachment)
       continue
     }
-    textLines.push(line)
+
+    if (lineWithoutInlineDirectives.trim()) {
+      textLines.push(lineWithoutInlineDirectives)
+    } else if (line.trim() === '') {
+      textLines.push('')
+    }
   }
 
   try {

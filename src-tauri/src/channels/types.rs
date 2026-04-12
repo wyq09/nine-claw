@@ -1,4 +1,5 @@
 use crate::agents::ConversationAgentConfig;
+use crate::{PiTokenUsagePayload, PiUsageMetadataPayload};
 use serde::{Deserialize, Serialize};
 
 /// Status of a bot channel.
@@ -22,6 +23,10 @@ pub struct BotMessage {
     pub timestamp: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<ConversationAgentConfig>,
+    #[serde(flatten)]
+    pub usage: Option<PiTokenUsagePayload>,
+    #[serde(flatten)]
+    pub usage_meta: Option<PiUsageMetadataPayload>,
 }
 
 /// Media types supported by channels.

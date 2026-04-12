@@ -264,11 +264,9 @@ fn persist_outbound_media_items(
     media_items
         .into_iter()
         .map(|item| {
-            let resolved_path = agent_workspace::resolve_agent_media_reference(
-                Some(agent_id),
-                &item.file_path,
-            )
-            .unwrap_or_else(|| PathBuf::from(&item.file_path));
+            let resolved_path =
+                agent_workspace::resolve_agent_media_reference(Some(agent_id), &item.file_path)
+                    .unwrap_or_else(|| PathBuf::from(&item.file_path));
             let source_path = resolved_path.as_path();
             match agent_workspace::persist_agent_outbound_artifact(
                 agent_id,
@@ -1669,6 +1667,44 @@ impl Channel for WeChatChannel {
                         let user_id_for_state = user_id.clone();
                         let app_for_cb = app_handle.clone();
                         let state_for_run = user_states.clone();
+                        let agent_id_for_task = agent_config.as_ref().map(|item| item.id.clone());
+
+                        if let Some(agent_id) = agent_id_for_task.as_deref() {
+                            let task_session_id = format!("{channel_id}:{user_id}");
+                            match crate::agent_tasks::handle_prompt(
+                                &app_handle,
+                                &prompt_text,
+                                &task_session_id,
+                                agent_id,
+                            ) {
+                                Ok(task_result) if task_result.handled => {
+                                    if let Ok(mut guard) = user_states.lock() {
+                                        if let Some(state) = guard.get_mut(&user_id) {
+                                            state.running = false;
+                                            state.active_run = None;
+                                        }
+                                    }
+                                    let content = task_result.assistant_message.trim().to_string();
+                                    if !content.is_empty() {
+                                        emit_bot_message(
+                                            &app_handle,
+                                            &channel_id,
+                                            &user_id,
+                                            "outbound_done",
+                                            &content,
+                                            agent_config.as_ref(),
+                                        );
+                                        let _ = rt
+                                            .block_on(api.send_message(&user_id, &content, ct_opt));
+                                    }
+                                    continue;
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    log::warn!("wechat task intent 处理失败: {}", error);
+                                }
+                            }
+                        }
 
                         let result = bridge.process_message_with_attachments_interruptible(
                             &channel_id,
@@ -1710,7 +1746,10 @@ impl Channel for WeChatChannel {
                         };
 
                         match result {
-                            Ok(PiProcessOutcome::Completed(full_text)) => {
+                            Ok(PiProcessOutcome::Completed(result)) => {
+                                let full_text = result.full_text;
+                                let usage = result.usage;
+                                let usage_meta = result.usage_meta;
                                 if has_pending_followup {
                                     emit_bot_status(
                                         &app_handle,
@@ -1742,13 +1781,15 @@ impl Channel for WeChatChannel {
                                         "warn",
                                         "pi 返回了空回复，请检查 provider 配置",
                                     );
-                                    emit_bot_message(
+                                    emit_bot_message_with_usage(
                                         &app_handle,
                                         &channel_id,
                                         &user_id,
                                         "outbound_done",
                                         "",
                                         agent_config.as_ref(),
+                                        usage.clone(),
+                                        usage_meta.clone(),
                                     );
                                     cleanup_idle_user_state(&user_states, &user_id);
                                     break;
@@ -1789,7 +1830,8 @@ impl Channel for WeChatChannel {
                                     );
                                 }
                                 if !cleaned_text_reply.is_empty() {
-                                    let cards = resolve_reply_card_items(&cleaned_text_reply, false);
+                                    let cards =
+                                        resolve_reply_card_items(&cleaned_text_reply, false);
                                     for seg in wechat_im_text_segments(&cards) {
                                         if !seg.is_empty() {
                                             send_reply_chunks(&rt, &api, &user_id, &seg, ct_opt);
@@ -1803,13 +1845,15 @@ impl Channel for WeChatChannel {
                                         log::error!("发送媒体消息失败: {error}");
                                     }
                                 }
-                                emit_bot_message(
+                                emit_bot_message_with_usage(
                                     &app_handle,
                                     &channel_id,
                                     &user_id,
                                     "outbound_done",
                                     &display_reply,
                                     agent_config.as_ref(),
+                                    usage,
+                                    usage_meta,
                                 );
                                 cleanup_idle_user_state(&user_states, &user_id);
                                 break;
@@ -1990,13 +2034,7 @@ fn send_media_item(
         MediaType::Audio | MediaType::File => MSG_ITEM_TYPE_FILE,
     };
 
-    rt.block_on(api.send_binary_media(
-        user_id,
-        item_type,
-        &media.file_name,
-        &data,
-        context_token,
-    ))
+    rt.block_on(api.send_binary_media(user_id, item_type, &media.file_name, &data, context_token))
 }
 
 /// Emit a `bot://status` event to the frontend for diagnostic display.
@@ -2022,6 +2060,21 @@ fn emit_bot_message(
     content: &str,
     agent: Option<&ConversationAgentConfig>,
 ) {
+    emit_bot_message_with_usage(
+        app, channel_id, user_id, direction, content, agent, None, None,
+    )
+}
+
+fn emit_bot_message_with_usage(
+    app: &AppHandle,
+    channel_id: &str,
+    user_id: &str,
+    direction: &str,
+    content: &str,
+    agent: Option<&ConversationAgentConfig>,
+    usage: Option<crate::PiTokenUsagePayload>,
+    usage_meta: Option<crate::PiUsageMetadataPayload>,
+) {
     let payload = BotMessage {
         channel_id: channel_id.to_string(),
         user_id: user_id.to_string(),
@@ -2029,6 +2082,8 @@ fn emit_bot_message(
         content: content.to_string(),
         timestamp: now_timestamp_ms(),
         agent: agent.cloned(),
+        usage,
+        usage_meta,
     };
     if let Err(e) = app.emit("bot://message", &payload) {
         log::error!("emit bot://message 失败: {e}");
@@ -2151,14 +2206,17 @@ mod tests {
             .expect("plain path media");
 
         assert!(matches!(item.media_type, MediaType::Image));
-        assert_eq!(item.file_path, "/Users/demo/Desktop/wechat_login_screenshot.png");
+        assert_eq!(
+            item.file_path,
+            "/Users/demo/Desktop/wechat_login_screenshot.png"
+        );
         assert_eq!(item.file_name, "wechat_login_screenshot.png");
     }
 
     #[test]
     fn parses_plain_file_name_media_path() {
-        let item = parse_plain_path_media("- wechat_login_screenshot.png")
-            .expect("plain file name media");
+        let item =
+            parse_plain_path_media("- wechat_login_screenshot.png").expect("plain file name media");
 
         assert!(matches!(item.media_type, MediaType::Image));
         assert_eq!(item.file_path, "wechat_login_screenshot.png");

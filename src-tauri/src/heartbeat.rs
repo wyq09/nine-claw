@@ -1,7 +1,10 @@
+#![allow(dead_code)]
+
 use crate::agent_workspace;
 use crate::agents::{self, AgentHeartbeatSchedule, AgentHeartbeatTask, AgentRecord};
 use crate::channels::pi_bridge::PiBridge;
 use crate::channels::types::{MediaPayload, MediaType};
+use crate::media_directives::{parse_markdown_media_reference, parse_media_directive_fields};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, FixedOffset, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
@@ -839,37 +842,13 @@ fn split_text_and_media(content: &str) -> (String, Vec<ParsedMediaItem>) {
 }
 
 fn parse_media_directive(line: &str) -> Option<ParsedMediaItem> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with("::nc-media{") || !trimmed.ends_with('}') {
-        return None;
-    }
-
-    let body = &trimmed["::nc-media{".len()..trimmed.len() - 1];
-    let mut media_type = None;
-    let mut path = None;
-
-    for pair in body.split_whitespace() {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        let normalized = value
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
-        match key {
-            "type" => media_type = Some(normalized),
-            "path" => path = Some(normalized),
-            _ => {}
-        }
-    }
-
-    let path = path?;
+    let parsed = parse_media_directive_fields(line)?;
+    let path = parsed.path;
     if !Path::new(&path).is_absolute() {
         return None;
     }
 
-    let media_type = match media_type.as_deref() {
+    let media_type = match parsed.media_type.as_deref() {
         Some("image") => MediaType::Image,
         Some("video") => MediaType::Video,
         Some("file") => MediaType::File,
@@ -886,27 +865,21 @@ fn parse_media_directive(line: &str) -> Option<ParsedMediaItem> {
 
     Some(ParsedMediaItem {
         media_type,
-        file_name: file_name_from_path(&path),
+        file_name: parsed.name.unwrap_or_else(|| file_name_from_path(&path)),
         file_path: path,
     })
 }
 
 fn parse_markdown_media(line: &str) -> Option<ParsedMediaItem> {
-    let trimmed = line.trim();
-    let start = trimmed.find('(')?;
-    let end = trimmed.rfind(')')?;
-    if end <= start + 1 {
+    let reference = parse_markdown_media_reference(line)?;
+    let path = reference.path;
+    if !Path::new(&path).is_absolute() {
         return None;
     }
 
-    let path = trimmed[start + 1..end].trim();
-    if !Path::new(path).is_absolute() {
-        return None;
-    }
-
-    let media_type = if trimmed.starts_with("![") || is_image_path(path) {
+    let media_type = if line.trim().starts_with("![") || is_image_path(&path) {
         MediaType::Image
-    } else if is_video_path(path) {
+    } else if is_video_path(&path) {
         MediaType::Video
     } else {
         MediaType::File
@@ -914,8 +887,8 @@ fn parse_markdown_media(line: &str) -> Option<ParsedMediaItem> {
 
     Some(ParsedMediaItem {
         media_type,
-        file_name: file_name_from_path(path),
-        file_path: path.to_string(),
+        file_name: file_name_from_path(&path),
+        file_path: path,
     })
 }
 

@@ -680,6 +680,49 @@ impl Channel for LarkChannel {
                         let user_id_for_state = session_user_id.clone();
                         let app_for_cb = app_handle.clone();
                         let state_for_run = user_states.clone();
+                        let agent_id_for_task = agent_config.as_ref().map(|item| item.id.clone());
+
+                        if let Some(agent_id) = agent_id_for_task.as_deref() {
+                            let task_session_id = format!("{channel_id}:{session_user_id}");
+                            match crate::agent_tasks::handle_prompt(
+                                &app_handle,
+                                &prompt_text,
+                                &task_session_id,
+                                agent_id,
+                            ) {
+                                Ok(task_result) if task_result.handled => {
+                                    if let Ok(mut guard) = user_states.lock() {
+                                        if let Some(state) = guard.get_mut(&session_user_id) {
+                                            state.running = false;
+                                            state.active_run = None;
+                                        }
+                                    }
+                                    let content = task_result.assistant_message.trim().to_string();
+                                    if !content.is_empty() {
+                                        emit_bot_message(
+                                            &app_handle,
+                                            &channel_id,
+                                            &session_user_id,
+                                            "outbound_done",
+                                            &content,
+                                            agent_config.as_ref(),
+                                        );
+                                        let _ = send_text_chunks(
+                                            &helper_stdin,
+                                            &pending_requests,
+                                            &receive_target,
+                                            &content,
+                                        );
+                                    }
+                                    continue;
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    log::warn!("lark task intent 处理失败: {}", error);
+                                }
+                            }
+                        }
+
                         let result = bridge.process_message_with_attachments_interruptible(
                             &channel_id,
                             &session_user_id,
@@ -720,7 +763,10 @@ impl Channel for LarkChannel {
                         };
 
                         match result {
-                            Ok(PiProcessOutcome::Completed(full_text)) => {
+                            Ok(PiProcessOutcome::Completed(result)) => {
+                                let full_text = result.full_text;
+                                let usage = result.usage;
+                                let usage_meta = result.usage_meta;
                                 dev_trace(
                                     "lark",
                                     format!(
@@ -758,13 +804,15 @@ impl Channel for LarkChannel {
                                         "warn",
                                         "模型返回了空回复",
                                     );
-                                    emit_bot_message(
+                                    emit_bot_message_with_usage(
                                         &app_handle,
                                         &channel_id,
                                         &session_user_id,
                                         "outbound_done",
                                         "",
                                         agent_config.as_ref(),
+                                        usage.clone(),
+                                        usage_meta.clone(),
                                     );
                                     cleanup_idle_user_state(&user_states, &session_user_id);
                                     break;
@@ -826,13 +874,15 @@ impl Channel for LarkChannel {
                                     "done",
                                     &format!("回复 {} 字符完成", full_text.len()),
                                 );
-                                emit_bot_message(
+                                emit_bot_message_with_usage(
                                     &app_handle,
                                     &channel_id,
                                     &session_user_id,
                                     "outbound_done",
                                     &display_reply,
                                     agent_config.as_ref(),
+                                    usage,
+                                    usage_meta,
                                 );
                                 cleanup_idle_user_state(&user_states, &session_user_id);
                                 break;
@@ -1420,11 +1470,9 @@ fn persist_outbound_media_items(
     media_items
         .into_iter()
         .map(|item| {
-            let resolved_path = agent_workspace::resolve_agent_media_reference(
-                Some(agent_id),
-                &item.file_path,
-            )
-            .unwrap_or_else(|| PathBuf::from(&item.file_path));
+            let resolved_path =
+                agent_workspace::resolve_agent_media_reference(Some(agent_id), &item.file_path)
+                    .unwrap_or_else(|| PathBuf::from(&item.file_path));
             let source_path = resolved_path.as_path();
             match agent_workspace::persist_agent_outbound_artifact(
                 agent_id,
@@ -1700,6 +1748,21 @@ fn emit_bot_message(
     content: &str,
     agent: Option<&ConversationAgentConfig>,
 ) {
+    emit_bot_message_with_usage(
+        app, channel_id, user_id, direction, content, agent, None, None,
+    )
+}
+
+fn emit_bot_message_with_usage(
+    app: &AppHandle,
+    channel_id: &str,
+    user_id: &str,
+    direction: &str,
+    content: &str,
+    agent: Option<&ConversationAgentConfig>,
+    usage: Option<crate::PiTokenUsagePayload>,
+    usage_meta: Option<crate::PiUsageMetadataPayload>,
+) {
     let payload = BotMessage {
         channel_id: channel_id.to_string(),
         user_id: user_id.to_string(),
@@ -1707,6 +1770,8 @@ fn emit_bot_message(
         content: content.to_string(),
         timestamp: now_timestamp_ms(),
         agent: agent.cloned(),
+        usage,
+        usage_meta,
     };
     let app_emit = app.clone();
     let _ = app.clone().run_on_main_thread(move || {

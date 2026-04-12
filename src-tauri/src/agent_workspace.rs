@@ -936,7 +936,10 @@ fn normalize_media_reference(reference: &str) -> String {
 
 fn looks_like_file_name_reference(reference: &str) -> bool {
     let candidate = reference.trim();
-    let Some(extension) = Path::new(candidate).extension().and_then(|value| value.to_str()) else {
+    let Some(extension) = Path::new(candidate)
+        .extension()
+        .and_then(|value| value.to_str())
+    else {
         return false;
     };
     if extension.is_empty() || extension.len() > 10 {
@@ -993,7 +996,12 @@ fn maybe_push_media_match(
     }
 }
 
-fn collect_media_matches(root: &Path, target_name: &str, raw_reference: &str, matches: &mut Vec<PathBuf>) {
+fn collect_media_matches(
+    root: &Path,
+    target_name: &str,
+    raw_reference: &str,
+    matches: &mut Vec<PathBuf>,
+) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
@@ -1007,10 +1015,7 @@ fn collect_media_matches(root: &Path, target_name: &str, raw_reference: &str, ma
     }
 }
 
-pub fn resolve_agent_media_reference(
-    agent_id: Option<&str>,
-    reference: &str,
-) -> Option<PathBuf> {
+pub fn resolve_agent_media_reference(agent_id: Option<&str>, reference: &str) -> Option<PathBuf> {
     let normalized = normalize_media_reference(reference);
     if normalized.is_empty() {
         return None;
@@ -1077,7 +1082,11 @@ pub fn register_agent_outbound_artifact_source(
             mime,
             file_path.display()
         ),
-        None => format!("生成并发送产物：{}（path=`{}`）", title, file_path.display()),
+        None => format!(
+            "生成并发送产物：{}（path=`{}`）",
+            title,
+            file_path.display()
+        ),
     };
     memory_wiki::ensure_memory_wiki_scaffold(&agent_home)?;
     memory_wiki::record_attachment_source(

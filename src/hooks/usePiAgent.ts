@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useEffectEvent, useRef, useState } from 'react'
+import { listen } from '@tauri-apps/api/event'
 import {
   abortPiStream,
   clearHistoryState,
   clearPiSession,
   clearPiSessionForId,
+  handleAgentTaskPrompt,
+  listAgentTaskDeliveries,
   loadHistoryState,
   saveHistoryState,
   streamPiPrompt,
@@ -17,6 +20,7 @@ import type {
   AgentCollaborationConfig,
   AgentExecutionMode,
   AgentSharedContextPolicy,
+  AgentTaskDeliveryRecord,
   BotConversationTarget,
   ConversationAgentSnapshot,
   ConversationTurn,
@@ -49,6 +53,46 @@ function createActivity(label: string, detail: string, state: ActivityState): Ac
     state,
     createdAt: Date.now(),
   }
+}
+
+function appendAgentTaskDeliveriesToHistory(
+  previous: HistoryItem[],
+  deliveries: AgentTaskDeliveryRecord[],
+): HistoryItem[] {
+  if (deliveries.length === 0) {
+    return previous
+  }
+
+  return previous.map((item) => {
+    const matches = deliveries.filter((delivery) => delivery.sessionId === item.id)
+    if (matches.length === 0) {
+      return item
+    }
+
+    const appendedTurns = matches
+      .filter((delivery) => !item.turns.some((turn) => turn.id === delivery.id))
+      .map((delivery) => ({
+        id: delivery.id,
+        prompt: `[系统定时任务] ${delivery.title}`,
+        answer: delivery.content,
+        status: 'done' as const,
+        createdAt: delivery.createdAt,
+        completedAt: delivery.createdAt,
+        activity: [],
+        thinking: '',
+        toolCalls: [],
+      }))
+
+    if (appendedTurns.length === 0) {
+      return item
+    }
+
+    return {
+      ...item,
+      updatedAt: Date.now(),
+      turns: [...item.turns, ...appendedTurns],
+    }
+  })
 }
 
 function updateLatestActivityState(
@@ -325,16 +369,31 @@ function extractTokenUsage(raw: Record<string, unknown> | undefined): TokenUsage
     return undefined
   }
 
+  // raw.usage covers the Tauri event path where PiTokenUsagePayload is a nested field.
+  // raw.inputTokens etc. covers the flattened Tauri event path via #[serde(flatten)].
+  // The short-name forms (input, output, cacheRead) cover direct PI JSON passthrough.
+  const usage = raw.usage as Record<string, unknown> | undefined
+
   const inputTokens =
-    parseOptionalNumber(raw.inputTokens ?? raw.input_tokens ?? raw.input) ?? 0
+    parseOptionalNumber(
+      usage?.inputTokens ?? usage?.input ?? raw.inputTokens ?? raw.input_tokens ?? raw.input,
+    ) ?? 0
   const outputTokens =
-    parseOptionalNumber(raw.outputTokens ?? raw.output_tokens ?? raw.output) ?? 0
+    parseOptionalNumber(
+      usage?.outputTokens ?? usage?.output ?? raw.outputTokens ?? raw.output_tokens ?? raw.output,
+    ) ?? 0
   const cacheReadTokens =
-    parseOptionalNumber(raw.cacheReadTokens ?? raw.cache_read_tokens ?? raw.cacheRead) ?? 0
+    parseOptionalNumber(
+      usage?.cacheReadTokens ?? usage?.cacheRead ?? raw.cacheReadTokens ?? raw.cache_read_tokens ?? raw.cacheRead,
+    ) ?? 0
   const cacheWriteTokens =
-    parseOptionalNumber(raw.cacheWriteTokens ?? raw.cache_write_tokens ?? raw.cacheWrite) ?? 0
+    parseOptionalNumber(
+      usage?.cacheWriteTokens ?? usage?.cacheWrite ?? raw.cacheWriteTokens ?? raw.cache_write_tokens ?? raw.cacheWrite,
+    ) ?? 0
   const totalTokens =
-    parseOptionalNumber(raw.totalTokens ?? raw.total_tokens) ??
+    parseOptionalNumber(
+      usage?.totalTokens ?? usage?.total ?? raw.totalTokens ?? raw.total_tokens,
+    ) ??
     inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
 
   if (
@@ -347,22 +406,36 @@ function extractTokenUsage(raw: Record<string, unknown> | undefined): TokenUsage
     return undefined
   }
 
+  // Prefer metadata from raw (flattened Tauri path), fall back to usage sub-object
+  const api: string | undefined =
+    (typeof raw.api === 'string' ? raw.api : undefined) ??
+    (typeof usage?.api === 'string' ? (usage.api as string) : undefined)
+  const provider: string | undefined =
+    (typeof raw.provider === 'string' ? raw.provider : undefined) ??
+    (typeof usage?.provider === 'string' ? (usage.provider as string) : undefined)
+  const model: string | undefined =
+    (typeof raw.model === 'string' ? raw.model : undefined) ??
+    (typeof usage?.model === 'string' ? (usage.model as string) : undefined)
+  const responseId: string | undefined =
+    (typeof raw.responseId === 'string' ? raw.responseId : undefined) ??
+    (typeof raw.response_id === 'string' ? raw.response_id : undefined) ??
+    (typeof usage?.responseId === 'string' ? (usage.responseId as string) : undefined) ??
+    (typeof usage?.response_id === 'string' ? (usage.response_id as string) : undefined)
+  const timestamp: number | undefined =
+    parseOptionalNumber(raw.timestamp) ??
+    parseOptionalNumber(usage?.timestamp as number)
+
   return {
     inputTokens,
     outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
     totalTokens,
-    api: typeof raw.api === 'string' ? raw.api : undefined,
-    provider: typeof raw.provider === 'string' ? raw.provider : undefined,
-    model: typeof raw.model === 'string' ? raw.model : undefined,
-    responseId:
-      typeof raw.responseId === 'string'
-        ? raw.responseId
-        : typeof raw.response_id === 'string'
-          ? raw.response_id
-          : undefined,
-    timestamp: parseOptionalNumber(raw.timestamp),
+    api,
+    provider,
+    model,
+    responseId,
+    timestamp,
   }
 }
 
@@ -675,6 +748,7 @@ export function usePiAgent() {
   const [history, setHistory] = useState<HistoryItem[]>([])
   const [activeHistoryId, setActiveHistoryId] = useState<string>('')
   const [historyHydrated, setHistoryHydrated] = useState(false)
+  const [runtimeReady, setRuntimeReady] = useState(false)
   const currentTurnIdsRef = useRef<Map<string, string>>(new Map())
   const receivedFirstDeltaRef = useRef<Map<string, boolean>>(new Map())
   /** 同步防连点：同 session 并发 `streamPiPrompt` 会触发后端池化 SIGKILL；`runningHistoryIds` 的 setState 追不上双击。 */
@@ -767,6 +841,14 @@ export function usePiAgent() {
     })
   }
 
+  // Listen for PI runtime readiness (emitted from Rust backend after extraction)
+  useEffect(() => {
+    const unlisten = listen<boolean>('pi://runtime-ready', (event) => {
+      if (event.payload) setRuntimeReady(true)
+    })
+    return () => { unlisten.then((fn) => fn()) }
+  }, [])
+
   useEffect(() => {
     let isMounted = true
 
@@ -815,7 +897,12 @@ export function usePiAgent() {
     }
 
     clearLegacyHistoryStorage()
-    void saveHistoryState(JSON.stringify(history))
+    const serialized = JSON.stringify(history)
+    const firstTurn = history[0]?.turns[0]
+    if (firstTurn?.usage) {
+      console.debug('[usage-debug] saving history, first turn usage:', JSON.stringify(firstTurn.usage))
+    }
+    void saveHistoryState(serialized)
   }, [history, historyHydrated])
 
   const handleStreamPayload = useEffectEvent((payload: PiStreamPayload) => {
@@ -993,6 +1080,8 @@ export function usePiAgent() {
 
     if (payload.event === 'done') {
       const usage = parseUsageFromPayload(payload)
+      console.debug('[usage-debug] done event payload keys:', Object.keys(payload))
+      console.debug('[usage-debug] parseUsageFromPayload result:', JSON.stringify(usage))
       setLatestActivityState(currentHistoryId, currentTurnId, '连接 pi 主脑', 'done')
       setLatestActivityState(currentHistoryId, currentTurnId, '流式输出中', 'done')
       setLatestActivityState(currentHistoryId, currentTurnId, '深度思考中', 'done')
@@ -1208,6 +1297,70 @@ export function usePiAgent() {
     }
   }, [])
 
+  useEffect(() => {
+    let cancelled = false
+
+    const pollTaskDeliveries = async () => {
+      const sessionIds = history.map((item) => item.id).filter((item) => item.trim().length > 0)
+      if (sessionIds.length === 0) {
+        return
+      }
+
+      try {
+        const deliveries = await listAgentTaskDeliveries(sessionIds)
+        if (cancelled || deliveries.length === 0) {
+          return
+        }
+
+        setHistory((previous) => appendAgentTaskDeliveriesToHistory(previous, deliveries))
+      } catch {
+        // ignore polling errors
+      }
+    }
+
+    void pollTaskDeliveries()
+    const timer = window.setInterval(() => {
+      void pollTaskDeliveries()
+    }, 15000)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [history])
+
+  useEffect(() => {
+    let active = true
+    let unlisten: (() => void) | undefined
+
+    void listen<AgentTaskDeliveryRecord>('agent-task-delivery', (event) => {
+      if (!active) {
+        return
+      }
+      const payload = event.payload
+      if (
+        !payload ||
+        typeof payload.id !== 'string' ||
+        typeof payload.sessionId !== 'string' ||
+        !payload.id.trim()
+      ) {
+        return
+      }
+      setHistory((previous) => appendAgentTaskDeliveriesToHistory(previous, [payload]))
+    }).then((fn) => {
+      if (active) {
+        unlisten = fn
+      } else {
+        fn()
+      }
+    })
+
+    return () => {
+      active = false
+      unlisten?.()
+    }
+  }, [])
+
   const submitPromptInternal = async (
     rawPrompt: string,
     context?: {
@@ -1283,6 +1436,34 @@ export function usePiAgent() {
       })
 
       try {
+        if (context?.agent?.id) {
+          const taskIntent = await handleAgentTaskPrompt({
+            prompt: trimmedPrompt,
+            sessionId: nextHistoryId,
+            agentId: context.agent.id,
+          })
+
+          if (taskIntent.handled) {
+            appendActivity(
+              nextHistoryId,
+              turn.id,
+              taskIntent.needsClarification ? '等待补充任务信息' : '定时任务已记录',
+              taskIntent.assistantMessage,
+              'done',
+            )
+            updateTurn(nextHistoryId, turn.id, (current) => ({
+              ...current,
+              answer: taskIntent.assistantMessage,
+              responseSegments: [{ type: 'text', text: taskIntent.assistantMessage }],
+              status: 'done',
+              completedAt: current.completedAt ?? Date.now(),
+            }))
+            updateSessionStatus(nextHistoryId, 'done')
+            markSessionSettled(nextHistoryId)
+            return true
+          }
+        }
+
         await streamPiPrompt(trimmedPrompt, {
           sessionId: nextHistoryId,
           providerConfig: context?.providerConfig,
@@ -1457,6 +1638,7 @@ export function usePiAgent() {
     setDraft,
     error,
     loading,
+    runtimeReady,
     runningHistoryIds,
     history,
     activeHistoryId,

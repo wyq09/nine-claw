@@ -190,8 +190,14 @@ impl PiRunHandle {
     }
 }
 
+pub struct PiProcessResult {
+    pub full_text: String,
+    pub usage: Option<crate::PiTokenUsagePayload>,
+    pub usage_meta: Option<crate::PiUsageMetadataPayload>,
+}
+
 pub enum PiProcessOutcome {
-    Completed(String),
+    Completed(PiProcessResult),
     Aborted,
 }
 
@@ -426,11 +432,12 @@ impl PiBridge {
             }
             _ => {
                 provider.insert("api".to_string(), json!("openai-completions"));
+                let reasoning = crate::openai_pi_compat_supports_reasoning_effort(model);
                 provider.insert(
                     "compat".to_string(),
                     json!({
                         "supportsDeveloperRole": false,
-                        "supportsReasoningEffort": false
+                        "supportsReasoningEffort": reasoning
                     }),
                 );
                 provider.insert(
@@ -607,6 +614,19 @@ impl PiBridge {
             .ok_or_else(|| "无法获取 pi stdin".to_string())?;
         let stdin = Arc::new(Mutex::new(Some(stdin)));
 
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "无法获取 pi stdout".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "无法获取 pi stderr".to_string())?;
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let stderr_buffer = Arc::new(Mutex::new(String::new()));
+        spawn_pi_stdout_logger(stdout, "bot.pi.raw", stdout_tx);
+        spawn_pi_stderr_logger(stderr, "bot.pi.stderr", stderr_buffer.clone());
+
         {
             let mut stdin_guard = stdin
                 .lock()
@@ -626,19 +646,6 @@ impl PiBridge {
                 .flush()
                 .map_err(|e| format!("flush stdin 失败: {e}"))?;
         }
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "无法获取 pi stdout".to_string())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "无法获取 pi stderr".to_string())?;
-        let (stdout_tx, stdout_rx) = mpsc::channel();
-        let stderr_buffer = Arc::new(Mutex::new(String::new()));
-        spawn_pi_stdout_logger(stdout, "bot.pi.raw", stdout_tx);
-        spawn_pi_stderr_logger(stderr, "bot.pi.stderr", stderr_buffer.clone());
 
         Ok((child, stdin, stdout_rx, stderr_buffer))
     }
@@ -664,7 +671,7 @@ impl PiBridge {
             on_chunk,
             |_| {},
         )? {
-            PiProcessOutcome::Completed(full_text) => Ok(full_text),
+            PiProcessOutcome::Completed(result) => Ok(result.full_text),
             PiProcessOutcome::Aborted => Err("pi 处理被中断".to_string()),
         }
     }
@@ -959,6 +966,8 @@ impl PiBridge {
         let mut saw_prompt_response = false;
         let mut saw_abort_event = false;
         let mut saw_assistant_activity = false;
+        let mut final_usage: Option<crate::PiTokenUsagePayload> = None;
+        let mut final_usage_meta: Option<crate::PiUsageMetadataPayload> = None;
         let started_at = Instant::now();
         let ttft_start = Instant::now();
         let mut logged_ttft = false;
@@ -1089,6 +1098,21 @@ impl PiBridge {
                 }
             }
 
+            if matches!(line_type, "message_start" | "message_end" | "turn_end") {
+                let message = value.get("message");
+                let is_assistant = message
+                    .and_then(|item| item.get("role"))
+                    .and_then(|item| item.as_str())
+                    == Some("assistant");
+                if is_assistant {
+                    final_usage = final_usage.or_else(|| {
+                        crate::extract_usage_payload(message.and_then(|item| item.get("usage")))
+                    });
+                    final_usage_meta =
+                        final_usage_meta.or_else(|| crate::extract_usage_metadata_payload(message));
+                }
+            }
+
             if line_type == "message_update" {
                 let event = value.get("assistantMessageEvent");
                 let delta_type = event
@@ -1132,6 +1156,13 @@ impl PiBridge {
                             chunk_buffer.push_str(&missing_text);
                         }
                     }
+                    final_usage = crate::extract_usage_payload(
+                        event
+                            .and_then(|v| v.get("message"))
+                            .and_then(|v| v.get("usage")),
+                    );
+                    final_usage_meta =
+                        crate::extract_usage_metadata_payload(event.and_then(|v| v.get("message")));
                     saw_done = true;
                     break;
                 }
@@ -1157,6 +1188,17 @@ impl PiBridge {
             }
 
             if line_type == "agent_end" {
+                if let Some(messages) = value.get("messages").and_then(|item| item.as_array()) {
+                    if let Some(last_assistant) = messages.iter().rev().find(|message| {
+                        message.get("role").and_then(|item| item.as_str()) == Some("assistant")
+                    }) {
+                        final_usage = final_usage
+                            .or_else(|| crate::extract_usage_payload(last_assistant.get("usage")));
+                        final_usage_meta = final_usage_meta.or_else(|| {
+                            crate::extract_usage_metadata_payload(Some(last_assistant))
+                        });
+                    }
+                }
                 saw_agent_end = true;
                 if run_handle.is_abort_requested() {
                     saw_abort_event = true;
@@ -1299,7 +1341,11 @@ impl PiBridge {
             if fresh_multimodal_session {
                 let _ = crate::record_multimodal_summary(&key, prompt, &full_text);
             }
-            return Ok(PiProcessOutcome::Completed(full_text));
+            return Ok(PiProcessOutcome::Completed(PiProcessResult {
+                full_text,
+                usage: final_usage,
+                usage_meta: final_usage_meta,
+            }));
         }
 
         close_stdin();
@@ -1339,6 +1385,10 @@ impl PiBridge {
         if fresh_multimodal_session {
             let _ = crate::record_multimodal_summary(&key, prompt, &full_text);
         }
-        Ok(PiProcessOutcome::Completed(full_text))
+        Ok(PiProcessOutcome::Completed(PiProcessResult {
+            full_text,
+            usage: final_usage,
+            usage_meta: final_usage_meta,
+        }))
     }
 }

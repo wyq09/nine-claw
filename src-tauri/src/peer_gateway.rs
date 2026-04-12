@@ -712,7 +712,15 @@ fn run_peer_turn(app: &AppHandle, body: &PeerInboundBody) -> Result<String, Stri
         }
         Ok(PiProcessOutcome::Aborted) => Err("处理被中断".to_string()),
         Err(e) => {
-            emit_peer_message(app, &session_user_id, "error", &e, Some(&agent_config), None, None);
+            emit_peer_message(
+                app,
+                &session_user_id,
+                "error",
+                &e,
+                Some(&agent_config),
+                None,
+                None,
+            );
             emit_peer_status(app, &session_user_id, "error", &e);
             Err(e)
         }

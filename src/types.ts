@@ -207,7 +207,7 @@ export type HistoryItem = {
   sessionLlmModel?: string
 }
 
-export type ViewKey = 'chat' | 'skills' | 'resources' | 'agents'
+export type ViewKey = 'chat' | 'skills' | 'resources' | 'agents' | 'tasks'
 
 export type SettingsTab = 'general' | 'appearance' | 'providers' | 'usage' | 'shortcuts'
 
@@ -460,6 +460,9 @@ export type AppearanceSettings = {
   themeMode: ThemeMode
   compactSidebar: boolean
   sidebarCollapsed: boolean
+  /** 展示模型思考过程（thinking 流） */
+  showThinkingProcess: boolean
+  /** 展示工具调用卡片与分段中的工具块 */
   showExecutionRail: boolean
   preferReducedMotion: boolean
 }
@@ -517,6 +520,56 @@ export type SchedulerServiceStatus = {
   platform: string
   detail: string
   launcherPath?: string | null
+}
+
+export type AgentTaskPromptResult = {
+  handled: boolean
+  needsClarification: boolean
+  assistantMessage: string
+  taskId?: string | null
+  draftId?: string | null
+}
+
+export type AgentTaskDeliveryRecord = {
+  id: string
+  taskId: string
+  runId: string
+  agentId: string
+  sessionId: string
+  title: string
+  content: string
+  createdAt: number
+}
+
+export type AgentTaskListItem = {
+  id: string
+  agentId: string
+  agentName: string
+  sourceSessionId: string
+  title: string
+  intentSummary: string
+  taskType: string
+  scheduleType: string
+  timezone: string
+  goal: string
+  intervalMinutes?: number | null
+  dailyTimes: string[]
+  status: string
+  nextRunAt?: number | null
+  lastRunAt?: number | null
+  deliveryKind: string
+  deliveryTarget: string
+  createdAt: number
+  updatedAt: number
+}
+
+export type AgentTaskUpdateInput = {
+  title: string
+  goal: string
+  scheduleType: string
+  timezone: string
+  intervalMinutes?: number | null
+  dailyTimes: string[]
 }
 
 export type SchedulerRuntimeStatus = {

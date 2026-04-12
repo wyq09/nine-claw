@@ -1,3 +1,4 @@
+import { AppIcon } from './AppIcon'
 import { useLocalMediaPreview } from '../hooks/useLocalMediaPreview'
 import { normalizeLocalAssetSource } from '../lib/inlineMedia'
 import { openLocalFile } from '../lib/piClient'
@@ -41,6 +42,12 @@ function InlineMediaAttachmentCard({
   const targetPath = attachment.path.trim()
   const targetSrc = attachment.src.trim()
   const canOpen = Boolean(targetPath || targetSrc)
+  const downloadSrc = targetPath
+    ? normalizeLocalAssetSource(targetPath)
+    : targetSrc
+      ? normalizeLocalAssetSource(targetSrc)
+      : ''
+  const canDownload = Boolean(downloadSrc)
   const previewSrc = useLocalMediaPreview({
     path: targetPath || targetSrc,
     fallbackSrc: targetSrc || (targetPath ? normalizeLocalAssetSource(targetPath) : ''),
@@ -86,28 +93,73 @@ function InlineMediaAttachmentCard({
     })
   }
 
+  const handleDownload = () => {
+    if (!downloadSrc) {
+      return
+    }
+
+    const anchor = document.createElement('a')
+    anchor.href = downloadSrc
+    anchor.download = title || 'attachment'
+    anchor.rel = 'noopener noreferrer'
+    anchor.style.display = 'none'
+    document.body.append(anchor)
+    anchor.click()
+    anchor.remove()
+  }
+
+  const toolbar = (
+    <div className="inline-media-toolbar">
+      <button
+        type="button"
+        className="inline-media-action-button"
+        onClick={handleOpen}
+        aria-label={`打开附件 ${title}`}
+        title={`打开 ${title}`}
+        disabled={!canOpen}
+      >
+        <AppIcon name="folder" size={14} />
+      </button>
+      <button
+        type="button"
+        className="inline-media-action-button"
+        onClick={handleDownload}
+        aria-label={`下载附件 ${title}`}
+        title={`下载 ${title}`}
+        disabled={!canDownload}
+      >
+        <AppIcon name="download" size={14} />
+      </button>
+    </div>
+  )
+
   return (
     <div className={`inline-media-card ${attachment.kind}`}>
-      {attachment.kind === 'file' ? (
-        <button
-          type="button"
-          className="inline-media-file-card"
-          onClick={handleOpen}
-          aria-label={`打开附件 ${title}`}
-          title={`打开 ${title}`}
-          disabled={!canOpen}
-        >
-          <span className="inline-media-file-kind">{typeLabel}</span>
-          <div className="inline-media-file-copy">
+      {attachment.kind !== 'file' ? (
+        <div className="inline-media-card-head">
+          <div className="inline-media-card-copy">
+            {showSecondaryLabel ? <span className="inline-media-kicker">{attachment.label}</span> : null}
             <strong title={title}>{title}</strong>
           </div>
-        </button>
-      ) : (
-        <div className="inline-media-card-head">
-          {showSecondaryLabel ? <span className="inline-media-kicker">{attachment.label}</span> : null}
-          <strong title={title}>{title}</strong>
         </div>
-      )}
+      ) : null}
+      {attachment.kind === 'file' ? (
+        <div className="inline-media-file-row">
+          <button
+            type="button"
+            className="inline-media-file-card"
+            onClick={handleOpen}
+            aria-label={`打开附件 ${title}`}
+            title={`打开 ${title}`}
+            disabled={!canOpen}
+          >
+            <span className="inline-media-file-kind">{typeLabel}</span>
+            <div className="inline-media-file-copy">
+              <strong title={title}>{title}</strong>
+            </div>
+          </button>
+        </div>
+      ) : null}
       {attachment.kind === 'image' && canPreview ? (
         <button
           type="button"
@@ -133,6 +185,7 @@ function InlineMediaAttachmentCard({
       ) : null}
       {attachment.kind === 'file' && !canOpen ? <div className="inline-media-empty">文件已接收，但当前没有可用路径。</div> : null}
       {attachment.transcript ? <div className="inline-media-transcript">转写：{attachment.transcript}</div> : null}
+      {toolbar}
     </div>
   )
 }

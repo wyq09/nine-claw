@@ -557,9 +557,20 @@ export function SettingsModal({
                   }
                 />
                 <SettingSwitch
+                  checked={appearanceSettings.showThinkingProcess}
+                  description="在助手回复中展示模型的 thinking 流（若供应商返回）。关闭后仍会在后台记录，仅不显示。"
+                  label="展示思考过程"
+                  onChange={() =>
+                    setAppearanceSettings((previous) => ({
+                      ...previous,
+                      showThinkingProcess: !previous.showThinkingProcess,
+                    }))
+                  }
+                />
+                <SettingSwitch
                   checked={appearanceSettings.showExecutionRail}
-                  description="在聊天页显示执行状态卡片，而不是直接暴露模型内部推理。"
-                  label="显示执行轨迹"
+                  description="在对话中展示工具调用卡片，以及分段回复里与工具相关的块。"
+                  label="展示工具调用"
                   onChange={() =>
                     setAppearanceSettings((previous) => ({
                       ...previous,

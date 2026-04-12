@@ -15,21 +15,26 @@
 ### Curated Wiki
 
 - `MEMORY.md`（人设与核心原则，**不**由 ingest 自动改写）
-- `WORKING.md`（短期上下文，ingest 会更新）
+- `USER_MODEL.md`（用户长期画像、隐含意图、测试模式）
+- `RELATIONSHIP_MAP.md`（重要人物与关系）
+- `PITFALLS.md`（高风险坑点、明确纠正）
+- `WORKING.md`（短期上下文，含 `OPEN_LOOPS`，ingest 会更新）
 - `DECISIONS.md`、`memory/categories/*.md`（**默认由人/模型整理**，不从每轮对话自动灌条目）
+- `memory/REVIEW_QUEUE.md`（待复查、待闭环、易过期项目状态）
 - `memory/YYYY-MM-DD.md`（按日流水，ingest 追加摘要行）
 
 ### Schema And Operations
 
 - `AGENTS.md`、agent 私有 markdown
-- `memory/WIKI_INDEX.md`（含 **Topic map**：从核心页 `##` 标题生成的导航）
+- `memory/INDEX.md`（根入口：告诉运行时去哪读，不是简单文件清单）
 - `memory/SOURCE_INDEX.md`（每条含 `Index: type=… ts=… cats=…` 便于 `rg` 过滤）
 - `memory/LOG.md`、`memory/LINT.md`
+- `wiki/INDEX.md`（外部知识与方法论入口）
 
 ## Runtime Flow
 
 1. 注入核心私有文件。
-2. 注入 `WIKI_INDEX.md`、`SOURCE_INDEX.md`、`LOG.md`、`LINT.md`。
+2. 注入 `memory/INDEX.md`、`SOURCE_INDEX.md`、`LOG.md`、`LINT.md`、`REVIEW_QUEUE.md`。
 3. 按问题抽取相关分类记忆（若对应 shard 存在且有内容）。
 4. 补最近两天的 daily log。
 
@@ -42,17 +47,19 @@
 - 写入 `memory/raw/`（或 inbox）原文或登记
 - 更新 `SOURCE_INDEX.md`（含结构化 `Index` 行）
 - 追加 `LOG.md`
-- 刷新 `WIKI_INDEX.md`
+- 刷新 `memory/INDEX.md` 和 `LINT.md`
 - 更新 `WORKING.md` 与当日 `memory/YYYY-MM-DD.md`
+- 对“别再这样”“不要误判”这类明确纠正，保守沉淀到 `PITFALLS.md`
+- 对承诺、阻塞、时效性项目状态自动补 `REVIEW_QUEUE.md`
 - **默认不再**向 `memory/categories/*.md` 追加（避免分类文件变成流水账）。若需恢复旧行为，启动前设置环境变量 `NINECLAW_APPEND_CATEGORY_MEMORY_ON_INGEST=1`（或 `true` / `yes`）。
 
 ### Query
 
-先读 `WIKI_INDEX.md`（含 Topic map），再下钻具体页；涉及附件/来源时查 `SOURCE_INDEX.md` 中的 `Path` / `Index` 行。
+先读 `memory/INDEX.md`，再按路由下钻：任务推进优先 `WORKING.md` 的 `OPEN_LOOPS`，规则优先 `DECISIONS.md` / `PITFALLS.md`，用户风格优先 `USER_MODEL.md`，人物关系优先 `RELATIONSHIP_MAP.md`，涉及附件/来源时查 `SOURCE_INDEX.md`，涉及外部知识时查 `wiki/INDEX.md`。
 
 ### Lint
 
-`LINT.md` 要求定期检查：把 daily / raw 中的重要结论合并进 `DECISIONS.md`、`MEMORY.md` 或 category shards，并处理矛盾与过期结论。
+`LINT.md` 现在会记录最近一次自动体检结果与分数：检查入口是否齐全、`OPEN_LOOPS` 是否存在、schema 是否完整、`commitments` 是否账本化、`inferences` 是否与事实分层、`USER_MODEL/PITFALLS/RELATIONSHIP_MAP` 是否存在、legacy `BOOTSTRAP/WIKI_INDEX` 是否已清理。
 
 ### 自动提炼到 MEMORY.md
 
