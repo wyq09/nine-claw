@@ -5,6 +5,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 
 const PI_RUNTIME_RESOURCE_DIR: &str = "pi-runtime";
@@ -96,6 +97,22 @@ pub struct RuntimeDependencyStatus {
     pub auto_install_attempted: bool,
     pub auto_install_succeeded: bool,
     pub messages: Vec<String>,
+}
+
+/// Ensures `ensure_runtime_dependencies_impl` runs at most once per process and returns the same
+/// snapshot to the frontend invoke and the startup background thread (avoids concurrent unpack).
+static PI_RUNTIME_STATUS_CACHE: Mutex<Option<RuntimeDependencyStatus>> = Mutex::new(None);
+
+pub(crate) fn cached_ensure_runtime_dependencies(app: &AppHandle) -> RuntimeDependencyStatus {
+    let mut guard = PI_RUNTIME_STATUS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(status) = guard.as_ref() {
+        return status.clone();
+    }
+    let status = ensure_runtime_dependencies_impl(app);
+    *guard = Some(status.clone());
+    status
 }
 
 pub(crate) fn resolve_command_path(candidates: &[&str]) -> Option<PathBuf> {

@@ -275,7 +275,7 @@ export function SettingsModal({
       : tab === 'providers'
         ? '统一管理大模型接口、默认模型与连通性校验。'
         : tab === 'usage'
-          ? '查看 SQLite 中累计保存的 token 使用记录与分布。'
+          ? '按模型、智能体与日期查看本地累计用量。'
         : '配置发送方式与常用桌面快捷操作。'
   const selectedProviderFormatDefaults = getProviderFormatDefaults(selectedProviderConfig.apiFormat)
 
@@ -940,7 +940,11 @@ export function SettingsModal({
               </div>
             ) : null}
 
-            {tab === 'usage' ? <UsageStatsPanel /> : null}
+            {tab === 'usage' ? (
+              <div className="settings-tab-body-scroll">
+                <UsageStatsPanel />
+              </div>
+            ) : null}
 
             <div className="settings-footer">
               <button type="button" className="outline-button settings-footer-button" onClick={onClose}>

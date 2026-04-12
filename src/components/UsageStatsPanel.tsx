@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { Download, RefreshCw } from 'lucide-react'
+import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { listTokenUsageRecords } from '../lib/piClient'
 import type { TokenUsageRecord } from '../types'
-import { AppIcon } from './AppIcon'
 
 type UsageBucket = {
   label: string
@@ -10,6 +10,21 @@ type UsageBucket = {
   outputTokens: number
   cacheTokens: number
   totalTokens: number
+}
+
+type DatePreset = 'all' | '1d' | '7d' | '30d'
+
+const PRESET_MS: Record<Exclude<DatePreset, 'all'>, number> = {
+  '1d': 86400000,
+  '7d': 7 * 86400000,
+  '30d': 30 * 86400000,
+}
+
+const PRESET_LABELS: Record<DatePreset, string> = {
+  all: '全部',
+  '1d': '1d',
+  '7d': '7d',
+  '30d': '30d',
 }
 
 function formatInteger(value: number): string {
@@ -30,12 +45,104 @@ function formatCompact(value: number): string {
   return formatInteger(value)
 }
 
+/** 表格主数字：大数用「万」，贴近 shadcn 参考里的展示习惯 */
+function formatTokensTable(value: number): string {
+  const abs = Math.abs(value)
+  if (abs >= 10_000) {
+    const wan = value / 10_000
+    const s = wan >= 100 ? wan.toFixed(0) : wan.toFixed(1)
+    return `${s}万`
+  }
+  if (abs >= 1_000) {
+    return `${(value / 1_000).toFixed(2)}K`
+  }
+  return formatInteger(value)
+}
+
 function normalizeDayLabel(timestamp: number): string {
   const date = new Date(timestamp)
   const year = date.getFullYear()
   const month = `${date.getMonth() + 1}`.padStart(2, '0')
   const day = `${date.getDate()}`.padStart(2, '0')
   return `${year}-${month}-${day}`
+}
+
+function recordSortTime(record: TokenUsageRecord): number {
+  return record.turnCompletedAt ?? record.usageTimestamp ?? record.turnCreatedAt
+}
+
+function filterRecordsByPreset(records: TokenUsageRecord[], preset: DatePreset): TokenUsageRecord[] {
+  if (preset === 'all') {
+    return records
+  }
+  const cutoff = Date.now() - PRESET_MS[preset]
+  return records.filter((record) => recordSortTime(record) >= cutoff)
+}
+
+function formatDataRangeLabel(records: TokenUsageRecord[]): string {
+  if (records.length === 0) {
+    return '暂无数据'
+  }
+  const times: number[] = []
+  for (const record of records) {
+    times.push(record.turnCreatedAt, recordSortTime(record))
+  }
+  const min = Math.min(...times)
+  const max = Math.max(...times)
+  const fmt = new Intl.DateTimeFormat('zh-CN', {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+  return `${fmt.format(new Date(min))} — ${fmt.format(new Date(max))}`
+}
+
+function escapeCsvCell(raw: string): string {
+  if (/[",\n\r]/.test(raw)) {
+    return `"${raw.replace(/"/g, '""')}"`
+  }
+  return raw
+}
+
+function exportUsageRecordsCsv(records: TokenUsageRecord[]): void {
+  const headers = [
+    'turnId',
+    'sessionId',
+    'turnCreatedAt',
+    'turnCompletedAt',
+    'agentId',
+    'agentName',
+    'api',
+    'provider',
+    'model',
+    'inputTokens',
+    'outputTokens',
+    'cacheReadTokens',
+    'cacheWriteTokens',
+    'totalTokens',
+    'recordedAt',
+  ] as const
+
+  const lines = [headers.join(',')]
+  for (const record of records) {
+    const row = headers.map((key) => {
+      const value = record[key]
+      if (value === null || value === undefined) {
+        return ''
+      }
+      return escapeCsvCell(String(value))
+    })
+    lines.push(row.join(','))
+  }
+
+  const blob = new Blob([`\uFEFF${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `nineclaw-usage-${new Date().toISOString().slice(0, 10)}.csv`
+  anchor.click()
+  URL.revokeObjectURL(url)
 }
 
 function buildUsageBuckets(
@@ -66,103 +173,228 @@ function buildUsageBuckets(
   return [...map.values()].sort((left, right) => right.totalTokens - left.totalTokens)
 }
 
-function UsageMetricCard({
+function UsageSummaryStat({
   label,
-  value,
-  detail,
+  valueCompact,
+  valueExact,
 }: {
   label: string
-  value: string
-  detail: string
+  valueCompact: string
+  valueExact: string
 }) {
+  const showBoth = valueCompact !== valueExact
   return (
-    <div className="usage-metric-card">
-      <span className="usage-metric-label">{label}</span>
-      <strong className="usage-metric-value">{value}</strong>
-      <span className="usage-metric-detail">{detail}</span>
+    <div className="usage-summary-stat">
+      <span className="usage-summary-stat-label">{label}</span>
+      <strong className="usage-summary-stat-value" title={valueExact}>
+        {valueExact}
+      </strong>
+      {showBoth ? <span className="usage-summary-stat-compact">{valueCompact}</span> : null}
     </div>
   )
 }
 
-function UsageBreakdownTable({
+function ShadcnTableCard({
   title,
-  rows,
+  description,
+  rowCount,
+  children,
 }: {
   title: string
-  rows: UsageBucket[]
+  description?: string
+  rowCount: number
+  children: ReactNode
 }) {
   return (
-    <section className="usage-table-card">
-      <div className="usage-table-head">
-        <strong>{title}</strong>
-        <span>{rows.length} 项</span>
+    <div className="rounded-xl border border-border bg-card text-card-foreground shadow-sm">
+      <div className="flex flex-wrap items-start justify-between gap-2 border-b border-border px-4 py-3">
+        <div className="min-w-0 space-y-1">
+          <h3 className="text-sm font-semibold leading-none tracking-tight text-card-foreground">{title}</h3>
+          {description ? <p className="text-xs text-muted-foreground">{description}</p> : null}
+        </div>
+        <span className="shrink-0 rounded-md border border-border bg-muted/50 px-2 py-0.5 text-xs tabular-nums text-muted-foreground">
+          {rowCount} 项
+        </span>
       </div>
-      <div className="usage-table-scroll">
-        <table className="usage-table">
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>消息</th>
-              <th>总量</th>
-              <th>输入</th>
-              <th>输出</th>
-              <th>缓存</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 ? (
-              <tr>
-                <td colSpan={6} className="usage-table-empty">
-                  暂无数据
-                </td>
-              </tr>
-            ) : (
-              rows.map((row) => (
-                <tr key={row.label}>
-                  <td>{row.label}</td>
-                  <td>{formatInteger(row.messageCount)}</td>
-                  <td>{formatCompact(row.totalTokens)}</td>
-                  <td>{formatCompact(row.inputTokens)}</td>
-                  <td>{formatCompact(row.outputTokens)}</td>
-                  <td>{formatCompact(row.cacheTokens)}</td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
-    </section>
+      <div className="relative max-h-[min(480px,52vh)] w-full overflow-auto">{children}</div>
+    </div>
   )
 }
 
-function UsageTrendCard({ rows }: { rows: UsageBucket[] }) {
+function UsageBreakdownShadcnTable({
+  title,
+  description,
+  nameHeader,
+  rows,
+}: {
+  title: string
+  description?: string
+  nameHeader: string
+  rows: UsageBucket[]
+}) {
+  return (
+    <ShadcnTableCard title={title} description={description} rowCount={rows.length}>
+      <table className="w-full caption-bottom text-sm">
+        <thead>
+          <tr className="border-b border-border">
+            <th className="sticky top-0 z-1 h-11 bg-card px-4 text-left align-middle text-xs font-medium tracking-wide text-muted-foreground">
+              {nameHeader}
+            </th>
+            <th className="sticky top-0 z-1 h-11 bg-card px-4 text-right align-middle text-xs font-medium tracking-wide text-muted-foreground">
+              消息
+            </th>
+            <th className="sticky top-0 z-1 h-11 bg-card px-4 text-right align-middle text-xs font-medium tracking-wide text-muted-foreground">
+              总量
+            </th>
+            <th className="sticky top-0 z-1 h-11 bg-card px-4 text-right align-middle text-xs font-medium tracking-wide text-muted-foreground">
+              输入
+            </th>
+            <th className="sticky top-0 z-1 h-11 bg-card px-4 text-right align-middle text-xs font-medium tracking-wide text-muted-foreground">
+              输出
+            </th>
+            <th className="sticky top-0 z-1 h-11 bg-card px-4 text-right align-middle text-xs font-medium tracking-wide text-muted-foreground">
+              缓存
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 ? (
+            <tr>
+              <td colSpan={6} className="px-4 py-10 text-center text-sm text-muted-foreground">
+                暂无数据
+              </td>
+            </tr>
+          ) : (
+            rows.map((row) => (
+              <tr
+                key={row.label}
+                className="border-b border-border/50 transition-colors last:border-0 hover:bg-muted/40"
+              >
+                <td className="px-4 py-3 align-middle font-medium text-foreground">{row.label}</td>
+                <td className="px-4 py-3 text-right align-middle tabular-nums text-foreground/90">
+                  {formatInteger(row.messageCount)}
+                </td>
+                <td className="px-4 py-3 text-right align-middle tabular-nums text-foreground/90">
+                  {formatTokensTable(row.totalTokens)}
+                </td>
+                <td className="px-4 py-3 text-right align-middle tabular-nums text-foreground/90">
+                  {formatTokensTable(row.inputTokens)}
+                </td>
+                <td className="px-4 py-3 text-right align-middle tabular-nums text-foreground/90">
+                  {formatTokensTable(row.outputTokens)}
+                </td>
+                <td className="px-4 py-3 text-right align-middle tabular-nums text-foreground/90">
+                  {formatTokensTable(row.cacheTokens)}
+                </td>
+              </tr>
+            ))
+          )}
+        </tbody>
+      </table>
+    </ShadcnTableCard>
+  )
+}
+
+function UsageDailyShadcnSection({ rows }: { rows: UsageBucket[] }) {
   const maxValue = rows.reduce((max, row) => Math.max(max, row.totalTokens), 0)
+  const chronological = [...rows].sort((left, right) => left.label.localeCompare(right.label))
+  const reversedDetail = [...chronological].reverse()
 
   return (
-    <section className="usage-trend-card">
-      <div className="usage-table-head">
-        <strong>按天趋势</strong>
-        <span>{rows.length} 天</span>
+    <div className="rounded-xl border border-border bg-card text-card-foreground shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
+        <div className="space-y-1">
+          <h3 className="text-sm font-semibold leading-none tracking-tight">按天</h3>
+          <p className="text-xs text-muted-foreground">趋势与明细 · {rows.length} 天</p>
+        </div>
       </div>
       {rows.length === 0 ? (
-        <div className="usage-trend-empty">暂无可展示的趋势数据</div>
+        <div className="flex min-h-[200px] items-center justify-center px-4 text-sm text-muted-foreground">
+          暂无可展示的趋势数据
+        </div>
       ) : (
-        <div className="usage-trend-bars">
-          {rows.map((row) => {
-            const height = maxValue > 0 ? Math.max(10, Math.round((row.totalTokens / maxValue) * 100)) : 10
-            return (
-              <div key={row.label} className="usage-trend-bar-column">
-                <span className="usage-trend-value">{formatCompact(row.totalTokens)}</span>
-                <div className="usage-trend-bar-track">
-                  <div className="usage-trend-bar-fill" style={{ height: `${height}%` }} />
+        <div className="space-y-0 p-4 pt-3">
+          <div
+            className="mb-4 grid max-h-[220px] min-h-[160px] items-end gap-2 border-b border-border/60 pb-4"
+            style={{
+              gridTemplateColumns: `repeat(${Math.max(chronological.length, 1)}, minmax(32px, 1fr))`,
+            }}
+            role="img"
+            aria-label="按天 Token 趋势"
+          >
+            {chronological.map((row) => {
+              const height =
+                maxValue > 0 ? Math.max(12, Math.round((row.totalTokens / maxValue) * 100)) : 12
+              return (
+                <div key={row.label} className="flex flex-col items-center gap-2">
+                  <span className="text-[11px] tabular-nums text-muted-foreground">
+                    {formatTokensTable(row.totalTokens)}
+                  </span>
+                  <div className="flex w-full min-h-[100px] max-h-[140px] items-end rounded-xl bg-muted/30 px-1 pb-1 pt-2">
+                    <div
+                      className="w-full rounded-lg bg-linear-to-b from-primary/90 to-primary/60"
+                      style={{ height: `${height}%`, minHeight: '6px' }}
+                    />
+                  </div>
+                  <span className="text-[11px] text-muted-foreground">{row.label.slice(5)}</span>
                 </div>
-                <span className="usage-trend-label">{row.label.slice(5)}</span>
-              </div>
-            )
-          })}
+              )
+            })}
+          </div>
+          <div className="relative max-h-[min(360px,45vh)] w-full overflow-auto rounded-lg border border-border/80">
+            <table className="w-full caption-bottom text-sm">
+              <thead>
+                <tr className="border-b border-border">
+                  <th className="sticky top-0 z-1 h-10 bg-card px-3 text-left align-middle text-xs font-medium tracking-wide text-muted-foreground">
+                    日期
+                  </th>
+                  <th className="sticky top-0 z-1 h-10 bg-card px-3 text-right align-middle text-xs font-medium tracking-wide text-muted-foreground">
+                    消息
+                  </th>
+                  <th className="sticky top-0 z-1 h-10 bg-card px-3 text-right align-middle text-xs font-medium tracking-wide text-muted-foreground">
+                    总量
+                  </th>
+                  <th className="sticky top-0 z-1 h-10 bg-card px-3 text-right align-middle text-xs font-medium tracking-wide text-muted-foreground">
+                    输入
+                  </th>
+                  <th className="sticky top-0 z-1 h-10 bg-card px-3 text-right align-middle text-xs font-medium tracking-wide text-muted-foreground">
+                    输出
+                  </th>
+                  <th className="sticky top-0 z-1 h-10 bg-card px-3 text-right align-middle text-xs font-medium tracking-wide text-muted-foreground">
+                    缓存
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {reversedDetail.map((row) => (
+                  <tr
+                    key={row.label}
+                    className="border-b border-border/50 transition-colors last:border-0 hover:bg-muted/40"
+                  >
+                    <td className="px-3 py-2.5 align-middle text-foreground">{row.label}</td>
+                    <td className="px-3 py-2.5 text-right align-middle tabular-nums text-foreground/90">
+                      {formatInteger(row.messageCount)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right align-middle tabular-nums text-foreground/90">
+                      {formatTokensTable(row.totalTokens)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right align-middle tabular-nums text-foreground/90">
+                      {formatTokensTable(row.inputTokens)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right align-middle tabular-nums text-foreground/90">
+                      {formatTokensTable(row.outputTokens)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right align-middle tabular-nums text-foreground/90">
+                      {formatTokensTable(row.cacheTokens)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
-    </section>
+    </div>
   )
 }
 
@@ -170,6 +402,7 @@ export function UsageStatsPanel() {
   const [records, setRecords] = useState<TokenUsageRecord[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [datePreset, setDatePreset] = useState<DatePreset>('all')
 
   const loadRecords = async () => {
     setLoading(true)
@@ -188,8 +421,12 @@ export function UsageStatsPanel() {
     void loadRecords()
   }, [])
 
+  const filteredRecords = useMemo(() => filterRecordsByPreset(records, datePreset), [records, datePreset])
+
+  const rangeLabel = useMemo(() => formatDataRangeLabel(filteredRecords), [filteredRecords])
+
   const summary = useMemo(() => {
-    return records.reduce(
+    return filteredRecords.reduce(
       (acc, record) => {
         acc.messages += 1
         acc.inputTokens += record.inputTokens
@@ -206,53 +443,133 @@ export function UsageStatsPanel() {
         totalTokens: 0,
       },
     )
-  }, [records])
+  }, [filteredRecords])
 
   const modelRows = useMemo(
-    () => buildUsageBuckets(records, (record) => record.model?.trim() || '未标记模型'),
-    [records],
+    () => buildUsageBuckets(filteredRecords, (record) => record.model?.trim() || '未标记模型'),
+    [filteredRecords],
   )
   const agentRows = useMemo(
-    () => buildUsageBuckets(records, (record) => record.agentName?.trim() || '主聊天'),
-    [records],
+    () => buildUsageBuckets(filteredRecords, (record) => record.agentName?.trim() || '主聊天'),
+    [filteredRecords],
   )
   const dailyRows = useMemo(() => {
-    const buckets = buildUsageBuckets(records, (record) =>
+    const buckets = buildUsageBuckets(filteredRecords, (record) =>
       normalizeDayLabel(record.turnCompletedAt ?? record.usageTimestamp ?? record.turnCreatedAt),
     )
     return [...buckets].sort((left, right) => left.label.localeCompare(right.label))
-  }, [records])
+  }, [filteredRecords])
+
+  const presets = (Object.keys(PRESET_LABELS) as DatePreset[]).map((key) => ({
+    key,
+    label: PRESET_LABELS[key],
+  }))
 
   return (
-    <div className="usage-dashboard">
-      <div className="usage-dashboard-head">
-        <div>
-          <strong>SQLite 用量统计</strong>
-          <p>按消息落库，当前展示的是数据库里的累计回复用量。</p>
+    <div className="usage-dashboard flex flex-col gap-6">
+      <div className="usage-dashboard-toolbar flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <p className="usage-dashboard-lede m-0 max-w-[52ch] text-[13px] leading-relaxed text-muted-foreground">
+          数据来自本地 SQLite，按每条回复（turn）汇总；可用时间范围筛选后查看分布。表格样式对齐 shadcn/ui Table + Card。
+        </p>
+        <div className="flex shrink-0 flex-col items-stretch gap-3 sm:items-end">
+          <button
+            type="button"
+            className="outline-button usage-dashboard-refresh inline-flex items-center justify-center gap-2"
+            onClick={() => void loadRecords()}
+            disabled={loading}
+          >
+            <RefreshCw className={`size-4 ${loading ? 'animate-spin' : ''}`} aria-hidden />
+            <span>{loading ? '刷新中…' : '刷新'}</span>
+          </button>
         </div>
-        <button type="button" className="outline-button" onClick={() => void loadRecords()} disabled={loading}>
-          <AppIcon name="refresh" size={16} />
-          <span>{loading ? '刷新中…' : '刷新'}</span>
+      </div>
+
+      <div className="flex flex-col gap-3 rounded-xl border border-border bg-card/40 px-4 py-3 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 flex-col gap-1 sm:flex-row sm:items-center sm:gap-3">
+          <span className="text-xs font-medium tabular-nums text-muted-foreground">{rangeLabel}</span>
+          <div className="inline-flex w-fit rounded-lg border border-border bg-muted/40 p-0.5">
+            {presets.map(({ key, label }) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setDatePreset(key)}
+                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
+                  datePreset === key
+                    ? 'bg-background text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => exportUsageRecordsCsv(filteredRecords)}
+          disabled={filteredRecords.length === 0}
+          className="inline-flex items-center justify-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50 disabled:pointer-events-none disabled:opacity-40"
+        >
+          <Download className="size-4 shrink-0 opacity-80" aria-hidden />
+          导出 CSV
         </button>
       </div>
 
       {error ? <div className="skills-feedback error">{error}</div> : null}
 
-      <div className="usage-metric-grid">
-        <UsageMetricCard label="总 Token" value={formatCompact(summary.totalTokens)} detail={`${formatInteger(summary.messages)} 条回复`} />
-        <UsageMetricCard label="输入" value={formatCompact(summary.inputTokens)} detail={formatInteger(summary.inputTokens)} />
-        <UsageMetricCard label="输出" value={formatCompact(summary.outputTokens)} detail={formatInteger(summary.outputTokens)} />
-        <UsageMetricCard label="缓存" value={formatCompact(summary.cacheTokens)} detail={formatInteger(summary.cacheTokens)} />
+      {loading && records.length === 0 ? (
+        <div className="usage-dashboard-skeleton flex flex-col gap-3" aria-hidden>
+          <div className="usage-skeleton usage-skeleton--hero rounded-xl" />
+          <div className="usage-skeleton-row grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div className="usage-skeleton h-16 rounded-xl" />
+            <div className="usage-skeleton h-16 rounded-xl" />
+            <div className="usage-skeleton h-16 rounded-xl" />
+          </div>
+        </div>
+      ) : (
+        <section className="usage-summary-panel">
+          <div className="usage-summary-primary">
+            <span className="usage-summary-primary-label">累计 Token</span>
+            <strong className="usage-summary-primary-value">{formatCompact(summary.totalTokens)}</strong>
+            <span className="usage-summary-primary-meta">{formatInteger(summary.messages)} 条回复（当前范围）</span>
+          </div>
+          <div className="usage-summary-divider" aria-hidden />
+          <div className="usage-summary-breakdown">
+            <UsageSummaryStat
+              label="输入"
+              valueCompact={formatCompact(summary.inputTokens)}
+              valueExact={formatInteger(summary.inputTokens)}
+            />
+            <UsageSummaryStat
+              label="输出"
+              valueCompact={formatCompact(summary.outputTokens)}
+              valueExact={formatInteger(summary.outputTokens)}
+            />
+            <UsageSummaryStat
+              label="缓存"
+              valueCompact={formatCompact(summary.cacheTokens)}
+              valueExact={formatInteger(summary.cacheTokens)}
+            />
+          </div>
+        </section>
+      )}
+
+      <div className="flex flex-col gap-6">
+        <UsageBreakdownShadcnTable
+          title="按模型统计"
+          description="按模型聚合当前筛选范围内的用量"
+          nameHeader="模型"
+          rows={modelRows}
+        />
+        <UsageBreakdownShadcnTable
+          title="按智能体统计"
+          description="按智能体名称聚合当前筛选范围内的用量"
+          nameHeader="智能体"
+          rows={agentRows}
+        />
       </div>
 
-      <div className="usage-dashboard-grid">
-        <UsageBreakdownTable title="按模型统计" rows={modelRows} />
-        <UsageBreakdownTable title="按智能体统计" rows={agentRows} />
-      </div>
-
-      <UsageTrendCard rows={dailyRows} />
-
-      <UsageBreakdownTable title="按天统计" rows={[...dailyRows].reverse()} />
+      <UsageDailyShadcnSection rows={dailyRows} />
     </div>
   )
 }

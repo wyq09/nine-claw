@@ -1,5 +1,17 @@
 import type { Dispatch, SetStateAction } from 'react'
-import { lazy, Suspense, startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import {
+  lazy,
+  Suspense,
+  startTransition,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { Check, Copy } from 'lucide-react'
 import './App.css'
 import { AppIcon, type IconName } from './components/AppIcon'
@@ -1003,9 +1015,53 @@ function hasUsageMetrics(usage?: TokenUsage): boolean {
   )
 }
 
-function TokenUsageDetailPill({ usage, variant = 'pill' }: { usage: TokenUsage; variant?: 'pill' | 'inline' }) {
+function TokenUsageDetailPill({ usage }: { usage: TokenUsage }) {
   const [open, setOpen] = useState(false)
   const containerRef = useRef<HTMLDivElement | null>(null)
+  const buttonRef = useRef<HTMLButtonElement | null>(null)
+  const tooltipRef = useRef<HTMLDivElement | null>(null)
+  const [tipPlacement, setTipPlacement] = useState<{ top: number; left: number } | null>(null)
+
+  const repositionTooltip = useCallback(() => {
+    const button = buttonRef.current
+    const tip = tooltipRef.current
+    if (!button || !tip) {
+      return
+    }
+    const anchor = button.getBoundingClientRect()
+    const margin = 12
+    const gap = 8
+    const tw = tip.offsetWidth
+    const th = tip.offsetHeight
+    let left = anchor.left
+    let top = anchor.bottom + gap
+    if (top + th > window.innerHeight - margin) {
+      top = Math.max(margin, anchor.top - th - gap)
+    }
+    if (left + tw > window.innerWidth - margin) {
+      left = window.innerWidth - margin - tw
+    }
+    if (left < margin) {
+      left = margin
+    }
+    setTipPlacement({ top, left })
+  }, [])
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setTipPlacement(null)
+      return
+    }
+    repositionTooltip()
+    const raf = window.requestAnimationFrame(() => repositionTooltip())
+    window.addEventListener('resize', repositionTooltip)
+    window.addEventListener('scroll', repositionTooltip, true)
+    return () => {
+      window.cancelAnimationFrame(raf)
+      window.removeEventListener('resize', repositionTooltip)
+      window.removeEventListener('scroll', repositionTooltip, true)
+    }
+  }, [open, repositionTooltip, usage.totalTokens])
 
   useEffect(() => {
     if (!open) {
@@ -1017,7 +1073,9 @@ function TokenUsageDetailPill({ usage, variant = 'pill' }: { usage: TokenUsage; 
       if (!(target instanceof Node)) {
         return
       }
-      if (!containerRef.current?.contains(target)) {
+      const inTrigger = containerRef.current?.contains(target)
+      const inTooltip = tooltipRef.current?.contains(target)
+      if (!inTrigger && !inTooltip) {
         setOpen(false)
       }
     }
@@ -1036,40 +1094,59 @@ function TokenUsageDetailPill({ usage, variant = 'pill' }: { usage: TokenUsage; 
     }
   }, [open])
 
-  const isInline = variant === 'inline'
+  const tooltipNode =
+    open &&
+    createPortal(
+      <div
+        ref={tooltipRef}
+        className="answer-result-tooltip"
+        role="dialog"
+        aria-label="Token 详情"
+        style={{
+          position: 'fixed',
+          top: tipPlacement?.top ?? -9999,
+          left: tipPlacement?.left ?? 0,
+          zIndex: 20050,
+          visibility: tipPlacement ? 'visible' : 'hidden',
+          pointerEvents: tipPlacement ? 'auto' : 'none',
+        }}
+      >
+        <div className="answer-result-tooltip-head">
+          <strong>{usage.model?.trim() || '未标记模型'}</strong>
+          {usage.provider || usage.api ? (
+            <span>{[usage.provider, usage.api].filter(Boolean).join(' · ')}</span>
+          ) : null}
+        </div>
+        <div className="answer-result-tooltip-grid">
+          <span>model</span>
+          <span>{usage.model?.trim() || '--'}</span>
+          <span>input</span>
+          <span>{formatTokenCount(usage.inputTokens)}</span>
+          <span>output</span>
+          <span>{formatTokenCount(usage.outputTokens)}</span>
+          <span>cacheRead</span>
+          <span>{formatTokenCount(usage.cacheReadTokens)}</span>
+          <span>cacheWrite</span>
+          <span>{formatTokenCount(usage.cacheWriteTokens)}</span>
+          <span>totalTokens</span>
+          <span>{formatTokenCount(usage.totalTokens)}</span>
+        </div>
+      </div>,
+      document.body,
+    )
 
   return (
-    <div className={`answer-result-meta-popover${isInline ? ' answer-result-meta-popover-inline' : ''}`} ref={containerRef}>
+    <div className="answer-result-meta-popover" ref={containerRef}>
       <button
+        ref={buttonRef}
         type="button"
-        className={isInline ? 'answer-result-meta-button-inline' : 'answer-result-meta-item answer-result-meta-button'}
+        className="answer-result-meta-item answer-result-meta-button"
         onClick={() => setOpen((current) => !current)}
         aria-expanded={open}
       >
         总 Token：{formatTokenCount(usage.totalTokens)}
       </button>
-      {open ? (
-        <div className="answer-result-tooltip" role="dialog" aria-label="Token 详情">
-          <div className="answer-result-tooltip-head">
-            <strong>{usage.model?.trim() || '未标记模型'}</strong>
-            {usage.provider || usage.api ? (
-              <span>{[usage.provider, usage.api].filter(Boolean).join(' · ')}</span>
-            ) : null}
-          </div>
-          <div className="answer-result-tooltip-grid">
-            <span>model</span>
-            <span>{usage.model?.trim() || '--'}</span>
-            <span>input</span>
-            <span>{formatTokenCount(usage.inputTokens)}</span>
-            <span>output</span>
-            <span>{formatTokenCount(usage.outputTokens)}</span>
-            <span>cacheRead</span>
-            <span>{formatTokenCount(usage.cacheReadTokens)}</span>
-            <span>totalTokens</span>
-            <span>{formatTokenCount(usage.totalTokens)}</span>
-          </div>
-        </div>
-      ) : null}
+      {tooltipNode}
     </div>
   )
 }
@@ -1425,6 +1502,7 @@ function App() {
     error,
     loading,
     runtimeReady,
+    runtimeBlockingReason,
     runningHistoryIds,
     history,
     activeHistoryId,
@@ -3229,6 +3307,7 @@ function App() {
           sessionLlmSelectValue={sessionLlmEncodedCurrent}
           onSessionLlmSelectChange={handleSessionLlmSelectChange}
           runtimeReady={runtimeReady}
+          runtimeBlockingReason={runtimeBlockingReason}
         />
       )
     }
@@ -3722,6 +3801,8 @@ type ChatViewProps = {
   sessionLlmSelectValue: string
   onSessionLlmSelectChange: (value: string) => void
   runtimeReady: boolean
+  /** 非空表示已确认 PI 不可用；`null` 且 `!runtimeReady` 表示仍在检测 */
+  runtimeBlockingReason: string | null
 }
 
 function ChatView({
@@ -3759,6 +3840,7 @@ function ChatView({
   sessionLlmSelectValue,
   onSessionLlmSelectChange,
   runtimeReady,
+  runtimeBlockingReason,
 }: ChatViewProps) {
   const [copiedTurnId, setCopiedTurnId] = useState('')
   const [copiedPromptTurnId, setCopiedPromptTurnId] = useState('')
@@ -3991,13 +4073,7 @@ function ChatView({
                               <AppIcon name="bot" size={20} />
                             </div>
                             <div className="assistant-message-stack">
-                              {shouldShowActions ? (
-                                <div className="assistant-message-toolbar">
-                                  <div className="assistant-message-toolbar-meta">
-                                    <TurnExecutionDetails turn={item} isStreaming={isStreamingTurn} variant="inline" />
-                                  </div>
-                                </div>
-                              ) : null}
+                              {shouldShowActions ? <TurnExecutionDetails turn={item} isStreaming={isStreamingTurn} /> : null}
                               <div
                                 className={`answer-result-card answer-result-card-chat${
                                   isWaitingOnly ? ' answer-result-card-waiting' : ''
@@ -4021,19 +4097,24 @@ function ChatView({
                               </div>
                               {shouldShowActions ? (
                                 <div className="assistant-message-answer-footer">
-                                  <button
-                                    type="button"
-                                    className={`answer-copy-control ${copiedTurnId === item.id ? 'copied' : ''}`}
-                                    onClick={() => void handleCopyAnswer(item.id, item.answer)}
-                                    aria-label={copiedTurnId === item.id ? '已复制结果' : '复制结果'}
-                                    title={copiedTurnId === item.id ? '已复制结果' : '复制结果'}
-                                    disabled={!item.answer}
-                                  >
-                                    {copiedTurnId === item.id ? <Check size={16} /> : <Copy size={16} />}
-                                    <span className="answer-copy-control-label">
-                                      {copiedTurnId === item.id ? '已复制' : '复制'}
-                                    </span>
-                                  </button>
+                                  <div className="assistant-answer-footer-actions">
+                                    {hasUsageMetrics(item.usage) && item.usage ? (
+                                      <TokenUsageDetailPill usage={item.usage} />
+                                    ) : null}
+                                    <button
+                                      type="button"
+                                      className={`answer-copy-control ${copiedTurnId === item.id ? 'copied' : ''}`}
+                                      onClick={() => void handleCopyAnswer(item.id, item.answer)}
+                                      aria-label={copiedTurnId === item.id ? '已复制结果' : '复制结果'}
+                                      title={copiedTurnId === item.id ? '已复制结果' : '复制结果'}
+                                      disabled={!item.answer}
+                                    >
+                                      {copiedTurnId === item.id ? <Check size={16} /> : <Copy size={16} />}
+                                      <span className="answer-copy-control-label">
+                                        {copiedTurnId === item.id ? '已复制' : '复制'}
+                                      </span>
+                                    </button>
+                                  </div>
                                 </div>
                               ) : null}
                             </div>
@@ -4198,7 +4279,7 @@ function ChatView({
         {attachmentError ? <div className="composer-attachment-error">{attachmentError}</div> : null}
         <div className="composer-footnote">
           {!runtimeReady
-            ? 'PI 运行时正在初始化，请稍候...'
+            ? runtimeBlockingReason ?? 'PI 运行时正在初始化，请稍候...'
             : globalBusy && !sessionStreaming
               ? '其他会话也在执行中；当前会话仍可继续发送。'
               : `发送快捷键：${getSubmitShortcutLabel(submitShortcut)}。Shift + Enter 可换行。`}
@@ -4910,43 +4991,21 @@ function TurnExecutionRail({
   )
 }
 
-function TurnExecutionDetails({
-  turn,
-  isStreaming,
-  variant = 'pills',
-}: {
-  turn: ConversationTurn
-  isStreaming: boolean
-  variant?: 'pills' | 'inline'
-}) {
+function TurnExecutionDetails({ turn, isStreaming }: { turn: ConversationTurn; isStreaming: boolean }) {
   useLiveNow(isStreaming, 500)
   const totalDuration = getElapsedMs(turn.createdAt, turn.completedAt, isStreaming)
-  const usage = turn.usage
 
-  if (typeof totalDuration !== 'number' && !hasUsageMetrics(usage)) {
+  if (typeof totalDuration !== 'number') {
     return null
   }
 
-  if (variant === 'inline') {
-    return (
-      <div className="assistant-turn-meta answer-result-meta-inline">
-        {typeof totalDuration === 'number' ? <span>已思考 {formatDurationLabel(totalDuration)}</span> : null}
-        {typeof totalDuration === 'number' && hasUsageMetrics(usage) && usage ? (
-          <span className="assistant-turn-meta-sep" aria-hidden>
-            ·
-          </span>
-        ) : null}
-        {hasUsageMetrics(usage) && usage ? <TokenUsageDetailPill usage={usage} variant="inline" /> : null}
-      </div>
-    )
-  }
-
   return (
-    <div className="answer-result-meta">
-      {typeof totalDuration === 'number' ? (
-        <span className="answer-result-meta-item">总耗时：{formatDurationLabel(totalDuration)}</span>
-      ) : null}
-      {hasUsageMetrics(usage) && usage ? <TokenUsageDetailPill usage={usage} /> : null}
+    <div className="assistant-message-toolbar">
+      <div className="assistant-message-toolbar-meta">
+        <div className="assistant-turn-meta answer-result-meta-inline">
+          <span>已思考 {formatDurationLabel(totalDuration)}</span>
+        </div>
+      </div>
     </div>
   )
 }

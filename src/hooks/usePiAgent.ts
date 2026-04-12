@@ -5,6 +5,7 @@ import {
   clearHistoryState,
   clearPiSession,
   clearPiSessionForId,
+  ensureRuntimeDependencies,
   handleAgentTaskPrompt,
   listAgentTaskDeliveries,
   loadHistoryState,
@@ -749,6 +750,8 @@ export function usePiAgent() {
   const [activeHistoryId, setActiveHistoryId] = useState<string>('')
   const [historyHydrated, setHistoryHydrated] = useState(false)
   const [runtimeReady, setRuntimeReady] = useState(false)
+  /** `null`：仍在检测或已就绪；非空：PI 不可用时的说明（避免一直显示「正在初始化」） */
+  const [runtimeBlockingReason, setRuntimeBlockingReason] = useState<string | null>(null)
   const currentTurnIdsRef = useRef<Map<string, string>>(new Map())
   const receivedFirstDeltaRef = useRef<Map<string, boolean>>(new Map())
   /** 同步防连点：同 session 并发 `streamPiPrompt` 会触发后端池化 SIGKILL；`runningHistoryIds` 的 setState 追不上双击。 */
@@ -841,12 +844,47 @@ export function usePiAgent() {
     })
   }
 
-  // Listen for PI runtime readiness (emitted from Rust backend after extraction)
+  // 同步 PI 就绪状态：后台线程可能在 WebView 订阅前就 emit，仅靠事件会永远等不到。
   useEffect(() => {
+    let cancelled = false
+
+    const applyStatus = (piAvailable: boolean, messages: string[]) => {
+      if (cancelled) {
+        return
+      }
+      if (piAvailable) {
+        setRuntimeReady(true)
+        setRuntimeBlockingReason(null)
+      } else {
+        setRuntimeReady(false)
+        const detail = messages.filter(Boolean).join(' | ').trim()
+        setRuntimeBlockingReason(detail || '未检测到可用的 PI 运行时')
+      }
+    }
+
+    void ensureRuntimeDependencies()
+      .then((status) => applyStatus(status.piAvailable, status.messages))
+      .catch((invokeError) => {
+        if (cancelled) {
+          return
+        }
+        setRuntimeReady(false)
+        const message = invokeError instanceof Error ? invokeError.message : String(invokeError)
+        setRuntimeBlockingReason(`无法校验 PI 运行时：${message}`)
+      })
+
     const unlisten = listen<boolean>('pi://runtime-ready', (event) => {
-      if (event.payload) setRuntimeReady(true)
+      if (cancelled || !event.payload) {
+        return
+      }
+      setRuntimeReady(true)
+      setRuntimeBlockingReason(null)
     })
-    return () => { unlisten.then((fn) => fn()) }
+
+    return () => {
+      cancelled = true
+      void unlisten.then((fn) => fn())
+    }
   }, [])
 
   useEffect(() => {
@@ -898,10 +936,6 @@ export function usePiAgent() {
 
     clearLegacyHistoryStorage()
     const serialized = JSON.stringify(history)
-    const firstTurn = history[0]?.turns[0]
-    if (firstTurn?.usage) {
-      console.debug('[usage-debug] saving history, first turn usage:', JSON.stringify(firstTurn.usage))
-    }
     void saveHistoryState(serialized)
   }, [history, historyHydrated])
 
@@ -1080,8 +1114,6 @@ export function usePiAgent() {
 
     if (payload.event === 'done') {
       const usage = parseUsageFromPayload(payload)
-      console.debug('[usage-debug] done event payload keys:', Object.keys(payload))
-      console.debug('[usage-debug] parseUsageFromPayload result:', JSON.stringify(usage))
       setLatestActivityState(currentHistoryId, currentTurnId, '连接 pi 主脑', 'done')
       setLatestActivityState(currentHistoryId, currentTurnId, '流式输出中', 'done')
       setLatestActivityState(currentHistoryId, currentTurnId, '深度思考中', 'done')
@@ -1639,6 +1671,7 @@ export function usePiAgent() {
     error,
     loading,
     runtimeReady,
+    runtimeBlockingReason,
     runningHistoryIds,
     history,
     activeHistoryId,

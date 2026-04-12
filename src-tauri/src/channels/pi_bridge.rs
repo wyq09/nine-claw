@@ -1105,11 +1105,14 @@ impl PiBridge {
                     .and_then(|item| item.as_str())
                     == Some("assistant");
                 if is_assistant {
-                    final_usage = final_usage.or_else(|| {
-                        crate::extract_usage_payload(message.and_then(|item| item.get("usage")))
-                    });
-                    final_usage_meta =
-                        final_usage_meta.or_else(|| crate::extract_usage_metadata_payload(message));
+                    let step_usage =
+                        crate::extract_usage_payload(message.and_then(|item| item.get("usage")));
+                    if step_usage.is_some() {
+                        crate::accumulate_pi_token_usage(&mut final_usage, step_usage);
+                        if let Some(meta) = crate::extract_usage_metadata_payload(message) {
+                            final_usage_meta = Some(meta);
+                        }
+                    }
                 }
             }
 
@@ -1189,14 +1192,13 @@ impl PiBridge {
 
             if line_type == "agent_end" {
                 if let Some(messages) = value.get("messages").and_then(|item| item.as_array()) {
-                    if let Some(last_assistant) = messages.iter().rev().find(|message| {
-                        message.get("role").and_then(|item| item.as_str()) == Some("assistant")
-                    }) {
-                        final_usage = final_usage
-                            .or_else(|| crate::extract_usage_payload(last_assistant.get("usage")));
-                        final_usage_meta = final_usage_meta.or_else(|| {
-                            crate::extract_usage_metadata_payload(Some(last_assistant))
-                        });
+                    let (aggregated_usage, aggregated_meta) =
+                        crate::aggregate_usage_from_agent_messages(messages.as_slice());
+                    if let Some(usage) = aggregated_usage {
+                        final_usage = Some(usage);
+                    }
+                    if let Some(meta) = aggregated_meta {
+                        final_usage_meta = Some(meta);
                     }
                 }
                 saw_agent_end = true;

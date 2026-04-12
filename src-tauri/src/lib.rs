@@ -822,10 +822,11 @@ fn desktop_incomplete_reply_error(
 #[cfg(test)]
 mod lib_tests {
     use super::{
-        build_desktop_outbound_display_text, desktop_incomplete_reply_error,
-        desktop_media_reply_prompt, infer_media_mime_type, prepend_multimodal_summary_context,
-        record_multimodal_summary, render_multimodal_summary_context, summary_file_path,
-        DesktopParsedMediaItem, ProviderRuntimeConfig,
+        aggregate_usage_from_agent_messages, build_desktop_outbound_display_text,
+        desktop_incomplete_reply_error, desktop_media_reply_prompt, infer_media_mime_type,
+        prepend_multimodal_summary_context, record_multimodal_summary,
+        render_multimodal_summary_context, summary_file_path, DesktopParsedMediaItem,
+        ProviderRuntimeConfig,
     };
     use crate::channels::types::MediaType;
     use std::fs;
@@ -934,6 +935,34 @@ mod lib_tests {
         let reason = desktop_incomplete_reply_error(Some(&provider), true, true, false)
             .expect("missing provider reason");
         assert!(reason.contains("没有关联完整的 Provider 配置"));
+    }
+
+    #[test]
+    fn aggregate_agent_end_sums_each_assistant_step() {
+        use serde_json::json;
+
+        let messages = vec![
+            json!({"role": "user"}),
+            json!({
+                "role": "assistant",
+                "usage": {"input": 8237, "output": 110, "cacheRead": 1088, "cacheWrite": 0, "totalTokens": 9435}
+            }),
+            json!({
+                "role": "assistant",
+                "usage": {"input": 221, "output": 45, "cacheRead": 9280, "cacheWrite": 0, "totalTokens": 9546}
+            }),
+            json!({
+                "role": "assistant",
+                "usage": {"input": 85, "output": 140, "cacheRead": 9472, "cacheWrite": 0, "totalTokens": 9697}
+            }),
+        ];
+        let (usage, _) = aggregate_usage_from_agent_messages(&messages);
+        let u = usage.expect("aggregated usage");
+        assert_eq!(u.input_tokens, Some(8543));
+        assert_eq!(u.output_tokens, Some(295));
+        assert_eq!(u.cache_read_tokens, Some(19840));
+        assert_eq!(u.cache_write_tokens, Some(0));
+        assert_eq!(u.total_tokens, Some(28678));
     }
 }
 
@@ -3164,6 +3193,63 @@ pub(crate) fn extract_usage_payload(
     })
 }
 
+fn usage_row_total_tokens(payload: &PiTokenUsagePayload) -> u64 {
+    payload.total_tokens.unwrap_or_else(|| {
+        payload.input_tokens.unwrap_or(0)
+            + payload.output_tokens.unwrap_or(0)
+            + payload.cache_read_tokens.unwrap_or(0)
+            + payload.cache_write_tokens.unwrap_or(0)
+    })
+}
+
+fn merge_pi_token_usage_payloads(left: &PiTokenUsagePayload, right: &PiTokenUsagePayload) -> PiTokenUsagePayload {
+    let input = left.input_tokens.unwrap_or(0) + right.input_tokens.unwrap_or(0);
+    let output = left.output_tokens.unwrap_or(0) + right.output_tokens.unwrap_or(0);
+    let cache_read = left.cache_read_tokens.unwrap_or(0) + right.cache_read_tokens.unwrap_or(0);
+    let cache_write = left.cache_write_tokens.unwrap_or(0) + right.cache_write_tokens.unwrap_or(0);
+    let total = usage_row_total_tokens(left) + usage_row_total_tokens(right);
+    PiTokenUsagePayload {
+        input_tokens: Some(input),
+        output_tokens: Some(output),
+        cache_read_tokens: Some(cache_read),
+        cache_write_tokens: Some(cache_write),
+        total_tokens: Some(total),
+    }
+}
+
+/// 将多轮 assistant 调用的用量相加（一次用户任务内可能有多条带 `usage` 的 assistant 消息）。
+pub(crate) fn accumulate_pi_token_usage(
+    into: &mut Option<PiTokenUsagePayload>,
+    step: Option<PiTokenUsagePayload>,
+) {
+    let Some(step) = step else {
+        return;
+    };
+    *into = Some(match into.take() {
+        None => step,
+        Some(prev) => merge_pi_token_usage_payloads(&prev, &step),
+    });
+}
+
+/// 从 `agent_end` 的 `messages` 数组汇总所有 assistant 的 `usage`，并取最后一条 assistant 的元数据。
+pub(crate) fn aggregate_usage_from_agent_messages(
+    messages: &[serde_json::Value],
+) -> (Option<PiTokenUsagePayload>, Option<PiUsageMetadataPayload>) {
+    let mut total: Option<PiTokenUsagePayload> = None;
+    let mut last_meta: Option<PiUsageMetadataPayload> = None;
+    for message in messages {
+        if message.get("role").and_then(|item| item.as_str()) != Some("assistant") {
+            continue;
+        }
+        let step = extract_usage_payload(message.get("usage"));
+        accumulate_pi_token_usage(&mut total, step);
+        if let Some(meta) = extract_usage_metadata_payload(Some(message)) {
+            last_meta = Some(meta);
+        }
+    }
+    (total, last_meta)
+}
+
 pub(crate) fn extract_usage_metadata_payload(
     value: Option<&serde_json::Value>,
 ) -> Option<PiUsageMetadataPayload> {
@@ -4214,11 +4300,14 @@ async fn stream_pi_prompt(
                         assistant_terminal_error = extract_message_terminal_error(message);
                     }
 
-                    final_usage = final_usage.or_else(|| {
-                        let raw = message.and_then(|item| item.get("usage"));
-                        extract_usage_payload(raw)
-                    });
-                    final_usage_meta = final_usage_meta.or_else(|| extract_usage_metadata_payload(message));
+                    let step_usage =
+                        extract_usage_payload(message.and_then(|item| item.get("usage")));
+                    if step_usage.is_some() {
+                        accumulate_pi_token_usage(&mut final_usage, step_usage);
+                        if let Some(meta) = extract_usage_metadata_payload(message) {
+                            final_usage_meta = Some(meta);
+                        }
+                    }
 
                     if matches!(line_type, "message_end" | "turn_end")
                         && (saw_snapshot || !emitted_assistant_text.trim().is_empty())
@@ -4317,6 +4406,9 @@ async fn stream_pi_prompt(
 
             if line_type == "agent_end" {
                 if let Some(messages) = value.get("messages").and_then(|item| item.as_array()) {
+                    let (aggregated_usage, aggregated_meta) =
+                        aggregate_usage_from_agent_messages(messages.as_slice());
+
                     if let Some(last_assistant) = messages.iter().rev().find(|message| {
                         message.get("role").and_then(|item| item.as_str()) == Some("assistant")
                     }) {
@@ -4347,13 +4439,13 @@ async fn stream_pi_prompt(
                             assistant_terminal_error =
                                 extract_message_terminal_error(Some(last_assistant));
                         }
+                    }
 
-                        final_usage = final_usage.or_else(|| {
-                            let usage_val = last_assistant.get("usage");
-                            extract_usage_payload(usage_val)
-                        });
-                        final_usage_meta = final_usage_meta
-                            .or_else(|| extract_usage_metadata_payload(Some(last_assistant)));
+                    if let Some(usage) = aggregated_usage {
+                        final_usage = Some(usage);
+                    }
+                    if let Some(meta) = aggregated_meta {
+                        final_usage_meta = Some(meta);
                     }
                 }
 
@@ -4760,7 +4852,7 @@ pub(crate) fn channel_manager() -> &'static Mutex<ChannelManager> {
 async fn ensure_runtime_dependencies(
     app: tauri::AppHandle,
 ) -> Result<RuntimeDependencyStatus, String> {
-    Ok(pi_runtime::ensure_runtime_dependencies_impl(&app))
+    Ok(pi_runtime::cached_ensure_runtime_dependencies(&app))
 }
 
 #[tauri::command]
@@ -5269,7 +5361,7 @@ pub fn run() {
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
                 dev_trace("app", "后台 runtime 初始化开始");
-                let status = pi_runtime::ensure_runtime_dependencies_impl(&app_handle);
+                let status = pi_runtime::cached_ensure_runtime_dependencies(&app_handle);
                 if !status.pi_available {
                     log::warn!("runtime dependency check: {}", status.messages.join(" | "));
                 }
