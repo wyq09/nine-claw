@@ -1,4 +1,4 @@
-import fs from 'node:fs'
+import fs, { writeSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -36,7 +36,8 @@ type ParsedArgs = {
   agentLabel: string
 }
 
-const STARTUP_TIMEOUT_MS = 15_000
+// 与 Rust 侧 STARTUP_TIMEOUT_SECS 对齐略有余量；弱网 / 首次拉取 WS 配置可能较慢。
+const STARTUP_TIMEOUT_MS = 45_000
 
 const args = parseArgs(process.argv.slice(2))
 
@@ -93,7 +94,17 @@ function emit(payload: Record<string, unknown>): void {
   if (process.stdout.destroyed || !process.stdout.writable) {
     return
   }
-  process.stdout.write(`${JSON.stringify(payload)}\n`)
+  const line = `${JSON.stringify(payload)}\n`
+  // 与父进程管道通信时必须同步写入；否则 write 可能留在缓冲区，随后 process.exit 导致主进程只看到 EOF。
+  if (process.stdout.isTTY) {
+    process.stdout.write(line)
+  } else {
+    try {
+      writeSync(1, line)
+    } catch {
+      // ignore
+    }
+  }
 }
 
 function emitStatus(level: 'processing' | 'done' | 'warn' | 'error', message: string): void {
@@ -120,7 +131,8 @@ function createWsClient() {
     appId: args.appId,
     appSecret: args.appSecret,
     logger,
-    loggerLevel: Lark.LoggerLevel.info,
+    // SDK 将「真正建连成功」记在 debug：ws connect success；info 的 ws client ready 在首连失败时仍可能打印，不能用作就绪条件。
+    loggerLevel: Lark.LoggerLevel.debug,
   })
 }
 
@@ -210,11 +222,6 @@ function forwardSdkLog(level: 'debug' | 'info' | 'warn' | 'error', parts: unknow
   }
 
   if (message.includes('ws connect success') || message.includes('event-dispatch is ready')) {
-    startupController?.markReady(`飞书机器人已连接，当前绑定智能体: ${args.agentLabel}`)
-    return
-  }
-
-  if (message.includes('ws client ready')) {
     startupController?.markReady(`飞书机器人已连接，当前绑定智能体: ${args.agentLabel}`)
     return
   }
@@ -748,6 +755,28 @@ process.on('SIGINT', () => {
 
 process.on('SIGTERM', () => {
   void shutdown()
+})
+
+function emitFatalStatus(message: string): void {
+  try {
+    writeSync(
+      1,
+      `${JSON.stringify({
+        type: 'status',
+        level: 'error',
+        message,
+        timestamp: Date.now(),
+      })}\n`,
+    )
+  } catch {
+    // ignore
+  }
+}
+
+process.on('uncaughtException', (error) => {
+  const message = error instanceof Error ? error.message : String(error)
+  emitFatalStatus(`飞书辅助进程未捕获异常: ${message}`)
+  process.exit(1)
 })
 
 main().catch((error) => {

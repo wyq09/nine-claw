@@ -38,8 +38,6 @@ import type {
   AgentTaskListItem,
   AgentTaskUpdateInput,
   AgentHeartbeatConfig,
-  AgentHeartbeatSchedule,
-  AgentHeartbeatTask,
   AgentInput,
   AgentRecord,
   AgentScenarioLlmConfig,
@@ -135,6 +133,8 @@ const LEGACY_GENERAL_SETTINGS_STORAGE_KEYS = ['yqagent.general-settings.v1']
 const LEGACY_APPEARANCE_SETTINGS_STORAGE_KEYS = ['yqagent.appearance-settings.v1']
 const LEGACY_PROVIDER_CONFIGS_STORAGE_KEYS = ['yqagent.provider-configs.v1']
 const LEGACY_CUSTOM_PROVIDERS_META_KEYS = ['yqagent.custom-providers-meta.v1']
+/** 侧栏左下角：头像与快捷入口；关闭时仅显示设置（后续再接） */
+const SIDEBAR_FOOTER_SHORTCUTS_ENABLED = false
 /** 与 TurnResponseBody 空闲占位一致；不应作为一条「回复」展示在列表中。 */
 const TURN_PLACEHOLDER_NO_OUTPUT = '当前轮次还没有输出内容。'
 const MarkdownRenderer = lazy(() => import('./components/MarkdownRenderer'))
@@ -372,21 +372,6 @@ function runAtMsToDatetimeLocalValue(ms: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-function formatAgentTaskSchedule(task: AgentTaskListItem): string {
-  if (task.scheduleType === 'interval') {
-    return task.nextRunAt
-      ? `间隔任务 · 下次 ${formatOptionalAbsoluteTime(task.nextRunAt)}`
-      : '间隔任务'
-  }
-  if (task.scheduleType === 'once_at') {
-    const t = task.runAtMs ?? task.nextRunAt
-    return t ? `一次性 · ${formatOptionalAbsoluteTime(t)}` : '一次性定时'
-  }
-  return task.nextRunAt
-    ? `每日定时 · 下次 ${formatOptionalAbsoluteTime(task.nextRunAt)}`
-    : '每日定时'
-}
-
 function formatAgentTaskScheduleShort(task: AgentTaskListItem): string {
   if (task.scheduleType === 'interval') {
     const m = task.intervalMinutes
@@ -563,36 +548,6 @@ function createEmptyHeartbeatConfig(): AgentHeartbeatConfig {
   }
 }
 
-function createEmptyHeartbeatTask(): AgentHeartbeatTask {
-  return {
-    id: generateDraftItemId('task'),
-    name: '',
-    description: '',
-    taskType: 'notify',
-    enabled: true,
-    messageTemplate: '',
-    command: '',
-    workingDirectory: '',
-    timeoutSec: 180,
-    notifyOnSuccess: true,
-    notifyOnFailure: true,
-  }
-}
-
-function createEmptyHeartbeatSchedule(): AgentHeartbeatSchedule {
-  return {
-    id: generateDraftItemId('schedule'),
-    name: '',
-    enabled: true,
-    taskId: '',
-    scheduleType: 'daily',
-    times: ['08:00'],
-    channelId: 'wechat',
-    targetUserId: '',
-    targetLabel: '',
-  }
-}
-
 function normalizeHeartbeatTimes(times: string[]): string[] {
   return Array.from(
     new Set(
@@ -744,27 +699,6 @@ function validateAgentDraft(input: AgentInput): string | null {
   }
   if (!input.defaultProviderId.trim() || !input.defaultModel.trim()) {
     return '请为智能体配置默认模型。'
-  }
-  const heartbeatConfig = normalizeHeartbeatConfig(input.heartbeatConfig)
-  const taskIds = new Set(heartbeatConfig.tasks.map((task) => task.id))
-  for (const task of heartbeatConfig.tasks) {
-    if (task.enabled && task.taskType === 'shell' && !task.command.trim()) {
-      return `任务「${task.name || '未命名任务'}」缺少执行命令。`
-    }
-  }
-  for (const schedule of heartbeatConfig.schedules) {
-    if (!schedule.enabled) {
-      continue
-    }
-    if (!schedule.taskId || !taskIds.has(schedule.taskId)) {
-      return `规则「${schedule.name || '未命名规则'}」需要绑定一个有效任务。`
-    }
-    if (schedule.times.length === 0) {
-      return `规则「${schedule.name || '未命名规则'}」至少要配置一个触发时间。`
-    }
-    if (!schedule.targetUserId.trim()) {
-      return `规则「${schedule.name || '未命名规则'}」缺少接收用户 ID。`
-    }
   }
   return null
 }
@@ -3649,15 +3583,19 @@ function App() {
           ) : null}
 
           <div className="sidebar-footer">
-            <button type="button" className="avatar-badge" aria-label="用户">
-              U
-            </button>
-            <button type="button" className="footer-icon-button" onClick={() => handleViewChange('chat')} aria-label="最近会话">
-              <AppIcon name="clock" size={18} />
-            </button>
-            <button type="button" className="footer-icon-button" onClick={() => handleViewChange('agents')} aria-label="AI 组织管理">
-              <AppIcon name="network" size={18} />
-            </button>
+            {SIDEBAR_FOOTER_SHORTCUTS_ENABLED ? (
+              <>
+                <button type="button" className="avatar-badge" aria-label="用户">
+                  U
+                </button>
+                <button type="button" className="footer-icon-button" onClick={() => handleViewChange('chat')} aria-label="最近会话">
+                  <AppIcon name="clock" size={18} />
+                </button>
+                <button type="button" className="footer-icon-button" onClick={() => handleViewChange('agents')} aria-label="AI 组织管理">
+                  <AppIcon name="network" size={18} />
+                </button>
+              </>
+            ) : null}
             <button type="button" className="footer-icon-button" onClick={() => openSettings('general')} aria-label="设置">
               <AppIcon name="settings" size={18} />
             </button>
@@ -5164,8 +5102,14 @@ function SkillsView({
             系统技能库
           </button>
         </div>
-        <button type="button" className="toolbar-link" onClick={() => void onRefresh()} disabled={skillsLoading}>
-          <AppIcon name="refresh" size={18} />
+        <button
+          type="button"
+          className={`page-toolbar-refresh${skillsLoading ? ' is-loading' : ''}`}
+          onClick={() => void onRefresh()}
+          disabled={skillsLoading}
+          aria-busy={skillsLoading}
+        >
+          <AppIcon name="refresh" size={16} />
           <span>{skillsLoading ? '刷新中…' : '刷新'}</span>
         </button>
       </div>
@@ -6313,11 +6257,6 @@ function AgentEditorDialog({
   const [peerGatewayInfo, setPeerGatewayInfo] = useState<PeerGatewayInfo | null>(null)
   const [peerGatewayLoadError, setPeerGatewayLoadError] = useState('')
   const [peerSnippetCopied, setPeerSnippetCopied] = useState(false)
-  const [agentTasks, setAgentTasks] = useState<AgentTaskListItem[]>([])
-  const [agentTasksLoading, setAgentTasksLoading] = useState(false)
-  const [agentTasksError, setAgentTasksError] = useState('')
-  const [agentTaskActionId, setAgentTaskActionId] = useState('')
-  const toast = useToast()
   type AgentEditorTab = 'basics' | 'models' | 'integrations' | 'advanced'
   const [editorTab, setEditorTab] = useState<AgentEditorTab>('basics')
 
@@ -6340,58 +6279,6 @@ function AgentEditorDialog({
     }
   }, [managedAgentId])
 
-  useEffect(() => {
-    const targetAgentId = selectedAgent?.id?.trim()
-    if (!targetAgentId || mode !== 'edit') {
-      setAgentTasks([])
-      setAgentTasksError('')
-      setAgentTasksLoading(false)
-      return
-    }
-
-    let cancelled = false
-    setAgentTasksLoading(true)
-    setAgentTasksError('')
-    void listAgentTasks(targetAgentId)
-      .then((items) => {
-        if (!cancelled) {
-          setAgentTasks(items)
-        }
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
-          setAgentTasksError(error instanceof Error ? error.message : String(error))
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setAgentTasksLoading(false)
-        }
-      })
-
-    return () => {
-      cancelled = true
-    }
-  }, [mode, selectedAgent?.id])
-
-  const refreshAgentTasks = useCallback(async () => {
-    const targetAgentId = selectedAgent?.id?.trim()
-    if (!targetAgentId || mode !== 'edit') {
-      setAgentTasks([])
-      return
-    }
-    setAgentTasksLoading(true)
-    setAgentTasksError('')
-    try {
-      const items = await listAgentTasks(targetAgentId)
-      setAgentTasks(items)
-    } catch (error) {
-      setAgentTasksError(error instanceof Error ? error.message : String(error))
-    } finally {
-      setAgentTasksLoading(false)
-    }
-  }, [mode, selectedAgent?.id])
-
   const peerDraftConfigs = createAgentBotConfigState(agentDraft?.botConfigs)
   const peerDraftSecret =
     peerDraftConfigs.peer?.peerSharedSecret?.trim() || peerDraftConfigs.peer?.clientSecret?.trim() || ''
@@ -6411,72 +6298,9 @@ function AgentEditorDialog({
   const editorAccent = getAgentColor(
     selectedAgent ?? { id: 'draft', name: agentDraft?.name || '智能体', accentColor: agentDraft?.accentColor },
   )
-  const heartbeatConfig = normalizeHeartbeatConfig(agentDraft?.heartbeatConfig)
-  const heartbeatTasks = heartbeatConfig.tasks
-  const heartbeatSchedules = heartbeatConfig.schedules
-  const updateHeartbeatConfig = (updater: (current: AgentHeartbeatConfig) => AgentHeartbeatConfig) => {
-    onDraftChange({ heartbeatConfig: updater(normalizeHeartbeatConfig(agentDraft?.heartbeatConfig)) })
-  }
-  const updateHeartbeatTask = (taskId: string, updates: Partial<AgentHeartbeatTask>) => {
-    updateHeartbeatConfig((current) => ({
-      ...current,
-      tasks: current.tasks.map((task) => (task.id === taskId ? { ...task, ...updates } : task)),
-    }))
-  }
-  const removeHeartbeatTask = (taskId: string) => {
-    updateHeartbeatConfig((current) => ({
-      ...current,
-      tasks: current.tasks.filter((task) => task.id !== taskId),
-      schedules: current.schedules.map((schedule) =>
-        schedule.taskId === taskId ? { ...schedule, taskId: '' } : schedule,
-      ),
-    }))
-  }
-  const addHeartbeatTask = () => {
-    updateHeartbeatConfig((current) => ({
-      ...current,
-      tasks: [...current.tasks, createEmptyHeartbeatTask()],
-    }))
-  }
-  const updateHeartbeatSchedule = (scheduleId: string, updates: Partial<AgentHeartbeatSchedule>) => {
-    updateHeartbeatConfig((current) => ({
-      ...current,
-      schedules: current.schedules.map((schedule) => (schedule.id === scheduleId ? { ...schedule, ...updates } : schedule)),
-    }))
-  }
-  const removeHeartbeatSchedule = (scheduleId: string) => {
-    updateHeartbeatConfig((current) => ({
-      ...current,
-      schedules: current.schedules.filter((schedule) => schedule.id !== scheduleId),
-    }))
-  }
-  const addHeartbeatSchedule = () => {
-    updateHeartbeatConfig((current) => ({
-      ...current,
-      schedules: [
-        ...current.schedules,
-        {
-          ...createEmptyHeartbeatSchedule(),
-          taskId: current.tasks[0]?.id ?? '',
-        },
-      ],
-    }))
-  }
   useEffect(() => {
     setEditorTab('basics')
   }, [managedAgentId, mode])
-
-  useEffect(() => {
-    if (
-      agentFormError &&
-      (agentFormError.includes('任务') ||
-        agentFormError.includes('规则') ||
-        agentFormError.includes('接收用户') ||
-        agentFormError.includes('时区'))
-    ) {
-      setEditorTab('advanced')
-    }
-  }, [agentFormError])
 
   if (!agentDraft) {
     return null
@@ -6527,8 +6351,8 @@ function AgentEditorDialog({
                   <h2 id="agent-editor-title">{mode === 'create' ? '新建智能体' : selectedAgent?.name ?? '编辑智能体'}</h2>
                   <p>
                     {mode === 'create'
-                      ? '先填名字与角色说明并挂载技能；在「模型配置」「三方对接」「高级与自动化」中完成其余设置。'
-                      : selectedAgent?.summary ?? '用下方 Tab 切换分区：基本信息、模型、三方对接、高级与自动化。'}
+                      ? '先填名字与角色说明并挂载技能；在「模型配置」「三方对接」「高级」中完成其余设置。'
+                      : selectedAgent?.summary ?? '用下方 Tab 切换分区：基本信息、模型、三方对接、高级。'}
                   </p>
                 </div>
               </div>
@@ -6598,7 +6422,7 @@ function AgentEditorDialog({
             aria-selected={editorTab === 'advanced'}
             onClick={() => setEditorTab('advanced')}
           >
-            高级与自动化
+            高级
           </button>
         </div>
 
@@ -6624,7 +6448,7 @@ function AgentEditorDialog({
 	              <div className="agent-section-header">
 	                <div>
 	                  <strong>基本信息</strong>
-	                  <p>名字与角色说明；列表摘要默认从角色说明自动生成，也可在「高级与自动化」里手动覆盖。</p>
+	                  <p>名字与角色说明；列表摘要默认从角色说明自动生成，也可在「高级」里手动覆盖。</p>
 	                </div>
 	              </div>
 
@@ -6652,7 +6476,7 @@ function AgentEditorDialog({
 	              <div className="agent-helper-copy">
 	                <strong>列表摘要将自动生成</strong>
 	                <span>
-	                  当前预览：{generatedSummary || '输入角色说明后会自动生成'}。若要手动改写摘要，请打开「高级与自动化」分页。
+	                  当前预览：{generatedSummary || '输入角色说明后会自动生成'}。若要手动改写摘要，请打开「高级」分页。定时类任务请在「任务中心」管理。
 	                </span>
 	              </div>
 	            </div>
@@ -6981,449 +6805,6 @@ function AgentEditorDialog({
 	                      />
 	                    </label>
 	                  </div>
-
-	                  <div className="agent-subsection">
-	                    <div className="agent-subsection-header">
-	                      <div>
-	                        <strong>自然语言定时任务</strong>
-	                        <p>这里展示用户在聊天里直接对这个智能体创建的真实任务。它们会带上当前智能体 ID，并由 scheduler 定时触发。</p>
-	                      </div>
-
-	                      <div className="agent-inline-actions">
-	                        <button type="button" className="outline-button" onClick={() => void refreshAgentTasks()} disabled={agentTasksLoading}>
-	                          <AppIcon name="refresh" size={16} />
-	                          <span>{agentTasksLoading ? '刷新中…' : '刷新列表'}</span>
-	                        </button>
-	                      </div>
-	                    </div>
-
-	                    {agentTasksError ? (
-	                      <div className="skills-feedback error agent-feedback inline">
-	                        <span>读取定时任务失败：{agentTasksError}</span>
-	                      </div>
-	                    ) : null}
-
-	                    {agentTasks.length > 0 ? (
-	                      <div className="agent-automation-list">
-	                        {agentTasks.map((task) => {
-	                          const actionBusy = agentTaskActionId === task.id
-	                          return (
-	                            <div key={task.id} className="agent-automation-card">
-	                              <div className="agent-automation-card-header">
-	                                <div>
-	                                  <strong>{task.title}</strong>
-	                                  <span>{formatAgentTaskSchedule(task)} · {formatAgentTaskStatus(task.status)}</span>
-	                                </div>
-	                                <div className="agent-inline-actions">
-                                  <button
-                                    type="button"
-                                    className="outline-button"
-                                    disabled={actionBusy || task.status === 'deleted'}
-                                    onClick={() => {
-                                      setAgentTaskActionId(task.id)
-                                      void runAgentTaskNow(task.id)
-                                        .then(async () => {
-                                          await refreshAgentTasks()
-                                          toast.success('已触发立即执行。')
-                                        })
-                                        .catch((error: unknown) => {
-                                          setAgentTasksError(error instanceof Error ? error.message : String(error))
-                                        })
-                                        .finally(() => setAgentTaskActionId(''))
-                                    }}
-                                  >
-                                    <span>{actionBusy ? '处理中…' : '立即执行'}</span>
-                                  </button>
-	                                  {task.status === 'active' ? (
-	                                    <button
-	                                      type="button"
-	                                      className="outline-button"
-	                                      disabled={actionBusy}
-	                                      onClick={() => {
-	                                        setAgentTaskActionId(task.id)
-	                                        void pauseAgentTask(task.id)
-	                                          .then(async () => {
-	                                            await refreshAgentTasks()
-	                                            toast.success('任务已暂停。')
-	                                          })
-	                                          .catch((error: unknown) => {
-	                                            setAgentTasksError(error instanceof Error ? error.message : String(error))
-	                                          })
-	                                          .finally(() => setAgentTaskActionId(''))
-	                                      }}
-	                                    >
-	                                      <span>{actionBusy ? '处理中…' : '暂停'}</span>
-	                                    </button>
-	                                  ) : task.status === 'paused' ? (
-	                                    <button
-	                                      type="button"
-	                                      className="outline-button"
-	                                      disabled={actionBusy}
-	                                      onClick={() => {
-	                                        setAgentTaskActionId(task.id)
-	                                        void resumeAgentTask(task.id)
-	                                          .then(async () => {
-	                                            await refreshAgentTasks()
-	                                            toast.success('任务已恢复。')
-	                                          })
-	                                          .catch((error: unknown) => {
-	                                            setAgentTasksError(error instanceof Error ? error.message : String(error))
-	                                          })
-	                                          .finally(() => setAgentTaskActionId(''))
-	                                      }}
-	                                    >
-	                                      <span>{actionBusy ? '处理中…' : '恢复'}</span>
-	                                    </button>
-	                                  ) : null}
-	                                  {task.status !== 'deleted' ? (
-	                                    <button
-	                                      type="button"
-	                                      className="icon-button subtle"
-	                                      disabled={actionBusy}
-	                                      onClick={() => {
-	                                        setAgentTaskActionId(task.id)
-	                                        void deleteAgentTask(task.id)
-	                                          .then(async () => {
-	                                            await refreshAgentTasks()
-	                                            toast.success('任务已删除。')
-	                                          })
-	                                          .catch((error: unknown) => {
-	                                            setAgentTasksError(error instanceof Error ? error.message : String(error))
-	                                          })
-	                                          .finally(() => setAgentTaskActionId(''))
-	                                      }}
-	                                    >
-	                                      <AppIcon name="trash" size={16} />
-	                                    </button>
-	                                  ) : null}
-	                                </div>
-	                              </div>
-
-	                              <div className="agent-workspace-hint">
-	                                <span>创建智能体：{task.agentName} ({task.agentId})</span>
-	                                <span>类型：{task.taskType === 'agent_prompt' ? 'agent_prompt · 到点后再唤起智能体' : 'reminder · 直接提醒'}</span>
-	                                <span>来源会话：{task.sourceSessionId}</span>
-	                                <span>投递：{task.deliveryKind} → {task.deliveryTarget}</span>
-	                                <span>上次执行：{formatOptionalAbsoluteTime(task.lastRunAt)}</span>
-	                              </div>
-
-	                              <label className="input-field agent-field-full">
-	                                <span>任务内容</span>
-	                                <textarea value={task.goal} readOnly rows={3} />
-	                              </label>
-	                            </div>
-	                          )
-	                        })}
-	                      </div>
-	                    ) : (
-	                      <div className="agent-empty-block">
-	                        <strong>{agentTasksLoading ? '正在读取任务…' : '还没有自然语言创建的任务'}</strong>
-	                        <span>先在聊天里对这个智能体说“每 10 分钟…”或“每天 9 点…”，这里就会出现对应记录。</span>
-	                      </div>
-	                    )}
-	                  </div>
-
-	                  <div className="agent-subsection">
-	                    <div className="agent-subsection-header">
-	                      <div>
-	                        <strong>心跳与任务</strong>
-	                        <p>给这个智能体配置定时提醒和可执行任务。规则到点后会自动通过绑定的 IM 通道给目标用户发消息，shell 任务会先执行程序，再推送结果。</p>
-	                      </div>
-
-	                      <div className="agent-inline-actions">
-	                        <button type="button" className="outline-button" onClick={addHeartbeatTask}>
-	                          <AppIcon name="plus" size={16} />
-	                          <span>添加任务</span>
-	                        </button>
-	                        <button type="button" className="outline-button" onClick={addHeartbeatSchedule}>
-	                          <AppIcon name="clock" size={16} />
-	                          <span>添加规则</span>
-	                        </button>
-	                      </div>
-	                    </div>
-
-	                    <div className="agent-form-grid">
-	                      <label className="input-field">
-	                        <span>时区</span>
-	                        <input
-	                          value={heartbeatConfig.timezone}
-	                          onChange={(event) =>
-	                            updateHeartbeatConfig((current) => ({
-	                              ...current,
-	                              timezone: event.target.value,
-	                            }))
-	                          }
-	                          placeholder="Asia/Shanghai"
-	                        />
-	                      </label>
-	                    </div>
-
-	                    <div className="agent-subsection">
-	                      <div className="agent-subsection-header">
-	                        <div>
-	                          <strong>任务</strong>
-	                          <p>`notify` 只负责提醒，`shell` 会执行命令后把结果发给用户。</p>
-	                        </div>
-	                      </div>
-
-	                      {heartbeatTasks.length > 0 ? (
-	                        <div className="agent-automation-list">
-	                          {heartbeatTasks.map((task, index) => (
-	                            <div key={task.id} className="agent-automation-card">
-	                              <div className="agent-automation-card-header">
-	                                <div>
-	                                  <strong>{task.name || `任务 ${index + 1}`}</strong>
-	                                  <span>{task.taskType === 'shell' ? '执行程序并回推结果' : '纯文本提醒'}</span>
-	                                </div>
-	                                <button type="button" className="icon-button subtle" onClick={() => removeHeartbeatTask(task.id)}>
-	                                  <AppIcon name="trash" size={16} />
-	                                </button>
-	                              </div>
-
-	                              <div className="agent-form-grid">
-	                                <label className="input-field">
-	                                  <span>任务名称</span>
-	                                  <input
-	                                    value={task.name}
-	                                    onChange={(event) => updateHeartbeatTask(task.id, { name: event.target.value })}
-	                                    placeholder="例如：早间播报"
-	                                  />
-	                                </label>
-
-	                                <label className="input-field">
-	                                  <span>任务类型</span>
-	                                  <select
-	                                    value={task.taskType}
-	                                    onChange={(event) =>
-	                                      updateHeartbeatTask(task.id, {
-	                                        taskType: event.target.value === 'shell' ? 'shell' : 'notify',
-	                                      })
-	                                    }
-	                                  >
-	                                    <option value="notify">notify · 纯提醒</option>
-	                                    <option value="shell">shell · 先执行程序</option>
-	                                  </select>
-	                                </label>
-	                              </div>
-
-	                              <label className="input-field agent-field-full">
-	                                <span>任务说明</span>
-	                                <textarea
-	                                  value={task.description}
-	                                  onChange={(event) => updateHeartbeatTask(task.id, { description: event.target.value })}
-	                                  rows={3}
-	                                  placeholder="说明这个任务在做什么，例如：每天 8 点推送昨晚抓取的数据摘要"
-	                                />
-	                              </label>
-
-	                              {task.taskType === 'shell' ? (
-	                                <>
-	                                  <label className="input-field agent-field-full">
-	                                    <span>执行命令</span>
-	                                    <input
-	                                      value={task.command}
-	                                      onChange={(event) => updateHeartbeatTask(task.id, { command: event.target.value })}
-	                                      placeholder="例如：python3 scripts/fetch_daily_report.py"
-	                                    />
-	                                  </label>
-
-	                                  <div className="agent-form-grid">
-	                                    <label className="input-field">
-	                                      <span>工作目录</span>
-	                                      <input
-	                                        value={task.workingDirectory}
-	                                        onChange={(event) => updateHeartbeatTask(task.id, { workingDirectory: event.target.value })}
-	                                        placeholder="留空时使用 agents/<agent-id>/"
-	                                      />
-	                                    </label>
-
-	                                    <label className="input-field">
-	                                      <span>超时秒数</span>
-	                                      <input
-	                                        type="number"
-	                                        min={10}
-	                                        step={10}
-	                                        value={task.timeoutSec}
-	                                        onChange={(event) =>
-	                                          updateHeartbeatTask(task.id, {
-	                                            timeoutSec: Number.parseInt(event.target.value || '180', 10) || 180,
-	                                          })
-	                                        }
-	                                      />
-	                                    </label>
-	                                  </div>
-	                                </>
-	                              ) : null}
-
-	                              <label className="input-field agent-field-full">
-	                                <span>消息模板</span>
-	                                <textarea
-	                                  value={task.messageTemplate}
-	                                  onChange={(event) => updateHeartbeatTask(task.id, { messageTemplate: event.target.value })}
-	                                  rows={4}
-	                                  placeholder={'留空时使用系统默认文案。可用变量：{{agent_name}} {{task_name}} {{schedule_name}} {{now}} {{stdout}} {{stderr}} {{exit_code}}'}
-	                                />
-	                              </label>
-
-	                              <div className="agent-toggle-row">
-	                                <label className="agent-check">
-	                                  <input
-	                                    type="checkbox"
-	                                    checked={task.enabled}
-	                                    onChange={(event) => updateHeartbeatTask(task.id, { enabled: event.target.checked })}
-	                                  />
-	                                  <span>启用任务</span>
-	                                </label>
-
-	                                {task.taskType === 'shell' ? (
-	                                  <>
-	                                    <label className="agent-check">
-	                                      <input
-	                                        type="checkbox"
-	                                        checked={task.notifyOnSuccess}
-	                                        onChange={(event) => updateHeartbeatTask(task.id, { notifyOnSuccess: event.target.checked })}
-	                                      />
-	                                      <span>成功后发消息</span>
-	                                    </label>
-
-	                                    <label className="agent-check">
-	                                      <input
-	                                        type="checkbox"
-	                                        checked={task.notifyOnFailure}
-	                                        onChange={(event) => updateHeartbeatTask(task.id, { notifyOnFailure: event.target.checked })}
-	                                      />
-	                                      <span>失败后发消息</span>
-	                                    </label>
-	                                  </>
-	                                ) : null}
-	                              </div>
-	                            </div>
-	                          ))}
-	                        </div>
-	                      ) : (
-	                        <div className="agent-empty-block">
-	                          <strong>还没有任务</strong>
-	                          <span>先添加一个 `notify` 或 `shell` 任务，再给它配置定时规则。</span>
-	                        </div>
-	                      )}
-	                    </div>
-
-	                    <div className="agent-subsection">
-	                      <div className="agent-subsection-header">
-	                        <div>
-	                          <strong>规则</strong>
-	                          <p>规则决定什么时候触发、触发哪个任务，以及把结果发给谁。当前 MVP 先支持每日固定时刻。</p>
-	                        </div>
-	                      </div>
-
-	                      {heartbeatSchedules.length > 0 ? (
-	                        <div className="agent-automation-list">
-	                          {heartbeatSchedules.map((schedule, index) => (
-	                            <div key={schedule.id} className="agent-automation-card">
-	                              <div className="agent-automation-card-header">
-	                                <div>
-	                                  <strong>{schedule.name || `规则 ${index + 1}`}</strong>
-	                                  <span>{schedule.times.join('、') || '未设置时间'} · {schedule.channelId || 'wechat'}</span>
-	                                </div>
-	                                <button type="button" className="icon-button subtle" onClick={() => removeHeartbeatSchedule(schedule.id)}>
-	                                  <AppIcon name="trash" size={16} />
-	                                </button>
-	                              </div>
-
-	                              <div className="agent-form-grid">
-	                                <label className="input-field">
-	                                  <span>规则名称</span>
-	                                  <input
-	                                    value={schedule.name}
-	                                    onChange={(event) => updateHeartbeatSchedule(schedule.id, { name: event.target.value })}
-	                                    placeholder="例如：工作日晚间复盘"
-	                                  />
-	                                </label>
-
-	                                <label className="input-field">
-	                                  <span>绑定任务</span>
-	                                  <select
-	                                    value={schedule.taskId}
-	                                    onChange={(event) => updateHeartbeatSchedule(schedule.id, { taskId: event.target.value })}
-	                                  >
-	                                    <option value="">请选择任务</option>
-	                                    {heartbeatTasks.map((task) => (
-	                                      <option key={task.id} value={task.id}>
-	                                        {task.name || task.id}
-	                                      </option>
-	                                    ))}
-	                                  </select>
-	                                </label>
-	                              </div>
-
-	                              <div className="agent-form-grid">
-	                                <label className="input-field">
-	                                  <span>触发时间</span>
-	                                  <input
-	                                    value={schedule.times.join(', ')}
-	                                    onChange={(event) =>
-	                                      updateHeartbeatSchedule(schedule.id, {
-	                                        times: event.target.value
-	                                          .split(',')
-	                                          .map((value) => value.trim())
-	                                          .filter(Boolean),
-	                                      })
-	                                    }
-	                                    placeholder="例如：08:00, 17:00"
-	                                  />
-	                                </label>
-
-	                                <label className="input-field">
-	                                  <span>通道 ID</span>
-	                                  <input
-	                                    value={schedule.channelId}
-	                                    onChange={(event) => updateHeartbeatSchedule(schedule.id, { channelId: event.target.value })}
-	                                    placeholder="wechat"
-	                                  />
-	                                </label>
-	                              </div>
-
-	                              <div className="agent-form-grid">
-	                                <label className="input-field">
-	                                  <span>接收用户 ID</span>
-	                                  <input
-	                                    value={schedule.targetUserId}
-	                                    onChange={(event) => updateHeartbeatSchedule(schedule.id, { targetUserId: event.target.value })}
-	                                    placeholder="例如：wxid_xxx"
-	                                  />
-	                                </label>
-
-	                                <label className="input-field">
-	                                  <span>接收人备注</span>
-	                                  <input
-	                                    value={schedule.targetLabel}
-	                                    onChange={(event) => updateHeartbeatSchedule(schedule.id, { targetLabel: event.target.value })}
-	                                    placeholder="例如：老板 / 自己 / 数据群"
-	                                  />
-	                                </label>
-	                              </div>
-
-	                              <div className="agent-toggle-row">
-	                                <label className="agent-check">
-	                                  <input
-	                                    type="checkbox"
-	                                    checked={schedule.enabled}
-	                                    onChange={(event) => updateHeartbeatSchedule(schedule.id, { enabled: event.target.checked })}
-	                                  />
-	                                  <span>启用规则</span>
-	                                </label>
-	                              </div>
-	                            </div>
-	                          ))}
-	                        </div>
-	                      ) : (
-	                        <div className="agent-empty-block">
-	                          <strong>还没有规则</strong>
-	                          <span>规则决定执行时机和接收对象。添加后，应用启动时会自动加载并在后台定时检查。</span>
-	                        </div>
-	                      )}
-	                    </div>
-	                  </div>
 	                </div>
 	            </div>
             ) : null}
@@ -7708,7 +7089,11 @@ function AgentBotBindingDialog({
                 ) : selectedBotId === 'lark' ? (
                   <>
                     <div className="agent-workspace-hint">
-                      <span>请在飞书开放平台开启机器人能力、长连接事件订阅，并订阅 `im.message.receive_v1`。</span>
+                      <span>
+                        请在飞书开放平台开启机器人能力、长连接事件订阅，并订阅 `im.message.receive_v1`。后台「接收事件」验证前请先在此启动飞书 Bot（保持长连接在线）；若使用 HTTP
+                        回调并填内网地址会失败，需公网 URL 或改成长连接。飞书辅助进程与 PI 共用应用内 Node：正式构建经 <code>prepare:pi-runtime</code> 打入的官网完整二进制即可，一般无需再装 Node；若提示「node
+                        体积过小」请重新执行 <code>npm run prepare:pi-runtime</code> 后打包。可选环境变量 <code>NINECLAW_LARK_NODE</code> 覆盖路径。
+                      </span>
                     </div>
                     <div className="bot-action-row">
                       <button type="button" className="outline-button" onClick={onLarkStart} disabled={botLoading || saving}>

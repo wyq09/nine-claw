@@ -12,6 +12,31 @@ const PI_RUNTIME_RESOURCE_DIR: &str = "pi-runtime";
 const PI_RUNTIME_BUNDLE_DIR: &str = "pi-runtime-bundles";
 const PI_RUNTIME_EXTRACT_DIR: &str = "pi-runtime-extracted";
 
+/// macOS 上部分 npm 包随附的 `node` 仅约 68KB（thin 包装器），依赖 adhoc 签名的 libnode，会在 Darwin 25+ 被 AMFI SIGKILL。
+/// `prepare-pi-runtime.mjs` 从 nodejs.org 下载的官方 `node` 通常为数十 MB，可与 PI、飞书 helper 等共用。
+pub(crate) const MIN_NODE_BYTES_PLAUSIBLE_FULL: u64 = 2 * 1024 * 1024;
+
+pub(crate) fn bundled_node_executable_path(resource_root: &Path) -> PathBuf {
+    if cfg!(target_os = "windows") {
+        resource_root.join("node.exe")
+    } else {
+        resource_root.join("node")
+    }
+}
+
+/// 是否为「完整」Node 可执行体（用于在 macOS 上拒绝 thin stub，避免 SIGKILL）。
+pub(crate) fn is_plausible_full_node_binary(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if !cfg!(target_os = "macos") {
+        return true;
+    }
+    fs::metadata(path)
+        .map(|m| m.len() >= MIN_NODE_BYTES_PLAUSIBLE_FULL)
+        .unwrap_or(false)
+}
+
 /// Global flag: repair_runtime_directory() should only run once per process.
 static REPAIR_DONE: AtomicBool = AtomicBool::new(false);
 
@@ -47,6 +72,29 @@ fn development_runtime_candidates() -> Vec<PathBuf> {
         .iter()
         .map(|executable_name| root.join(executable_name))
         .collect()
+}
+
+fn development_runtime_root() -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+
+    Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(PI_RUNTIME_RESOURCE_DIR)
+            .join(platform_dir_name()),
+    )
+}
+
+fn is_development_runtime_path(path: &Path) -> bool {
+    let Some(root) = development_runtime_root() else {
+        return false;
+    };
+
+    let canonical_root = fs::canonicalize(&root).unwrap_or(root);
+    let canonical_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical_path.starts_with(canonical_root)
 }
 
 fn development_runtime_archive_candidates() -> Vec<PathBuf> {
@@ -390,7 +438,7 @@ fn ensure_extracted_runtime(app: &AppHandle) -> Result<PathBuf, String> {
 pub(crate) fn resolve_bundled_pi_executable(app: &AppHandle) -> Option<PathBuf> {
     if let Some(candidate) = bundled_runtime_candidates(app)
         .into_iter()
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| candidate.is_file() && !is_development_runtime_path(candidate))
     {
         if let Some(root) = candidate.parent() {
             let _ = repair_runtime_directory(root);
@@ -398,6 +446,10 @@ pub(crate) fn resolve_bundled_pi_executable(app: &AppHandle) -> Option<PathBuf> 
         return Some(candidate);
     }
 
+    // In dev mode, always use the extracted runtime archive instead of the
+    // checked-in source tree. The repair step mutates permissions/xattrs and
+    // will otherwise touch src-tauri/resources/pi-runtime, which can trigger
+    // Tauri dev restart loops.
     let extracted_root = ensure_extracted_runtime(app).ok()?;
     platform_executable_names()
         .iter()

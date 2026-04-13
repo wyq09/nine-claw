@@ -6,6 +6,7 @@ import {
   clearPiSession,
   clearPiSessionForId,
   ensureRuntimeDependencies,
+  generateSessionConversationTitle,
   handleAgentTaskPrompt,
   listAgentTaskDeliveries,
   loadHistoryState,
@@ -326,6 +327,10 @@ function collectTitleClauses(text: string): string[] {
     .flatMap((segment) => segment.split(/[，,、]/))
     .map((segment) => cleanupTitleClause(segment))
     .filter((segment) => segment.length > 1 && !isWeakTitleClause(segment))
+}
+
+function cleanLlmSessionTitle(raw: string): string {
+  return raw.replace(/^(标题|Title)[：:]\s*/iu, '').trim()
 }
 
 function joinTitleParts(parts: string[]): string {
@@ -828,6 +833,8 @@ export function usePiAgent() {
   const openTaskSessionRef = useRef<(sessionId: string) => void>(() => {})
   const notifyNewTaskDeliveryRef = useRef<(delivery: AgentTaskDeliveryRecord) => void>(() => {})
   const notifiedTaskDeliveryIdsRef = useRef<Set<string>>(new Set())
+  /** 防止同一会话重复并发「标题 LLM」请求 */
+  const sessionTitleLlmInflightRef = useRef<Set<string>>(new Set())
 
   const updateHistoryItem = (id: string, updater: (item: HistoryItem) => HistoryItem) => {
     setHistory((previous) => previous.map((item) => (item.id === id ? updater(item) : item)))
@@ -900,19 +907,60 @@ export function usePiAgent() {
     receivedFirstDeltaRef.current.delete(historyId)
   }
 
-  const refreshHistoryTitle = (historyId: string) => {
-    updateHistoryItem(historyId, (item) => {
+  /** 首轮完成后用智能体「标题生成」模型起名；多轮仅按首轮文案做本地摘要；无智能体则始终本地摘要。 */
+  const finalizeHistoryTitleAfterTurn = (historyId: string) => {
+    setHistory((prev) => {
+      const item = prev.find((h) => h.id === historyId)
+      if (!item) {
+        return prev
+      }
+
       const firstTurn = item.turns[0]
-      const nextTitle = deriveConversationTitle(firstTurn?.prompt ?? item.title, firstTurn?.answer ?? '', item.title)
+      const applyHeuristic = () =>
+        truncateTitle(
+          deriveConversationTitle(firstTurn?.prompt ?? item.title, firstTurn?.answer ?? '', item.title),
+        )
 
-      if (nextTitle === item.title) {
-        return item
+      if (item.turns.length !== 1) {
+        const nextTitle = applyHeuristic()
+        if (nextTitle === item.title) {
+          return prev
+        }
+        return prev.map((h) => (h.id === historyId ? { ...h, title: nextTitle } : h))
       }
 
-      return {
-        ...item,
-        title: nextTitle,
+      const agentId = item.agent?.id?.trim()
+      if (!agentId) {
+        const nextTitle = applyHeuristic()
+        if (nextTitle === item.title) {
+          return prev
+        }
+        return prev.map((h) => (h.id === historyId ? { ...h, title: nextTitle } : h))
       }
+
+      if (sessionTitleLlmInflightRef.current.has(historyId)) {
+        return prev
+      }
+      sessionTitleLlmInflightRef.current.add(historyId)
+
+      const userMsg = firstTurn?.prompt ?? ''
+      const assistantMsg = firstTurn?.answer ?? ''
+
+      void (async () => {
+        try {
+          const raw = await generateSessionConversationTitle(agentId, userMsg, assistantMsg)
+          const cleaned = cleanLlmSessionTitle(raw).trim()
+          const nextTitle = cleaned.length > 0 ? truncateTitle(cleaned) : applyHeuristic()
+          setHistory((p) => p.map((h) => (h.id === historyId ? { ...h, title: nextTitle } : h)))
+        } catch {
+          const nextTitle = applyHeuristic()
+          setHistory((p) => p.map((h) => (h.id === historyId ? { ...h, title: nextTitle } : h)))
+        } finally {
+          sessionTitleLlmInflightRef.current.delete(historyId)
+        }
+      })()
+
+      return prev
     })
   }
 
@@ -1197,7 +1245,7 @@ export function usePiAgent() {
         usage: usage ?? turn.usage,
       }))
       updateSessionStatus(currentHistoryId, 'done')
-      refreshHistoryTitle(currentHistoryId)
+      finalizeHistoryTitleAfterTurn(currentHistoryId)
       markSessionSettled(currentHistoryId)
       return
     }
@@ -1219,7 +1267,7 @@ export function usePiAgent() {
         completedAt: turn.completedAt ?? Date.now(),
       }))
       updateSessionStatus(currentHistoryId, 'error')
-      refreshHistoryTitle(currentHistoryId)
+      finalizeHistoryTitleAfterTurn(currentHistoryId)
       markSessionSettled(currentHistoryId)
     }
   })
@@ -1360,7 +1408,7 @@ export function usePiAgent() {
         usage: usage ?? turn.usage,
       }))
       updateSessionStatus(historyId, 'done')
-      refreshHistoryTitle(historyId)
+      finalizeHistoryTitleAfterTurn(historyId)
       return
     }
 
@@ -1376,7 +1424,7 @@ export function usePiAgent() {
         completedAt: turn.completedAt ?? Date.now(),
       }))
       updateSessionStatus(historyId, 'error')
-      refreshHistoryTitle(historyId)
+      finalizeHistoryTitleAfterTurn(historyId)
     }
   })
 

@@ -27,7 +27,27 @@ use uuid::Uuid;
 const TEXT_CHUNK_SIZE: usize = 3000;
 const STREAM_CHUNK_SIZE: usize = 500;
 const REQUEST_TIMEOUT_SECS: u64 = 90;
-const STARTUP_TIMEOUT_SECS: u64 = 20;
+const STARTUP_TIMEOUT_SECS: u64 = 50;
+
+/// 展示子进程退出原因；Unix 下包含信号号（如 9=SIGKILL，常见于 macOS 拒绝加载应用内 Node）。
+fn format_child_exit_hint(status: std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            let extra = if signal == 9 {
+                "，可能被系统终止：请勿使用应用内打包的 Node 启动飞书辅助进程，请安装系统 Node（如 brew install node）或设置环境变量 NINECLAW_LARK_NODE"
+            } else {
+                ""
+            };
+            return format!("（信号 {signal}{extra}）");
+        }
+    }
+    status
+        .code()
+        .map(|c| format!("（退出码 {c}）"))
+        .unwrap_or_else(|| "（非正常退出）".to_string())
+}
 
 #[derive(Clone, Debug)]
 struct WorkItem {
@@ -146,21 +166,60 @@ impl LarkChannel {
     fn resolve_helper_node_path(
         pi_runtime: &crate::pi_runtime::PiRuntimeLocation,
     ) -> Result<PathBuf, String> {
+        if let Ok(raw) = std::env::var("NINECLAW_LARK_NODE") {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err("环境变量 NINECLAW_LARK_NODE 为空".to_string());
+            }
+            let path = PathBuf::from(trimmed);
+            if path.is_file() {
+                return Ok(path);
+            }
+            return Err(format!(
+                "NINECLAW_LARK_NODE 不是有效文件: {}",
+                path.display()
+            ));
+        }
+
+        let bundled_node = pi_runtime.resource_root.as_ref().map(|root| {
+            crate::pi_runtime::bundled_node_executable_path(root.as_path())
+        });
+
         if cfg!(target_os = "macos") {
+            // 优先：与 PI 同目录、由 prepare-pi-runtime 从 nodejs.org 打入的完整 node（用户无需再装 Node）。
+            if let Some(ref path) = bundled_node {
+                if crate::pi_runtime::is_plausible_full_node_binary(path.as_path()) {
+                    return Ok(path.clone());
+                }
+                if path.is_file() {
+                    return Err(format!(
+                        "应用内 node 体积过小（疑似 thin 包装器，会被 macOS 终止）。请执行 `npm run prepare:pi-runtime` 后重新打包应用，或安装系统 Node / 设置 NINECLAW_LARK_NODE。当前路径: {}",
+                        path.display()
+                    ));
+                }
+            }
             if let Some(system_node) = crate::pi_runtime::resolve_command_path(&["node"]) {
                 return Ok(system_node);
             }
+            for candidate in [
+                "/opt/homebrew/bin/node",
+                "/usr/local/bin/node",
+                "/opt/homebrew/opt/node/bin/node",
+            ] {
+                let path = PathBuf::from(candidate);
+                if path.is_file() {
+                    return Ok(path);
+                }
+            }
+            return Err(
+                "未找到可用的 Node.js，无法启动飞书辅助进程。请确认已运行 `npm run prepare:pi-runtime` 将官方 Node 打入运行时，或安装 Node 18+ / 设置 NINECLAW_LARK_NODE。"
+                    .to_string(),
+            );
         }
 
-        if let Some(resource_root) = pi_runtime.resource_root.as_ref() {
-            let bundled_name = if cfg!(target_os = "windows") {
-                "node.exe"
-            } else {
-                "node"
-            };
-            let bundled_node = resource_root.join(bundled_name);
-            if bundled_node.is_file() {
-                return Ok(bundled_node);
+        if let Some(path) = bundled_node {
+            if path.is_file() {
+                return Ok(path);
             }
         }
 
@@ -255,6 +314,7 @@ impl Channel for LarkChannel {
             let agent_config = self.agent_config.clone();
             let user_states = user_states.clone();
             let startup_signal = startup_signal.clone();
+            let helper_child_wait = self.helper_child.clone();
 
             thread::spawn(move || {
                 let reader = BufReader::new(helper_stdout);
@@ -501,29 +561,32 @@ impl Channel for LarkChannel {
                 if running.load(Ordering::SeqCst) {
                     running.store(false, Ordering::SeqCst);
                     drain_pending_requests(&pending_requests, "飞书机器人辅助进程已退出");
-                    *status.lock().unwrap() =
-                        ChannelStatus::Error("飞书机器人辅助进程已退出".to_string());
-                    notify_startup_result(
-                        &startup_signal,
-                        Err("飞书机器人辅助进程已退出".to_string()),
-                    );
-                    emit_bot_status(
-                        &app_handle,
-                        &channel_id,
-                        "",
-                        "error",
-                        "飞书机器人辅助进程已退出",
-                    );
+                    let exit_hint = {
+                        let mut guard = helper_child_wait.lock().unwrap();
+                        if let Some(child) = guard.as_mut() {
+                            match child.try_wait() {
+                                Ok(Some(st)) => format_child_exit_hint(st),
+                                _ => String::new(),
+                            }
+                        } else {
+                            String::new()
+                        }
+                    };
+                    let message = if exit_hint.is_empty() {
+                        "飞书机器人辅助进程已退出".to_string()
+                    } else {
+                        format!("飞书机器人辅助进程已退出{exit_hint}")
+                    };
+                    *status.lock().unwrap() = ChannelStatus::Error(message.clone());
+                    notify_startup_result(&startup_signal, Err(message.clone()));
+                    emit_bot_status(&app_handle, &channel_id, "", "error", &message);
                 }
             });
         }
 
         {
-            let running = self.running.clone();
             let app_handle = app.clone();
             let channel_id = self.channel_id.clone();
-            let status = self.status.clone();
-            let startup_signal = startup_signal.clone();
 
             thread::spawn(move || {
                 let reader = BufReader::new(helper_stderr);
@@ -544,22 +607,7 @@ impl Channel for LarkChannel {
                         &format!("飞书辅助进程: {trimmed}"),
                     );
                 }
-
-                if running.load(Ordering::SeqCst)
-                    && matches!(*status.lock().unwrap(), ChannelStatus::Connecting)
-                {
-                    notify_startup_result(
-                        &startup_signal,
-                        Err("飞书机器人启动期间辅助进程提前退出".to_string()),
-                    );
-                    emit_bot_status(
-                        &app_handle,
-                        &channel_id,
-                        "",
-                        "warn",
-                        "飞书机器人仍在连接中，请确认开放平台已开启长连接订阅和机器人权限",
-                    );
-                }
+                // 不在此 notify_startup_result：stderr 往往先于 stdout EOF，会与真实错误 JSON 竞态，误报「启动期间提前退出」。
             });
         }
 

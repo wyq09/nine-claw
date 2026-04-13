@@ -103228,7 +103228,7 @@ var import_node_path = __toESM(require("node:path"), 1);
 var import_node_readline = __toESM(require("node:readline"), 1);
 var import_node_crypto = require("node:crypto");
 var Lark = __toESM(require_lib2(), 1);
-var STARTUP_TIMEOUT_MS = 15e3;
+var STARTUP_TIMEOUT_MS = 45e3;
 var args = parseArgs(process.argv.slice(2));
 var PROXY_ENV_KEYS = ["all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"];
 var logger = {
@@ -103266,8 +103266,16 @@ function emit(payload) {
   if (process.stdout.destroyed || !process.stdout.writable) {
     return;
   }
-  process.stdout.write(`${JSON.stringify(payload)}
-`);
+  const line = `${JSON.stringify(payload)}
+`;
+  if (process.stdout.isTTY) {
+    process.stdout.write(line);
+  } else {
+    try {
+      (0, import_node_fs.writeSync)(1, line);
+    } catch {
+    }
+  }
 }
 function emitStatus(level, message) {
   emit({
@@ -103291,7 +103299,8 @@ function createWsClient() {
     appId: args.appId,
     appSecret: args.appSecret,
     logger,
-    loggerLevel: Lark.LoggerLevel.info
+    // SDK 将「真正建连成功」记在 debug：ws connect success；info 的 ws client ready 在首连失败时仍可能打印，不能用作就绪条件。
+    loggerLevel: Lark.LoggerLevel.debug
   });
 }
 function createStartupController() {
@@ -103364,10 +103373,6 @@ function forwardSdkLog(level, parts) {
     return;
   }
   if (message.includes("ws connect success") || message.includes("event-dispatch is ready")) {
-    startupController?.markReady(`\u98DE\u4E66\u673A\u5668\u4EBA\u5DF2\u8FDE\u63A5\uFF0C\u5F53\u524D\u7ED1\u5B9A\u667A\u80FD\u4F53: ${args.agentLabel}`);
-    return;
-  }
-  if (message.includes("ws client ready")) {
     startupController?.markReady(`\u98DE\u4E66\u673A\u5668\u4EBA\u5DF2\u8FDE\u63A5\uFF0C\u5F53\u524D\u7ED1\u5B9A\u667A\u80FD\u4F53: ${args.agentLabel}`);
     return;
   }
@@ -103821,6 +103826,26 @@ process.on("SIGINT", () => {
 });
 process.on("SIGTERM", () => {
   void shutdown();
+});
+function emitFatalStatus(message) {
+  try {
+    (0, import_node_fs.writeSync)(
+      1,
+      `${JSON.stringify({
+        type: "status",
+        level: "error",
+        message,
+        timestamp: Date.now()
+      })}
+`
+    );
+  } catch {
+  }
+}
+process.on("uncaughtException", (error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  emitFatalStatus(`\u98DE\u4E66\u8F85\u52A9\u8FDB\u7A0B\u672A\u6355\u83B7\u5F02\u5E38: ${message}`);
+  process.exit(1);
 });
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);

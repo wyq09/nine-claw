@@ -155,6 +155,19 @@ export async function testLlmProviderConnection(payload: {
   })
 }
 
+/** 使用智能体「标题生成」模型（未配置则用默认对话模型）根据首轮问答生成会话标题。 */
+export async function generateSessionConversationTitle(
+  agentId: string,
+  userMessage: string,
+  assistantMessage: string,
+): Promise<string> {
+  return invoke<string>('generate_session_conversation_title', {
+    agentId,
+    userMessage,
+    assistantMessage,
+  })
+}
+
 export async function loadHistoryState(): Promise<string | null> {
   return invoke<string | null>('load_history_state')
 }

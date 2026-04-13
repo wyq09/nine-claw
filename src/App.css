@@ -381,7 +381,7 @@ button {
 .footer-icon-button:hover,
 .rail-button:hover,
 .outline-button:hover,
-.toolbar-link:hover,
+.page-toolbar-refresh:hover,
 .sidebar-button:hover,
 .category-button:hover,
 .tab-button:hover {
@@ -597,8 +597,7 @@ button {
   text-transform: uppercase;
 }
 
-.link-button,
-.toolbar-link {
+.link-button {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -833,7 +832,6 @@ button {
 .outline-button,
 .tab-button,
 .category-button,
-.toolbar-link,
 .model-chip,
 .select-field,
 .search-field,
@@ -4126,6 +4124,56 @@ select.task-edit-control {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.page-toolbar-refresh {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 10px;
+  border: 1px solid var(--secondary-button-border);
+  background: var(--secondary-button-bg);
+  color: var(--chrome-text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 180ms ease, background-color 180ms ease, border-color 180ms ease, color 180ms ease;
+}
+
+.page-toolbar-refresh .app-icon {
+  flex-shrink: 0;
+  color: var(--chrome-soft);
+  transition: color 180ms ease;
+}
+
+.page-toolbar-refresh:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--chrome-border);
+  color: var(--chrome-text);
+}
+
+.page-toolbar-refresh:hover:not(:disabled) .app-icon {
+  color: var(--chrome-text);
+}
+
+.page-toolbar-refresh:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.page-toolbar-refresh.is-loading .app-icon {
+  animation: page-toolbar-refresh-spin 0.75s linear infinite;
+}
+
+@keyframes page-toolbar-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .tab-row {

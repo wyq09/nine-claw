@@ -1,2 +1,8 @@
 src-tauri/[0-9]*
 src-tauri/[0-9]*/**
+
+# PI runtime 在 dev 启动时会被解压/同步，监视该目录会导致 cargo 反复 rebuild、应用闪退循环
+src-tauri/resources/pi-runtime/
+src-tauri/resources/pi-runtime-bundles/
+**/pi-runtime/**
+**/pi-runtime-bundles/**

@@ -133,7 +133,24 @@ export function AppIcon({ name, size = 20 }: { name: IconName; size?: number }) 
         </>
       ) : null}
       {name === 'refresh' ? (
-        <path d="M20 11a8 8 0 1 0 2 5.3M20 4v5h-5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
+        <>
+          <path
+            d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"
+            stroke="currentColor"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth={stroke}
+          />
+          <path d="M21 3v5h-5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
+          <path
+            d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"
+            stroke="currentColor"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth={stroke}
+          />
+          <path d="M3 21v-5h5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} />
+        </>
       ) : null}
       {name === 'bag' ? (
         <>
