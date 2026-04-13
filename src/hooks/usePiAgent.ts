@@ -14,12 +14,18 @@ import {
   subscribeBotMessage,
   subscribePiStream,
 } from '../lib/piClient'
+import {
+  listenTaskDeliveryNotificationActions,
+  showTaskDeliveryDesktopNotification,
+} from '../lib/taskDeliveryNotification'
 import type { BotMessageEvent } from '../lib/piClient'
 import type {
   ActivityEntry,
   ActivityState,
   AgentCollaborationConfig,
   AgentExecutionMode,
+  AgentScenarioLlmConfig,
+  AgentScenarioLlmSlot,
   AgentSharedContextPolicy,
   AgentTaskDeliveryRecord,
   BotConversationTarget,
@@ -59,30 +65,64 @@ function createActivity(label: string, detail: string, state: ActivityState): Ac
 function appendAgentTaskDeliveriesToHistory(
   previous: HistoryItem[],
   deliveries: AgentTaskDeliveryRecord[],
+  onEachNewDelivery?: (delivery: AgentTaskDeliveryRecord) => void,
 ): HistoryItem[] {
   if (deliveries.length === 0) {
     return previous
   }
 
-  return previous.map((item) => {
+  const existingIds = new Set(previous.map((item) => item.id))
+  const newSessionIds = new Set<string>()
+  for (const delivery of deliveries) {
+    if (!existingIds.has(delivery.sessionId)) {
+      newSessionIds.add(delivery.sessionId)
+    }
+  }
+
+  const now = Date.now()
+  const prepended: HistoryItem[] = []
+  for (const sessionId of newSessionIds) {
+    const group = deliveries.filter((d) => d.sessionId === sessionId)
+    const sorted = [...group].sort((a, b) => a.createdAt - b.createdAt)
+    const first = sorted[0]!
+    prepended.push({
+      id: sessionId,
+      title: first.title.trim() || '定时任务',
+      status: 'done',
+      createdAt: Math.min(...sorted.map((d) => d.createdAt)),
+      updatedAt: now,
+      turns: [],
+      ...(first.agent ? { agent: first.agent } : {}),
+    })
+    existingIds.add(sessionId)
+  }
+
+  const next = [...prepended, ...previous]
+
+  return next.map((item) => {
     const matches = deliveries.filter((delivery) => delivery.sessionId === item.id)
     if (matches.length === 0) {
       return item
     }
 
-    const appendedTurns = matches
-      .filter((delivery) => !item.turns.some((turn) => turn.id === delivery.id))
-      .map((delivery) => ({
-        id: delivery.id,
-        prompt: `[系统定时任务] ${delivery.title}`,
-        answer: delivery.content,
-        status: 'done' as const,
-        createdAt: delivery.createdAt,
-        completedAt: delivery.createdAt,
-        activity: [],
-        thinking: '',
-        toolCalls: [],
-      }))
+    const newDeliveries = matches.filter(
+      (delivery) => !item.turns.some((turn) => turn.id === delivery.id),
+    )
+    for (const delivery of newDeliveries) {
+      onEachNewDelivery?.(delivery)
+    }
+
+    const appendedTurns = newDeliveries.map((delivery) => ({
+      id: delivery.id,
+      prompt: `[系统定时任务] ${delivery.title}`,
+      answer: delivery.content,
+      status: 'done' as const,
+      createdAt: delivery.createdAt,
+      completedAt: delivery.createdAt,
+      activity: [],
+      thinking: '',
+      toolCalls: [],
+    }))
 
     if (appendedTurns.length === 0) {
       return item
@@ -90,7 +130,7 @@ function appendAgentTaskDeliveriesToHistory(
 
     return {
       ...item,
-      updatedAt: Date.now(),
+      updatedAt: now,
       turns: [...item.turns, ...appendedTurns],
     }
   })
@@ -148,6 +188,32 @@ function parseStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
 }
 
+function parseScenarioLlmSlot(value: unknown): AgentScenarioLlmSlot | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined
+  }
+  const o = value as Record<string, unknown>
+  const providerId = typeof o.providerId === 'string' ? o.providerId.trim() : ''
+  const model = typeof o.model === 'string' ? o.model.trim() : ''
+  if (!providerId || !model) {
+    return undefined
+  }
+  return { providerId, model }
+}
+
+function parseScenarioLlmConfig(value: unknown): AgentScenarioLlmConfig | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined
+  }
+  const o = value as Record<string, unknown>
+  const titleGeneration = parseScenarioLlmSlot(o.titleGeneration)
+  const memoryExtraction = parseScenarioLlmSlot(o.memoryExtraction)
+  if (!titleGeneration && !memoryExtraction) {
+    return undefined
+  }
+  return { titleGeneration, memoryExtraction }
+}
+
 function parseAgentCollaborationConfig(value: unknown): AgentCollaborationConfig | undefined {
   if (typeof value !== 'object' || value === null) {
     return undefined
@@ -182,6 +248,8 @@ function parseConversationAgentSnapshot(value: unknown): ConversationAgentSnapsh
     return undefined
   }
 
+  const scenarioLlmConfig = parseScenarioLlmConfig(candidate.scenarioLlmConfig)
+
   return {
     id: candidate.id,
     name: candidate.name,
@@ -196,6 +264,7 @@ function parseConversationAgentSnapshot(value: unknown): ConversationAgentSnapsh
     ...(typeof candidate.accentColor === 'string' && candidate.accentColor
       ? { accentColor: candidate.accentColor }
       : {}),
+    ...(scenarioLlmConfig ? { scenarioLlmConfig } : {}),
   }
 }
 
@@ -756,6 +825,9 @@ export function usePiAgent() {
   const receivedFirstDeltaRef = useRef<Map<string, boolean>>(new Map())
   /** 同步防连点：同 session 并发 `streamPiPrompt` 会触发后端池化 SIGKILL；`runningHistoryIds` 的 setState 追不上双击。 */
   const desktopStreamHoldRef = useRef<Set<string>>(new Set())
+  const openTaskSessionRef = useRef<(sessionId: string) => void>(() => {})
+  const notifyNewTaskDeliveryRef = useRef<(delivery: AgentTaskDeliveryRecord) => void>(() => {})
+  const notifiedTaskDeliveryIdsRef = useRef<Set<string>>(new Set())
 
   const updateHistoryItem = (id: string, updater: (item: HistoryItem) => HistoryItem) => {
     setHistory((previous) => previous.map((item) => (item.id === id ? updater(item) : item)))
@@ -1330,6 +1402,40 @@ export function usePiAgent() {
   }, [])
 
   useEffect(() => {
+    openTaskSessionRef.current = (sessionId: string) => {
+      const trimmed = sessionId.trim()
+      if (!trimmed) {
+        return
+      }
+      setActiveHistoryId(trimmed)
+      setError('')
+    }
+    notifyNewTaskDeliveryRef.current = (delivery: AgentTaskDeliveryRecord) => {
+      const seen = notifiedTaskDeliveryIdsRef.current
+      if (seen.has(delivery.id)) {
+        return
+      }
+      seen.add(delivery.id)
+      if (seen.size > 200) {
+        notifiedTaskDeliveryIdsRef.current = new Set([...seen].slice(-100))
+      }
+      void showTaskDeliveryDesktopNotification(delivery, () => openTaskSessionRef.current(delivery.sessionId))
+    }
+  }, [])
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined
+    void listenTaskDeliveryNotificationActions((sessionId) => {
+      openTaskSessionRef.current(sessionId)
+    }).then((unlisten) => {
+      dispose = unlisten
+    })
+    return () => {
+      dispose?.()
+    }
+  }, [])
+
+  useEffect(() => {
     let cancelled = false
 
     const pollTaskDeliveries = async () => {
@@ -1344,7 +1450,9 @@ export function usePiAgent() {
           return
         }
 
-        setHistory((previous) => appendAgentTaskDeliveriesToHistory(previous, deliveries))
+        setHistory((previous) =>
+          appendAgentTaskDeliveriesToHistory(previous, deliveries, (d) => notifyNewTaskDeliveryRef.current(d)),
+        )
       } catch {
         // ignore polling errors
       }
@@ -1378,7 +1486,9 @@ export function usePiAgent() {
       ) {
         return
       }
-      setHistory((previous) => appendAgentTaskDeliveriesToHistory(previous, [payload]))
+      setHistory((previous) =>
+        appendAgentTaskDeliveriesToHistory(previous, [payload], (d) => notifyNewTaskDeliveryRef.current(d)),
+      )
     }).then((fn) => {
       if (active) {
         unlisten = fn

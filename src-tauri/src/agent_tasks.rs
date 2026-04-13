@@ -1,7 +1,9 @@
-use chrono::{DateTime, Local, Timelike};
+use chrono::{DateTime, Local, Timelike, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+
+use crate::agents::{self, ConversationAgentConfig};
 
 const STATUS_DRAFT: &str = "draft";
 const STATUS_ACTIVE: &str = "active";
@@ -11,6 +13,7 @@ const TASK_TYPE_REMINDER: &str = "reminder";
 const TASK_TYPE_AGENT_PROMPT: &str = "agent_prompt";
 const SCHEDULE_TYPE_INTERVAL: &str = "interval";
 const SCHEDULE_TYPE_DAILY_TIME: &str = "daily_time";
+pub const SCHEDULE_TYPE_ONCE_AT: &str = "once_at";
 const DELIVERY_KIND_DESKTOP: &str = "desktop_session";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +50,10 @@ pub struct AgentTaskListItem {
     pub goal: String,
     pub interval_minutes: Option<i64>,
     pub daily_times: Vec<String>,
+    #[serde(default)]
+    pub run_at_ms: Option<i64>,
+    #[serde(default)]
+    pub result_in_new_session: bool,
     pub status: String,
     pub next_run_at: Option<i64>,
     pub last_run_at: Option<i64>,
@@ -65,6 +72,10 @@ pub struct AgentTaskUpdateInput {
     pub timezone: String,
     pub interval_minutes: Option<i64>,
     pub daily_times: Vec<String>,
+    #[serde(default)]
+    pub run_at_ms: Option<i64>,
+    #[serde(default)]
+    pub result_in_new_session: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +89,8 @@ pub struct AgentTaskDeliveryRecord {
     pub title: String,
     pub content: String,
     pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<ConversationAgentConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +108,8 @@ pub struct AgentTaskPromptResult {
 pub struct AgentTaskDeliveryTarget {
     pub kind: String,
     pub session_id: String,
+    #[serde(default)]
+    pub result_in_new_session: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +135,12 @@ pub struct DailyTimeSchedule {
     pub days_of_week: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnceAtSchedule {
+    pub run_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct AgentTaskDraftData {
@@ -130,6 +151,10 @@ struct AgentTaskDraftData {
     timezone: String,
     interval_minutes: Option<i64>,
     daily_times: Vec<String>,
+    #[serde(default)]
+    run_at_ms: Option<i64>,
+    #[serde(default)]
+    result_in_new_session: bool,
     goal: String,
 }
 
@@ -195,6 +220,65 @@ pub fn ensure_agent_task_schema(connection: &Connection) -> Result<(), String> {
                 ON agent_task_deliveries(session_id, delivered_at, created_at DESC);",
         )
         .map_err(|error| format!("初始化 agent task 数据表失败: {error}"))?;
+    ensure_agent_task_deliveries_agent_column(connection)?;
+    Ok(())
+}
+
+fn ensure_agent_task_deliveries_agent_column(connection: &Connection) -> Result<(), String> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(agent_task_deliveries)")
+        .map_err(|error| format!("读取 agent_task_deliveries 列信息失败: {error}"))?;
+    let mut has_column = false;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("遍历 agent_task_deliveries 列失败: {error}"))?;
+    for name in rows {
+        let name = name.map_err(|error| format!("读取列名失败: {error}"))?;
+        if name == "agent_snapshot_json" {
+            has_column = true;
+            break;
+        }
+    }
+    if !has_column {
+        connection
+            .execute(
+                "ALTER TABLE agent_task_deliveries ADD COLUMN agent_snapshot_json TEXT",
+                [],
+            )
+            .map_err(|error| format!("迁移 agent_task_deliveries 失败: {error}"))?;
+    }
+    Ok(())
+}
+
+/// 将已过期的一次性任务自动暂停，避免列表中长期显示「运行中」却永不触发。
+pub fn pause_expired_once_at_tasks(connection: &mut Connection) -> Result<(), String> {
+    ensure_agent_task_schema(connection)?;
+    let now = crate::chrono_like_timestamp();
+    let mut statement = connection
+        .prepare(
+            "SELECT id, schedule_json FROM agent_tasks
+             WHERE status = ?1 AND schedule_type = ?2",
+        )
+        .map_err(|error| format!("查询一次性任务失败: {error}"))?;
+    let rows = statement
+        .query_map(params![STATUS_ACTIVE, SCHEDULE_TYPE_ONCE_AT], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("读取一次性任务行失败: {error}"))?;
+
+    for row in rows {
+        let (id, schedule_json) = row.map_err(|error| format!("解析一次性任务行失败: {error}"))?;
+        if let Ok(schedule) = serde_json::from_str::<OnceAtSchedule>(&schedule_json) {
+            if schedule.run_at_ms <= now {
+                connection
+                    .execute(
+                        "UPDATE agent_tasks SET status = ?2, updated_at = ?3 WHERE id = ?1",
+                        params![id, STATUS_PAUSED, now],
+                    )
+                    .map_err(|error| format!("暂停过期一次性任务失败: {error}"))?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -233,7 +317,7 @@ pub fn handle_prompt(
         .as_ref()
         .and_then(|row| serde_json::from_str::<AgentTaskDraftData>(&row.draft_json).ok())
         .unwrap_or_default();
-    let merged = merge_prompt_into_draft(base_draft, trimmed_prompt);
+    let mut merged = merge_prompt_into_draft(base_draft, trimmed_prompt);
     let missing_fields = collect_missing_fields(&merged);
     let now = crate::chrono_like_timestamp();
 
@@ -264,9 +348,24 @@ pub fn handle_prompt(
         delete_draft(&connection, &existing.id)?;
     }
 
+    let schedule_hint = format_schedule_hint_for_llm(&merged);
+    if let Some((t, s)) = crate::refine_agent_task_metadata(
+        app,
+        agent_id,
+        &merged.goal,
+        &merged.task_type,
+        &schedule_hint,
+    ) {
+        merged.title = t;
+        merged.intent_summary = s;
+    } else {
+        merged.title = build_title(&merged.goal, &merged.task_type);
+        merged.intent_summary = summarize_goal_fallback(&merged.goal);
+    }
+
     let task_id = format!("agent_task_{}", uuid::Uuid::new_v4().simple());
     let record = build_task_record(&task_id, agent_id, session_id, &merged, now)?;
-    insert_task(&mut connection, &record)?;
+    insert_task(&mut connection, &record, &merged)?;
     let _ = crate::scheduler::sync_materialized_jobs(app);
 
     Ok(AgentTaskPromptResult {
@@ -294,7 +393,7 @@ pub fn list_delivery_records(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT id, task_id, run_id, agent_id, session_id, title, content, created_at
+        "SELECT id, task_id, run_id, agent_id, session_id, title, content, created_at, agent_snapshot_json
          FROM agent_task_deliveries
          WHERE delivered_at IS NULL
            AND session_id IN ({placeholders})
@@ -309,6 +408,10 @@ pub fn list_delivery_records(
         .map_err(|error| format!("读取 task delivery 失败: {error}"))?;
     let rows = statement
         .query_map(rusqlite::params_from_iter(values), |row| {
+            let agent_json: Option<String> = row.get(8)?;
+            let agent = agent_json
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<ConversationAgentConfig>(text).ok());
             Ok(AgentTaskDeliveryRecord {
                 id: row.get(0)?,
                 task_id: row.get(1)?,
@@ -318,6 +421,7 @@ pub fn list_delivery_records(
                 title: row.get(5)?,
                 content: row.get(6)?,
                 created_at: row.get(7)?,
+                agent,
             })
         })
         .map_err(|error| format!("解析 task delivery 失败: {error}"))?;
@@ -403,28 +507,41 @@ pub fn list_tasks(
                     )
                 })?;
             let schedule_json: String = row.get(10)?;
-            let (interval_minutes, daily_times) = if row.get::<_, String>(7)?
-                == SCHEDULE_TYPE_INTERVAL
-            {
-                let schedule =
-                    serde_json::from_str::<IntervalSchedule>(&schedule_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            10,
-                            rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
-                        )
-                    })?;
-                (Some(schedule.every_minutes), Vec::new())
-            } else {
-                let schedule =
-                    serde_json::from_str::<DailyTimeSchedule>(&schedule_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            10,
-                            rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
-                        )
-                    })?;
-                (None, schedule.times)
+            let schedule_type: String = row.get(7)?;
+            let (interval_minutes, daily_times, run_at_ms) = match schedule_type.as_str() {
+                SCHEDULE_TYPE_INTERVAL => {
+                    let schedule =
+                        serde_json::from_str::<IntervalSchedule>(&schedule_json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                10,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                            )
+                        })?;
+                    (Some(schedule.every_minutes), Vec::new(), None)
+                }
+                SCHEDULE_TYPE_ONCE_AT => {
+                    let schedule =
+                        serde_json::from_str::<OnceAtSchedule>(&schedule_json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                10,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                            )
+                        })?;
+                    (None, Vec::new(), Some(schedule.run_at_ms))
+                }
+                _ => {
+                    let schedule =
+                        serde_json::from_str::<DailyTimeSchedule>(&schedule_json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                10,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                            )
+                        })?;
+                    (None, schedule.times, None)
+                }
             };
             let delivery_json: String = row.get(14)?;
             let delivery = serde_json::from_str::<AgentTaskDeliveryTarget>(&delivery_json)
@@ -443,11 +560,13 @@ pub fn list_tasks(
                 title: row.get(4)?,
                 intent_summary: row.get(5)?,
                 task_type: row.get(6)?,
-                schedule_type: row.get(7)?,
+                schedule_type,
                 timezone: row.get(8)?,
                 goal: payload.goal,
                 interval_minutes,
                 daily_times,
+                run_at_ms,
+                result_in_new_session: delivery.result_in_new_session,
                 status: row.get(11)?,
                 next_run_at: row.get(12)?,
                 last_run_at: row.get(13)?,
@@ -497,7 +616,10 @@ pub fn update_task(
     }
 
     let schedule_type = input.schedule_type.trim();
-    if schedule_type != SCHEDULE_TYPE_INTERVAL && schedule_type != SCHEDULE_TYPE_DAILY_TIME {
+    if schedule_type != SCHEDULE_TYPE_INTERVAL
+        && schedule_type != SCHEDULE_TYPE_DAILY_TIME
+        && schedule_type != SCHEDULE_TYPE_ONCE_AT
+    {
         return Err("暂不支持这种触发方式".to_string());
     }
 
@@ -507,6 +629,8 @@ pub fn update_task(
         input.timezone.trim().to_string()
     };
 
+    let now = crate::chrono_like_timestamp();
+
     let schedule_json = if schedule_type == SCHEDULE_TYPE_INTERVAL {
         let every_minutes = input.interval_minutes.unwrap_or(0);
         if every_minutes <= 0 {
@@ -514,10 +638,17 @@ pub fn update_task(
         }
         serde_json::to_string(&IntervalSchedule {
             every_minutes: every_minutes.clamp(1, 24 * 60),
-            start_at: Some(crate::chrono_like_timestamp()),
+            start_at: Some(now),
             end_at: None,
         })
         .map_err(|error| format!("序列化 interval schedule 失败: {error}"))?
+    } else if schedule_type == SCHEDULE_TYPE_ONCE_AT {
+        let run_at = input.run_at_ms.ok_or_else(|| "请指定一次性任务的执行时间".to_string())?;
+        if run_at <= now {
+            return Err("一次性任务的执行时间须晚于当前时间".to_string());
+        }
+        serde_json::to_string(&OnceAtSchedule { run_at_ms: run_at })
+            .map_err(|error| format!("序列化 once_at schedule 失败: {error}"))?
     } else {
         let mut times = input
             .daily_times
@@ -537,6 +668,30 @@ pub fn update_task(
         .map_err(|error| format!("序列化 daily schedule 失败: {error}"))?
     };
 
+    let existing_delivery_json: String = connection
+        .query_row(
+            "SELECT delivery_json FROM agent_tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("读取任务投递配置失败: {error}"))?;
+    let mut delivery: AgentTaskDeliveryTarget =
+        serde_json::from_str(&existing_delivery_json)
+            .map_err(|error| format!("解析任务投递配置失败: {error}"))?;
+    let want_new_session = input
+        .result_in_new_session
+        .unwrap_or(delivery.result_in_new_session);
+    if want_new_session {
+        if delivery.session_id == existing.source_session_id {
+            delivery.session_id = format!("task_sess_{}", uuid::Uuid::new_v4().simple());
+        }
+    } else {
+        delivery.session_id = existing.source_session_id.clone();
+    }
+    delivery.result_in_new_session = want_new_session;
+    let delivery_json = serde_json::to_string(&delivery)
+        .map_err(|error| format!("序列化任务投递配置失败: {error}"))?;
+
     let payload_json = serde_json::to_string(&AgentTaskPayload {
         goal: goal.to_string(),
         reminder_text: if existing.task_type == TASK_TYPE_REMINDER {
@@ -552,12 +707,27 @@ pub fn update_task(
     })
     .map_err(|error| format!("序列化 task payload 失败: {error}"))?;
 
-    let title = if input.title.trim().is_empty() {
-        build_title(goal, &existing.task_type)
-    } else {
-        input.title.trim().to_string()
-    };
-    let now = crate::chrono_like_timestamp();
+    let schedule_hint = format_schedule_hint_for_update(input, schedule_type);
+    let (title, intent_summary) =
+        match crate::refine_agent_task_metadata(app, &existing.agent_id, goal, &existing.task_type, &schedule_hint)
+        {
+            Some((t, s)) => {
+                let title = if input.title.trim().is_empty() {
+                    t
+                } else {
+                    input.title.trim().to_string()
+                };
+                (title, s)
+            }
+            None => {
+                let title = if input.title.trim().is_empty() {
+                    build_title(goal, &existing.task_type)
+                } else {
+                    input.title.trim().to_string()
+                };
+                (title, summarize_goal_fallback(goal))
+            }
+        };
     connection
         .execute(
             "UPDATE agent_tasks
@@ -567,16 +737,18 @@ pub fn update_task(
                  timezone = ?5,
                  payload_json = ?6,
                  schedule_json = ?7,
-                 updated_at = ?8
+                 delivery_json = ?8,
+                 updated_at = ?9
              WHERE id = ?1",
             params![
                 task_id,
                 title,
-                goal,
+                intent_summary,
                 schedule_type,
                 timezone,
                 payload_json,
                 schedule_json,
+                delivery_json,
                 now
             ],
         )
@@ -586,6 +758,7 @@ pub fn update_task(
 }
 
 pub fn record_delivery(
+    app: &tauri::AppHandle,
     connection: &Connection,
     task_id: &str,
     run_id: &str,
@@ -597,11 +770,15 @@ pub fn record_delivery(
     ensure_agent_task_schema(connection)?;
     let now = crate::chrono_like_timestamp();
     let id = format!("delivery_{}", uuid::Uuid::new_v4().simple());
+    let agent_snapshot = agents::get_conversation_agent_config(app, agent_id).ok().flatten();
+    let agent_json = agent_snapshot
+        .as_ref()
+        .and_then(|cfg| serde_json::to_string(cfg).ok());
     connection
         .execute(
             "INSERT INTO agent_task_deliveries (
-                id, task_id, run_id, agent_id, session_id, title, content, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                id, task_id, run_id, agent_id, session_id, title, content, created_at, agent_snapshot_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id.clone(),
                 task_id,
@@ -610,7 +787,8 @@ pub fn record_delivery(
                 session_id,
                 title,
                 content,
-                now
+                now,
+                agent_json
             ],
         )
         .map_err(|error| format!("写入 task delivery 失败: {error}"))?;
@@ -623,6 +801,7 @@ pub fn record_delivery(
         title: title.to_string(),
         content: content.to_string(),
         created_at: now,
+        agent: agent_snapshot,
     })
 }
 
@@ -784,6 +963,7 @@ fn merge_prompt_into_draft(mut draft: AgentTaskDraftData, prompt: &str) -> Agent
                 draft.daily_times = merged;
             }
         }
+        SCHEDULE_TYPE_ONCE_AT => {}
         _ => {}
     }
 
@@ -815,6 +995,11 @@ fn collect_missing_fields(draft: &AgentTaskDraftData) -> Vec<String> {
         items.push("interval_minutes".to_string());
     } else if draft.schedule_type == SCHEDULE_TYPE_DAILY_TIME && draft.daily_times.is_empty() {
         items.push("daily_times".to_string());
+    } else if draft.schedule_type == SCHEDULE_TYPE_ONCE_AT {
+        let now = crate::chrono_like_timestamp();
+        if draft.run_at_ms.map(|ms| ms <= now).unwrap_or(true) {
+            items.push("run_at_ms".to_string());
+        }
     }
     items
 }
@@ -825,7 +1010,7 @@ fn build_follow_up_question(draft: &AgentTaskDraftData, missing_fields: &[String
         .map(String::as_str)
         .collect::<HashSet<_>>();
     if missing.contains("task_goal") && missing.contains("schedule_type") {
-        return "想让这个智能体定时做什么？触发方式是“每隔几分钟/几小时”，还是“每天几点”？"
+        return "想让这个智能体定时做什么？触发方式是“每隔几分钟/几小时”“每天几点”，还是“指定某个时间只执行一次”？"
             .to_string();
     }
     if missing.contains("task_goal") {
@@ -833,7 +1018,7 @@ fn build_follow_up_question(draft: &AgentTaskDraftData, missing_fields: &[String
     }
     if missing.contains("schedule_type") {
         return format!(
-            "任务内容我记下了：{}。触发方式是“每隔几分钟/几小时”，还是“每天几点”？",
+            "任务内容我记下了：{}。触发方式是“每隔几分钟/几小时”“每天几点”，还是“指定某个时间只执行一次”？",
             draft.goal.trim()
         );
     }
@@ -846,6 +1031,12 @@ fn build_follow_up_question(draft: &AgentTaskDraftData, missing_fields: &[String
     if missing.contains("daily_times") {
         return format!(
             "我会让智能体每天定时执行“{}”。请补充具体时间，比如“每天 09:00”或“每天早上 9 点”。",
+            draft.goal.trim()
+        );
+    }
+    if missing.contains("run_at_ms") {
+        return format!(
+            "我会让智能体在指定时间只执行一次“{}”。请说明具体的日期和时间（例如明天 15:30），或在任务中心里选择时间。",
             draft.goal.trim()
         );
     }
@@ -879,6 +1070,12 @@ fn build_task_record(
             end_at: None,
         })
         .map_err(|error| format!("序列化 interval schedule 失败: {error}"))?
+    } else if draft.schedule_type == SCHEDULE_TYPE_ONCE_AT {
+        let run_at = draft
+            .run_at_ms
+            .ok_or_else(|| "一次性任务缺少执行时间".to_string())?;
+        serde_json::to_string(&OnceAtSchedule { run_at_ms: run_at })
+            .map_err(|error| format!("序列化 once_at schedule 失败: {error}"))?
     } else {
         serde_json::to_string(&DailyTimeSchedule {
             times: draft.daily_times.clone(),
@@ -907,10 +1104,20 @@ fn build_task_record(
     })
 }
 
-fn insert_task(connection: &mut Connection, record: &AgentTaskRecord) -> Result<(), String> {
+fn insert_task(
+    connection: &mut Connection,
+    record: &AgentTaskRecord,
+    draft: &AgentTaskDraftData,
+) -> Result<(), String> {
+    let session_id = if draft.result_in_new_session {
+        format!("task_sess_{}", uuid::Uuid::new_v4().simple())
+    } else {
+        record.source_session_id.clone()
+    };
     let delivery = serde_json::to_string(&AgentTaskDeliveryTarget {
         kind: DELIVERY_KIND_DESKTOP.to_string(),
-        session_id: record.source_session_id.clone(),
+        session_id,
+        result_in_new_session: draft.result_in_new_session,
     })
     .map_err(|error| format!("序列化 task delivery 失败: {error}"))?;
     connection
@@ -1012,6 +1219,62 @@ fn delete_draft(connection: &Connection, draft_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn format_once_at_label(run_at_ms: i64) -> String {
+    match DateTime::<Utc>::from_timestamp_millis(run_at_ms) {
+        Some(dt) => dt.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string(),
+        None => format!("{run_at_ms}"),
+    }
+}
+
+fn format_schedule_hint_for_llm(draft: &AgentTaskDraftData) -> String {
+    match draft.schedule_type.as_str() {
+        SCHEDULE_TYPE_INTERVAL => {
+            let m = draft.interval_minutes.unwrap_or(10);
+            format!("每 {m} 分钟重复")
+        }
+        SCHEDULE_TYPE_ONCE_AT => draft
+            .run_at_ms
+            .map(|ms| format!("一次性，计划时间 {}", format_once_at_label(ms)))
+            .unwrap_or_else(|| "一次性定时".to_string()),
+        _ => {
+            if draft.daily_times.is_empty() {
+                "每日定时".to_string()
+            } else {
+                format!("每日 {}", draft.daily_times.join("、"))
+            }
+        }
+    }
+}
+
+fn format_schedule_hint_for_update(input: &AgentTaskUpdateInput, schedule_type: &str) -> String {
+    match schedule_type {
+        SCHEDULE_TYPE_INTERVAL => format!("每 {} 分钟重复", input.interval_minutes.unwrap_or(10)),
+        SCHEDULE_TYPE_ONCE_AT => input
+            .run_at_ms
+            .map(|ms| format!("一次性，{}", format_once_at_label(ms)))
+            .unwrap_or_else(|| "一次性定时".to_string()),
+        _ => {
+            if input.daily_times.is_empty() {
+                "每日定时".to_string()
+            } else {
+                format!("每日 {}", input.daily_times.join("、"))
+            }
+        }
+    }
+}
+
+fn summarize_goal_fallback(goal: &str) -> String {
+    let t = goal.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    const MAX: usize = 100;
+    if t.chars().count() <= MAX {
+        return t.to_string();
+    }
+    format!("{}…", t.chars().take(MAX).collect::<String>())
+}
+
 fn mark_deliveries_as_seen(connection: &Connection, ids: &[String]) -> Result<(), String> {
     if ids.is_empty() {
         return Ok(());
@@ -1036,6 +1299,11 @@ fn mark_deliveries_as_seen(connection: &Connection, ids: &[String]) -> Result<()
 fn build_created_message(record: &AgentTaskRecord, draft: &AgentTaskDraftData) -> String {
     let schedule_summary = if record.schedule_type == SCHEDULE_TYPE_INTERVAL {
         format!("每 {} 分钟触发一次", draft.interval_minutes.unwrap_or(10))
+    } else if record.schedule_type == SCHEDULE_TYPE_ONCE_AT {
+        draft
+            .run_at_ms
+            .map(|ms| format!("一次性 · {}", format_once_at_label(ms)))
+            .unwrap_or_else(|| "一次性定时".to_string())
     } else {
         format!("每天 {}", draft.daily_times.join("、"))
     };
@@ -1047,6 +1315,13 @@ fn build_created_message(record: &AgentTaskRecord, draft: &AgentTaskDraftData) -
 
 fn detect_schedule_type(prompt: &str) -> String {
     let text = prompt.trim();
+    if text.contains("一次性")
+        || text.contains("只执行一次")
+        || text.contains("就一次")
+        || text.contains("单次")
+    {
+        return SCHEDULE_TYPE_ONCE_AT.to_string();
+    }
     if text.contains("每隔") || text.contains("分钟") || text.contains("小时") {
         if extract_interval_minutes(text).is_some() {
             return SCHEDULE_TYPE_INTERVAL.to_string();

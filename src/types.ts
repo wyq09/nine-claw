@@ -161,6 +161,17 @@ export type AgentHeartbeatConfig = {
   schedules: AgentHeartbeatSchedule[]
 }
 
+/** 可选场景模型；未设置时由运行时回退到默认对话模型 */
+export type AgentScenarioLlmSlot = {
+  providerId: ProviderId
+  model: string
+}
+
+export type AgentScenarioLlmConfig = {
+  titleGeneration?: AgentScenarioLlmSlot
+  memoryExtraction?: AgentScenarioLlmSlot
+}
+
 export type ConversationAgentSnapshot = {
   id: string
   name: string
@@ -173,6 +184,7 @@ export type ConversationAgentSnapshot = {
   executionMode: AgentExecutionMode
   collaborationConfig?: AgentCollaborationConfig
   accentColor?: string
+  scenarioLlmConfig?: AgentScenarioLlmConfig
 }
 
 export type ConversationTurn = {
@@ -287,6 +299,7 @@ export type AgentRecord = {
   executionMode: AgentExecutionMode
   collaborationConfig?: AgentCollaborationConfig
   accentColor?: string
+  scenarioLlmConfig?: AgentScenarioLlmConfig
   botConfigs: AgentBotBindings
   heartbeatConfig: AgentHeartbeatConfig
   createdAt: number
@@ -304,6 +317,7 @@ export type AgentInput = {
   executionMode: AgentExecutionMode
   collaborationConfig?: AgentCollaborationConfig
   accentColor?: string
+  scenarioLlmConfig?: AgentScenarioLlmConfig
   botConfigs: AgentBotBindings
   heartbeatConfig: AgentHeartbeatConfig
 }
@@ -319,6 +333,7 @@ export type AgentBuilderDraft = {
   executionMode: AgentExecutionMode
   collaborationConfig?: AgentCollaborationConfig
   accentColor?: string
+  scenarioLlmConfig?: AgentScenarioLlmConfig
   botConfigs?: AgentBotBindings
   heartbeatConfig?: AgentHeartbeatConfig
   workspaceNotes?: string
@@ -539,6 +554,8 @@ export type AgentTaskDeliveryRecord = {
   title: string
   content: string
   createdAt: number
+  /** 桌面投递时附带，用于新建会话时恢复智能体上下文 */
+  agent?: ConversationAgentSnapshot
 }
 
 export type AgentTaskListItem = {
@@ -554,6 +571,10 @@ export type AgentTaskListItem = {
   goal: string
   intervalMinutes?: number | null
   dailyTimes: string[]
+  /** 一次性任务：计划触发时间（UTC 毫秒） */
+  runAtMs?: number | null
+  /** 是否在独立会话中展示执行结果 */
+  resultInNewSession?: boolean
   status: string
   nextRunAt?: number | null
   lastRunAt?: number | null
@@ -570,6 +591,8 @@ export type AgentTaskUpdateInput = {
   timezone: string
   intervalMinutes?: number | null
   dailyTimes: string[]
+  runAtMs?: number | null
+  resultInNewSession?: boolean
 }
 
 export type SchedulerRuntimeStatus = {

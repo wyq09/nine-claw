@@ -31,6 +31,7 @@ import {
 } from './mockData'
 import { useComposerAttachments } from './hooks/useComposerAttachments'
 import { usePiAgent } from './hooks/usePiAgent'
+import { useToast } from './hooks/useToast'
 import type {
   AgentExecutionMode,
   AgentBuilderDraft,
@@ -41,6 +42,8 @@ import type {
   AgentHeartbeatTask,
   AgentInput,
   AgentRecord,
+  AgentScenarioLlmConfig,
+  AgentScenarioLlmSlot,
   AgentWorkspaceBundle,
   AgentWorkspaceFile,
   AppearanceSettings,
@@ -360,11 +363,24 @@ function formatAgentTaskStatus(status: string): string {
   }
 }
 
+function runAtMsToDatetimeLocalValue(ms: number): string {
+  const d = new Date(ms)
+  if (!Number.isFinite(d.getTime())) {
+    return ''
+  }
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
 function formatAgentTaskSchedule(task: AgentTaskListItem): string {
   if (task.scheduleType === 'interval') {
     return task.nextRunAt
       ? `间隔任务 · 下次 ${formatOptionalAbsoluteTime(task.nextRunAt)}`
       : '间隔任务'
+  }
+  if (task.scheduleType === 'once_at') {
+    const t = task.runAtMs ?? task.nextRunAt
+    return t ? `一次性 · ${formatOptionalAbsoluteTime(t)}` : '一次性定时'
   }
   return task.nextRunAt
     ? `每日定时 · 下次 ${formatOptionalAbsoluteTime(task.nextRunAt)}`
@@ -378,6 +394,9 @@ function formatAgentTaskScheduleShort(task: AgentTaskListItem): string {
       return `每 ${m} 分钟`
     }
     return '间隔执行'
+  }
+  if (task.scheduleType === 'once_at') {
+    return '一次性'
   }
   if (task.dailyTimes.length > 0) {
     return `每日 ${task.dailyTimes.join('、')}`
@@ -524,6 +543,7 @@ function buildConversationAgentSnapshot(agent: AgentRecord): ConversationAgentSn
     executionMode: agent.executionMode,
     ...(agent.collaborationConfig ? { collaborationConfig: agent.collaborationConfig } : {}),
     ...(agent.accentColor ? { accentColor: agent.accentColor } : {}),
+    ...(agent.scenarioLlmConfig ? { scenarioLlmConfig: agent.scenarioLlmConfig } : {}),
   }
 }
 
@@ -635,6 +655,28 @@ function createEmptyAgentDraft(
   }
 }
 
+function normalizeAgentScenarioLlmConfigInDraft(
+  config?: AgentScenarioLlmConfig | null,
+): AgentScenarioLlmConfig | undefined {
+  if (!config) {
+    return undefined
+  }
+  const pick = (slot?: AgentScenarioLlmSlot | null) => {
+    const providerId = slot?.providerId?.trim() ?? ''
+    const model = slot?.model?.trim() ?? ''
+    if (!providerId || !model) {
+      return undefined
+    }
+    return { providerId, model }
+  }
+  const titleGeneration = pick(config.titleGeneration)
+  const memoryExtraction = pick(config.memoryExtraction)
+  if (!titleGeneration && !memoryExtraction) {
+    return undefined
+  }
+  return { titleGeneration, memoryExtraction }
+}
+
 function createAgentDraftFromRecord(agent: AgentRecord): AgentInput {
   return {
     name: agent.name,
@@ -649,6 +691,7 @@ function createAgentDraftFromRecord(agent: AgentRecord): AgentInput {
     heartbeatConfig: normalizeHeartbeatConfig(agent.heartbeatConfig),
     ...(agent.collaborationConfig ? { collaborationConfig: agent.collaborationConfig } : {}),
     ...(agent.accentColor ? { accentColor: agent.accentColor } : {}),
+    ...(agent.scenarioLlmConfig ? { scenarioLlmConfig: agent.scenarioLlmConfig } : {}),
   }
 }
 
@@ -688,6 +731,7 @@ function normalizeAgentDraft(input: AgentInput): AgentInput {
     skillIds: Array.from(new Set(input.skillIds.map((item) => item.trim()).filter(Boolean))),
     botConfigs: createAgentBotConfigState(input.botConfigs),
     heartbeatConfig: normalizeHeartbeatConfig(input.heartbeatConfig),
+    scenarioLlmConfig: normalizeAgentScenarioLlmConfigInDraft(input.scenarioLlmConfig),
   }
 }
 
@@ -1264,32 +1308,66 @@ function pickFallbackAgentModel(
   }
 }
 
+function sanitizeAgentScenarioSlot(
+  slot: AgentScenarioLlmSlot | undefined,
+  definitions: ProviderDefinition[],
+  providerConfigs: Record<string, ProviderConfig>,
+): AgentScenarioLlmSlot | undefined {
+  if (!slot) {
+    return undefined
+  }
+  if (isValidConfiguredModelReference(slot.providerId, slot.model, definitions, providerConfigs)) {
+    return slot
+  }
+  return undefined
+}
+
+function sanitizeAgentScenarioLlmConfig(
+  config: AgentScenarioLlmConfig | undefined,
+  definitions: ProviderDefinition[],
+  providerConfigs: Record<string, ProviderConfig>,
+): AgentScenarioLlmConfig | undefined {
+  if (!config) {
+    return undefined
+  }
+  const titleGeneration = sanitizeAgentScenarioSlot(config.titleGeneration, definitions, providerConfigs)
+  const memoryExtraction = sanitizeAgentScenarioSlot(config.memoryExtraction, definitions, providerConfigs)
+  if (!titleGeneration && !memoryExtraction) {
+    return undefined
+  }
+  return { titleGeneration, memoryExtraction }
+}
+
 function sanitizeAgentInputModelReference(
   draft: AgentInput,
   definitions: ProviderDefinition[],
   providerConfigs: Record<string, ProviderConfig>,
 ): AgentInput {
+  let next = draft
+
   if (
-    isValidConfiguredModelReference(
+    !isValidConfiguredModelReference(
       draft.defaultProviderId,
       draft.defaultModel,
       definitions,
       providerConfigs,
     )
   ) {
-    return draft
+    const fallback = pickFallbackAgentModel(definitions, providerConfigs, draft.defaultProviderId)
+    if (fallback) {
+      next = {
+        ...draft,
+        defaultProviderId: fallback.providerId,
+        defaultModel: fallback.model,
+      }
+    }
   }
 
-  const fallback = pickFallbackAgentModel(definitions, providerConfigs, draft.defaultProviderId)
-  if (!fallback) {
-    return draft
+  const scenarioLlmConfig = sanitizeAgentScenarioLlmConfig(next.scenarioLlmConfig, definitions, providerConfigs)
+  if (scenarioLlmConfig === next.scenarioLlmConfig) {
+    return next
   }
-
-  return {
-    ...draft,
-    defaultProviderId: fallback.providerId,
-    defaultModel: fallback.model,
-  }
+  return { ...next, scenarioLlmConfig }
 }
 
 function shouldSubmitWithShortcut(
@@ -5466,51 +5544,52 @@ function TaskCenterEditPage({
   onDelete,
 }: TaskCenterEditPageProps) {
   return (
-    <div className="page-shell task-center-page task-edit-page">
-      <header className="task-edit-page-header">
-        <button type="button" className="task-edit-back" onClick={onBack} aria-label="返回任务列表">
-          <AppIcon name="arrow-left" size={18} />
-          <span>返回</span>
-        </button>
-        <div className="task-edit-page-header-main">
-          <h1 className="task-edit-page-title">{task.title.trim() || '未命名任务'}</h1>
-          <p className="task-edit-page-kicker">
-            {formatAgentTaskStatus(task.status)} · {formatAgentTaskScheduleShort(task)}
-            {task.nextRunAt ? ` · 下次 ${formatOptionalAbsoluteTime(task.nextRunAt)}` : ''}
-          </p>
+    <div className="page-shell task-center-page task-linear-page task-edit-page">
+      <header className="page-header task-linear-page-toolbar task-edit-detail-header">
+        <div className="task-edit-header-leading">
+          <button type="button" className="outline-button task-edit-header-back" onClick={onBack} aria-label="返回任务列表">
+            <AppIcon name="arrow-left" size={18} />
+            <span>返回</span>
+          </button>
+          <div className="task-linear-page-toolbar-text task-edit-header-titles">
+            <h1>{task.title.trim() || '未命名任务'}</h1>
+            <p className="task-linear-page-sub">
+              {formatAgentTaskStatus(task.status)} · {formatAgentTaskScheduleShort(task)}
+              {task.nextRunAt ? ` · 下次 ${formatOptionalAbsoluteTime(task.nextRunAt)}` : ''}
+            </p>
+          </div>
         </div>
-      </header>
-
-      <div className="task-center-body task-edit-body">
-        <div className="task-edit-toolbar">
+        <div className="task-edit-header-actions">
           <button
             type="button"
-            className="outline-button task-edit-toolbar-btn"
+            className="primary-cta task-linear-toolbar-cta"
             disabled={actionBusy || task.status === 'deleted'}
             onClick={onRunNow}
           >
             {actionBusy ? '处理中…' : '立即执行'}
           </button>
           {task.status === 'active' ? (
-            <button type="button" className="outline-button task-edit-toolbar-btn" disabled={actionBusy} onClick={onPause}>
+            <button type="button" className="outline-button" disabled={actionBusy} onClick={onPause}>
               {actionBusy ? '处理中…' : '暂停'}
             </button>
           ) : null}
           {task.status === 'paused' ? (
-            <button type="button" className="outline-button task-edit-toolbar-btn" disabled={actionBusy} onClick={onResume}>
+            <button type="button" className="outline-button" disabled={actionBusy} onClick={onResume}>
               {actionBusy ? '处理中…' : '恢复'}
             </button>
           ) : null}
           {task.status !== 'deleted' ? (
-            <button type="button" className="outline-button task-edit-toolbar-btn danger" disabled={actionBusy} onClick={onDelete}>
+            <button type="button" className="outline-button danger" disabled={actionBusy} onClick={onDelete}>
               删除
             </button>
           ) : null}
-          <button type="button" className="link-button task-edit-toolbar-link" onClick={() => onOpenAgent(task.agentId)}>
+          <button type="button" className="outline-button" onClick={() => onOpenAgent(task.agentId)}>
             打开智能体
           </button>
         </div>
+      </header>
 
+      <div className="task-center-body task-edit-body">
         <section className="task-edit-section">
           <h2 className="task-edit-section-title">上下文</h2>
           <dl className="task-edit-dl">
@@ -5530,6 +5609,7 @@ function TaskCenterEditPage({
               <dt>投递</dt>
               <dd>
                 {task.deliveryKind} → {task.deliveryTarget}
+                {task.resultInNewSession ? '（独立会话）' : ''}
               </dd>
             </div>
             <div className="task-edit-dl-row">
@@ -5565,6 +5645,12 @@ function TaskCenterEditPage({
                           scheduleType: event.target.value,
                           intervalMinutes: event.target.value === 'interval' ? current.intervalMinutes || 10 : null,
                           dailyTimes: event.target.value === 'daily_time' ? current.dailyTimes : [],
+                          runAtMs:
+                            event.target.value === 'once_at'
+                              ? current.runAtMs ?? Date.now() + 60 * 60 * 1000
+                              : null,
+                          resultInNewSession:
+                            event.target.value === 'once_at' ? (current.resultInNewSession ?? false) : false,
                         }
                       : current,
                   )
@@ -5572,6 +5658,7 @@ function TaskCenterEditPage({
               >
                 <option value="interval">每隔若干分钟</option>
                 <option value="daily_time">每天固定时间</option>
+                <option value="once_at">指定时间（只执行一次）</option>
               </select>
             </label>
             {editDraft.scheduleType === 'interval' ? (
@@ -5594,6 +5681,35 @@ function TaskCenterEditPage({
                   }
                 />
               </label>
+            ) : editDraft.scheduleType === 'once_at' ? (
+              <>
+                <label className="task-edit-field">
+                  <span className="task-edit-label">执行时间（本地）</span>
+                  <input
+                    className="task-edit-control"
+                    type="datetime-local"
+                    value={runAtMsToDatetimeLocalValue(editDraft.runAtMs ?? Date.now() + 3600000)}
+                    onChange={(event) => {
+                      const ms = new Date(event.target.value).getTime()
+                      setEditDraft((current) =>
+                        current && Number.isFinite(ms) ? { ...current, runAtMs: ms } : current,
+                      )
+                    }}
+                  />
+                </label>
+                <label className="task-edit-field task-edit-field-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={editDraft.resultInNewSession ?? false}
+                    onChange={(event) =>
+                      setEditDraft((current) =>
+                        current ? { ...current, resultInNewSession: event.target.checked } : current,
+                      )
+                    }
+                  />
+                  <span className="task-edit-label-inline">在独立会话中展示结果（会话列表会出现新会话）</span>
+                </label>
+              </>
             ) : (
               <label className="task-edit-field">
                 <span className="task-edit-label">每日时间</span>
@@ -5658,6 +5774,7 @@ function TasksView({ agents, onOpenAgent }: TasksViewProps) {
   const [agentFilter, setAgentFilter] = useState('')
   const [detailTaskId, setDetailTaskId] = useState('')
   const [editDraft, setEditDraft] = useState<AgentTaskUpdateInput | null>(null)
+  const toast = useToast()
 
   const refreshTasks = useCallback(async () => {
     setLoading(true)
@@ -5705,6 +5822,8 @@ function TasksView({ agents, onOpenAgent }: TasksViewProps) {
       timezone: task.timezone || 'Asia/Shanghai',
       intervalMinutes: task.intervalMinutes ?? null,
       dailyTimes: task.dailyTimes ?? [],
+      runAtMs: task.runAtMs ?? task.nextRunAt ?? null,
+      resultInNewSession: task.resultInNewSession ?? false,
     })
   }, [])
 
@@ -5732,17 +5851,21 @@ function TasksView({ agents, onOpenAgent }: TasksViewProps) {
   if (detailTaskId) {
     if (!detailTask || !editDraft) {
       return (
-        <div className="page-shell task-center-page task-edit-page">
-          <header className="task-edit-page-header">
-            <button type="button" className="task-edit-back" onClick={closeTaskDetail} aria-label="返回">
-              <AppIcon name="arrow-left" size={18} />
-              <span>返回</span>
-            </button>
-            <h1 className="task-edit-page-title">任务不可用</h1>
+        <div className="page-shell task-center-page task-linear-page task-edit-page">
+          <header className="page-header task-linear-page-toolbar task-edit-detail-header">
+            <div className="task-edit-header-leading">
+              <button type="button" className="outline-button task-edit-header-back" onClick={closeTaskDetail} aria-label="返回">
+                <AppIcon name="arrow-left" size={18} />
+                <span>返回</span>
+              </button>
+              <div className="task-linear-page-toolbar-text task-edit-header-titles">
+                <h1>任务不可用</h1>
+              </div>
+            </div>
           </header>
           <div className="task-center-body task-edit-body">
             <p className="task-linear-empty-hint">该任务可能已被删除或不在当前筛选结果中。</p>
-            <button type="button" className="outline-button" onClick={closeTaskDetail}>
+            <button type="button" className="primary-cta task-linear-toolbar-cta" onClick={closeTaskDetail}>
               返回列表
             </button>
           </div>
@@ -5763,7 +5886,10 @@ function TasksView({ agents, onOpenAgent }: TasksViewProps) {
         onSave={() => {
           setActionTaskId(detailTask.id)
           void updateAgentTask(detailTask.id, editDraft)
-            .then(() => refreshTasks())
+            .then(async () => {
+              await refreshTasks()
+              toast.success('任务已保存。')
+            })
             .catch((taskError: unknown) => {
               setError(taskError instanceof Error ? taskError.message : String(taskError))
             })
@@ -5772,7 +5898,10 @@ function TasksView({ agents, onOpenAgent }: TasksViewProps) {
         onRunNow={() => {
           setActionTaskId(detailTask.id)
           void runAgentTaskNow(detailTask.id)
-            .then(refreshTasks)
+            .then(async () => {
+              await refreshTasks()
+              toast.success('已触发立即执行。')
+            })
             .catch((runError: unknown) => {
               setError(runError instanceof Error ? runError.message : String(runError))
             })
@@ -5781,7 +5910,10 @@ function TasksView({ agents, onOpenAgent }: TasksViewProps) {
         onPause={() => {
           setActionTaskId(detailTask.id)
           void pauseAgentTask(detailTask.id)
-            .then(refreshTasks)
+            .then(async () => {
+              await refreshTasks()
+              toast.success('任务已暂停。')
+            })
             .catch((taskError: unknown) => {
               setError(taskError instanceof Error ? taskError.message : String(taskError))
             })
@@ -5790,7 +5922,10 @@ function TasksView({ agents, onOpenAgent }: TasksViewProps) {
         onResume={() => {
           setActionTaskId(detailTask.id)
           void resumeAgentTask(detailTask.id)
-            .then(refreshTasks)
+            .then(async () => {
+              await refreshTasks()
+              toast.success('任务已恢复。')
+            })
             .catch((taskError: unknown) => {
               setError(taskError instanceof Error ? taskError.message : String(taskError))
             })
@@ -5802,6 +5937,7 @@ function TasksView({ agents, onOpenAgent }: TasksViewProps) {
             .then(async () => {
               closeTaskDetail()
               await refreshTasks()
+              toast.success('任务已删除。')
             })
             .catch((taskError: unknown) => {
               setError(taskError instanceof Error ? taskError.message : String(taskError))
@@ -5891,7 +6027,7 @@ function TasksView({ agents, onOpenAgent }: TasksViewProps) {
                     </div>
                   </div>
                   {section.items.map((task) => {
-                    const subtitle = (task.goal || task.intentSummary || '').trim()
+                    const subtitle = (task.intentSummary || task.goal || '').trim()
                     const subtitleShort = subtitle.length > 72 ? `${subtitle.slice(0, 72)}…` : subtitle
                     return (
                       <button
@@ -5932,7 +6068,7 @@ function TasksView({ agents, onOpenAgent }: TasksViewProps) {
               <p className="task-center-empty-title">正在读取任务…</p>
             ) : (
               <p className="task-center-empty-desc">
-                先在聊天里对智能体说「每 10 分钟…」或「每天 9 点…」，保存后这里会出现记录。
+                在聊天里说「每 10 分钟…」「每天 9 点…」或「一次性…」，或在任务中心打开已有任务并改为「指定时间（只执行一次）」。
               </p>
             )}
           </section>
@@ -6181,8 +6317,9 @@ function AgentEditorDialog({
   const [agentTasksLoading, setAgentTasksLoading] = useState(false)
   const [agentTasksError, setAgentTasksError] = useState('')
   const [agentTaskActionId, setAgentTaskActionId] = useState('')
-  const [advancedOpen, setAdvancedOpen] = useState(mode === 'edit')
-  const advancedPresetKeyRef = useRef('')
+  const toast = useToast()
+  type AgentEditorTab = 'basics' | 'models' | 'integrations' | 'advanced'
+  const [editorTab, setEditorTab] = useState<AgentEditorTab>('basics')
 
   useEffect(() => {
     let cancelled = false
@@ -6269,8 +6406,6 @@ function AgentEditorDialog({
       ? sessionLlmEncode(agentDraft.defaultProviderId, agentDraft.defaultModel)
       : ''
   const generatedSummary = buildAutoAgentSummary(agentDraft?.description ?? '', agentDraft?.name ?? '')
-  const summaryOverride = agentDraft?.summary.trim() ?? ''
-  const hasSummaryOverride = Boolean(summaryOverride) && summaryOverride !== generatedSummary
   const missingSkillIds = (agentDraft?.skillIds ?? []).filter((skillId) => !allSkills.some((skill) => skill.id === skillId))
   const mountedSkills = allSkills.filter((skill) => agentDraft?.skillIds.includes(skill.id) ?? false)
   const editorAccent = getAgentColor(
@@ -6327,22 +6462,9 @@ function AgentEditorDialog({
       ],
     }))
   }
-  const hasAdvancedSettings =
-    hasSummaryOverride ||
-    (agentDraft ? agentDraft.executionMode !== 'single' : false) ||
-    Boolean(agentDraft?.systemPrompt.trim()) ||
-    heartbeatTasks.length > 0 ||
-    heartbeatSchedules.length > 0 ||
-    Boolean(peerDraftSecret)
-
   useEffect(() => {
-    const nextKey = `${mode}:${managedAgentId || 'draft'}`
-    if (advancedPresetKeyRef.current === nextKey) {
-      return
-    }
-    advancedPresetKeyRef.current = nextKey
-    setAdvancedOpen(mode === 'edit' && hasAdvancedSettings)
-  }, [hasAdvancedSettings, managedAgentId, mode])
+    setEditorTab('basics')
+  }, [managedAgentId, mode])
 
   useEffect(() => {
     if (
@@ -6352,7 +6474,7 @@ function AgentEditorDialog({
         agentFormError.includes('接收用户') ||
         agentFormError.includes('时区'))
     ) {
-      setAdvancedOpen(true)
+      setEditorTab('advanced')
     }
   }, [agentFormError])
 
@@ -6360,72 +6482,128 @@ function AgentEditorDialog({
     return null
   }
 
+  const scenarioCfg = agentDraft.scenarioLlmConfig ?? {}
+  const titleScenarioValue =
+    scenarioCfg.titleGeneration?.providerId?.trim() && scenarioCfg.titleGeneration.model?.trim()
+      ? sessionLlmEncode(scenarioCfg.titleGeneration.providerId, scenarioCfg.titleGeneration.model)
+      : ''
+  const memoryScenarioValue =
+    scenarioCfg.memoryExtraction?.providerId?.trim() && scenarioCfg.memoryExtraction.model?.trim()
+      ? sessionLlmEncode(scenarioCfg.memoryExtraction.providerId, scenarioCfg.memoryExtraction.model)
+      : ''
+
+  const setScenarioSlot = (key: 'titleGeneration' | 'memoryExtraction', encoded: string) => {
+    const parsed = encoded.trim() ? sessionLlmDecode(encoded) : null
+    const next: AgentScenarioLlmConfig = { ...scenarioCfg }
+    if (!parsed) {
+      if (key === 'titleGeneration') {
+        delete next.titleGeneration
+      } else {
+        delete next.memoryExtraction
+      }
+    } else {
+      next[key] = { providerId: parsed.providerId, model: parsed.model }
+    }
+    onDraftChange({ scenarioLlmConfig: normalizeAgentScenarioLlmConfigInDraft(next) })
+  }
+
   return (
-    <div className="confirm-dialog-overlay" role="presentation" onClick={onClose}>
+    <div className="agent-editor-page-root">
       <div
-        className="agent-editor-dialog"
+        className="agent-editor-dialog agent-editor-page"
         role="dialog"
         aria-modal="true"
         aria-labelledby="agent-editor-title"
-        onClick={(event) => event.stopPropagation()}
       >
-        <div className="agent-editor-dialog-header">
-          <div className="agent-editor-header-copy">
-            <span className="agent-page-kicker">{mode === 'create' ? 'Create Agent' : 'Agent Editor'}</span>
-            <strong id="agent-editor-title">{mode === 'create' ? '新建智能体' : selectedAgent?.name ?? '编辑智能体'}</strong>
-            <span>
-              {mode === 'create'
-                ? ''
-                : selectedAgent?.summary ?? '修改角色定位、运行模型和挂载技能。'}
-            </span>
-          </div>
-
-          <div className="agent-editor-header-actions">
-            <button
-              type="button"
-              className="outline-button"
-              onClick={onRefreshAgent}
-              disabled={agentRefreshing || agentSaving || mode !== 'edit' || !selectedAgent}
-            >
-              <AppIcon name="refresh" size={16} />
-              <span>{agentRefreshing ? '刷新中…' : '刷新'}</span>
-            </button>
-
-            <button type="button" className="icon-button subtle" onClick={onClose} aria-label="关闭智能体编辑器">
-              <AppIcon name="close" size={18} />
-            </button>
-          </div>
-        </div>
-
-        <div className="agent-editor-dialog-scroll">
-          <div className="agent-detail-card agent-editor-card">
-            <div className="agent-detail-hero" style={{ borderColor: `${editorAccent}1f` }}>
+        <header className="agent-editor-hero-band">
+          <div className="agent-detail-hero agent-editor-hero-stage" style={{ borderColor: `${editorAccent}1f` }}>
+            <div className="agent-editor-hero-head">
               <div className="agent-detail-hero-main">
                 <span className="agent-badge large" style={{ backgroundColor: editorAccent }}>
                   <AppIcon name="bot" size={24} />
                 </span>
                 <div className="agent-detail-copy">
                   <span className="agent-page-kicker">{mode === 'create' ? 'Create Agent' : 'Agent Editor'}</span>
-	                  <h2>{mode === 'create' ? '新建智能体' : selectedAgent?.name ?? '编辑智能体'}</h2>
-	                  <p>
-	                    {mode === 'create'
-	                      ? '先填名字、角色说明、默认模型和挂载技能，就能建出一个可直接使用的智能体。更细的运行参数都放在高级设置里。'
-	                      : selectedAgent?.summary ?? '先改角色说明、模型和技能；需要时再展开高级设置，调整运行参数和自动化能力。'}
-	                  </p>
-	                </div>
-	              </div>
-
-	              <div className="agent-hero-pills">
-	                <span className="agent-hero-pill">{mode === 'create' ? '未保存' : '用户智能体'}</span>
-	                {agentDraft.executionMode !== 'single' ? (
-	                  <span className="agent-hero-pill">{formatAgentExecutionModeLabel(agentDraft.executionMode)}</span>
-	                ) : null}
-	                <span className="agent-hero-pill">{agentDraft.skillIds.length} 个挂载技能</span>
-	                {selectedAgent ? <span className="agent-hero-pill">ID: {selectedAgent.id}</span> : null}
-	                {selectedAgent?.id === defaultAgentId ? <span className="agent-hero-pill accent">当前默认</span> : null}
+                  <h2 id="agent-editor-title">{mode === 'create' ? '新建智能体' : selectedAgent?.name ?? '编辑智能体'}</h2>
+                  <p>
+                    {mode === 'create'
+                      ? '先填名字与角色说明并挂载技能；在「模型配置」「三方对接」「高级与自动化」中完成其余设置。'
+                      : selectedAgent?.summary ?? '用下方 Tab 切换分区：基本信息、模型、三方对接、高级与自动化。'}
+                  </p>
+                </div>
+              </div>
+              <div className="agent-editor-hero-toolbar">
+                <button type="button" className="outline-button" onClick={onClose}>
+                  <AppIcon name="arrow-left" size={16} />
+                  <span>返回列表</span>
+                </button>
+                <button
+                  type="button"
+                  className="outline-button"
+                  onClick={onRefreshAgent}
+                  disabled={agentRefreshing || agentSaving || mode !== 'edit' || !selectedAgent}
+                >
+                  <AppIcon name="refresh" size={16} />
+                  <span>{agentRefreshing ? '刷新中…' : '刷新'}</span>
+                </button>
+                <button type="button" className="icon-button subtle" onClick={onClose} aria-label="关闭智能体配置页">
+                  <AppIcon name="close" size={18} />
+                </button>
               </div>
             </div>
+            <div className="agent-hero-pills">
+              <span className="agent-hero-pill">{mode === 'create' ? '未保存' : '用户智能体'}</span>
+              {agentDraft.executionMode !== 'single' ? (
+                <span className="agent-hero-pill">{formatAgentExecutionModeLabel(agentDraft.executionMode)}</span>
+              ) : null}
+              <span className="agent-hero-pill">{agentDraft.skillIds.length} 个挂载技能</span>
+              {selectedAgent ? <span className="agent-hero-pill">ID: {selectedAgent.id}</span> : null}
+              {selectedAgent?.id === defaultAgentId ? <span className="agent-hero-pill accent">当前默认</span> : null}
+            </div>
+          </div>
+        </header>
 
+        <div className="agent-editor-tablist" role="tablist" aria-label="智能体配置分区">
+          <button
+            type="button"
+            role="tab"
+            className={`agent-editor-tab ${editorTab === 'basics' ? 'active' : ''}`}
+            aria-selected={editorTab === 'basics'}
+            onClick={() => setEditorTab('basics')}
+          >
+            基本信息
+          </button>
+          <button
+            type="button"
+            role="tab"
+            className={`agent-editor-tab ${editorTab === 'models' ? 'active' : ''}`}
+            aria-selected={editorTab === 'models'}
+            onClick={() => setEditorTab('models')}
+          >
+            模型配置
+          </button>
+          <button
+            type="button"
+            role="tab"
+            className={`agent-editor-tab ${editorTab === 'integrations' ? 'active' : ''}`}
+            aria-selected={editorTab === 'integrations'}
+            onClick={() => setEditorTab('integrations')}
+          >
+            三方对接
+          </button>
+          <button
+            type="button"
+            role="tab"
+            className={`agent-editor-tab ${editorTab === 'advanced' ? 'active' : ''}`}
+            aria-selected={editorTab === 'advanced'}
+            onClick={() => setEditorTab('advanced')}
+          >
+            高级与自动化
+          </button>
+        </div>
+
+        <div className="agent-editor-dialog-scroll">
+          <div className="agent-detail-card agent-editor-card agent-editor-form-surface">
             {agentFormError ? (
               <div className="skills-feedback error agent-feedback inline">
                 <strong>保存失败</strong>
@@ -6440,48 +6618,24 @@ function AgentEditorDialog({
               </div>
             ) : null}
 
+            {editorTab === 'basics' ? (
+              <>
 	            <div className="agent-section">
 	              <div className="agent-section-header">
 	                <div>
-	                  <strong>快速创建</strong>
-	                  <p>常用配置只保留名字、角色说明、默认模型和技能。列表摘要会自动从角色说明提炼，避免重复填写。</p>
+	                  <strong>基本信息</strong>
+	                  <p>名字与角色说明；列表摘要默认从角色说明自动生成，也可在「高级与自动化」里手动覆盖。</p>
 	                </div>
 	              </div>
 
 	              <div className="agent-form-grid">
-	                <label className="input-field">
+	                <label className="input-field agent-field-full">
                   <span>名字</span>
                   <input
                     value={agentDraft.name}
                     onChange={(event) => onDraftChange({ name: event.target.value })}
                     placeholder="例如：诉讼项目助理"
                   />
-	                </label>
-
-	                <label className="input-field">
-	                  <span>默认模型</span>
-	                  <select
-	                    value={selectedModelValue}
-	                    onChange={(event) => {
-	                      const parsed = sessionLlmDecode(event.target.value)
-	                      if (parsed) {
-	                        onDraftChange({
-	                          defaultProviderId: parsed.providerId,
-	                          defaultModel: parsed.model,
-	                        })
-	                      }
-	                    }}
-	                  >
-	                    {modelOptions.length === 0 ? (
-	                      <option value="">暂无已配置模型</option>
-	                    ) : (
-	                      modelOptions.map((option) => (
-	                        <option key={option.value} value={option.value}>
-	                          {option.label}
-	                        </option>
-	                      ))
-	                    )}
-	                  </select>
 	                </label>
 	              </div>
 
@@ -6498,7 +6652,7 @@ function AgentEditorDialog({
 	              <div className="agent-helper-copy">
 	                <strong>列表摘要将自动生成</strong>
 	                <span>
-	                  当前预览：{generatedSummary || '输入角色说明后会自动生成'}。如果你想手动改写，可以在高级设置里覆盖。
+	                  当前预览：{generatedSummary || '输入角色说明后会自动生成'}。若要手动改写摘要，请打开「高级与自动化」分页。
 	                </span>
 	              </div>
 	            </div>
@@ -6582,24 +6736,200 @@ function AgentEditorDialog({
               ) : null}
             </div>
 
-	            <div className="agent-section">
-	              <button
-	                type="button"
-	                className={`agent-advanced-toggle ${advancedOpen ? 'open' : ''}`}
-	                onClick={() => setAdvancedOpen((current) => !current)}
-	                aria-expanded={advancedOpen}
-	              >
-	                <div className="agent-advanced-toggle-copy">
-	                  <strong>高级设置</strong>
-	                  <span>摘要覆盖、执行模式、高级指令、对等 HTTP 对接、心跳任务都收在这里。</span>
-	                </div>
-	                <div className="agent-advanced-toggle-meta">
-	                  <span>{hasAdvancedSettings ? '已配置' : '可选'}</span>
-	                  <AppIcon name="chevron-down" size={18} />
-	                </div>
-	              </button>
+            <div className="agent-section">
+              <div className="agent-section-header">
+                <div>
+                  <strong>工作区 Markdown</strong>
+                  <p>查看这个智能体对应的 `IDENTITY.md`、`ROLE.md`、`MEMORY.md`、`WORKING.md` 等文件内容。</p>
+                </div>
 
-	              {advancedOpen ? (
+                <button
+                  type="button"
+                  className="outline-button"
+                  onClick={onOpenWorkspace}
+                  disabled={!selectedAgent || mode !== 'edit'}
+                >
+                  <AppIcon name="book" size={16} />
+                  <span>{selectedAgent && mode === 'edit' ? '查看 md 文件' : '保存后可查看'}</span>
+                </button>
+              </div>
+
+              <div className="agent-workspace-hint">
+                <span>智能体 ID：{selectedAgent?.id ?? '保存后生成'}</span>
+                <span>私有目录：{selectedAgent ? `agents/${selectedAgent.id}/` : '尚未创建'}</span>
+                <span>共享文件：`AGENTS.md`、`SOUL.md`、`USER.md`、`MEMORY.md`、`TOOLS.md`</span>
+              </div>
+            </div>
+              </>
+            ) : null}
+
+            {editorTab === 'models' ? (
+              <div className="agent-section agent-model-scenarios">
+                <div className="agent-section-header">
+                  <div>
+                    <strong>模型配置</strong>
+                    <p>
+                      为每个场景单独指定模型；未设置的场景将自动使用「默认对话模型」。记忆相关写入遵循工作区规则（含 MEMORY.md 与用户记忆索引）。
+                    </p>
+                  </div>
+                </div>
+
+                <div className="agent-model-scenario-list">
+                  <div className="agent-model-scenario-row">
+                    <div className="agent-model-scenario-copy">
+                      <strong>默认对话模型</strong>
+                      <span>主对话、新建话题时使用的模型</span>
+                    </div>
+                    <label className="input-field agent-model-scenario-select">
+                      <select
+                        value={selectedModelValue}
+                        onChange={(event) => {
+                          const parsed = sessionLlmDecode(event.target.value)
+                          if (parsed) {
+                            onDraftChange({
+                              defaultProviderId: parsed.providerId,
+                              defaultModel: parsed.model,
+                            })
+                          }
+                        }}
+                      >
+                        {modelOptions.length === 0 ? (
+                          <option value="">暂无已配置模型</option>
+                        ) : (
+                          modelOptions.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                    </label>
+                  </div>
+
+                  <div className="agent-model-scenario-row">
+                    <div className="agent-model-scenario-copy">
+                      <strong>标题生成</strong>
+                      <span>每次对话后自动生成会话标题（配置已保存；与主对话模型分工时可单独指定）</span>
+                    </div>
+                    <label className="input-field agent-model-scenario-select">
+                      <select
+                        value={titleScenarioValue}
+                        onChange={(event) => setScenarioSlot('titleGeneration', event.target.value)}
+                      >
+                        <option value="">同默认对话模型</option>
+                        {modelOptions.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+
+                  <div className="agent-model-scenario-row">
+                    <div className="agent-model-scenario-copy">
+                      <strong>记忆提取与分类</strong>
+                      <span>每轮对话后的记忆沉淀与分类（MEMORY.md / 用户记忆；与主模型分工时可单独指定）</span>
+                    </div>
+                    <label className="input-field agent-model-scenario-select">
+                      <select
+                        value={memoryScenarioValue}
+                        onChange={(event) => setScenarioSlot('memoryExtraction', event.target.value)}
+                      >
+                        <option value="">同默认对话模型</option>
+                        {modelOptions.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            {editorTab === 'integrations' ? (
+              <div className="agent-section agent-integrations-section">
+                <div className="agent-section-header">
+                  <div>
+                    <strong>三方对接</strong>
+                    <p>与外部系统互通时的地址与说明。对等 HTTP（虾）入站与全应用共用监听端口；下列信息含本智能体 ID 与密钥，可一键复制给对方。</p>
+                  </div>
+                </div>
+                <div className="agent-settings-panel-card">
+                  <div className="agent-peer-integration-card">
+                    <div className="agent-peer-integration-head">
+                      <strong>对等 HTTP（虾）对接</strong>
+                      <span>全应用共用一个监听端口；下列地址与一键说明会包含本智能体的密钥与 ID。</span>
+                    </div>
+                    {peerGatewayLoadError ? (
+                      <div className="skills-feedback error agent-feedback inline">
+                        <span>读取网关信息失败：{peerGatewayLoadError}</span>
+                      </div>
+                    ) : null}
+                    {peerGatewayInfo ? (
+                      <>
+                        <div className="agent-peer-api-grid">
+                          <label className="input-field">
+                            <span>监听地址（NINECLAW_PEER_BIND）</span>
+                            <input
+                              readOnly
+                              value={
+                                peerGatewayInfo.enabled && peerGatewayInfo.listenAddress
+                                  ? peerGatewayInfo.listenAddress
+                                  : '未配置（未监听）'
+                              }
+                            />
+                          </label>
+                          <label className="input-field">
+                            <span>入站 API（POST）</span>
+                            <input readOnly value={peerGatewayInfo.inboundUrl ?? '—'} />
+                          </label>
+                          <label className="input-field">
+                            <span>健康检查（GET）</span>
+                            <input readOnly value={peerGatewayInfo.healthUrl ?? '—'} />
+                          </label>
+                        </div>
+                        <div className="agent-peer-snippet-toolbar">
+                          <span className="agent-peer-snippet-label">给对方的一键说明（含密钥）</span>
+                          <button
+                            type="button"
+                            className="outline-button"
+                            onClick={() => {
+                              void navigator.clipboard.writeText(peerSnippetText).then(() => {
+                                setPeerSnippetCopied(true)
+                                window.setTimeout(() => setPeerSnippetCopied(false), 2000)
+                              })
+                            }}
+                          >
+                            {peerSnippetCopied ? (
+                              <>
+                                <Check size={16} />
+                                <span>已复制</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy size={16} />
+                                <span>复制全文</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                        <pre className="agent-peer-snippet-pre">{peerSnippetText}</pre>
+                      </>
+                    ) : (
+                      <div className="agent-workspace-hint">
+                        <span>正在读取对等网关信息…</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            {editorTab === 'advanced' ? (
+	            <div className="agent-section">
 	                <div className="agent-advanced-stack">
 	                  <div className="agent-subsection">
 	                    <div className="agent-subsection-header">
@@ -6652,73 +6982,6 @@ function AgentEditorDialog({
 	                    </label>
 	                  </div>
 
-	                  <div className="agent-peer-integration-card">
-	                    <div className="agent-peer-integration-head">
-	                      <strong>对等 HTTP（虾）对接</strong>
-	                      <span>全应用共用一个监听端口；下列地址与一键说明会包含本智能体的密钥与 ID。</span>
-	                    </div>
-	                    {peerGatewayLoadError ? (
-	                      <div className="skills-feedback error agent-feedback inline">
-	                        <span>读取网关信息失败：{peerGatewayLoadError}</span>
-	                      </div>
-	                    ) : null}
-	                    {peerGatewayInfo ? (
-	                      <>
-	                        <div className="agent-peer-api-grid">
-	                          <label className="input-field">
-	                            <span>监听地址（NINECLAW_PEER_BIND）</span>
-	                            <input
-	                              readOnly
-	                              value={
-	                                peerGatewayInfo.enabled && peerGatewayInfo.listenAddress
-	                                  ? peerGatewayInfo.listenAddress
-	                                  : '未配置（未监听）'
-	                              }
-	                            />
-	                          </label>
-	                          <label className="input-field">
-	                            <span>入站 API（POST）</span>
-	                            <input readOnly value={peerGatewayInfo.inboundUrl ?? '—'} />
-	                          </label>
-	                          <label className="input-field">
-	                            <span>健康检查（GET）</span>
-	                            <input readOnly value={peerGatewayInfo.healthUrl ?? '—'} />
-	                          </label>
-	                        </div>
-	                        <div className="agent-peer-snippet-toolbar">
-	                          <span className="agent-peer-snippet-label">给对方的一键说明（含密钥）</span>
-	                          <button
-	                            type="button"
-	                            className="outline-button"
-	                            onClick={() => {
-	                              void navigator.clipboard.writeText(peerSnippetText).then(() => {
-	                                setPeerSnippetCopied(true)
-	                                window.setTimeout(() => setPeerSnippetCopied(false), 2000)
-	                              })
-	                            }}
-	                          >
-	                            {peerSnippetCopied ? (
-	                              <>
-	                                <Check size={16} />
-	                                <span>已复制</span>
-	                              </>
-	                            ) : (
-	                              <>
-	                                <Copy size={16} />
-	                                <span>复制全文</span>
-	                              </>
-	                            )}
-	                          </button>
-	                        </div>
-	                        <pre className="agent-peer-snippet-pre">{peerSnippetText}</pre>
-	                      </>
-	                    ) : (
-	                      <div className="agent-workspace-hint">
-	                        <span>正在读取对等网关信息…</span>
-	                      </div>
-	                    )}
-	                  </div>
-
 	                  <div className="agent-subsection">
 	                    <div className="agent-subsection-header">
 	                      <div>
@@ -6759,7 +7022,10 @@ function AgentEditorDialog({
                                     onClick={() => {
                                       setAgentTaskActionId(task.id)
                                       void runAgentTaskNow(task.id)
-                                        .then(refreshAgentTasks)
+                                        .then(async () => {
+                                          await refreshAgentTasks()
+                                          toast.success('已触发立即执行。')
+                                        })
                                         .catch((error: unknown) => {
                                           setAgentTasksError(error instanceof Error ? error.message : String(error))
                                         })
@@ -6776,7 +7042,10 @@ function AgentEditorDialog({
 	                                      onClick={() => {
 	                                        setAgentTaskActionId(task.id)
 	                                        void pauseAgentTask(task.id)
-	                                          .then(refreshAgentTasks)
+	                                          .then(async () => {
+	                                            await refreshAgentTasks()
+	                                            toast.success('任务已暂停。')
+	                                          })
 	                                          .catch((error: unknown) => {
 	                                            setAgentTasksError(error instanceof Error ? error.message : String(error))
 	                                          })
@@ -6793,7 +7062,10 @@ function AgentEditorDialog({
 	                                      onClick={() => {
 	                                        setAgentTaskActionId(task.id)
 	                                        void resumeAgentTask(task.id)
-	                                          .then(refreshAgentTasks)
+	                                          .then(async () => {
+	                                            await refreshAgentTasks()
+	                                            toast.success('任务已恢复。')
+	                                          })
 	                                          .catch((error: unknown) => {
 	                                            setAgentTasksError(error instanceof Error ? error.message : String(error))
 	                                          })
@@ -6811,7 +7083,10 @@ function AgentEditorDialog({
 	                                      onClick={() => {
 	                                        setAgentTaskActionId(task.id)
 	                                        void deleteAgentTask(task.id)
-	                                          .then(refreshAgentTasks)
+	                                          .then(async () => {
+	                                            await refreshAgentTasks()
+	                                            toast.success('任务已删除。')
+	                                          })
 	                                          .catch((error: unknown) => {
 	                                            setAgentTasksError(error instanceof Error ? error.message : String(error))
 	                                          })
@@ -6834,7 +7109,7 @@ function AgentEditorDialog({
 
 	                              <label className="input-field agent-field-full">
 	                                <span>任务内容</span>
-	                                <textarea value={task.goal || task.intentSummary} readOnly rows={3} />
+	                                <textarea value={task.goal} readOnly rows={3} />
 	                              </label>
 	                            </div>
 	                          )
@@ -7150,33 +7425,8 @@ function AgentEditorDialog({
 	                    </div>
 	                  </div>
 	                </div>
-	              ) : null}
 	            </div>
-
-            <div className="agent-section">
-              <div className="agent-section-header">
-                <div>
-                  <strong>工作区 Markdown</strong>
-                  <p>查看这个智能体对应的 `IDENTITY.md`、`ROLE.md`、`MEMORY.md`、`WORKING.md` 等文件内容。</p>
-                </div>
-
-                <button
-                  type="button"
-                  className="outline-button"
-                  onClick={onOpenWorkspace}
-                  disabled={!selectedAgent || mode !== 'edit'}
-                >
-                  <AppIcon name="book" size={16} />
-                  <span>{selectedAgent && mode === 'edit' ? '查看 md 文件' : '保存后可查看'}</span>
-                </button>
-              </div>
-
-              <div className="agent-workspace-hint">
-                <span>智能体 ID：{selectedAgent?.id ?? '保存后生成'}</span>
-                <span>私有目录：{selectedAgent ? `agents/${selectedAgent.id}/` : '尚未创建'}</span>
-                <span>共享文件：`AGENTS.md`、`SOUL.md`、`USER.md`、`MEMORY.md`、`TOOLS.md`</span>
-              </div>
-            </div>
+            ) : null}
           </div>
         </div>
 
@@ -7927,8 +8177,8 @@ function AgentsView({
   const studioCountLabel = loading ? '正在同步智能体…' : '已保存智能体'
 
   return (
-    <div className="agent-layout">
-      <div className="agent-studio-shell">
+    <div className={`agent-layout ${agentEditorOpen ? 'agent-layout-editor-open' : ''}`}>
+      <div className="agent-studio-shell" hidden={agentEditorOpen}>
         <header className="agent-page-header agent-page-header-inline">
           <div>
             <span className="agent-page-kicker">Agent Studio</span>
@@ -7998,7 +8248,7 @@ function AgentsView({
                       </strong>
                       <span className="agent-inline-id">ID: {agent.id}</span>
                       <span>{agent.summary}</span>
-                      <small>{agent.description || '点击进入弹窗，补充介绍、模型和挂载技能。'}</small>
+                      <small>{agent.description || '进入配置页，补充介绍、模型与技能。'}</small>
                     </span>
                     <span className="agent-list-meta">
                       <span className="agent-list-meta-pill">

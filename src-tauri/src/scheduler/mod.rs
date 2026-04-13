@@ -1,10 +1,10 @@
 use crate::agent_tasks::{
     self, AgentTaskPayload, DailyTimeSchedule as AgentDailyTimeSchedule,
-    IntervalSchedule as AgentIntervalSchedule,
+    IntervalSchedule as AgentIntervalSchedule, OnceAtSchedule,
 };
 use crate::agent_workspace;
 use crate::agents::{self, AgentRecord};
-use crate::channels::pi_bridge::PiBridge;
+use crate::channels::pi_bridge::{PiBridge, PiProcessOutcome};
 use crate::channels::types::{MediaPayload, MediaType};
 use crate::media_directives::{parse_markdown_media_reference, parse_media_directive_fields};
 use chrono::{
@@ -33,6 +33,7 @@ const SOURCE_KIND_AGENT_HEARTBEAT: &str = "agent_heartbeat";
 const SOURCE_KIND_AGENT_TASK: &str = "agent_task";
 const TRIGGER_TYPE_DAILY_TIME: &str = "daily_time";
 const TRIGGER_TYPE_INTERVAL: &str = "interval";
+const TRIGGER_TYPE_ONCE_AT: &str = "once_at";
 const LEASE_KEY_DAEMON_LEADER: &str = "daemon_leader";
 const MACOS_LAUNCH_AGENT_LABEL: &str = "com.wuyq.nineclaw.scheduler";
 #[cfg(target_os = "windows")]
@@ -182,6 +183,8 @@ struct ExistingJobState {
 #[derive(Debug, Clone)]
 struct DueJobCandidate {
     id: String,
+    source_kind: String,
+    source_schedule_id: String,
     owner_agent_id: String,
     kind: String,
     timezone: String,
@@ -196,6 +199,8 @@ struct DueJobCandidate {
 struct ClaimedRun {
     run_id: String,
     job_id: String,
+    source_kind: String,
+    source_schedule_id: String,
     owner_agent_id: String,
     kind: String,
     timezone: String,
@@ -239,12 +244,24 @@ fn active_runs() -> &'static Mutex<HashSet<String>> {
     ACTIVE_RUNS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn process_owner_id(prefix: &str) -> String {
-    format!(
-        "{prefix}:{}:{}",
-        std::process::id(),
-        Uuid::new_v4().simple()
-    )
+/// Leader lease renewal requires a **stable** owner id per process. A random UUID per tick breaks
+/// `ON CONFLICT ... WHERE owner_id = ?2` and stops all scheduler work after the first interval.
+fn embedded_scheduler_owner_id() -> String {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| format!("embedded:{}", std::process::id()))
+        .clone()
+}
+
+fn daemon_scheduler_owner_id() -> String {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| format!("daemon:{}", std::process::id()))
+        .clone()
+}
+
+fn manual_scheduler_owner_id() -> String {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| format!("manual:{}", std::process::id()))
+        .clone()
 }
 
 pub fn ensure_scheduler_schema(connection: &Connection) -> Result<(), String> {
@@ -315,7 +332,7 @@ pub fn start_embedded_scheduler(app: AppHandle) {
     }
 
     thread::spawn(move || {
-        let owner_id = process_owner_id("embedded");
+        let owner_id = embedded_scheduler_owner_id();
         if let Err(error) = scheduler_tick(&app, &owner_id) {
             log::warn!("首次扫描 scheduler 失败: {}", error);
         }
@@ -330,7 +347,7 @@ pub fn start_embedded_scheduler(app: AppHandle) {
 }
 
 pub fn run_daemon(app: AppHandle) -> Result<(), String> {
-    let owner_id = process_owner_id("daemon");
+    let owner_id = daemon_scheduler_owner_id();
     if let Err(error) = scheduler_tick(&app, &owner_id) {
         log::warn!("scheduler daemon 首次扫描失败: {}", error);
     }
@@ -360,11 +377,11 @@ pub fn trigger_agent_task_now(app: &AppHandle, task_id: &str) -> Result<(), Stri
     let connection = crate::open_history_db(app)?;
     ensure_scheduler_schema(&connection)?;
     let now = crate::chrono_like_timestamp();
-    let owner_id = process_owner_id("manual");
+    let owner_id = manual_scheduler_owner_id();
 
     let candidate = connection
         .query_row(
-            "SELECT id, owner_agent_id, kind, timezone, payload_json, delivery_json
+            "SELECT id, owner_agent_id, kind, timezone, payload_json, delivery_json, source_kind, source_schedule_id
              FROM scheduled_jobs
              WHERE source_kind = ?1
                AND source_schedule_id = ?2
@@ -376,6 +393,8 @@ pub fn trigger_agent_task_now(app: &AppHandle, task_id: &str) -> Result<(), Stri
                 Ok(ClaimedRun {
                     run_id: format!("run_{}", Uuid::new_v4().simple()),
                     job_id: row.get(0)?,
+                    source_kind: row.get(6)?,
+                    source_schedule_id: row.get(7)?,
                     owner_agent_id: row.get(1)?,
                     kind: row.get(2)?,
                     timezone: row.get(3)?,
@@ -541,7 +560,7 @@ pub fn trigger_job_now(app: &AppHandle, job_id: &str) -> Result<(), String> {
     if updated == 0 {
         return Err("未找到可立即执行的 scheduler 任务".to_string());
     }
-    let _ = scheduler_tick(app, &process_owner_id("manual"));
+    let _ = scheduler_tick(app, &manual_scheduler_owner_id());
     Ok(())
 }
 
@@ -793,6 +812,7 @@ fn sync_materialized_jobs_with_connection(
     agent_records: &[AgentRecord],
 ) -> Result<usize, String> {
     ensure_scheduler_schema(connection)?;
+    agent_tasks::pause_expired_once_at_tasks(connection)?;
     let existing_map = load_existing_job_states(connection)?;
     let now = crate::chrono_like_timestamp();
     let mut desired_jobs = materialize_jobs_from_agents(agent_records)?;
@@ -1024,6 +1044,38 @@ fn materialize_jobs_from_agent_tasks(
             schedule_name: item.task.title.clone(),
         };
         match item.task.schedule_type.as_str() {
+            agent_tasks::SCHEDULE_TYPE_ONCE_AT => {
+                let schedule: OnceAtSchedule =
+                    serde_json::from_str(&item.task.schedule_json).map_err(|error| {
+                        format!("解析 once_at agent task schedule 失败: {error}")
+                    })?;
+                let now_ms = crate::chrono_like_timestamp();
+                let enabled =
+                    item.task.status == "active" && schedule.run_at_ms > now_ms;
+                jobs.push(MaterializedJob {
+                    id: format!("task:{}:once", item.task.id),
+                    source_kind: SOURCE_KIND_AGENT_TASK.to_string(),
+                    owner_agent_id: item.task.agent_id.clone(),
+                    source_schedule_id: item.task.id.clone(),
+                    source_task_id: item.task.id.clone(),
+                    kind: match item.task.task_type.as_str() {
+                        "agent_prompt" => "agent_prompt".to_string(),
+                        _ => "notify".to_string(),
+                    },
+                    name: item.task.title.clone(),
+                    description: item.task.intent_summary.clone(),
+                    enabled,
+                    timezone: normalize_scheduler_timezone(&item.task.timezone),
+                    trigger_type: TRIGGER_TYPE_ONCE_AT.to_string(),
+                    trigger_spec_json: serde_json::to_string(&schedule)
+                        .map_err(|error| format!("序列化 once_at trigger 失败: {error}"))?,
+                    payload_json: serde_json::to_string(&base_payload).map_err(|error| {
+                        format!("序列化 agent task scheduler payload 失败: {error}")
+                    })?,
+                    delivery_json: serde_json::to_string(&delivery)
+                        .map_err(|error| format!("序列化 agent task delivery 失败: {error}"))?,
+                });
+            }
             TRIGGER_TYPE_INTERVAL => {
                 let schedule: AgentIntervalSchedule =
                     serde_json::from_str(&item.task.schedule_json).map_err(|error| {
@@ -1167,6 +1219,8 @@ fn claim_due_jobs(connection: &mut Connection, owner_id: &str) -> Result<Vec<Cla
             .query_row(
                 "SELECT
                     id,
+                    source_kind,
+                    source_schedule_id,
                     owner_agent_id,
                     kind,
                     name,
@@ -1182,14 +1236,16 @@ fn claim_due_jobs(connection: &mut Connection, owner_id: &str) -> Result<Vec<Cla
                 |row| {
                     Ok(DueJobCandidate {
                         id: row.get(0)?,
-                        owner_agent_id: row.get(1)?,
-                        kind: row.get(2)?,
-                        timezone: row.get(4)?,
-                        trigger_type: row.get(5)?,
-                        trigger_spec_json: row.get(6)?,
-                        payload_json: row.get(7)?,
-                        delivery_json: row.get(8)?,
-                        next_run_at: row.get(9)?,
+                        source_kind: row.get(1)?,
+                        source_schedule_id: row.get(2)?,
+                        owner_agent_id: row.get(3)?,
+                        kind: row.get(4)?,
+                        timezone: row.get(6)?,
+                        trigger_type: row.get(7)?,
+                        trigger_spec_json: row.get(8)?,
+                        payload_json: row.get(9)?,
+                        delivery_json: row.get(10)?,
+                        next_run_at: row.get(11)?,
                     })
                 },
             )
@@ -1241,6 +1297,8 @@ fn claim_due_jobs(connection: &mut Connection, owner_id: &str) -> Result<Vec<Cla
         claims.push(ClaimedRun {
             run_id,
             job_id: snapshot.id,
+            source_kind: snapshot.source_kind,
+            source_schedule_id: snapshot.source_schedule_id,
             owner_agent_id: snapshot.owner_agent_id,
             kind: snapshot.kind,
             timezone: snapshot.timezone,
@@ -1262,6 +1320,8 @@ fn load_due_candidates(
         .prepare(
             "SELECT
                 id,
+                source_kind,
+                source_schedule_id,
                 owner_agent_id,
                 kind,
                 name,
@@ -1284,14 +1344,16 @@ fn load_due_candidates(
         .query_map(params![now, limit as i64], |row| {
             Ok(DueJobCandidate {
                 id: row.get(0)?,
-                owner_agent_id: row.get(1)?,
-                kind: row.get(2)?,
-                timezone: row.get(4)?,
-                trigger_type: row.get(5)?,
-                trigger_spec_json: row.get(6)?,
-                payload_json: row.get(7)?,
-                delivery_json: row.get(8)?,
-                next_run_at: row.get(9)?,
+                source_kind: row.get(1)?,
+                source_schedule_id: row.get(2)?,
+                owner_agent_id: row.get(3)?,
+                kind: row.get(4)?,
+                timezone: row.get(6)?,
+                trigger_type: row.get(7)?,
+                trigger_spec_json: row.get(8)?,
+                payload_json: row.get(9)?,
+                delivery_json: row.get(10)?,
+                next_run_at: row.get(11)?,
             })
         })
         .map_err(|error| format!("解析 due scheduler 任务失败: {error}"))?;
@@ -1301,6 +1363,86 @@ fn load_due_candidates(
         candidates.push(row.map_err(|error| format!("读取 due scheduler 行失败: {error}"))?);
     }
     Ok(candidates)
+}
+
+fn task_delivery_record_task_id(claim: &ClaimedRun) -> String {
+    if claim.source_kind == SOURCE_KIND_AGENT_TASK {
+        claim.source_schedule_id.clone()
+    } else {
+        claim.job_id.clone()
+    }
+}
+
+/// Pushes plain-text task results to IM channels that are both **bound** on the agent and have a
+/// non-empty `target_user_id` on a heartbeat schedule. Skips the primary delivery target, logs and
+/// continues on errors.
+fn push_scheduler_result_to_auxiliary_im_channels(
+    _app: &AppHandle,
+    agent: &AgentRecord,
+    primary_delivery: &SchedulerDelivery,
+    raw_content: &str,
+) {
+    let text = auxiliary_im_plain_text(raw_content);
+    if text.trim().is_empty() {
+        return;
+    }
+    let primary_rt = runtime_channel_id(&agent.id, &primary_delivery.channel_id);
+    let primary_uid = primary_delivery.target_user_id.trim();
+
+    let manager = match crate::channel_manager().lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            log::warn!("scheduler IM 广播：无法锁定通道管理器: {error}");
+            return;
+        }
+    };
+
+    for schedule in &agent.heartbeat_config.schedules {
+        if !schedule.enabled {
+            continue;
+        }
+        let ch = schedule.channel_id.trim();
+        if ch.is_empty() || ch == "desktop_session" || ch == "peer" {
+            continue;
+        }
+        let Some(bot_cfg) = agent.bot_configs.get(ch) else {
+            continue;
+        };
+        if !bot_cfg.enabled || bot_cfg.im_channel_paused {
+            continue;
+        }
+        let uid = schedule.target_user_id.trim();
+        if uid.is_empty() {
+            continue;
+        }
+        let rt = runtime_channel_id(&agent.id, ch);
+        if rt == primary_rt && uid == primary_uid {
+            continue;
+        }
+        if let Err(error) = manager.send_message(&rt, uid, &text) {
+            log::warn!(
+                "scheduler 任务结果 IM 推送跳过: agent={} channel={} user={} error={}",
+                agent.id,
+                rt,
+                uid,
+                error
+            );
+        }
+    }
+}
+
+fn auxiliary_im_plain_text(raw: &str) -> String {
+    let (text, _) = split_text_and_media(raw);
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let fallback = raw.trim();
+    if fallback.is_empty() {
+        String::new()
+    } else {
+        "[定时任务] 输出包含媒体或附件，请在桌面端会话查看完整结果。".to_string()
+    }
 }
 
 fn execute_claimed_run(app: &AppHandle, claim: &ClaimedRun) -> Result<TaskExecutionResult, String> {
@@ -1385,21 +1527,67 @@ fn finalize_run(
             format_scheduled_for(claim.scheduled_for, &claim.timezone),
             display_target(&delivery)
         );
-        let assistant_message = sent_message.unwrap_or_else(|| {
-            if let Some(error) = error.clone() {
-                format!("执行失败：{error}")
-            } else if details.trim().is_empty() {
-                summary.clone()
-            } else {
-                format!("{}\n\n{}", summary, details)
+        let assistant_message = match &sent_message {
+            Some(text) if !text.trim().is_empty() => text.clone(),
+            _ => {
+                if let Some(error) = error.clone() {
+                    format!("执行失败：{error}")
+                } else if details.trim().is_empty() {
+                    summary.clone()
+                } else {
+                    format!("{}\n\n{}", summary, details)
+                }
             }
-        });
+        };
+
+        if agent_tasks::is_desktop_delivery_kind(&delivery.channel_id) {
+            let needs_desktop_delivery = status == "error" || sent_message.is_none();
+            if needs_desktop_delivery {
+                if let Ok(conn) = crate::open_history_db(app) {
+                    let title = if delivery.schedule_name.trim().is_empty() {
+                        "定时任务".to_string()
+                    } else {
+                        delivery.schedule_name.clone()
+                    };
+                    if let Ok(record) = agent_tasks::record_delivery(
+                        app,
+                        &conn,
+                        &task_delivery_record_task_id(claim),
+                        &claim.run_id,
+                        &agent.id,
+                        &delivery.target_user_id,
+                        &title,
+                        &assistant_message,
+                    ) {
+                        let _ = app.emit("agent-task-delivery", record);
+                    }
+                }
+            }
+        }
+
         let _ = agent_workspace::append_agent_memory_entry(
             &agent.id,
             &delivery.target_user_id,
             &user_message,
             &assistant_message,
         );
+
+        push_scheduler_result_to_auxiliary_im_channels(app, &agent, &delivery, &assistant_message);
+    }
+
+    // 仅在实际「到点」触发时暂停一次性任务；「立即执行」的 scheduled_for 为当前时间，与 run_at_ms 不同，不暂停。
+    if claim.source_kind == SOURCE_KIND_AGENT_TASK && claim.job_id.ends_with(":once") {
+        if let Ok(spec_json) = connection.query_row(
+            "SELECT trigger_spec_json FROM scheduled_jobs WHERE id = ?1",
+            params![&claim.job_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            if let Ok(spec) = serde_json::from_str::<OnceAtSchedule>(&spec_json) {
+                if (claim.scheduled_for - spec.run_at_ms).abs() < 120_000 {
+                    let _ = agent_tasks::pause_task(app, &claim.source_schedule_id);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1612,6 +1800,55 @@ fn render_message(
     rendered.trim().to_string()
 }
 
+fn scheduler_session_label(delivery: &SchedulerDelivery, claim: &ClaimedRun, agent_id: &str) -> String {
+    let trimmed = delivery.target_user_id.trim();
+    if trimmed.is_empty() {
+        format!("scheduler-session:{agent_id}:{}", claim.run_id)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn run_scheduler_pi_prompt(
+    bridge: &PiBridge,
+    app: &AppHandle,
+    channel_id: &str,
+    synthetic_user: &str,
+    prompt: &str,
+    claim: &ClaimedRun,
+    delivery: &SchedulerDelivery,
+    agent: &AgentRecord,
+    runtime_model: &str,
+    usage_suffix: &str,
+) -> Result<String, String> {
+    let outcome = bridge.process_message_interruptible(
+        channel_id,
+        synthetic_user,
+        prompt,
+        AI_CHUNK_SIZE,
+        |_| {},
+        |_| {},
+    )?;
+    match outcome {
+        PiProcessOutcome::Completed(result) => {
+            let session_key = scheduler_session_label(delivery, claim, &agent.id);
+            if let Err(error) = crate::record_token_usage_for_scheduler_pi_completion(
+                app,
+                format!("{}:{}", claim.run_id, usage_suffix),
+                &session_key,
+                agent,
+                runtime_model,
+                result.usage,
+                result.usage_meta,
+            ) {
+                log::warn!("写入 scheduler 任务用量统计失败: {}", error);
+            }
+            Ok(result.full_text)
+        }
+        PiProcessOutcome::Aborted => Err("pi 处理被中断".to_string()),
+    }
+}
+
 fn generate_agentic_message(
     app: &AppHandle,
     claim: &ClaimedRun,
@@ -1652,8 +1889,18 @@ fn generate_agentic_message(
     );
     let synthetic_user = format!("{}#scheduler", delivery.target_user_id);
     let channel_id = runtime_channel_id(&agent.id, &delivery.channel_id);
-    let message =
-        bridge.process_message(&channel_id, &synthetic_user, &prompt, AI_CHUNK_SIZE, |_| {})?;
+    let message = run_scheduler_pi_prompt(
+        &bridge,
+        app,
+        &channel_id,
+        &synthetic_user,
+        &prompt,
+        claim,
+        delivery,
+        agent,
+        &runtime.model,
+        "agentic-msg",
+    )?;
     let trimmed = message.trim().to_string();
     if trimmed.is_empty() {
         Ok(None)
@@ -1693,8 +1940,18 @@ fn execute_agent_prompt(
     );
     let synthetic_user = format!("{}#scheduled-agent-task", delivery.target_user_id);
     let channel_id = runtime_channel_id(&agent.id, &delivery.channel_id);
-    let message =
-        bridge.process_message(&channel_id, &synthetic_user, &prompt, AI_CHUNK_SIZE, |_| {})?;
+    let message = run_scheduler_pi_prompt(
+        &bridge,
+        app,
+        &channel_id,
+        &synthetic_user,
+        &prompt,
+        claim,
+        delivery,
+        agent,
+        &runtime.model,
+        "agent-prompt",
+    )?;
     let trimmed = message.trim().to_string();
     if trimmed.is_empty() {
         Err("智能体定时任务没有返回内容".to_string())
@@ -1808,8 +2065,9 @@ fn send_task_message(
             text_content.clone()
         };
         let record = agent_tasks::record_delivery(
+            app,
             &connection,
-            &claim.job_id,
+            &task_delivery_record_task_id(claim),
             &claim.run_id,
             &agent.id,
             &delivery.target_user_id,
@@ -2058,6 +2316,15 @@ fn compute_next_run_at(
                 &trigger.time,
                 after_ms,
             )?))
+        }
+        TRIGGER_TYPE_ONCE_AT => {
+            let trigger: OnceAtSchedule = serde_json::from_str(trigger_spec_json).map_err(|error| {
+                format!("解析 scheduler once_at trigger 失败: {error}")
+            })?;
+            if after_ms >= trigger.run_at_ms {
+                return Ok(None);
+            }
+            Ok(Some(trigger.run_at_ms))
         }
         _ => Err(format!("不支持的 scheduler trigger 类型: {trigger_type}")),
     }

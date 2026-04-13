@@ -17,36 +17,47 @@
   --color-sidebar-border: var(--sidebar-border);
 }
 
-/* 这里仅保留首屏回退值，真正的主题变量由 src/theme/themePresets.ts 统一注入。 */
+/* 这里仅保留首屏回退值，真正的主题变量由 src/theme/themePresets.ts 统一注入。
+   版式参考仓库根目录 DESIGN.md（Claude 暖色编辑风）：标题衬线、界面无衬线。 */
 :root {
-  font-family:
+  --font-display: Georgia, 'Times New Roman', 'Noto Serif SC', 'Songti SC', 'STSong', serif;
+  --font-sans:
     'SF Pro Display',
     'SF Pro Text',
     'PingFang SC',
     'Hiragino Sans GB',
     'Microsoft YaHei',
+    system-ui,
     sans-serif;
-  line-height: 1.5;
+  font-family: var(--font-sans);
+  line-height: 1.55;
   font-weight: 400;
-  color: var(--foreground, rgba(255, 255, 255, 0.94));
-  background: var(--background, #151619);
+  color: var(--foreground, rgba(250, 249, 245, 0.94));
+  background: var(--background, #141413);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  --background: var(--app-bg, #151619);
-  --foreground: var(--text, rgba(255, 255, 255, 0.94));
-  --card: var(--panel, #1b1c20);
-  --card-foreground: var(--text, rgba(255, 255, 255, 0.94));
-  --muted: var(--panel-muted, #2a2c31);
-  --muted-foreground: var(--text-muted, rgba(255, 255, 255, 0.62));
-  --border: var(--chrome-border, rgba(255, 255, 255, 0.12));
-  --sidebar: var(--chrome-sidebar, #27282d);
-  --sidebar-border: var(--chrome-border, rgba(255, 255, 255, 0.12));
-  --input: var(--surface-input, rgba(255, 255, 255, 0.12));
-  --primary: var(--blue, #4f7cff);
-  --primary-foreground: var(--primary-button-fg, #111114);
+  --background: var(--app-bg, #141413);
+  --foreground: var(--text, rgba(250, 249, 245, 0.94));
+  --card: var(--panel, #1c1c1a);
+  --card-foreground: var(--text, rgba(250, 249, 245, 0.94));
+  --muted: var(--panel-muted, #262624);
+  --muted-foreground: var(--text-muted, rgba(176, 174, 165, 0.92));
+  --border: var(--chrome-border, rgba(240, 238, 230, 0.09));
+  --sidebar: var(--chrome-sidebar, #252523);
+  --sidebar-border: var(--chrome-border, rgba(240, 238, 230, 0.1));
+  --input: var(--surface-input, rgba(240, 238, 230, 0.1));
+  --primary: var(--blue, #c96442);
+  --primary-foreground: var(--primary-button-fg, #faf9f5);
   --radius: 0.875rem;
+}
+
+h1,
+h2 {
+  font-family: var(--font-display);
+  font-weight: 500;
+  letter-spacing: normal;
 }
 
 html,
@@ -59,8 +70,8 @@ body,
 body {
   margin: 0;
   overflow: hidden;
-  background: var(--app-bg, #151619);
-  color: var(--text, rgba(255, 255, 255, 0.94));
+  background: var(--app-bg, #141413);
+  color: var(--text, rgba(250, 249, 245, 0.94));
 }
 
 #root {

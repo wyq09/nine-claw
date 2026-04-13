@@ -64,6 +64,7 @@ use agent_workspace::AgentWorkspaceBundle;
 use agents::{AgentInput, AgentRecord, ConversationAgentConfig};
 use channels::factory::ChannelConfig;
 use channels::manager::ChannelManager;
+use channels::pi_bridge::{PiBridge, PiProcessOutcome};
 use channels::types::{MediaPayload, MediaType};
 use channels::wechat::WeChatChannel;
 use chat_attachments::{ChatAttachmentUpload, PersistedChatAttachment};
@@ -1789,6 +1790,66 @@ fn upsert_usage_record_from_snapshot(
     Ok(())
 }
 
+/// Persists PI/LLM token usage from scheduler-driven runs (任务中心 / 心跳定时) into `token_usage_records`.
+pub(crate) fn record_token_usage_for_scheduler_pi_completion(
+    app: &tauri::AppHandle,
+    turn_id: String,
+    session_label_id: &str,
+    agent: &crate::agents::AgentRecord,
+    session_model: &str,
+    usage: Option<PiTokenUsagePayload>,
+    usage_meta: Option<PiUsageMetadataPayload>,
+) -> Result<(), String> {
+    let Some(usage_payload) = usage else {
+        return Ok(());
+    };
+    if usage_row_total_tokens(&usage_payload) == 0 {
+        return Ok(());
+    }
+
+    let recorded_at = chrono_like_timestamp();
+    let mut usage_value =
+        serde_json::to_value(&usage_payload).map_err(|e| format!("序列化 scheduler usage 失败: {e}"))?;
+    if let Some(meta) = usage_meta {
+        if let serde_json::Value::Object(ref mut map) = usage_value {
+            if let Some(ref v) = meta.api {
+                map.insert("api".into(), serde_json::Value::String(v.clone()));
+            }
+            if let Some(ref v) = meta.provider {
+                map.insert("provider".into(), serde_json::Value::String(v.clone()));
+            }
+            if let Some(ref v) = meta.model {
+                map.insert("model".into(), serde_json::Value::String(v.clone()));
+            }
+            if let Some(ref v) = meta.response_id {
+                map.insert("responseId".into(), serde_json::Value::String(v.clone()));
+            }
+            if let Some(v) = meta.timestamp {
+                map.insert("timestamp".into(), serde_json::json!(v));
+            }
+        }
+    }
+
+    let turn = serde_json::json!({
+        "id": turn_id,
+        "createdAt": recorded_at,
+        "completedAt": recorded_at,
+        "usage": usage_value,
+    });
+
+    let connection = open_history_db(app)?;
+    ensure_token_usage_schema(&connection)?;
+    upsert_usage_record_from_snapshot(
+        &connection,
+        session_label_id,
+        Some(agent.id.as_str()),
+        Some(agent.name.as_str()),
+        Some(session_model),
+        &turn,
+        recorded_at,
+    )
+}
+
 fn sync_usage_records_from_history_payload(
     connection: &mut Connection,
     payload: &str,
@@ -2193,6 +2254,133 @@ fn update_agent_task(
 #[tauri::command]
 fn run_agent_task_now(app: tauri::AppHandle, task_id: String) -> Result<(), String> {
     scheduler::trigger_agent_task_now(&app, &task_id)
+}
+
+const TASK_METADATA_LLM_CHUNK: usize = 512;
+
+fn clamp_display_chars(value: &str, max_chars: usize) -> String {
+    let t = value.trim();
+    if t.chars().count() <= max_chars {
+        return t.to_string();
+    }
+    t.chars().take(max_chars).collect()
+}
+
+fn parse_agent_task_metadata_llm_output(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    let slice = &trimmed[start..=end];
+    let v: serde_json::Value = serde_json::from_str(slice).ok()?;
+    let title = v
+        .get("title")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let summary = v
+        .get("summary")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    Some((
+        clamp_display_chars(&title, 28),
+        clamp_display_chars(&summary, 120),
+    ))
+}
+
+/// 用智能体绑定的模型把任务正文改写成列表标题 + 一句话介绍；失败返回 `None`（由调用方回退）。
+pub(crate) fn refine_agent_task_metadata(
+    app: &AppHandle,
+    agent_id: &str,
+    goal: &str,
+    task_type: &str,
+    schedule_hint: &str,
+) -> Option<(String, String)> {
+    if std::env::var("NINECLAW_SKIP_TASK_METADATA_LLM")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let goal = goal.trim();
+    if goal.is_empty() {
+        return None;
+    }
+    let record = agents::get_agent_record(app, agent_id).ok().flatten()?;
+    let agent_config = agents::get_conversation_agent_config(app, agent_id).ok().flatten()?;
+    let runtime = resolve_im_llm_runtime(
+        app,
+        &record.default_provider_id,
+        &record.default_model,
+    )
+    .ok()?;
+    let base_normalized = normalized_provider_runtime_base_url(
+        &runtime.base_url,
+        &runtime.api_format,
+        &runtime.provider_id,
+    );
+    let pi_rt = pi_runtime::require_pi_runtime_location(app).ok()?;
+    let bridge = PiBridge::new(
+        pi_rt,
+        &runtime.provider_id,
+        &runtime.api_format,
+        &base_normalized,
+        &runtime.api_key,
+        &runtime.model,
+        Some(agent_config),
+    );
+    let channel_id = format!("nc:taskmeta:{agent_id}");
+    let user_id = format!("refine_{}", uuid::Uuid::new_v4().simple());
+    let task_type_label = match task_type.trim() {
+        "reminder" => "reminder（到点仅提醒）",
+        "agent_prompt" => "agent_prompt（到点由智能体执行）",
+        other => other,
+    };
+    let prompt = format!(
+        "你是 NineClaw 定时任务在列表里的展示文案编辑。根据「任务正文」生成 **title**（列表标题）和 **summary**（一句话介绍）。\n\
+不要执行任何任务、不要编造正文中没有的需求、不要输出思考过程。\n\
+规则：\n\
+- title：4～20 个字左右的短名，不用书名号，不要用「定时任务」开头\n\
+- summary：20～100 字，概括要做什么或提醒什么；不要逐字复制正文开头；具体触发时间已在其它列展示，summary 里不必重复钟点\n\
+\n\
+任务类型：{task_type_label}\n\
+调度（帮助理解语境）：{schedule_hint}\n\
+\n\
+任务正文：\n\
+{goal}\n\
+\n\
+只输出一行合法 JSON，不要 markdown 代码块，格式：{{\"title\":\"...\",\"summary\":\"...\"}}"
+    );
+    let outcome = bridge
+        .process_message_interruptible(
+            &channel_id,
+            &user_id,
+            &prompt,
+            TASK_METADATA_LLM_CHUNK,
+            |_| {},
+            |_| {},
+        )
+        .ok()?;
+    let text = match outcome {
+        PiProcessOutcome::Completed(r) => r.full_text,
+        PiProcessOutcome::Aborted => return None,
+    };
+    let parsed = parse_agent_task_metadata_llm_output(&text);
+    if parsed.is_none() {
+        dev_trace(
+            "task.meta",
+            format!(
+                "LLM 元数据解析失败，输出前 200 字：{}",
+                text.chars().take(200).collect::<String>()
+            ),
+        );
+    }
+    parsed
 }
 
 pub(crate) fn chrono_like_timestamp() -> i64 {
@@ -5351,6 +5539,7 @@ async fn bot_send_media(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             dev_trace("app", "NineClaw 启动");
             resize_main_window_to_screen(&app.handle());

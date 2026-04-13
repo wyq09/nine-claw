@@ -9,6 +9,24 @@ const DEFAULT_AGENT_STATE_KEY: &str = "default_agent_id";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentScenarioLlmSlot {
+    #[serde(default)]
+    pub provider_id: String,
+    #[serde(default)]
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentScenarioLlmConfig {
+    #[serde(default)]
+    pub title_generation: Option<AgentScenarioLlmSlot>,
+    #[serde(default)]
+    pub memory_extraction: Option<AgentScenarioLlmSlot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentCollaborationConfig {
     #[serde(default)]
     pub allowed_delegate_agent_ids: Vec<String>,
@@ -38,6 +56,8 @@ pub struct AgentRecord {
     pub bot_configs: HashMap<String, AgentBotConfig>,
     #[serde(default)]
     pub heartbeat_config: AgentHeartbeatConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario_llm_config: Option<AgentScenarioLlmConfig>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -64,6 +84,8 @@ pub struct AgentInput {
     pub bot_configs: HashMap<String, AgentBotConfig>,
     #[serde(default)]
     pub heartbeat_config: AgentHeartbeatConfig,
+    #[serde(default)]
+    pub scenario_llm_config: Option<AgentScenarioLlmConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,6 +209,8 @@ pub struct ConversationAgentConfig {
     pub collaboration_config: Option<AgentCollaborationConfig>,
     #[serde(default)]
     pub accent_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario_llm_config: Option<AgentScenarioLlmConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +293,7 @@ pub fn get_conversation_agent_config(
         execution_mode: record.execution_mode,
         collaboration_config: record.collaboration_config,
         accent_color: record.accent_color,
+        scenario_llm_config: record.scenario_llm_config.clone(),
     }))
 }
 
@@ -429,6 +454,7 @@ fn ensure_agents_schema(connection: &Connection) -> Result<(), String> {
         .map_err(|error| format!("初始化智能体数据表失败: {error}"))?;
 
     add_agents_column_if_missing(connection, "heartbeat_config_json", "TEXT")?;
+    add_agents_column_if_missing(connection, "scenario_llm_config_json", "TEXT")?;
     crate::heartbeat::ensure_heartbeat_schema(connection)?;
 
     Ok(())
@@ -478,8 +504,8 @@ fn seed_builtin_agents(connection: &Connection) -> Result<(), String> {
                 "INSERT OR IGNORE INTO agents (
                 id, name, summary, description, system_prompt, default_provider_id,
                 default_model, is_builtin, is_archived, execution_mode,
-                collaboration_config_json, heartbeat_config_json, accent_color, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, 'single', NULL, NULL, ?8, ?9, ?9)",
+                collaboration_config_json, heartbeat_config_json, accent_color, scenario_llm_config_json, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, 'single', NULL, NULL, ?8, NULL, ?9, ?9)",
                 params![
                     seed.id,
                     seed.name,
@@ -598,6 +624,7 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
                 collaboration_config_json,
                 heartbeat_config_json,
                 accent_color,
+                scenario_llm_config_json,
                 created_at,
                 updated_at
             FROM agents
@@ -627,9 +654,10 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
                 collaboration_config: deserialize_collaboration_config(row.get(10)?),
                 heartbeat_config: deserialize_heartbeat_config(row.get(11)?),
                 accent_color: row.get(12)?,
+                scenario_llm_config: deserialize_scenario_llm_config(row.get(13)?),
                 bot_configs: HashMap::new(),
-                created_at: row.get(13)?,
-                updated_at: row.get(14)?,
+                created_at: row.get(14)?,
+                updated_at: row.get(15)?,
             })
         })
         .map_err(|error| format!("解析智能体列表失败: {error}"))?;
@@ -703,6 +731,7 @@ fn get_active_agent_by_id(
                 collaboration_config_json,
                 heartbeat_config_json,
                 accent_color,
+                scenario_llm_config_json,
                 created_at,
                 updated_at
             FROM agents
@@ -727,9 +756,10 @@ fn get_active_agent_by_id(
                 collaboration_config: deserialize_collaboration_config(row.get(10)?),
                 heartbeat_config: deserialize_heartbeat_config(row.get(11)?),
                 accent_color: row.get(12)?,
+                scenario_llm_config: deserialize_scenario_llm_config(row.get(13)?),
                 bot_configs: HashMap::new(),
-                created_at: row.get(13)?,
-                updated_at: row.get(14)?,
+                created_at: row.get(14)?,
+                updated_at: row.get(15)?,
             })
         })
         .optional()
@@ -814,6 +844,7 @@ fn create_agent_with_connection(
     let collaboration_json =
         serialize_collaboration_config(normalized.collaboration_config.as_ref())?;
     let heartbeat_json = serialize_heartbeat_config(&normalized.heartbeat_config)?;
+    let scenario_json = serialize_scenario_llm_config(&normalized.scenario_llm_config)?;
 
     let transaction = connection
         .transaction()
@@ -824,8 +855,8 @@ fn create_agent_with_connection(
             "INSERT INTO agents (
                 id, name, summary, description, system_prompt, default_provider_id,
                 default_model, is_builtin, is_archived, execution_mode,
-                collaboration_config_json, heartbeat_config_json, accent_color, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, ?10, ?11, ?12, ?12)",
+                collaboration_config_json, heartbeat_config_json, accent_color, scenario_llm_config_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
             params![
                 agent_id.as_str(),
                 normalized.name.as_str(),
@@ -838,6 +869,7 @@ fn create_agent_with_connection(
                 collaboration_json,
                 heartbeat_json,
                 normalized.accent_color.as_deref(),
+                scenario_json,
                 now,
             ],
         )
@@ -875,6 +907,7 @@ fn update_agent_with_connection(
     let collaboration_json =
         serialize_collaboration_config(normalized.collaboration_config.as_ref())?;
     let heartbeat_json = serialize_heartbeat_config(&normalized.heartbeat_config)?;
+    let scenario_json = serialize_scenario_llm_config(&normalized.scenario_llm_config)?;
 
     let transaction = connection
         .transaction()
@@ -894,7 +927,8 @@ fn update_agent_with_connection(
                 collaboration_config_json = ?9,
                 heartbeat_config_json = ?10,
                 accent_color = ?11,
-                updated_at = ?12
+                scenario_llm_config_json = ?12,
+                updated_at = ?13
             WHERE id = ?1 AND is_archived = 0",
             params![
                 agent_id,
@@ -908,6 +942,7 @@ fn update_agent_with_connection(
                 collaboration_json,
                 heartbeat_json,
                 normalized.accent_color,
+                scenario_json,
                 now,
             ],
         )
@@ -1285,6 +1320,7 @@ fn normalize_agent_input(payload: AgentInput) -> Result<NormalizedAgentInput, St
             .filter(|color| !color.is_empty()),
         bot_configs: normalize_bot_configs(payload.bot_configs)?,
         heartbeat_config: normalize_heartbeat_config(payload.heartbeat_config)?,
+        scenario_llm_config: normalize_scenario_llm_config(payload.scenario_llm_config),
     })
 }
 
@@ -1445,6 +1481,54 @@ fn deserialize_heartbeat_config(raw: Option<String>) -> AgentHeartbeatConfig {
     raw.and_then(|value| serde_json::from_str::<AgentHeartbeatConfig>(&value).ok())
         .and_then(|config| normalize_heartbeat_config(config).ok())
         .unwrap_or_default()
+}
+
+fn normalize_scenario_llm_slot(slot: Option<AgentScenarioLlmSlot>) -> Option<AgentScenarioLlmSlot> {
+    let slot = slot?;
+    let provider_id = slot.provider_id.trim().to_string();
+    let model = slot.model.trim().to_string();
+    if provider_id.is_empty() || model.is_empty() {
+        None
+    } else {
+        Some(AgentScenarioLlmSlot { provider_id, model })
+    }
+}
+
+fn normalize_scenario_llm_config(
+    config: Option<AgentScenarioLlmConfig>,
+) -> Option<AgentScenarioLlmConfig> {
+    let config = config.unwrap_or_default();
+    let title_generation = normalize_scenario_llm_slot(config.title_generation);
+    let memory_extraction = normalize_scenario_llm_slot(config.memory_extraction);
+    if title_generation.is_none() && memory_extraction.is_none() {
+        None
+    } else {
+        Some(AgentScenarioLlmConfig {
+            title_generation,
+            memory_extraction,
+        })
+    }
+}
+
+fn serialize_scenario_llm_config(
+    config: &Option<AgentScenarioLlmConfig>,
+) -> Result<Option<String>, String> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    serde_json::to_string(config)
+        .map(Some)
+        .map_err(|error| format!("序列化场景模型配置失败: {error}"))
+}
+
+fn deserialize_scenario_llm_config(raw: Option<String>) -> Option<AgentScenarioLlmConfig> {
+    let raw = raw?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed: AgentScenarioLlmConfig = serde_json::from_str(trimmed).ok()?;
+    normalize_scenario_llm_config(Some(parsed))
 }
 
 fn normalize_heartbeat_config(
@@ -1727,6 +1811,7 @@ struct NormalizedAgentInput {
     accent_color: Option<String>,
     bot_configs: HashMap<String, AgentBotConfig>,
     heartbeat_config: AgentHeartbeatConfig,
+    scenario_llm_config: Option<AgentScenarioLlmConfig>,
 }
 
 fn sync_active_agent_workspaces(connection: &Connection) -> Result<(), String> {
@@ -1810,6 +1895,7 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
                 collaboration_config_json,
                 heartbeat_config_json,
                 accent_color,
+                scenario_llm_config_json,
                 created_at,
                 updated_at
             FROM agents
@@ -1835,9 +1921,10 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
                 collaboration_config: deserialize_collaboration_config(row.get(10)?),
                 heartbeat_config: deserialize_heartbeat_config(row.get(11)?),
                 accent_color: row.get(12)?,
+                scenario_llm_config: deserialize_scenario_llm_config(row.get(13)?),
                 bot_configs: HashMap::new(),
-                created_at: row.get(13)?,
-                updated_at: row.get(14)?,
+                created_at: row.get(14)?,
+                updated_at: row.get(15)?,
             })
         })
         .map_err(|error| format!("读取同步用 agent 数据失败: {error}"))?;
@@ -1887,6 +1974,7 @@ mod tests {
                 accent_color: Some("#112233".to_string()),
                 bot_configs: HashMap::new(),
                 heartbeat_config: AgentHeartbeatConfig::default(),
+                scenario_llm_config: None,
             },
         )
         .expect("create agent");
@@ -1917,6 +2005,7 @@ mod tests {
                 accent_color: None,
                 bot_configs: HashMap::new(),
                 heartbeat_config: AgentHeartbeatConfig::default(),
+                scenario_llm_config: None,
             },
         )
         .expect("update agent");
@@ -1952,6 +2041,7 @@ mod tests {
                 accent_color: None,
                 bot_configs: HashMap::new(),
                 heartbeat_config: AgentHeartbeatConfig::default(),
+                scenario_llm_config: None,
             },
         )
         .expect("create agent");
@@ -1992,6 +2082,7 @@ mod tests {
                 accent_color: None,
                 bot_configs: HashMap::new(),
                 heartbeat_config: AgentHeartbeatConfig::default(),
+                scenario_llm_config: None,
             },
         )
         .expect("create custom");
@@ -2029,6 +2120,7 @@ mod tests {
             execution_mode: "single".to_string(),
             collaboration_config: None,
             accent_color: None,
+            scenario_llm_config: None,
         })
         .expect("prompt");
 
@@ -2083,6 +2175,7 @@ mod tests {
                         target_label: "自己".to_string(),
                     }],
                 },
+                scenario_llm_config: None,
             },
         )
         .expect("create agent");
