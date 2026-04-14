@@ -371,7 +371,6 @@ export function AgentWorkspaceDialog({
     'shared',
     'private',
     'memoryIndex',
-    'categoryMemory',
     'dailyLog',
     'wiki',
   ]

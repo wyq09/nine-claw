@@ -11,11 +11,8 @@ const DEFAULT_WORKSPACE_RELATIVE_PATH: &str = ".nineclaw/workspace";
 const LEGACY_WORKSPACE_RELATIVE_PATH: &str = ".openclaw/workspace";
 const PRIMARY_WORKSPACE_ROOT_ENV: &str = "NINECLAW_WORKSPACE_ROOT";
 const LEGACY_WORKSPACE_ROOT_ENVS: &[&str] = &["NINECLAW_AGENT_WORKSPACE_ROOT"];
-/// 设为 `1` / `true` / `yes` 时，每次 ingest 仍向 `memory/categories/*.md` 追加条目（易成流水账；默认关闭）。
-const APPEND_CATEGORY_MEMORY_ENV: &str = "NINECLAW_APPEND_CATEGORY_MEMORY_ON_INGEST";
 const TEMPLATE_DIR: &str = "agents/_template";
 const LEGACY_TEMPLATE_DIR: &str = "agents/_templates";
-const CATEGORY_MEMORY_DIR: &str = "memory/categories";
 const WORKSPACE_SYSTEM_PROMPT_CHAR_LIMIT: usize = 1600;
 const ROOT_FILES: &[&str] = &[
     "AGENTS.md",
@@ -50,22 +47,8 @@ const AGENT_TEMPLATE_FILES: &[&str] = &[
     "WORKING.md",
     "DECISIONS.md",
     "PUBLIC_CONTEXT.md",
-    "memory/INDEX.md",
-    "memory/REVIEW_QUEUE.md",
-    "memory/LINT.md",
     "memory/SOURCE_INDEX.md",
-    "memory/LOG.md",
     "memory/DAILY_INDEX.md",
-    "memory/categories/INDEX.md",
-    "memory/categories/general.md",
-    "memory/categories/user_profile.md",
-    "memory/categories/preferences.md",
-    "memory/categories/projects.md",
-    "memory/categories/commitments.md",
-    "memory/categories/decisions.md",
-    "memory/categories/relationships.md",
-    "memory/categories/pitfalls.md",
-    "memory/categories/inferences.md",
     "wiki/INDEX.md",
 ];
 const SHARED_VIEW_FILES: &[&str] = &[
@@ -98,15 +81,6 @@ struct MemoryCategoryDefinition {
     description: &'static str,
     storage_keywords: &'static [&'static str],
     query_keywords: &'static [&'static str],
-}
-
-fn append_category_memory_on_ingest() -> bool {
-    std::env::var(APPEND_CATEGORY_MEMORY_ENV)
-        .map(|value| {
-            let value = value.trim().to_lowercase();
-            matches!(value.as_str(), "1" | "true" | "yes")
-        })
-        .unwrap_or(false)
 }
 
 const MEMORY_CATEGORY_DEFINITIONS: &[MemoryCategoryDefinition] = &[
@@ -487,8 +461,7 @@ pub fn ensure_agent_workspace(
     }
 
     cleanup_generated_bootstrap(&agent_home, seed)?;
-    ensure_category_memory_scaffold(&agent_home)?;
-    memory_wiki::refresh_memory_wiki(&agent_home)?;
+    memory_wiki::ensure_memory_wiki_scaffold(&agent_home)?;
 
     Ok(agent_home)
 }
@@ -561,11 +534,11 @@ pub fn build_workspace_system_prompt_for_query(
             .to_string(),
     );
     sections.push(
-        "写回：短期写 WORKING.md；长期请整理 memory/categories/*.md、DECISIONS.md、PUBLIC_CONTEXT.md、wiki/*.md。MEMORY.md 只保留启动最小记忆；对话 ingest 默认写 raw、daily、SOURCE_INDEX/LOG、REVIEW_QUEUE 与 WORKING，不自动写 MEMORY.md。若需恢复每次对话追加分类，设置环境变量 NINECLAW_APPEND_CATEGORY_MEMORY_ON_INGEST=1。"
+        "写回：短期写 WORKING.md（含 OPEN_LOOPS 和复查项）；长期整理 DECISIONS.md、PITFALLS.md、PUBLIC_CONTEXT.md、wiki/*.md。MEMORY.md 只保留启动最小记忆；对话 ingest 默认写 raw、daily、SOURCE_INDEX 与 WORKING，不自动写 MEMORY.md。"
             .to_string(),
     );
     sections.push(
-        "检索顺序：先判断是否真的需要查记忆；任务与未闭环优先看 WORKING.md 的 `Current Focus` / `OPEN_LOOPS`；规则优先看 DECISIONS.md 与 PITFALLS.md；用户风格优先看 MEMORY.md 与 USER_MODEL.md；人物关系优先看 RELATIONSHIP_MAP.md 与 relationships；没有证据就不要装记得。"
+        "检索顺序：先判断是否真的需要查记忆；任务与未闭环优先看 WORKING.md 的 `Current Focus` / `OPEN_LOOPS`；规则优先看 DECISIONS.md 与 PITFALLS.md；用户风格优先看 MEMORY.md 与 USER_MODEL.md；人物关系优先看 RELATIONSHIP_MAP.md；没有证据就不要装记得。"
             .to_string(),
     );
     sections.push(
@@ -582,11 +555,6 @@ pub fn build_workspace_system_prompt_for_query(
         build_specialized_memory_snapshot(&root, agent_id, current_prompt)?
     {
         sections.push(specialized_snapshot);
-    }
-    if let Some(category_snapshot) =
-        build_categorized_memory_snapshot(&root, agent_id, current_prompt)?
-    {
-        sections.push(category_snapshot);
     }
     if let Some(daily_index_snapshot) =
         build_daily_digest_retrieval_snapshot(&root, agent_id, current_prompt)?
@@ -703,9 +671,6 @@ pub fn read_agent_workspace_bundle(agent_id: &str) -> Result<AgentWorkspaceBundl
     let mut memory_wiki_files = memory_wiki::read_memory_wiki_files(&root, agent_id)?;
     files.append(&mut memory_wiki_files);
 
-    let mut category_files = read_agent_category_memory_files(&root, agent_id)?;
-    files.append(&mut category_files);
-
     let mut wiki_files = read_agent_wiki_files(&root, agent_id)?;
     files.append(&mut wiki_files);
 
@@ -750,7 +715,6 @@ pub fn append_agent_memory_entry(
     let agent_home = root.join("agents").join(agent_id);
     fs::create_dir_all(agent_home.join("memory"))
         .map_err(|error| format!("创建 agent memory 目录失败: {error}"))?;
-    ensure_category_memory_scaffold(&agent_home)?;
     memory_wiki::ensure_memory_wiki_scaffold(&agent_home)?;
 
     let timestamp = current_timestamp_label();
@@ -779,19 +743,28 @@ pub fn append_agent_memory_entry(
         &source_ref,
         &categories,
     );
-    fs::write(
-        &working_path,
-        upsert_working_open_loops(
-            &working_with_context,
-            &build_open_loop_entries(
-                user_message,
-                assistant_message,
-                &ingest_summary,
-                &categories,
-            ),
+    let working_with_loops = upsert_working_open_loops(
+        &working_with_context,
+        &build_open_loop_entries(
+            user_message,
+            assistant_message,
+            &ingest_summary,
+            &categories,
         ),
-    )
-    .map_err(|error| format!("写入 WORKING.md 失败: {error}"))?;
+    );
+    // REVIEW_QUEUE 已合并到 WORKING.md：把复查项追加到 OPEN_LOOPS
+    let working_with_review = upsert_working_review_items(
+        &working_with_loops,
+        &build_review_items_for_working(
+            user_message,
+            assistant_message,
+            &ingest_summary,
+            &categories,
+            &source_ref,
+        ),
+    );
+    fs::write(&working_path, working_with_review)
+        .map_err(|error| format!("写入 WORKING.md 失败: {error}"))?;
 
     append_pitfall_entries(
         &agent_home,
@@ -799,9 +772,6 @@ pub fn append_agent_memory_entry(
     )?;
 
     // MEMORY.md 不再自动写入 — 仅保留人设和核心原则，由用户手动编辑
-    if append_category_memory_on_ingest() {
-        append_category_memory_entries(&agent_home, agent_id, &category_notes, &source_ref)?;
-    }
 
     let daily_log_path = agent_home
         .join("memory")
@@ -829,19 +799,6 @@ pub fn append_agent_memory_entry(
         &ingest_summary,
         &categories,
     )?;
-
-    append_review_queue_entries(
-        &agent_home,
-        &build_review_queue_items(
-            user_message,
-            assistant_message,
-            &ingest_summary,
-            &categories,
-            &source_ref,
-        ),
-    )?;
-
-    memory_wiki::refresh_memory_wiki(&agent_home)?;
 
     Ok(())
 }
@@ -903,7 +860,6 @@ pub fn register_agent_attachment_source(
         &attachment_message,
         &[],
     )?;
-    memory_wiki::refresh_memory_wiki(&agent_home)?;
     Ok(())
 }
 
@@ -1174,7 +1130,6 @@ pub fn register_agent_outbound_artifact_source(
         &artifact_message,
         &[],
     )?;
-    memory_wiki::refresh_memory_wiki(&agent_home)?;
     Ok(())
 }
 
@@ -1404,47 +1359,6 @@ fn build_specialized_memory_snapshot(
     }
 }
 
-fn build_categorized_memory_snapshot(
-    root: &Path,
-    agent_id: &str,
-    current_prompt: Option<&str>,
-) -> Result<Option<String>, String> {
-    let agent_home = root.join("agents").join(agent_id);
-    ensure_category_memory_scaffold(&agent_home)?;
-
-    let selected_categories = select_memory_categories_for_query(current_prompt);
-    let mut selected_labels = Vec::new();
-    let mut sections = Vec::new();
-
-    for category in selected_categories.into_iter().take(2) {
-        let path = category_memory_file_path(&agent_home, category.key);
-        if !path.exists() {
-            continue;
-        }
-
-        let content = safe_read_trimmed(path, if category.key == "general" { 380 } else { 260 })?;
-        if content.is_empty() {
-            continue;
-        }
-
-        selected_labels.push(category.title);
-        sections.push(format!(
-            "{}（{}）:\n{}",
-            category.title, category.description, content
-        ));
-    }
-
-    if sections.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(format!(
-            "相关分类记忆（{}）：\n{}",
-            selected_labels.join("、"),
-            sections.join("\n\n")
-        )))
-    }
-}
-
 struct DailyIndexRow {
     day: String,
     ts: String,
@@ -1569,98 +1483,6 @@ fn build_daily_digest_retrieval_snapshot(
         matched.join("\n")
     );
     Ok(Some(trim_to_char_limit(&block, 900)))
-}
-
-fn ensure_category_memory_scaffold(agent_home: &Path) -> Result<(), String> {
-    let dir = category_memory_dir(agent_home);
-    fs::create_dir_all(&dir).map_err(|error| format!("创建分类记忆目录失败: {error}"))?;
-
-    let index_path = dir.join("INDEX.md");
-    if !index_path.exists() {
-        fs::write(&index_path, build_category_index_content())
-            .map_err(|error| format!("写入分类记忆索引失败: {error}"))?;
-    }
-
-    Ok(())
-}
-
-fn category_memory_dir(agent_home: &Path) -> PathBuf {
-    agent_home.join(CATEGORY_MEMORY_DIR)
-}
-
-fn category_memory_file_path(agent_home: &Path, key: &str) -> PathBuf {
-    category_memory_dir(agent_home).join(format!("{key}.md"))
-}
-
-fn build_category_index_content() -> String {
-    let mut content = String::from(
-        "# INDEX.md - Memory Categories\n\nUse these shards for curated long-term memory. Do not dump raw conversation logs here.\n\n## Rules\n\n- Prefer the most specific shard.\n- `general.md` is fallback memory, not a junk drawer.\n- `inferences.md` stores tentative conclusions and must not be treated as confirmed fact.\n- `commitments.md` is a ledger of follow-ups, not a brainstorm list.\n\n## Categories\n\n",
-    );
-
-    for category in MEMORY_CATEGORY_DEFINITIONS {
-        let _ = writeln!(
-            content,
-            "- `{}` / `{}`: {}",
-            category.key, category.title, category.description
-        );
-    }
-
-    content
-}
-
-fn build_category_file_template(category: MemoryCategoryDefinition) -> String {
-    format!(
-        "# {}.md\n\n## Purpose\n\n{}\n\n## Schema\n\n{}\n\n## Entries\n\nNo curated entries yet.\n",
-        category.key,
-        category.description,
-        category_schema_block(category)
-    )
-}
-
-fn read_agent_category_memory_files(
-    root: &Path,
-    agent_id: &str,
-) -> Result<Vec<AgentWorkspaceFile>, String> {
-    let category_dir = root.join("agents").join(agent_id).join(CATEGORY_MEMORY_DIR);
-    if !category_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut entries = fs::read_dir(&category_dir)
-        .map_err(|error| format!("读取分类记忆目录失败: {error}"))?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let path = entry.path();
-            let file_name = path.file_name()?.to_str()?.to_string();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-                return None;
-            }
-            Some((file_name, path))
-        })
-        .collect::<Vec<_>>();
-
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-    Ok(entries
-        .into_iter()
-        .map(|(file_name, path)| {
-            let relative_path = PathBuf::from("agents")
-                .join(agent_id)
-                .join("memory")
-                .join("categories")
-                .join(&file_name);
-            let lazy_fetch = !file_name.eq_ignore_ascii_case("INDEX.md");
-            read_workspace_file(
-                "agent",
-                "categoryMemory",
-                &file_name,
-                relative_path,
-                path,
-                false,
-                lazy_fetch,
-            )
-        })
-        .collect())
 }
 
 fn read_agent_wiki_files(root: &Path, agent_id: &str) -> Result<Vec<AgentWorkspaceFile>, String> {
@@ -1828,164 +1650,6 @@ fn contains_memory_recall_signal(content: &str) -> bool {
     )
 }
 
-fn append_category_memory_entries(
-    agent_home: &Path,
-    agent_id: &str,
-    notes: &[(String, String)],
-    source_ref: &str,
-) -> Result<(), String> {
-    ensure_category_memory_scaffold(agent_home)?;
-
-    for (category_key, note) in notes {
-        let Some(category) = memory_category_definition(category_key) else {
-            continue;
-        };
-        let path = category_memory_file_path(agent_home, category.key);
-        let existing = if path.exists() {
-            fs::read_to_string(&path).unwrap_or_default()
-        } else {
-            build_category_file_template(category)
-        };
-
-        fs::write(
-            &path,
-            append_category_memory_file(&existing, category, agent_id, note, source_ref),
-        )
-        .map_err(|error| format!("写入分类记忆 {} 失败: {error}", path.display()))?;
-    }
-
-    Ok(())
-}
-
-fn append_category_memory_file(
-    existing: &str,
-    category: MemoryCategoryDefinition,
-    agent_id: &str,
-    note: &str,
-    source_ref: &str,
-) -> String {
-    let mut next = existing.trim_end().to_string();
-    if !next.contains("## Entries") {
-        next.push_str("\n\n## Entries\n");
-    }
-
-    if next.contains(note) {
-        return format!("{next}\n");
-    }
-
-    if next.contains("No curated entries yet.") {
-        next = next.replace("No curated entries yet.", "");
-    }
-
-    let structured_entry = build_structured_category_entry(category, agent_id, note, source_ref);
-    let _ = writeln!(next, "\n{}", structured_entry.trim_end());
-    next.push('\n');
-    next
-}
-
-fn category_schema_block(category: MemoryCategoryDefinition) -> String {
-    match category.key {
-        "commitments" => "- item: concrete promise or follow-up\n  status: open|blocked|done|dropped\n  owner: agent or person responsible\n  created: YYYY-MM-DD\n  next_check: YYYY-MM-DD\n  blocker: none or dependency\n  source: file#anchor or memory/raw/... path\n  updated: YYYY-MM-DD".to_string(),
-        "inferences" => "- item: inferred tendency or assumption\n  type: inference\n  status: tentative|confirmed|rejected\n  confidence: high|medium|low\n  source: file#anchor or memory/raw/... path\n  updated: YYYY-MM-DD\n  review_at: YYYY-MM-DD".to_string(),
-        _ => format!(
-            "- item: concise memory statement\n  type: {}\n  status: {}\n  confidence: {}\n  source: file#anchor or memory/raw/... path\n  updated: YYYY-MM-DD",
-            category_default_type(category),
-            category_default_status(category),
-            category_default_confidence(category),
-        ),
-    }
-}
-
-fn category_default_type(category: MemoryCategoryDefinition) -> &'static str {
-    match category.key {
-        "user_profile" => "profile_fact",
-        "preferences" => "preference",
-        "projects" => "project_context",
-        "commitments" => "commitment",
-        "decisions" => "decision",
-        "relationships" => "relationship",
-        "pitfalls" => "pitfall",
-        "inferences" => "inference",
-        _ => "general_memory",
-    }
-}
-
-fn category_default_status(category: MemoryCategoryDefinition) -> &'static str {
-    match category.key {
-        "commitments" => "open",
-        "inferences" => "tentative",
-        _ => "active",
-    }
-}
-
-fn category_default_confidence(category: MemoryCategoryDefinition) -> &'static str {
-    match category.key {
-        "projects" | "relationships" | "pitfalls" | "general" | "inferences" => "medium",
-        _ => "high",
-    }
-}
-
-fn build_structured_category_entry(
-    category: MemoryCategoryDefinition,
-    agent_id: &str,
-    note: &str,
-    source_ref: &str,
-) -> String {
-    let item = truncate_for_memory(note.trim(), 220);
-    let today = current_date_label();
-    match category.key {
-        "commitments" => format!(
-            "- item: {}\n  status: {}\n  owner: {}\n  created: {}\n  next_check: {}\n  blocker: {}\n  source: {}\n  updated: {}\n",
-            item,
-            category_default_status(category),
-            agent_id,
-            today,
-            days_from_now_label(3),
-            derive_commitment_blocker(note),
-            source_ref,
-            today,
-        ),
-        "inferences" => format!(
-            "- item: {}\n  type: {}\n  status: {}\n  confidence: {}\n  source: {}\n  updated: {}\n  review_at: {}\n",
-            item,
-            category_default_type(category),
-            category_default_status(category),
-            category_default_confidence(category),
-            source_ref,
-            today,
-            days_from_now_label(7),
-        ),
-        _ => format!(
-            "- item: {}\n  type: {}\n  status: {}\n  confidence: {}\n  source: {}\n  updated: {}\n",
-            item,
-            category_default_type(category),
-            category_default_status(category),
-            category_default_confidence(category),
-            source_ref,
-            today,
-        ),
-    }
-}
-
-fn derive_commitment_blocker(note: &str) -> &'static str {
-    if contains_any_keyword(
-        &normalize_memory_match_text(note),
-        &[
-            "等待",
-            "依赖",
-            "blocked",
-            "blocker",
-            "需要",
-            "待提供",
-            "外部",
-        ],
-    ) {
-        "pending external dependency"
-    } else {
-        "none"
-    }
-}
-
 fn days_from_now_label(days: i64) -> String {
     use chrono::{Duration, Local};
     (Local::now().date_naive() + Duration::days(days))
@@ -2094,42 +1758,6 @@ fn dedupe_review_queue_items(items: Vec<ReviewQueueItem>) -> Vec<ReviewQueueItem
     deduped
 }
 
-fn append_review_queue_entries(agent_home: &Path, items: &[ReviewQueueItem]) -> Result<(), String> {
-    if items.is_empty() {
-        return Ok(());
-    }
-
-    let path = agent_home.join("memory").join("REVIEW_QUEUE.md");
-    let existing =
-        fs::read_to_string(&path).unwrap_or_else(|_| fallback_template("memory/REVIEW_QUEUE.md"));
-    fs::write(&path, append_review_queue_file(&existing, items))
-        .map_err(|error| format!("写入 REVIEW_QUEUE.md 失败: {error}"))
-}
-
-fn append_review_queue_file(existing: &str, items: &[ReviewQueueItem]) -> String {
-    let mut next = existing.trim_end().to_string();
-    if !next.contains("## Entries") {
-        next.push_str("\n\n## Entries\n");
-    }
-    if next.contains("No scheduled review yet.") {
-        next = next.replace("No scheduled review yet.", "");
-    }
-
-    for item in items {
-        if next.contains(&item.item) && next.contains(&item.source) {
-            continue;
-        }
-        let _ = writeln!(next, "\n- item: {}", item.item);
-        let _ = writeln!(next, "  status: {}", item.status);
-        let _ = writeln!(next, "  review_at: {}", item.review_at);
-        let _ = writeln!(next, "  reason: {}", item.reason);
-        let _ = writeln!(next, "  source: {}", item.source);
-        let _ = writeln!(next, "  updated: {}", item.updated);
-    }
-
-    next.push('\n');
-    next
-}
 
 fn safe_read_trimmed(path: PathBuf, limit: usize) -> Result<String, String> {
     if !path.exists() {
@@ -2353,6 +1981,21 @@ fn resolve_readable_workspace_path(
             return Ok(root.join(file_name));
         }
     }
+    // 迁移兼容：允许读取已下线的 memory/categories/*.md 文件（只读）
+    if normalized.len() == 5
+        && normalized[0] == "agents"
+        && normalized[1] == agent_id
+        && normalized[2] == "memory"
+        && normalized[3] == "categories"
+        && normalized[4].ends_with(".md")
+    {
+        return Ok(root
+            .join("agents")
+            .join(agent_id)
+            .join("memory")
+            .join("categories")
+            .join(&normalized[4]));
+    }
     resolve_writable_workspace_path(root, agent_id, relative_path)
 }
 
@@ -2392,21 +2035,6 @@ fn classify_workspace_file_for_read(
         return Ok(("agent".to_string(), section.to_string(), name, false));
     }
 
-    if normalized.len() == 5
-        && normalized[0] == "agents"
-        && normalized[1] == agent_id
-        && normalized[2] == "memory"
-        && normalized[3] == "categories"
-    {
-        let name = normalized[4].clone();
-        return Ok((
-            "agent".to_string(),
-            "categoryMemory".to_string(),
-            name,
-            false,
-        ));
-    }
-
     if normalized.len() >= 4
         && normalized[0] == "agents"
         && normalized[1] == agent_id
@@ -2421,6 +2049,18 @@ fn classify_workspace_file_for_read(
             .unwrap_or("wiki.md")
             .to_string();
         return Ok(("agent".to_string(), "wiki".to_string(), name, false));
+    }
+
+    // 迁移兼容：旧 categories 文件仍可读（只读，映射到 memoryIndex）
+    if normalized.len() == 5
+        && normalized[0] == "agents"
+        && normalized[1] == agent_id
+        && normalized[2] == "memory"
+        && normalized[3] == "categories"
+        && normalized[4].ends_with(".md")
+    {
+        let name = normalized[4].clone();
+        return Ok(("agent".to_string(), "memoryIndex".to_string(), name, true));
     }
 
     Err("路径不在当前智能体可读 workspace 范围内".to_string())
@@ -2462,21 +2102,6 @@ fn resolve_writable_workspace_path(
             .join(agent_id)
             .join("memory")
             .join(&normalized[3]));
-    }
-
-    if normalized.len() == 5
-        && normalized[0] == "agents"
-        && normalized[1] == agent_id
-        && normalized[2] == "memory"
-        && normalized[3] == "categories"
-        && normalized[4].ends_with(".md")
-    {
-        return Ok(root
-            .join("agents")
-            .join(agent_id)
-            .join("memory")
-            .join("categories")
-            .join(&normalized[4]));
     }
 
     if normalized.len() >= 4
@@ -2955,6 +2580,63 @@ fn upsert_working_open_loops(existing: &str, open_loops: &[String]) -> String {
     next
 }
 
+/// REVIEW_QUEUE 合并到 WORKING.md：在 `## REVIEW_ITEMS` 下追加复查项。
+fn upsert_working_review_items(existing: &str, items: &[String]) -> String {
+    if items.is_empty() {
+        return existing.to_string();
+    }
+    let marker = "## REVIEW_ITEMS";
+    let mut entries = extract_section_bullets(existing, marker)
+        .into_iter()
+        .filter(|item| !item.contains("No review items yet"))
+        .collect::<Vec<_>>();
+
+    for item in items {
+        if entries
+            .iter()
+            .any(|existing| existing.trim().eq_ignore_ascii_case(item.trim()))
+        {
+            continue;
+        }
+        entries.push(item.trim().to_string());
+    }
+
+    if entries.len() > 8 {
+        entries = entries.split_off(entries.len() - 8);
+    }
+
+    let cleaned = strip_markdown_section(existing, marker);
+    let mut next = cleaned.trim_end().to_string();
+    next.push_str(&format!("\n\n{marker}\n"));
+
+    if entries.is_empty() {
+        next.push_str("\n- No review items yet.\n");
+    } else {
+        for entry in entries {
+            next.push_str(&format!("\n- {}\n", entry));
+        }
+    }
+    next.push('\n');
+    next
+}
+
+/// 从 ingest 内容中提取需要复查的项目（原 REVIEW_QUEUE 逻辑，现合并到 WORKING.md）。
+fn build_review_items_for_working(
+    user_message: &str,
+    assistant_message: &str,
+    summary: &str,
+    categories: &[MemoryCategoryDefinition],
+    source_ref: &str,
+) -> Vec<String> {
+    let items = build_review_queue_items(user_message, assistant_message, summary, categories, source_ref);
+    items.into_iter().map(|item| {
+        format!(
+            "[{}] {}（reason: {}，review_at: {}，source: `{}`）",
+            item.status, item.item, item.reason, item.review_at, item.source
+        )
+    }).collect()
+}
+
 #[derive(Clone)]
 struct PitfallEntry {
     item: String,
@@ -3151,7 +2833,7 @@ fn fallback_template(file_name: &str) -> String {
     match file_name {
         "IDENTITY.md" => "# IDENTITY.md\n\n- **Agent ID:** {{AGENT_ID}}\n- **Name:** {{AGENT_NAME}}\n- **Creature:** 智能体\n- **Vibe:** 高效、直接、少废话\n- **Accent Color:** {{AGENT_ACCENT_COLOR}}\n\n## Identity Notes\n\n- Summary: {{AGENT_SUMMARY}}\n".to_string(),
         "ROLE.md" => "# ROLE.md\n\n## Mission\n\n{{AGENT_DESCRIPTION}}\n\n## Ownership\n\n- Define ownership here.\n\n## Do Not\n\n- Leak private memory.\n- Confuse tentative memory with confirmed facts.\n- Act externally without confirmation.\n".to_string(),
-        "MEMORY.md" => "# MEMORY.md\n\n这是 `{{AGENT_NAME}}` 的最小启动记忆，只保留高频、稳定、开局就该知道的内容。\n\n## Identity Anchor\n\n- Agent name: {{AGENT_NAME}}\n- Summary: {{AGENT_SUMMARY}}\n\n## Core Principles\n\n- 保持直接、准确、可执行。\n- 推断和事实必须分层；不确定就直说。\n- 承诺要进入账本并持续跟进。\n\n## Stable Preferences\n\n- 在这里放高频、稳定、明确确认过的偏好。\n\n## Relationship Anchors\n\n- 在这里放最稳定、最高频的人物关系锚点。\n\n## Current Theme Anchors\n\n- 只放最近一段时间持续重要的主题，不放流水账。\n\n## Routing\n\n- 当前任务与未闭环：`WORKING.md`\n- 稳定规则与约定：`DECISIONS.md`\n- 用户长期模型：`USER_MODEL.md`\n- 关系图：`RELATIONSHIP_MAP.md`\n- 高风险坑点：`PITFALLS.md`\n- 详细长期记忆：`memory/categories/*.md`\n- 承诺与复查：`memory/categories/commitments.md`、`memory/REVIEW_QUEUE.md`\n- 外部知识：`wiki/INDEX.md`\n\n> 此文件不会在对话过程中被自动修改。如需调整，请手动编辑。\n".to_string(),
+        "MEMORY.md" => "# MEMORY.md\n\n这是 `{{AGENT_NAME}}` 的最小启动记忆，只保留高频、稳定、开局就该知道的内容。\n\n## Identity Anchor\n\n- Agent name: {{AGENT_NAME}}\n- Summary: {{AGENT_SUMMARY}}\n\n## Core Principles\n\n- 保持直接、准确、可执行。\n- 推断和事实必须分层；不确定就直说。\n- 承诺要进入账本并持续跟进。\n\n## Stable Preferences\n\n- 在这里放高频、稳定、明确确认过的偏好。\n\n## Relationship Anchors\n\n- 在这里放最稳定、最高频的人物关系锚点。\n\n## Current Theme Anchors\n\n- 只放最近一段时间持续重要的主题，不放流水账。\n\n## Routing\n\n- 当前任务与未闭环：`WORKING.md`\n- 稳定规则与约定：`DECISIONS.md`\n- 用户长期模型：`USER_MODEL.md`\n- 关系图：`RELATIONSHIP_MAP.md`\n- 高风险坑点：`PITFALLS.md`\n- 外部知识：`wiki/INDEX.md`\n\n> 此文件不会在对话过程中被自动修改。如需调整，请手动编辑。\n".to_string(),
         "USER_MODEL.md" => "# USER_MODEL.md\n\n## Purpose\n\nCapture the user's long-term interaction model, not daily chatter.\n\n## Stable Preferences\n\n- No confirmed model entry yet.\n\n## Interaction Style\n\n- No confirmed style rule yet.\n\n## Implicit Signals\n\n- Record repeated hidden intent patterns here.\n\n## Test Patterns\n\n- Record recurring ways the user tests responsiveness or understanding.\n\n## Collaboration Modes\n\n- Note how the user wants the agent to behave in different contexts.\n".to_string(),
         "RELATIONSHIP_MAP.md" => "# RELATIONSHIP_MAP.md\n\n## Purpose\n\nTrack the important people around the user and why they matter.\n\n## Key People\n\n- No key person recorded yet.\n\n## Teams And Groups\n\n- No team mapping recorded yet.\n\n## Open Questions\n\n- Record unresolved identities or relationship ambiguities here.\n".to_string(),
         "PITFALLS.md" => "# PITFALLS.md\n\n## Purpose\n\nTrack recurring failure modes, explicit user corrections, and things this agent must stop doing.\n\n## Active Pitfalls\n\n- No active pitfall recorded yet.\n\n## Rules\n\n- Promote only concrete, reusable pitfalls.\n- Prefer actionable phrasing over vague blame.\n- Retire items when the behavior is truly fixed.\n".to_string(),
@@ -3160,22 +2842,8 @@ fn fallback_template(file_name: &str) -> String {
         "WORKING.md" => "# WORKING.md\n\n## Current Focus\n\n- No active task yet.\n\n## OPEN_LOOPS\n\n- No open loop yet.\n\n## Open Threads\n\n- No open thread yet.\n\n## IM Latest Context\n\n- No IM context ingested yet.\n".to_string(),
         "DECISIONS.md" => "# DECISIONS.md\n\n## Decision Log\n\n- No decisions logged yet.\n\n## Sync Rules\n\n- Stable rules should be mirrored into `MEMORY.md` or category memory when relevant.\n".to_string(),
         "PUBLIC_CONTEXT.md" => "# PUBLIC_CONTEXT.md\n\n## Safe Identity\n\n- Agent: {{AGENT_NAME}}\n- Summary: {{AGENT_SUMMARY}}\n\n## External Notes\n\n- Put channel-safe context here.\n".to_string(),
-        "memory/INDEX.md" => "# INDEX.md\n\nThis file is the entry point for the agent memory system.\n".to_string(),
-        "memory/REVIEW_QUEUE.md" => "# REVIEW_QUEUE.md\n\n## Purpose\n\nTrack time-sensitive memory that needs re-checking so stale state does not masquerade as truth.\n\n## Rules\n\n- Add unresolved commitments, blockers, tentative inferences, and medium-confidence changing facts.\n- Mark resolved items as done or dropped instead of silently forgetting them.\n\n## Schema\n\n- item: what needs review\n  status: pending|done|dropped\n  review_at: YYYY-MM-DD\n  reason: why this can go stale\n  source: file#anchor or memory/raw/... path\n  updated: YYYY-MM-DD\n\n## Entries\n\nNo scheduled review yet.\n".to_string(),
-        "memory/LINT.md" => "# LINT.md\n\n## Health Checklist\n\n- Keep `memory/INDEX.md` aligned with the actual directory layout.\n- Keep commitments structured and reviewable.\n- Keep inferences separate from confirmed facts.\n- Keep raw evidence, daily summaries, curated memory, and wiki content in their own layers.\n\n## Last Pass\n\n- No lint pass recorded yet.\n".to_string(),
         "memory/SOURCE_INDEX.md" => "# SOURCE_INDEX.md\n\nThis file registers immutable raw sources and uploaded artifacts. The LLM should never rewrite the underlying source files; it should only update the curated memory around them.\n\nEach entry includes an `Index:` line (`type=… ts=… cats=…`) for quick filtering.\n\n## Entries\n".to_string(),
         "memory/DAILY_INDEX.md" => "# DAILY_INDEX.md\n\n**Retrieval index** for `memory/YYYY-MM-DD.md` digest lines. Each machine line starts with `DAILY|` then `date|timestamp|user|cats|summary` (fields must not contain `|`).\n\n- Use `rg` / editor search on `cats` (e.g. `projects`) or keywords before opening a full daily file.\n- Full context stays in the dated markdown files.\n\n## Lines\n".to_string(),
-        "memory/LOG.md" => "# LOG.md\n\nAppend-only operational log for ingest, source registration, and memory maintenance.\n\n## Entries\n".to_string(),
-        "memory/categories/INDEX.md" => build_category_index_content(),
-        "memory/categories/general.md" => build_category_file_template(memory_category_definition("general").expect("general category")),
-        "memory/categories/user_profile.md" => build_category_file_template(memory_category_definition("user_profile").expect("user_profile category")),
-        "memory/categories/preferences.md" => build_category_file_template(memory_category_definition("preferences").expect("preferences category")),
-        "memory/categories/projects.md" => build_category_file_template(memory_category_definition("projects").expect("projects category")),
-        "memory/categories/commitments.md" => build_category_file_template(memory_category_definition("commitments").expect("commitments category")),
-        "memory/categories/decisions.md" => build_category_file_template(memory_category_definition("decisions").expect("decisions category")),
-        "memory/categories/relationships.md" => build_category_file_template(memory_category_definition("relationships").expect("relationships category")),
-        "memory/categories/pitfalls.md" => build_category_file_template(memory_category_definition("pitfalls").expect("pitfalls category")),
-        "memory/categories/inferences.md" => build_category_file_template(memory_category_definition("inferences").expect("inferences category")),
         "wiki/INDEX.md" => "# INDEX.md\n\nThis wiki stores external knowledge, research notes, and reusable methodology. Do not store user identity, promises, or live project status here.\n\n## Boundaries\n\n- Put `who we are / what we promised / what the user prefers` into memory, not wiki.\n- Put external articles, GitHub project notes, technical summaries, and methods into wiki.\n\n## Routes\n\n- New research note: create a page under `wiki/` and link it here.\n- Memory question: go back to `memory/INDEX.md`.\n\n## Pages\n\n- No wiki pages yet.\n".to_string(),
         _ => String::new(),
     }
@@ -3314,26 +2982,10 @@ mod tests {
         assert!(home.join("RELATIONSHIP_MAP.md").exists());
         assert!(home.join("PITFALLS.md").exists());
         assert!(!home.join("BOOTSTRAP.md").exists());
-        assert!(home.join("memory").join("INDEX.md").exists());
-        assert!(home.join("memory").join("REVIEW_QUEUE.md").exists());
-        assert!(home
-            .join("memory")
-            .join("categories")
-            .join("inferences.md")
-            .exists());
-        assert!(home
-            .join("memory")
-            .join("categories")
-            .join("pitfalls.md")
-            .exists());
+        assert!(home.join("memory").join("SOURCE_INDEX.md").exists());
+        assert!(home.join("memory").join("DAILY_INDEX.md").exists());
         assert!(home.join("wiki").join("INDEX.md").exists());
         assert!(!home.join("memory").join("WIKI_INDEX.md").exists());
-        assert!(root
-            .join("agents")
-            .join("_template")
-            .join("memory")
-            .join("INDEX.md")
-            .exists());
         assert!(root
             .join("agents")
             .join("_template")
@@ -3346,7 +2998,7 @@ mod tests {
         assert!(identity.contains("#112233"));
 
         let prompt = build_workspace_system_prompt("test-agent").expect("workspace prompt");
-        assert!(prompt.contains("memory/INDEX.md"));
+        assert!(prompt.contains("SOURCE_INDEX"));
         assert!(prompt.contains("wiki/INDEX.md"));
         assert!(!prompt.contains("BOOTSTRAP.md"));
 
@@ -3368,14 +3020,7 @@ mod tests {
         assert!(bundle
             .files
             .iter()
-            .any(|file| file.relative_path == "agents/test-agent/memory/INDEX.md"));
-        assert!(
-            bundle
-                .files
-                .iter()
-                .any(|file| file.relative_path
-                    == "agents/test-agent/memory/categories/commitments.md")
-        );
+            .any(|file| file.relative_path == "agents/test-agent/memory/SOURCE_INDEX.md"));
         assert!(bundle
             .files
             .iter()
@@ -3474,7 +3119,6 @@ mod tests {
         let _guard = lock_workspace_test();
         let root = temp_root();
         std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
-        std::env::remove_var(APPEND_CATEGORY_MEMORY_ENV);
 
         let seed = AgentWorkspaceSeed {
             id: "memory-agent",
@@ -3501,16 +3145,6 @@ mod tests {
         assert!(memory.contains("## Core Principles"));
         assert!(!memory.contains("Current note"));
 
-        let user_profile = read_string(
-            root.join("agents")
-                .join("memory-agent")
-                .join("memory")
-                .join("categories")
-                .join("user_profile.md"),
-        );
-        assert!(user_profile.contains("## Schema"));
-        assert!(!user_profile.contains("- item: 我是产品经理"));
-
         let working =
             fs::read_to_string(root.join("agents").join("memory-agent").join("WORKING.md"))
                 .expect("read working");
@@ -3530,35 +3164,6 @@ mod tests {
         assert!(source_index.contains("memory/raw/"));
         assert!(source_index.contains("Index: type=conversation"));
 
-        let memory_index = fs::read_to_string(
-            root.join("agents")
-                .join("memory-agent")
-                .join("memory")
-                .join("INDEX.md"),
-        )
-        .expect("read memory index");
-        assert!(memory_index.contains("raw is evidence"));
-        assert!(memory_index.contains("wiki/INDEX.md"));
-
-        let review_queue = read_string(
-            root.join("agents")
-                .join("memory-agent")
-                .join("memory")
-                .join("REVIEW_QUEUE.md"),
-        );
-        assert!(review_queue.contains("review_at:"));
-        assert!(review_queue.contains("pending"));
-        assert!(review_queue.contains("webhook"));
-
-        let lint = read_string(
-            root.join("agents")
-                .join("memory-agent")
-                .join("memory")
-                .join("LINT.md"),
-        );
-        assert!(lint.contains("## Scorecard"));
-        assert!(lint.contains("Total: 100/100"));
-
         let raw_source_dir = root
             .join("agents")
             .join("memory-agent")
@@ -3576,82 +3181,9 @@ mod tests {
         .expect("read daily log");
         assert!(daily_log.contains("Summary:"));
         assert!(daily_log.contains("Source:"));
-        assert!(!root
-            .join("agents")
-            .join("memory-agent")
-            .join("memory")
-            .join("WIKI_INDEX.md")
-            .exists());
 
         fs::remove_dir_all(&root).expect("cleanup");
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
-    }
-
-    #[test]
-    fn append_agent_memory_entry_appends_category_shards_when_env_enabled() {
-        let _guard = lock_workspace_test();
-        let root = temp_root();
-        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
-        std::env::set_var(APPEND_CATEGORY_MEMORY_ENV, "1");
-
-        let seed = AgentWorkspaceSeed {
-            id: "memory-agent-env",
-            name: "记忆助理",
-            summary: "验证环境变量写回分类",
-            description: "负责验证分类追加",
-            accent_color: Some("#556677"),
-            is_builtin: false,
-        };
-
-        ensure_agent_workspace(seed, true).expect("scaffold workspace");
-        append_agent_memory_entry(
-            "memory-agent-env",
-            "user-1",
-            "我是产品经理，这个项目下周要上线，待办是之后统一按周报格式同步。",
-            "收到，我会继续按周报格式跟进上线计划，并保留这个约定。",
-        )
-        .expect("append memory with categories");
-
-        let user_profile = fs::read_to_string(
-            root.join("agents")
-                .join("memory-agent-env")
-                .join("memory")
-                .join("categories")
-                .join("user_profile.md"),
-        )
-        .expect("read user_profile category");
-        assert!(user_profile.contains("- item: 我是产品经理"));
-        assert!(user_profile.contains("type: profile_fact"));
-        assert!(user_profile.contains("confidence: high"));
-
-        let decisions = fs::read_to_string(
-            root.join("agents")
-                .join("memory-agent-env")
-                .join("memory")
-                .join("categories")
-                .join("decisions.md"),
-        )
-        .expect("read decisions category");
-        assert!(decisions.contains("type: decision"));
-        assert!(decisions.contains("status: active"));
-
-        let commitments = fs::read_to_string(
-            root.join("agents")
-                .join("memory-agent-env")
-                .join("memory")
-                .join("categories")
-                .join("commitments.md"),
-        )
-        .expect("read commitments category");
-        assert!(commitments.contains("status: open"));
-        assert!(commitments.contains("owner: memory-agent-env"));
-        assert!(commitments.contains("created:"));
-        assert!(commitments.contains("next_check:"));
-        assert!(commitments.contains("source: memory/raw/"));
-
-        fs::remove_dir_all(&root).expect("cleanup");
-        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
-        std::env::remove_var(APPEND_CATEGORY_MEMORY_ENV);
     }
 
     #[test]
@@ -3728,15 +3260,6 @@ mod tests {
         assert!(source_index.contains("attachment"));
         assert!(source_index.contains("sample.txt"));
 
-        let log = read_string(
-            root.join("agents")
-                .join("attach-agent")
-                .join("memory")
-                .join("LOG.md"),
-        );
-        assert!(log.contains("source"));
-        assert!(log.contains("sample.txt"));
-
         let daily_log = read_string(
             root.join("agents")
                 .join("attach-agent")
@@ -3755,7 +3278,6 @@ mod tests {
         let _guard = lock_workspace_test();
         let root = temp_root();
         std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
-        std::env::set_var(APPEND_CATEGORY_MEMORY_ENV, "1");
 
         let seed = AgentWorkspaceSeed {
             id: "query-agent",
@@ -3801,22 +3323,17 @@ mod tests {
         )
         .expect("workspace prompt");
 
-        assert!(prompt.contains("memory/INDEX.md"));
+        assert!(prompt.contains("SOURCE_INDEX"));
         assert!(prompt.contains("wiki/INDEX.md"));
-        assert!(prompt.contains("memory/REVIEW_QUEUE.md"));
-        assert!(prompt.contains("memory/categories/projects.md"));
-        assert!(prompt.contains("memory/categories/preferences.md"));
         assert!(prompt.contains("专项记忆路由"));
         assert!(prompt.contains("USER_MODEL"));
         assert!(prompt.contains("PITFALLS"));
         assert!(prompt.contains("RELATIONSHIP_MAP"));
-        assert!(prompt.contains("相关分类记忆"));
         assert!(!prompt.contains("BOOTSTRAP.md"));
         assert!(!prompt.contains("WIKI_INDEX.md"));
 
         fs::remove_dir_all(&root).expect("cleanup");
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
-        std::env::remove_var(APPEND_CATEGORY_MEMORY_ENV);
     }
 
     #[test]
@@ -3824,7 +3341,6 @@ mod tests {
         let _guard = lock_workspace_test();
         let root = temp_root();
         std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
-        std::env::set_var(APPEND_CATEGORY_MEMORY_ENV, "1");
 
         let seed = AgentWorkspaceSeed {
             id: "score-agent",
@@ -3872,18 +3388,9 @@ mod tests {
 
         let second_home = ensure_agent_workspace(second_seed, true).expect("scaffold second agent");
 
-        let memory_index = read_string(home.join("memory").join("INDEX.md"));
-        let review_queue = read_string(home.join("memory").join("REVIEW_QUEUE.md"));
-        let commitments = read_string(
-            home.join("memory")
-                .join("categories")
-                .join("commitments.md"),
-        );
         let pitfalls = read_string(home.join("PITFALLS.md"));
         let working = read_string(home.join("WORKING.md"));
-        let lint = read_string(home.join("memory").join("LINT.md"));
         let source_index = read_string(home.join("memory").join("SOURCE_INDEX.md"));
-        let log = read_string(home.join("memory").join("LOG.md"));
         let template_root = root.join("agents").join("_template");
 
         let scores = vec![
@@ -3892,18 +3399,18 @@ mod tests {
                 vec![
                     ("BOOTSTRAP removed", !home.join("BOOTSTRAP.md").exists()),
                     (
-                        "memory index scaffolded",
-                        home.join("memory").join("INDEX.md").exists(),
-                    ),
-                    (
-                        "review queue scaffolded",
-                        home.join("memory").join("REVIEW_QUEUE.md").exists(),
-                    ),
-                    (
                         "wiki index scaffolded",
                         home.join("wiki").join("INDEX.md").exists(),
                     ),
                     ("pitfalls scaffolded", home.join("PITFALLS.md").exists()),
+                    (
+                        "source index scaffolded",
+                        home.join("memory").join("SOURCE_INDEX.md").exists(),
+                    ),
+                    (
+                        "daily index scaffolded",
+                        home.join("memory").join("DAILY_INDEX.md").exists(),
+                    ),
                     (
                         "legacy WIKI_INDEX removed",
                         !home.join("memory").join("WIKI_INDEX.md").exists(),
@@ -3928,48 +3435,8 @@ mod tests {
                             .exists(),
                     ),
                     (
-                        "review queue scheduled",
-                        review_queue.contains("review_at:"),
-                    ),
-                    (
                         "source index recorded conversation",
                         source_index.contains("Index: type=conversation"),
-                    ),
-                    ("lint scorecard emitted", lint.contains("Total: 100/100")),
-                ],
-            ),
-            score_scenario(
-                "category-ledger",
-                vec![
-                    (
-                        "commitments structured",
-                        commitments.contains("status: open"),
-                    ),
-                    (
-                        "commitments owner set",
-                        commitments.contains("owner: score-agent"),
-                    ),
-                    (
-                        "commitments next_check set",
-                        commitments.contains("next_check:"),
-                    ),
-                    (
-                        "inferences shard exists",
-                        home.join("memory")
-                            .join("categories")
-                            .join("inferences.md")
-                            .exists(),
-                    ),
-                    (
-                        "pitfalls shard exists",
-                        home.join("memory")
-                            .join("categories")
-                            .join("pitfalls.md")
-                            .exists(),
-                    ),
-                    (
-                        "memory index boundary text",
-                        memory_index.contains("raw is evidence"),
                     ),
                 ],
             ),
@@ -3980,7 +3447,6 @@ mod tests {
                         "attachment indexed",
                         source_index.contains("score-attachment.txt"),
                     ),
-                    ("attachment logged", log.contains("score-attachment.txt")),
                     (
                         "attachment daily log recorded",
                         read_string(
@@ -3993,26 +3459,22 @@ mod tests {
                         "attachment kept evidence boundary",
                         source_index.contains("attachment"),
                     ),
-                    (
-                        "lint survived attachment refresh",
-                        lint.contains("Status: healthy"),
-                    ),
                 ],
             ),
             score_scenario(
                 "prompt-routing",
                 vec![
                     (
-                        "prompt points to memory index",
-                        prompt.contains("memory/INDEX.md"),
+                        "prompt points to SOURCE_INDEX",
+                        prompt.contains("SOURCE_INDEX"),
                     ),
                     (
                         "prompt points to wiki index",
                         prompt.contains("wiki/INDEX.md"),
                     ),
                     (
-                        "prompt points to review queue",
-                        prompt.contains("memory/REVIEW_QUEUE.md"),
+                        "prompt references WORKING",
+                        prompt.contains("WORKING"),
                     ),
                     ("prompt includes query route", prompt.contains("检索顺序")),
                     ("prompt omits BOOTSTRAP", !prompt.contains("BOOTSTRAP.md")),
@@ -4023,25 +3485,6 @@ mod tests {
                 "template-rollout",
                 vec![
                     ("_template exists", template_root.exists()),
-                    (
-                        "template memory index exists",
-                        template_root.join("memory").join("INDEX.md").exists(),
-                    ),
-                    (
-                        "template review queue exists",
-                        template_root
-                            .join("memory")
-                            .join("REVIEW_QUEUE.md")
-                            .exists(),
-                    ),
-                    (
-                        "template inferences shard exists",
-                        template_root
-                            .join("memory")
-                            .join("categories")
-                            .join("inferences.md")
-                            .exists(),
-                    ),
                     (
                         "template pitfalls exists",
                         template_root.join("PITFALLS.md").exists(),
@@ -4068,10 +3511,6 @@ mod tests {
                         "relationship map template exists",
                         home.join("RELATIONSHIP_MAP.md").exists(),
                     ),
-                    (
-                        "lint checks human model files",
-                        lint.contains("USER_MODEL / PITFALLS / RELATIONSHIP_MAP"),
-                    ),
                 ],
             ),
         ];
@@ -4088,7 +3527,153 @@ mod tests {
 
         fs::remove_dir_all(&root).expect("cleanup");
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
-        std::env::remove_var(APPEND_CATEGORY_MEMORY_ENV);
+    }
+
+    /// PRD: Memory System Simplification — 验证简化后的三层架构
+    /// 目标：脚手架只创建保留层文件，不创建已下线文件
+    #[test]
+    fn simplified_memory_architecture_scaffold_and_ingest() {
+        let _guard = lock_workspace_test();
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+
+        let seed = AgentWorkspaceSeed {
+            id: "simple-agent",
+            name: "简化助理",
+            summary: "验证简化记忆架构",
+            description: "负责验证 PRD 定义的三层收敛",
+            accent_color: Some("#aabbcc"),
+            is_builtin: false,
+        };
+
+        let home = ensure_agent_workspace(seed, true).expect("scaffold workspace");
+
+        // ── Scaffold: 保留层必须存在 ──
+        // 稳定档案层
+        assert!(home.join("MEMORY.md").exists(), "MEMORY.md");
+        assert!(home.join("USER_MODEL.md").exists(), "USER_MODEL.md");
+        assert!(home.join("RELATIONSHIP_MAP.md").exists(), "RELATIONSHIP_MAP.md");
+        // 执行态层
+        assert!(home.join("WORKING.md").exists(), "WORKING.md");
+        // 规则层
+        assert!(home.join("DECISIONS.md").exists(), "DECISIONS.md");
+        assert!(home.join("PITFALLS.md").exists(), "PITFALLS.md");
+        // 证据层
+        assert!(home.join("memory").join("SOURCE_INDEX.md").exists(), "SOURCE_INDEX.md");
+        assert!(home.join("memory").join("raw").exists(), "memory/raw/");
+        // 历史检索层
+        assert!(home.join("memory").join("DAILY_INDEX.md").exists(), "DAILY_INDEX.md");
+        // 外部知识层
+        assert!(home.join("wiki").join("INDEX.md").exists(), "wiki/INDEX.md");
+
+        // ── Scaffold: 已下线文件不得存在 ──
+        assert!(!home.join("memory").join("LINT.md").exists(), "LINT.md should not exist");
+        assert!(!home.join("memory").join("LOG.md").exists(), "LOG.md should not exist");
+        assert!(!home.join("memory").join("REVIEW_QUEUE.md").exists(), "REVIEW_QUEUE.md should not exist");
+        assert!(!home.join("memory").join("INDEX.md").exists(), "memory/INDEX.md should not exist");
+        assert!(!home.join("memory").join("categories").exists(), "memory/categories/ should not exist");
+        assert!(!home.join("BOOTSTRAP.md").exists(), "BOOTSTRAP.md should not exist");
+
+        // ── Ingest: 写入只走保留层 ──
+        append_agent_memory_entry(
+            "simple-agent",
+            "user-1",
+            "我是产品经理，项目下周上线，webhook 还没给。",
+            "收到，我会跟进上线计划，等 webhook 后联调。",
+        )
+        .expect("append memory");
+
+        // 保留层写入验证
+        let working = read_string(home.join("WORKING.md"));
+        assert!(working.contains("user-1"), "WORKING.md has context");
+        assert!(working.contains("OPEN_LOOPS"), "WORKING.md has open loops");
+
+        let source_index = read_string(home.join("memory").join("SOURCE_INDEX.md"));
+        assert!(source_index.contains("memory/raw/"), "SOURCE_INDEX has raw ref");
+
+        let daily_log_path = home.join("memory").join(format!("{}.md", current_date_label()));
+        assert!(daily_log_path.exists(), "daily log created");
+        let daily_log = read_string(daily_log_path);
+        assert!(daily_log.contains("Summary:"), "daily log has summary");
+
+        // 已下线文件不得被 ingest 创建
+        assert!(!home.join("memory").join("LINT.md").exists(), "LINT.md not created by ingest");
+        assert!(!home.join("memory").join("LOG.md").exists(), "LOG.md not created by ingest");
+        assert!(
+            !home.join("memory").join("REVIEW_QUEUE.md").exists(),
+            "REVIEW_QUEUE.md not created by ingest"
+        );
+        assert!(
+            !home.join("memory").join("INDEX.md").exists(),
+            "memory/INDEX.md not created by ingest"
+        );
+        assert!(
+            !home.join("memory").join("categories").exists(),
+            "categories/ not created by ingest"
+        );
+
+        // ── Prompt: 只引用保留层 ──
+        let prompt = build_workspace_system_prompt_for_query(
+            "simple-agent",
+            Some("继续这个项目的发布规划"),
+        )
+        .expect("prompt");
+        // 保留层引用
+        assert!(prompt.contains("WORKING.md"), "prompt references WORKING.md");
+        assert!(prompt.contains("SOURCE_INDEX"), "prompt references SOURCE_INDEX");
+        assert!(prompt.contains("DAILY_INDEX"), "prompt references DAILY_INDEX");
+        // 已下线引用不得出现
+        assert!(!prompt.contains("LINT.md"), "prompt must not reference LINT.md");
+        assert!(!prompt.contains("LOG.md"), "prompt must not reference LOG.md");
+        assert!(
+            !prompt.contains("REVIEW_QUEUE"),
+            "prompt must not reference REVIEW_QUEUE"
+        );
+        assert!(
+            !prompt.contains("memory/INDEX.md"),
+            "prompt must not reference memory/INDEX.md"
+        );
+        assert!(
+            !prompt.contains("memory/categories/"),
+            "prompt must not reference categories/"
+        );
+
+        // ── Bundle: 不包含已下线 section ──
+        let bundle = read_agent_workspace_bundle("simple-agent").expect("bundle");
+        let sections: std::collections::HashSet<&str> =
+            bundle.files.iter().map(|f| f.section.as_str()).collect();
+        assert!(
+            !sections.contains("categoryMemory"),
+            "bundle must not have categoryMemory section"
+        );
+        // 保留的 section 必须存在
+        assert!(sections.contains("private"), "bundle has private section");
+        assert!(sections.contains("dailyLog"), "bundle has dailyLog section");
+        assert!(sections.contains("wiki"), "bundle has wiki section");
+
+        // bundle 中不应有 categories 路径的文件
+        for file in &bundle.files {
+            assert!(
+                !file.relative_path.contains("categories/"),
+                "bundle file {} should not be in categories/",
+                file.relative_path
+            );
+            assert!(
+                !file.relative_path.contains("LINT.md"),
+                "bundle should not contain LINT.md"
+            );
+            assert!(
+                !file.relative_path.contains("LOG.md"),
+                "bundle should not contain LOG.md"
+            );
+            assert!(
+                !file.relative_path.contains("REVIEW_QUEUE.md"),
+                "bundle should not contain REVIEW_QUEUE.md"
+            );
+        }
+
+        fs::remove_dir_all(&root).expect("cleanup");
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
     }
 
     #[test]

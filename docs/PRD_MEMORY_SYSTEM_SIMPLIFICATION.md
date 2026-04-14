@@ -123,6 +123,9 @@
 8. FR-8: 系统必须支持现有 agent workspace 在迁移期内继续被读取，不因文件下线而直接损坏。
 9. FR-9: 系统必须为 UI 展示提供与新架构匹配的 section 标签和默认打开策略。
 10. FR-10: 系统必须为下线层定义兼容策略，避免系统提示仍然引用已废弃文件。
+11. FR-11: 系统必须为“用户记忆”定义固定 schema，而不是允许稳定档案层长期自由发散。
+12. FR-12: 系统必须确保“身份画像 / 工作方式 / 写作风格”三类信息可被稳定存储、编辑、检索和迁移。
+13. FR-13: 任一记忆 markdown 文件不得超过 500 行；接近上限时必须拆分、归档或迁移到更合适的层。
 
 ## Non-Goals
 
@@ -139,6 +142,7 @@
 - `DECISIONS.md` 与部分 category shards 当前存在“模板存在、检索存在、自动写入不稳定”的半活跃状态，迁移时需要先明确“主文件”。
 - 前端 workspace 分组当前显式展示 `memoryIndex`、`categoryMemory`、`dailyLog`、`wiki`，需要与新分层保持一致。[src/app/agents/AgentChannelDialogs.tsx](/Users/yiqunwu/wuyiqun/power_project/ai-x/ai_coding/nine-claw/src/app/agents/AgentChannelDialogs.tsx:370)
 - 文案和 section label 目前绑定旧心智模型，需同步更新。[src/app/lib/appFormatting.tsx](/Users/yiqunwu/wuyiqun/power_project/ai-x/ai_coding/nine-claw/src/app/lib/appFormatting.tsx:580)
+- 记忆文件单文件上限为 500 行，模板、自动写入和迁移策略都必须围绕这个上限设计，不能默认无限增长。
 
 ## Success Metrics
 
@@ -158,6 +162,75 @@
 - 历史检索层：`memory/YYYY-MM-DD.md`、`memory/DAILY_INDEX.md`
 - 证据层：`memory/raw/`、`memory/SOURCE_INDEX.md`
 - 外部知识层：`wiki/`（可选保留）
+
+### Stable Profile Schema
+
+稳定档案层必须覆盖以下“用户记忆”结构，并作为模板与迁移的目标 schema：
+
+```md
+# 用户身份 / Identity
+
+## 用户身份
+
+### 基本信息
+- 称呼：
+- 所在地区：
+
+### 职业与背景
+
+### 身边的人
+
+### 日常偏好
+
+## 工作方式
+
+### 开发流程
+
+### 组织与整理
+
+### 调试习惯
+
+### AI 交互偏好
+
+## 写作风格
+
+### 整体调性
+
+### 句式与节奏
+
+### 段落结构
+
+### 表达模式
+```
+
+推荐落位如下：
+
+- `MEMORY.md`：保留最稳定、最高频的身份锚点与协作原则
+- `USER_MODEL.md`：承载“工作方式”与“写作风格”的主体 schema
+- `RELATIONSHIP_MAP.md`：承载“身边的人”，并与人物关系保持独立可维护
+
+如果后续决定进一步收敛为单一 `PROFILE.md`，该 schema 应整体迁入，不允许拆散为任意自由段落。
+
+### Memory File Size Limit
+
+所有记忆 markdown 文件都必须遵守 500 行上限：
+
+- `MEMORY.md`
+- `USER_MODEL.md`
+- `RELATIONSHIP_MAP.md`
+- `WORKING.md`
+- `DECISIONS.md`
+- `PITFALLS.md`
+- `memory/YYYY-MM-DD.md`
+- `memory/SOURCE_INDEX.md`
+- `memory/DAILY_INDEX.md`
+
+达到或接近上限时，系统必须采用以下策略之一：
+
+- 将历史内容归档到更低频的历史文件
+- 将不同职责内容拆到独立文件
+- 将已闭环内容从执行态文件迁移到历史层
+- 将高频摘要与低频明细分离，避免主文件持续膨胀
 
 建议下线或并入其他层的文件：
 

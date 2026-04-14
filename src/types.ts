@@ -344,7 +344,7 @@ export type AgentBuilderDraft = {
 export type AgentWorkspaceFile = {
   key: string
   scope: 'agent' | 'shared'
-  section: 'private' | 'shared' | 'dailyLog' | 'memoryIndex' | 'categoryMemory' | 'wiki'
+  section: 'private' | 'shared' | 'dailyLog' | 'memoryIndex' | 'wiki'
   name: string
   relativePath: string
   absolutePath: string

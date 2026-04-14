@@ -582,10 +582,7 @@ export function formatWorkspaceFileSectionLabel(section: AgentWorkspaceFile['sec
     return '私有文件'
   }
   if (section === 'memoryIndex') {
-    return '记忆入口'
-  }
-  if (section === 'categoryMemory') {
-    return '分类记忆'
+    return '记忆索引'
   }
   if (section === 'wiki') {
     return '知识 Wiki'
