@@ -55,6 +55,7 @@ const AGENT_TEMPLATE_FILES: &[&str] = &[
     "memory/LINT.md",
     "memory/SOURCE_INDEX.md",
     "memory/LOG.md",
+    "memory/DAILY_INDEX.md",
     "memory/categories/INDEX.md",
     "memory/categories/general.md",
     "memory/categories/user_profile.md",
@@ -418,6 +419,9 @@ pub struct AgentWorkspaceFile {
     pub read_only: bool,
     pub exists: bool,
     pub content: String,
+    /// 为 true 时 `content` 未预载；前端应调用 `read_agent_workspace_file` 再编辑。
+    #[serde(default)]
+    pub lazy_fetch: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -564,6 +568,10 @@ pub fn build_workspace_system_prompt_for_query(
         "检索顺序：先判断是否真的需要查记忆；任务与未闭环优先看 WORKING.md 的 `Current Focus` / `OPEN_LOOPS`；规则优先看 DECISIONS.md 与 PITFALLS.md；用户风格优先看 MEMORY.md 与 USER_MODEL.md；人物关系优先看 RELATIONSHIP_MAP.md 与 relationships；没有证据就不要装记得。"
             .to_string(),
     );
+    sections.push(
+        "历史日记：除非用户明确要求追溯，不要用工具通读全部 memory/YYYY-MM-DD.md；先用 memory/DAILY_INDEX.md（或 NineClaw 注入的「日记检索」摘要）按分类/关键词筛选，再打开对应 memory/YYYY-MM-DD.md 段落；今昨两天可直接读日记。"
+            .to_string(),
+    );
 
     if let Some(wiki_snapshot) =
         memory_wiki::build_memory_wiki_snapshot(&agent_home, current_prompt)?
@@ -579,6 +587,11 @@ pub fn build_workspace_system_prompt_for_query(
         build_categorized_memory_snapshot(&root, agent_id, current_prompt)?
     {
         sections.push(category_snapshot);
+    }
+    if let Some(daily_index_snapshot) =
+        build_daily_digest_retrieval_snapshot(&root, agent_id, current_prompt)?
+    {
+        sections.push(daily_index_snapshot);
     }
     sections.push(build_legacy_workspace_memory_snapshot(&root, agent_id)?);
 
@@ -625,6 +638,31 @@ pub fn read_agent_heartbeat_instructions(agent_id: &str) -> Result<Option<String
     }
 }
 
+/// 按相对路径读取单个工作区文件（用于 `lazy_fetch` 条目的按需加载）。
+pub fn read_agent_workspace_file(
+    agent_id: &str,
+    relative_path: &str,
+) -> Result<AgentWorkspaceFile, String> {
+    let root = resolve_workspace_root()?;
+    ensure_root_scaffold(&root)?;
+    let absolute_path = resolve_readable_workspace_path(&root, agent_id, relative_path)?;
+    let normalized = normalize_relative_workspace_path(relative_path)?;
+    let (scope, section, name, read_only) =
+        classify_workspace_file_for_read(agent_id, &normalized)?;
+    let relative_path_buf = normalized
+        .iter()
+        .fold(PathBuf::new(), |acc, seg| acc.join(seg));
+    Ok(read_workspace_file(
+        &scope,
+        &section,
+        &name,
+        relative_path_buf,
+        absolute_path,
+        read_only,
+        false,
+    ))
+}
+
 pub fn read_agent_workspace_bundle(agent_id: &str) -> Result<AgentWorkspaceBundle, String> {
     let root = resolve_workspace_root()?;
     ensure_root_scaffold(&root)?;
@@ -644,6 +682,7 @@ pub fn read_agent_workspace_bundle(agent_id: &str) -> Result<AgentWorkspaceBundl
             PathBuf::from(file_name),
             path,
             shared_file_is_read_only(file_name),
+            false,
         ));
     }
 
@@ -656,6 +695,7 @@ pub fn read_agent_workspace_bundle(agent_id: &str) -> Result<AgentWorkspaceBundl
             file_name,
             relative_path,
             path,
+            false,
             false,
         ));
     }
@@ -781,6 +821,15 @@ pub fn append_agent_memory_entry(
     )
     .map_err(|error| format!("写入 daily log 失败: {error}"))?;
 
+    memory_wiki::append_daily_digest_index_line(
+        &agent_home,
+        &current_date_label(),
+        &timestamp,
+        user_id,
+        &ingest_summary,
+        &categories,
+    )?;
+
     append_review_queue_entries(
         &agent_home,
         &build_review_queue_items(
@@ -846,6 +895,14 @@ pub fn register_agent_attachment_source(
         ),
     )
     .map_err(|error| format!("写入附件 daily log 失败: {error}"))?;
+    memory_wiki::append_daily_digest_index_line(
+        &agent_home,
+        &current_date_label(),
+        &timestamp,
+        "attachment",
+        &attachment_message,
+        &[],
+    )?;
     memory_wiki::refresh_memory_wiki(&agent_home)?;
     Ok(())
 }
@@ -1109,6 +1166,14 @@ pub fn register_agent_outbound_artifact_source(
         ),
     )
     .map_err(|error| format!("写入出站产物 daily log 失败: {error}"))?;
+    memory_wiki::append_daily_digest_index_line(
+        &agent_home,
+        &current_date_label(),
+        &timestamp,
+        "outbound_artifact",
+        &artifact_message,
+        &[],
+    )?;
     memory_wiki::refresh_memory_wiki(&agent_home)?;
     Ok(())
 }
@@ -1380,6 +1445,132 @@ fn build_categorized_memory_snapshot(
     }
 }
 
+struct DailyIndexRow {
+    day: String,
+    ts: String,
+    user: String,
+    cats: String,
+    summary: String,
+}
+
+fn parse_daily_index_line(line: &str) -> Option<DailyIndexRow> {
+    let rest = line.strip_prefix("DAILY|")?;
+    let mut it = rest.splitn(5, '|');
+    let day = it.next()?.to_string();
+    let ts = it.next()?.to_string();
+    let user = it.next()?.to_string();
+    let cats = it.next()?.to_string();
+    let summary = it.next()?.to_string();
+    Some(DailyIndexRow {
+        day,
+        ts,
+        user,
+        cats,
+        summary,
+    })
+}
+
+fn daily_index_row_matches(row: &DailyIndexRow, selected_keys: &[&str], prompt_norm: &str) -> bool {
+    let cat_tokens: Vec<&str> = row
+        .cats
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let non_general_keys: Vec<&str> = selected_keys
+        .iter()
+        .copied()
+        .filter(|k| *k != "general")
+        .collect();
+    if !non_general_keys.is_empty() {
+        for sk in &non_general_keys {
+            if cat_tokens.iter().any(|c| *c == *sk) {
+                return true;
+            }
+        }
+    }
+    if !prompt_norm.is_empty()
+        && prompt_norm.len() >= 2
+        && row.summary.to_lowercase().contains(prompt_norm)
+    {
+        return true;
+    }
+    false
+}
+
+fn build_daily_digest_retrieval_snapshot(
+    root: &Path,
+    agent_id: &str,
+    current_prompt: Option<&str>,
+) -> Result<Option<String>, String> {
+    let agent_home = root.join("agents").join(agent_id);
+    let path = agent_home.join("memory").join("DAILY_INDEX.md");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw =
+        fs::read_to_string(&path).map_err(|error| format!("读取 DAILY_INDEX.md 失败: {error}"))?;
+    let lines: Vec<&str> = raw
+        .lines()
+        .filter(|line| line.starts_with("DAILY|"))
+        .collect();
+    if lines.is_empty() {
+        return Ok(None);
+    }
+
+    let prompt_raw = current_prompt.unwrap_or_default();
+    let prompt_norm = normalize_memory_match_text(prompt_raw);
+    if prompt_norm.is_empty() {
+        return Ok(None);
+    }
+
+    let selected = select_memory_categories_for_query(current_prompt);
+    let selected_keys: Vec<&str> = selected.iter().map(|category| category.key).collect();
+    let mut matched: Vec<String> = Vec::new();
+
+    if contains_memory_recall_signal(prompt_raw) {
+        for line in lines.iter().rev().take(10) {
+            if let Some(row) = parse_daily_index_line(line) {
+                matched.push(format!(
+                    "- {} · {} · {} | {}",
+                    row.day,
+                    row.ts,
+                    row.user,
+                    trim_to_char_limit(&row.summary, 120)
+                ));
+            }
+        }
+    } else {
+        for line in lines.iter().rev() {
+            let Some(row) = parse_daily_index_line(line) else {
+                continue;
+            };
+            if daily_index_row_matches(&row, &selected_keys, &prompt_norm) {
+                matched.push(format!(
+                    "- {} · {} · {} | {}",
+                    row.day,
+                    row.ts,
+                    row.user,
+                    trim_to_char_limit(&row.summary, 120)
+                ));
+            }
+            if matched.len() >= 12 {
+                break;
+            }
+        }
+    }
+
+    if matched.is_empty() {
+        return Ok(None);
+    }
+
+    let block = format!(
+        "日记检索（由 memory/DAILY_INDEX.md 按分类/关键词筛选；全文见对应 memory/YYYY-MM-DD.md）：\n{}",
+        matched.join("\n")
+    );
+    Ok(Some(trim_to_char_limit(&block, 900)))
+}
+
 fn ensure_category_memory_scaffold(agent_home: &Path) -> Result<(), String> {
     let dir = category_memory_dir(agent_home);
     fs::create_dir_all(&dir).map_err(|error| format!("创建分类记忆目录失败: {error}"))?;
@@ -1458,6 +1649,7 @@ fn read_agent_category_memory_files(
                 .join("memory")
                 .join("categories")
                 .join(&file_name);
+            let lazy_fetch = !file_name.eq_ignore_ascii_case("INDEX.md");
             read_workspace_file(
                 "agent",
                 "categoryMemory",
@@ -1465,6 +1657,7 @@ fn read_agent_category_memory_files(
                 relative_path,
                 path,
                 false,
+                lazy_fetch,
             )
         })
         .collect())
@@ -1510,7 +1703,15 @@ fn read_agent_wiki_files(root: &Path, agent_id: &str) -> Result<Vec<AgentWorkspa
                 .and_then(|item| item.to_str())
                 .unwrap_or("wiki.md")
                 .to_string();
-            read_workspace_file("agent", "wiki", &file_name, relative_path, path, false)
+            read_workspace_file(
+                "agent",
+                "wiki",
+                &file_name,
+                relative_path,
+                path,
+                false,
+                false,
+            )
         })
         .collect())
 }
@@ -2047,9 +2248,12 @@ fn read_workspace_file(
     relative_path: PathBuf,
     absolute_path: PathBuf,
     read_only: bool,
+    lazy_fetch: bool,
 ) -> AgentWorkspaceFile {
     let exists = absolute_path.exists();
-    let content = if exists {
+    let content = if lazy_fetch {
+        String::new()
+    } else if exists {
         fs::read_to_string(&absolute_path).unwrap_or_else(|error| format!("读取失败：{error}"))
     } else {
         String::new()
@@ -2065,6 +2269,7 @@ fn read_workspace_file(
         read_only,
         exists,
         content,
+        lazy_fetch,
     }
 }
 
@@ -2091,16 +2296,28 @@ fn read_agent_daily_logs(root: &Path, agent_id: &str) -> Result<Vec<AgentWorkspa
         .collect::<Vec<_>>();
 
     entries.sort_by(|left, right| right.0.cmp(&left.0));
-    entries.truncate(5);
+
+    // 与 docs/MEMORY_WIKI_SYSTEM.md 一致：预载最近两天；更早的日记在侧栏点开时再读。
+    const DAILY_LOG_EAGER_COUNT: usize = 2;
 
     Ok(entries
         .into_iter()
-        .map(|(file_name, path)| {
+        .enumerate()
+        .map(|(index, (file_name, path))| {
             let relative_path = PathBuf::from("agents")
                 .join(agent_id)
                 .join("memory")
                 .join(&file_name);
-            read_workspace_file("agent", "dailyLog", &file_name, relative_path, path, false)
+            let lazy_fetch = index >= DAILY_LOG_EAGER_COUNT;
+            read_workspace_file(
+                "agent",
+                "dailyLog",
+                &file_name,
+                relative_path,
+                path,
+                false,
+                lazy_fetch,
+            )
         })
         .collect())
 }
@@ -2122,6 +2339,91 @@ fn is_agent_daily_log_name(file_name: &str) -> bool {
 
 fn shared_file_is_read_only(file_name: &str) -> bool {
     matches!(file_name, "AGENT_REGISTRY.md")
+}
+
+fn resolve_readable_workspace_path(
+    root: &Path,
+    agent_id: &str,
+    relative_path: &str,
+) -> Result<PathBuf, String> {
+    let normalized = normalize_relative_workspace_path(relative_path)?;
+    if normalized.len() == 1 {
+        let file_name = &normalized[0];
+        if SHARED_VIEW_FILES.contains(&file_name.as_str()) {
+            return Ok(root.join(file_name));
+        }
+    }
+    resolve_writable_workspace_path(root, agent_id, relative_path)
+}
+
+fn classify_workspace_file_for_read(
+    agent_id: &str,
+    normalized: &[String],
+) -> Result<(String, String, String, bool), String> {
+    if normalized.len() == 1 {
+        let name = normalized[0].clone();
+        if !SHARED_VIEW_FILES.contains(&name.as_str()) {
+            return Err("路径不在当前智能体可读 workspace 范围内".to_string());
+        }
+        let read_only = shared_file_is_read_only(&name);
+        return Ok(("shared".to_string(), "shared".to_string(), name, read_only));
+    }
+
+    if normalized.len() == 3
+        && normalized[0] == "agents"
+        && normalized[1] == agent_id
+        && AGENT_VIEW_FILES.contains(&normalized[2].as_str())
+    {
+        let name = normalized[2].clone();
+        return Ok(("agent".to_string(), "private".to_string(), name, false));
+    }
+
+    if normalized.len() == 4
+        && normalized[0] == "agents"
+        && normalized[1] == agent_id
+        && normalized[2] == "memory"
+    {
+        let name = normalized[3].clone();
+        let section = if is_agent_daily_log_name(&name) {
+            "dailyLog"
+        } else {
+            "memoryIndex"
+        };
+        return Ok(("agent".to_string(), section.to_string(), name, false));
+    }
+
+    if normalized.len() == 5
+        && normalized[0] == "agents"
+        && normalized[1] == agent_id
+        && normalized[2] == "memory"
+        && normalized[3] == "categories"
+    {
+        let name = normalized[4].clone();
+        return Ok((
+            "agent".to_string(),
+            "categoryMemory".to_string(),
+            name,
+            false,
+        ));
+    }
+
+    if normalized.len() >= 4
+        && normalized[0] == "agents"
+        && normalized[1] == agent_id
+        && normalized[2] == "wiki"
+        && normalized
+            .last()
+            .is_some_and(|segment| segment.ends_with(".md"))
+    {
+        let name = normalized
+            .last()
+            .map(String::as_str)
+            .unwrap_or("wiki.md")
+            .to_string();
+        return Ok(("agent".to_string(), "wiki".to_string(), name, false));
+    }
+
+    Err("路径不在当前智能体可读 workspace 范围内".to_string())
 }
 
 fn resolve_writable_workspace_path(
@@ -2862,6 +3164,7 @@ fn fallback_template(file_name: &str) -> String {
         "memory/REVIEW_QUEUE.md" => "# REVIEW_QUEUE.md\n\n## Purpose\n\nTrack time-sensitive memory that needs re-checking so stale state does not masquerade as truth.\n\n## Rules\n\n- Add unresolved commitments, blockers, tentative inferences, and medium-confidence changing facts.\n- Mark resolved items as done or dropped instead of silently forgetting them.\n\n## Schema\n\n- item: what needs review\n  status: pending|done|dropped\n  review_at: YYYY-MM-DD\n  reason: why this can go stale\n  source: file#anchor or memory/raw/... path\n  updated: YYYY-MM-DD\n\n## Entries\n\nNo scheduled review yet.\n".to_string(),
         "memory/LINT.md" => "# LINT.md\n\n## Health Checklist\n\n- Keep `memory/INDEX.md` aligned with the actual directory layout.\n- Keep commitments structured and reviewable.\n- Keep inferences separate from confirmed facts.\n- Keep raw evidence, daily summaries, curated memory, and wiki content in their own layers.\n\n## Last Pass\n\n- No lint pass recorded yet.\n".to_string(),
         "memory/SOURCE_INDEX.md" => "# SOURCE_INDEX.md\n\nThis file registers immutable raw sources and uploaded artifacts. The LLM should never rewrite the underlying source files; it should only update the curated memory around them.\n\nEach entry includes an `Index:` line (`type=… ts=… cats=…`) for quick filtering.\n\n## Entries\n".to_string(),
+        "memory/DAILY_INDEX.md" => "# DAILY_INDEX.md\n\n**Retrieval index** for `memory/YYYY-MM-DD.md` digest lines. Each machine line starts with `DAILY|` then `date|timestamp|user|cats|summary` (fields must not contain `|`).\n\n- Use `rg` / editor search on `cats` (e.g. `projects`) or keywords before opening a full daily file.\n- Full context stays in the dated markdown files.\n\n## Lines\n".to_string(),
         "memory/LOG.md" => "# LOG.md\n\nAppend-only operational log for ingest, source registration, and memory maintenance.\n\n## Entries\n".to_string(),
         "memory/categories/INDEX.md" => build_category_index_content(),
         "memory/categories/general.md" => build_category_file_template(memory_category_definition("general").expect("general category")),

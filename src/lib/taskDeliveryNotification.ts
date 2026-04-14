@@ -10,6 +10,23 @@ import type { AgentTaskDeliveryRecord } from '../types'
 
 let actionTypesRegistered = false
 
+/** 与 `public/nineclaw-notification.png` 同源，供 Web Notification 使用 */
+function resolveWebNotificationIconUrl(): string {
+  const base = import.meta.env.BASE_URL || '/'
+  return new URL('nineclaw-notification.png', window.location.origin + base).href
+}
+
+/** 打包进 bundle.resources 的图标，供 Tauri 原生通知用系统路径加载 */
+async function resolveTauriBundledNotificationIconPath(): Promise<string | undefined> {
+  try {
+    const { resourceDir, join } = await import('@tauri-apps/api/path')
+    const root = await resourceDir()
+    return await join(root, 'icons', '128x128.png')
+  } catch {
+    return undefined
+  }
+}
+
 async function ensureMobileActionTypes(): Promise<void> {
   if (actionTypesRegistered) {
     return
@@ -65,6 +82,7 @@ export async function showTaskDeliveryDesktopNotification(
         const n = new Notification(title, {
           body,
           tag: `nineclaw-task-${payload.id}`,
+          icon: resolveWebNotificationIconUrl(),
         })
         n.onclick = (ev) => {
           ev.preventDefault()
@@ -87,9 +105,11 @@ export async function showTaskDeliveryDesktopNotification(
       granted = r === 'granted'
     }
     if (granted) {
+      const iconPath = await resolveTauriBundledNotificationIconPath()
       sendNotification({
         title,
         body,
+        ...(iconPath ? { icon: iconPath } : {}),
         actionTypeId: 'nineclaw-agent-task',
         extra: { sessionId: payload.sessionId, deliveryId: payload.id },
       })

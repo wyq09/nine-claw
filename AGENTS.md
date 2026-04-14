@@ -133,6 +133,12 @@ npm run tauri build -- --bundles dmg
 | `PI_RUNTIME_PLATFORM` | 指定目标平台（macos/windows/linux） |
 | `PI_MONO_REPO_DIR` | 指定 pi-mono 仓库路径（用于完整快照） |
 
+## Source file size — 800 lines max
+
+- **Hand-written source**（本仓库内由我们编写、维护的 `.ts` / `.tsx` / `.rs` / `.css` 等）**单文件不宜超过 800 行**；**非必要不得**新增或把文件撑到 800 行以上。
+- 接近或超过上限时：**拆模块**（按领域/功能分文件）、**抽 React 组件或 hook**、**把纯函数挪到 `*.ts` 工具文件**，而不是继续在同一文件堆叠逻辑。
+- **例外**（不强制套用 800 行）：第三方 vendored 源码、构建/锁文件、明确标注为机器生成的文件、以及仅含数据/配置的极长静态表（仍应优先考虑单独数据文件）。
+
 ## Code Review Rubrics
 
 When reviewing plans or code changes, evaluate on these dimensions (1-10 scale):

@@ -4,10 +4,10 @@ import type {
   AgentInput,
   AgentTaskDeliveryRecord,
   AgentTaskListItem,
-  AgentTaskPromptResult,
   AgentTaskUpdateInput,
   AgentRecord,
   AgentWorkspaceBundle,
+  AgentWorkspaceFile,
   PeerGatewayInfo,
   PeerGatewaySettings,
   ConversationAgentSnapshot,
@@ -43,18 +43,6 @@ export async function streamPiPrompt(
     providerConfig: options?.providerConfig ?? null,
     agentConfig: options?.agentConfig ?? null,
     attachments: options?.attachments ?? [],
-  })
-}
-
-export async function handleAgentTaskPrompt(payload: {
-  prompt: string
-  sessionId: string
-  agentId: string
-}): Promise<AgentTaskPromptResult> {
-  return invoke<AgentTaskPromptResult>('handle_agent_task_prompt', {
-    prompt: payload.prompt,
-    sessionId: payload.sessionId,
-    agentId: payload.agentId,
   })
 }
 
@@ -264,6 +252,13 @@ export async function setDefaultAgent(agentId: string): Promise<AgentRecord | nu
 
 export async function readAgentWorkspaceBundle(agentId: string): Promise<AgentWorkspaceBundle> {
   return invoke<AgentWorkspaceBundle>('read_agent_workspace_bundle', { agentId })
+}
+
+export async function readAgentWorkspaceFile(payload: {
+  agentId: string
+  relativePath: string
+}): Promise<AgentWorkspaceFile> {
+  return invoke<AgentWorkspaceFile>('read_agent_workspace_file', payload)
 }
 
 export async function writeAgentWorkspaceFile(payload: {

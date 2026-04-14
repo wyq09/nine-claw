@@ -181,9 +181,10 @@ impl LarkChannel {
             ));
         }
 
-        let bundled_node = pi_runtime.resource_root.as_ref().map(|root| {
-            crate::pi_runtime::bundled_node_executable_path(root.as_path())
-        });
+        let bundled_node = pi_runtime
+            .resource_root
+            .as_ref()
+            .map(|root| crate::pi_runtime::bundled_node_executable_path(root.as_path()));
 
         if cfg!(target_os = "macos") {
             // 优先：与 PI 同目录、由 prepare-pi-runtime 从 nodejs.org 打入的完整 node（用户无需再装 Node）。
@@ -728,48 +729,6 @@ impl Channel for LarkChannel {
                         let user_id_for_state = session_user_id.clone();
                         let app_for_cb = app_handle.clone();
                         let state_for_run = user_states.clone();
-                        let agent_id_for_task = agent_config.as_ref().map(|item| item.id.clone());
-
-                        if let Some(agent_id) = agent_id_for_task.as_deref() {
-                            let task_session_id = format!("{channel_id}:{session_user_id}");
-                            match crate::agent_tasks::handle_prompt(
-                                &app_handle,
-                                &prompt_text,
-                                &task_session_id,
-                                agent_id,
-                            ) {
-                                Ok(task_result) if task_result.handled => {
-                                    if let Ok(mut guard) = user_states.lock() {
-                                        if let Some(state) = guard.get_mut(&session_user_id) {
-                                            state.running = false;
-                                            state.active_run = None;
-                                        }
-                                    }
-                                    let content = task_result.assistant_message.trim().to_string();
-                                    if !content.is_empty() {
-                                        emit_bot_message(
-                                            &app_handle,
-                                            &channel_id,
-                                            &session_user_id,
-                                            "outbound_done",
-                                            &content,
-                                            agent_config.as_ref(),
-                                        );
-                                        let _ = send_text_chunks(
-                                            &helper_stdin,
-                                            &pending_requests,
-                                            &receive_target,
-                                            &content,
-                                        );
-                                    }
-                                    continue;
-                                }
-                                Ok(_) => {}
-                                Err(error) => {
-                                    log::warn!("lark task intent 处理失败: {}", error);
-                                }
-                            }
-                        }
 
                         let result = bridge.process_message_with_attachments_interruptible(
                             &channel_id,

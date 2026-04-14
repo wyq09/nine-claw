@@ -1667,44 +1667,6 @@ impl Channel for WeChatChannel {
                         let user_id_for_state = user_id.clone();
                         let app_for_cb = app_handle.clone();
                         let state_for_run = user_states.clone();
-                        let agent_id_for_task = agent_config.as_ref().map(|item| item.id.clone());
-
-                        if let Some(agent_id) = agent_id_for_task.as_deref() {
-                            let task_session_id = format!("{channel_id}:{user_id}");
-                            match crate::agent_tasks::handle_prompt(
-                                &app_handle,
-                                &prompt_text,
-                                &task_session_id,
-                                agent_id,
-                            ) {
-                                Ok(task_result) if task_result.handled => {
-                                    if let Ok(mut guard) = user_states.lock() {
-                                        if let Some(state) = guard.get_mut(&user_id) {
-                                            state.running = false;
-                                            state.active_run = None;
-                                        }
-                                    }
-                                    let content = task_result.assistant_message.trim().to_string();
-                                    if !content.is_empty() {
-                                        emit_bot_message(
-                                            &app_handle,
-                                            &channel_id,
-                                            &user_id,
-                                            "outbound_done",
-                                            &content,
-                                            agent_config.as_ref(),
-                                        );
-                                        let _ = rt
-                                            .block_on(api.send_message(&user_id, &content, ct_opt));
-                                    }
-                                    continue;
-                                }
-                                Ok(_) => {}
-                                Err(error) => {
-                                    log::warn!("wechat task intent 处理失败: {}", error);
-                                }
-                            }
-                        }
 
                         let result = bridge.process_message_with_attachments_interruptible(
                             &channel_id,

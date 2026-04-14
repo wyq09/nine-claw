@@ -75,16 +75,19 @@ pub fn resolve_skill_directories(skill_ids: &[String]) -> Result<Vec<PathBuf>, S
     }
 
     let installed = list_installed_skills()?;
-    let installed_by_id = installed
+    let mut available_by_id = installed
         .into_iter()
         .map(|skill| (skill.id, PathBuf::from(skill.path)))
         .collect::<HashMap<_, _>>();
+    for (skill_id, path) in list_runtime_system_skill_directories()? {
+        available_by_id.entry(skill_id).or_insert(path);
+    }
 
     let mut resolved = Vec::new();
     let mut seen = HashSet::new();
 
     for skill_id in skill_ids {
-        let Some(path) = installed_by_id.get(skill_id) else {
+        let Some(path) = available_by_id.get(skill_id) else {
             continue;
         };
 
@@ -95,6 +98,27 @@ pub fn resolve_skill_directories(skill_ids: &[String]) -> Result<Vec<PathBuf>, S
     }
 
     Ok(resolved)
+}
+
+fn list_runtime_system_skill_directories() -> Result<HashMap<String, PathBuf>, String> {
+    let mut items = HashMap::new();
+    for root in discover_runtime_system_skill_roots() {
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let skill_id = entry.file_name().to_string_lossy().trim().to_string();
+            if skill_id.is_empty() || skill_id.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.join("SKILL.md").is_file() {
+                items.entry(skill_id).or_insert(path);
+            }
+        }
+    }
+    Ok(items)
 }
 
 pub fn list_system_skill_catalog_for_app(app: &AppHandle) -> Result<SystemSkillCatalog, String> {
@@ -260,6 +284,48 @@ fn discover_dev_system_skill_root() -> Option<PathBuf> {
     }
 
     None
+}
+
+fn discover_runtime_system_skill_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(dev_root) = discover_dev_system_skill_root() {
+        let canonical = fs::canonicalize(&dev_root).unwrap_or(dev_root.clone());
+        if seen.insert(canonical) {
+            roots.push(dev_root);
+        }
+    }
+
+    let mut start_points = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        start_points.push(current_dir);
+    }
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            start_points.push(parent.to_path_buf());
+        }
+    }
+
+    for start_point in start_points {
+        for ancestor in start_point.ancestors() {
+            for candidate in [
+                ancestor.join("system-skills"),
+                ancestor.join("resources").join("system-skills"),
+                ancestor.join("Resources").join("system-skills"),
+            ] {
+                if !candidate.is_dir() {
+                    continue;
+                }
+                let canonical = fs::canonicalize(&candidate).unwrap_or(candidate.clone());
+                if seen.insert(canonical) {
+                    roots.push(candidate);
+                }
+            }
+        }
+    }
+
+    roots
 }
 
 fn resolve_system_skill_path(app: &AppHandle, skill_id: &str) -> Result<Option<PathBuf>, String> {
@@ -941,5 +1007,35 @@ description: >
         assert_eq!(catalog.skills[0].description, "guided builder");
 
         remove_dir_all(temp_root).expect("cleanup temp root");
+    }
+
+    #[test]
+    fn resolve_skill_directories_reads_runtime_system_skills() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "nineclaw-runtime-system-skill-test-{}",
+            system_time_to_ms(SystemTime::now())
+        ));
+        let app_root = temp_root.join("app");
+        let resources_root = app_root.join("resources").join("system-skills");
+        create_dir_all(resources_root.join("nineclaw-task-creator")).expect("create system skill");
+        write(
+            resources_root
+                .join("nineclaw-task-creator")
+                .join("SKILL.md"),
+            "---\nname: nineclaw-task-creator\ndescription: default task creator\n---\n",
+        )
+        .expect("write system skill manifest");
+
+        let previous_dir = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&app_root).expect("set current dir");
+
+        let resolved =
+            resolve_skill_directories(&["nineclaw-task-creator".to_string()]).expect("resolve");
+
+        std::env::set_current_dir(previous_dir).expect("restore current dir");
+        remove_dir_all(temp_root).expect("cleanup temp root");
+
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].ends_with("nineclaw-task-creator"));
     }
 }

@@ -170,6 +170,8 @@ export type AgentScenarioLlmSlot = {
 export type AgentScenarioLlmConfig = {
   titleGeneration?: AgentScenarioLlmSlot
   memoryExtraction?: AgentScenarioLlmSlot
+  /** 定时任务在任务列表 / 系统推送里展示的标题与一句话简介（与 refine 任务元数据同一次调用） */
+  taskPushNotificationCopy?: AgentScenarioLlmSlot
 }
 
 export type ConversationAgentSnapshot = {
@@ -349,6 +351,8 @@ export type AgentWorkspaceFile = {
   readOnly: boolean
   exists: boolean
   content: string
+  /** 为 true 时正文未预载，选中时由前端再请求完整内容 */
+  lazyFetch?: boolean
 }
 
 export type AgentWorkspaceBundle = {
@@ -537,14 +541,6 @@ export type SchedulerServiceStatus = {
   launcherPath?: string | null
 }
 
-export type AgentTaskPromptResult = {
-  handled: boolean
-  needsClarification: boolean
-  assistantMessage: string
-  taskId?: string | null
-  draftId?: string | null
-}
-
 export type AgentTaskDeliveryRecord = {
   id: string
   taskId: string
@@ -571,6 +567,8 @@ export type AgentTaskListItem = {
   goal: string
   intervalMinutes?: number | null
   dailyTimes: string[]
+  weeklyDays: number[]
+  monthlyDays: number[]
   /** 一次性任务：计划触发时间（UTC 毫秒） */
   runAtMs?: number | null
   /** 是否在独立会话中展示执行结果 */
@@ -591,6 +589,8 @@ export type AgentTaskUpdateInput = {
   timezone: string
   intervalMinutes?: number | null
   dailyTimes: string[]
+  weeklyDays: number[]
+  monthlyDays: number[]
   runAtMs?: number | null
   resultInNewSession?: boolean
 }

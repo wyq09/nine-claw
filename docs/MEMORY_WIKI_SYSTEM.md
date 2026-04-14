@@ -22,6 +22,7 @@
 - `DECISIONS.md`、`memory/categories/*.md`（**默认由人/模型整理**，不从每轮对话自动灌条目）
 - `memory/REVIEW_QUEUE.md`（待复查、待闭环、易过期项目状态）
 - `memory/YYYY-MM-DD.md`（按日流水，ingest 追加摘要行）
+- `memory/DAILY_INDEX.md`（**日记检索索引**：每行 `DAILY|date|ts|user|cats|summary`，与 ingest 分类一致；先过滤再打开对应日期全文）
 
 ### Schema And Operations
 
@@ -36,7 +37,8 @@
 1. 注入核心私有文件。
 2. 注入 `memory/INDEX.md`、`SOURCE_INDEX.md`、`LOG.md`、`LINT.md`、`REVIEW_QUEUE.md`。
 3. 按问题抽取相关分类记忆（若对应 shard 存在且有内容）。
-4. 补最近两天的 daily log。
+4. 用当前用户问题对 `memory/DAILY_INDEX.md` 做 **轻量检索**（分类交集 + 摘要子串匹配；显式「还记得/上次」类问法取最近若干条），将命中摘要注入系统提示（有长度上限）；**不**把全部日记载入上下文。
+5. 最近两天的 daily log 全文仍可在需要时由模型按路径打开；工作区 bundle 里只预载最近两天日记正文与 `memory/categories/INDEX.md`，`DAILY_INDEX.md` 在 UI 中按需加载；其余分类分片与更早日记点击后再读盘（`read_agent_workspace_file`）。
 
 ## Write Flow
 
@@ -48,7 +50,7 @@
 - 更新 `SOURCE_INDEX.md`（含结构化 `Index` 行）
 - 追加 `LOG.md`
 - 刷新 `memory/INDEX.md` 和 `LINT.md`
-- 更新 `WORKING.md` 与当日 `memory/YYYY-MM-DD.md`
+- 更新 `WORKING.md` 与当日 `memory/YYYY-MM-DD.md`，并追加一行到 `memory/DAILY_INDEX.md`（含当日 ingest 分类键）
 - 对“别再这样”“不要误判”这类明确纠正，保守沉淀到 `PITFALLS.md`
 - 对承诺、阻塞、时效性项目状态自动补 `REVIEW_QUEUE.md`
 - **默认不再**向 `memory/categories/*.md` 追加（避免分类文件变成流水账）。若需恢复旧行为，启动前设置环境变量 `NINECLAW_APPEND_CATEGORY_MEMORY_ON_INGEST=1`（或 `true` / `yes`）。

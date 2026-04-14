@@ -1,7 +1,10 @@
-use crate::agent_tasks::{
-    self, AgentTaskPayload, DailyTimeSchedule as AgentDailyTimeSchedule,
-    IntervalSchedule as AgentIntervalSchedule, OnceAtSchedule,
+use crate::agent_task_schedule::{
+    DailyTimeSchedule as AgentDailyTimeSchedule, IntervalSchedule as AgentIntervalSchedule,
+    MonthlyTimeSchedule as AgentMonthlyTimeSchedule, OnceAtSchedule,
+    WeeklyTimeSchedule as AgentWeeklyTimeSchedule, SCHEDULE_TYPE_MONTHLY_TIME,
+    SCHEDULE_TYPE_ONCE_AT, SCHEDULE_TYPE_WEEKLY_TIME,
 };
+use crate::agent_tasks::{self, AgentTaskPayload};
 use crate::agent_workspace;
 use crate::agents::{self, AgentRecord};
 use crate::channels::pi_bridge::{PiBridge, PiProcessOutcome};
@@ -34,6 +37,8 @@ const SOURCE_KIND_AGENT_TASK: &str = "agent_task";
 const TRIGGER_TYPE_DAILY_TIME: &str = "daily_time";
 const TRIGGER_TYPE_INTERVAL: &str = "interval";
 const TRIGGER_TYPE_ONCE_AT: &str = "once_at";
+const TRIGGER_TYPE_WEEKLY_TIME: &str = "weekly_time";
+const TRIGGER_TYPE_MONTHLY_TIME: &str = "monthly_time";
 const LEASE_KEY_DAEMON_LEADER: &str = "daemon_leader";
 const MACOS_LAUNCH_AGENT_LABEL: &str = "com.wuyq.nineclaw.scheduler";
 #[cfg(target_os = "windows")]
@@ -41,6 +46,11 @@ const WINDOWS_TASK_NAME: &str = "NineClaw Scheduler";
 
 static EMBEDDED_SCHEDULER_STARTED: OnceLock<()> = OnceLock::new();
 static ACTIVE_RUNS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// 桌面端任务推送写入本地历史时，每次执行使用独立会话，与创建任务时的会话解耦。
+fn desktop_delivery_history_session_id() -> String {
+    format!("task_sess_{}", Uuid::new_v4().simple())
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,6 +124,20 @@ pub struct SchedulerSyncResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DailyTimeTrigger {
+    time: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WeeklyTimeTrigger {
+    day_of_week: u32,
+    time: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MonthlyTimeTrigger {
+    day_of_month: u32,
     time: String,
 }
 
@@ -1044,14 +1068,11 @@ fn materialize_jobs_from_agent_tasks(
             schedule_name: item.task.title.clone(),
         };
         match item.task.schedule_type.as_str() {
-            agent_tasks::SCHEDULE_TYPE_ONCE_AT => {
-                let schedule: OnceAtSchedule =
-                    serde_json::from_str(&item.task.schedule_json).map_err(|error| {
-                        format!("解析 once_at agent task schedule 失败: {error}")
-                    })?;
+            SCHEDULE_TYPE_ONCE_AT => {
+                let schedule: OnceAtSchedule = serde_json::from_str(&item.task.schedule_json)
+                    .map_err(|error| format!("解析 once_at agent task schedule 失败: {error}"))?;
                 let now_ms = crate::chrono_like_timestamp();
-                let enabled =
-                    item.task.status == "active" && schedule.run_at_ms > now_ms;
+                let enabled = item.task.status == "active" && schedule.run_at_ms > now_ms;
                 jobs.push(MaterializedJob {
                     id: format!("task:{}:once", item.task.id),
                     source_kind: SOURCE_KIND_AGENT_TASK.to_string(),
@@ -1075,6 +1096,84 @@ fn materialize_jobs_from_agent_tasks(
                     delivery_json: serde_json::to_string(&delivery)
                         .map_err(|error| format!("序列化 agent task delivery 失败: {error}"))?,
                 });
+            }
+            SCHEDULE_TYPE_WEEKLY_TIME => {
+                let schedule: AgentWeeklyTimeSchedule =
+                    serde_json::from_str(&item.task.schedule_json).map_err(|error| {
+                        format!("解析 weekly agent task schedule 失败: {error}")
+                    })?;
+                for day in schedule.days_of_week {
+                    for time in &schedule.times {
+                        jobs.push(MaterializedJob {
+                            id: format!("task:{}:w{}:{}", item.task.id, day, time.replace(':', "")),
+                            source_kind: SOURCE_KIND_AGENT_TASK.to_string(),
+                            owner_agent_id: item.task.agent_id.clone(),
+                            source_schedule_id: item.task.id.clone(),
+                            source_task_id: item.task.id.clone(),
+                            kind: match item.task.task_type.as_str() {
+                                "agent_prompt" => "agent_prompt".to_string(),
+                                _ => "notify".to_string(),
+                            },
+                            name: format!("{} @ 周{} {}", item.task.title, day, time),
+                            description: item.task.intent_summary.clone(),
+                            enabled: item.task.status == "active",
+                            timezone: normalize_scheduler_timezone(&item.task.timezone),
+                            trigger_type: TRIGGER_TYPE_WEEKLY_TIME.to_string(),
+                            trigger_spec_json: serde_json::to_string(&WeeklyTimeTrigger {
+                                day_of_week: day,
+                                time: time.clone(),
+                            })
+                            .map_err(|error| format!("序列化 weekly trigger 失败: {error}"))?,
+                            payload_json: serde_json::to_string(&base_payload).map_err(
+                                |error| {
+                                    format!("序列化 agent task scheduler payload 失败: {error}")
+                                },
+                            )?,
+                            delivery_json: serde_json::to_string(&delivery).map_err(|error| {
+                                format!("序列化 agent task delivery 失败: {error}")
+                            })?,
+                        });
+                    }
+                }
+            }
+            SCHEDULE_TYPE_MONTHLY_TIME => {
+                let schedule: AgentMonthlyTimeSchedule =
+                    serde_json::from_str(&item.task.schedule_json).map_err(|error| {
+                        format!("解析 monthly agent task schedule 失败: {error}")
+                    })?;
+                for day in schedule.days_of_month {
+                    for time in &schedule.times {
+                        jobs.push(MaterializedJob {
+                            id: format!("task:{}:m{}:{}", item.task.id, day, time.replace(':', "")),
+                            source_kind: SOURCE_KIND_AGENT_TASK.to_string(),
+                            owner_agent_id: item.task.agent_id.clone(),
+                            source_schedule_id: item.task.id.clone(),
+                            source_task_id: item.task.id.clone(),
+                            kind: match item.task.task_type.as_str() {
+                                "agent_prompt" => "agent_prompt".to_string(),
+                                _ => "notify".to_string(),
+                            },
+                            name: format!("{} @ 每月{}号 {}", item.task.title, day, time),
+                            description: item.task.intent_summary.clone(),
+                            enabled: item.task.status == "active",
+                            timezone: normalize_scheduler_timezone(&item.task.timezone),
+                            trigger_type: TRIGGER_TYPE_MONTHLY_TIME.to_string(),
+                            trigger_spec_json: serde_json::to_string(&MonthlyTimeTrigger {
+                                day_of_month: day,
+                                time: time.clone(),
+                            })
+                            .map_err(|error| format!("序列化 monthly trigger 失败: {error}"))?,
+                            payload_json: serde_json::to_string(&base_payload).map_err(
+                                |error| {
+                                    format!("序列化 agent task scheduler payload 失败: {error}")
+                                },
+                            )?,
+                            delivery_json: serde_json::to_string(&delivery).map_err(|error| {
+                                format!("序列化 agent task delivery 失败: {error}")
+                            })?,
+                        });
+                    }
+                }
             }
             TRIGGER_TYPE_INTERVAL => {
                 let schedule: AgentIntervalSchedule =
@@ -1549,13 +1648,14 @@ fn finalize_run(
                     } else {
                         delivery.schedule_name.clone()
                     };
+                    let session_for_history = desktop_delivery_history_session_id();
                     if let Ok(record) = agent_tasks::record_delivery(
                         app,
                         &conn,
                         &task_delivery_record_task_id(claim),
                         &claim.run_id,
                         &agent.id,
-                        &delivery.target_user_id,
+                        &session_for_history,
                         &title,
                         &assistant_message,
                     ) {
@@ -1800,7 +1900,11 @@ fn render_message(
     rendered.trim().to_string()
 }
 
-fn scheduler_session_label(delivery: &SchedulerDelivery, claim: &ClaimedRun, agent_id: &str) -> String {
+fn scheduler_session_label(
+    delivery: &SchedulerDelivery,
+    claim: &ClaimedRun,
+    agent_id: &str,
+) -> String {
     let trimmed = delivery.target_user_id.trim();
     if trimmed.is_empty() {
         format!("scheduler-session:{agent_id}:{}", claim.run_id)
@@ -2064,13 +2168,14 @@ fn send_task_message(
         } else {
             text_content.clone()
         };
+        let session_for_history = desktop_delivery_history_session_id();
         let record = agent_tasks::record_delivery(
             app,
             &connection,
             &task_delivery_record_task_id(claim),
             &claim.run_id,
             &agent.id,
-            &delivery.target_user_id,
+            &session_for_history,
             &title,
             &outbound,
         )?;
@@ -2317,10 +2422,29 @@ fn compute_next_run_at(
                 after_ms,
             )?))
         }
+        TRIGGER_TYPE_WEEKLY_TIME => {
+            let trigger: WeeklyTimeTrigger = serde_json::from_str(trigger_spec_json)
+                .map_err(|error| format!("解析 scheduler weekly trigger 失败: {error}"))?;
+            Ok(Some(compute_next_weekly_run_at(
+                &normalize_scheduler_timezone(timezone),
+                trigger.day_of_week,
+                &trigger.time,
+                after_ms,
+            )?))
+        }
+        TRIGGER_TYPE_MONTHLY_TIME => {
+            let trigger: MonthlyTimeTrigger = serde_json::from_str(trigger_spec_json)
+                .map_err(|error| format!("解析 scheduler monthly trigger 失败: {error}"))?;
+            Ok(Some(compute_next_monthly_run_at(
+                &normalize_scheduler_timezone(timezone),
+                trigger.day_of_month,
+                &trigger.time,
+                after_ms,
+            )?))
+        }
         TRIGGER_TYPE_ONCE_AT => {
-            let trigger: OnceAtSchedule = serde_json::from_str(trigger_spec_json).map_err(|error| {
-                format!("解析 scheduler once_at trigger 失败: {error}")
-            })?;
+            let trigger: OnceAtSchedule = serde_json::from_str(trigger_spec_json)
+                .map_err(|error| format!("解析 scheduler once_at trigger 失败: {error}"))?;
             if after_ms >= trigger.run_at_ms {
                 return Ok(None);
             }
@@ -2366,6 +2490,97 @@ fn compute_next_daily_run_at(
             let local_after = after_utc.with_timezone(&offset);
             for day_offset in 0_i64..=7_i64 {
                 let date = local_after.date_naive() + ChronoDuration::days(day_offset);
+                let candidate = offset
+                    .with_ymd_and_hms(
+                        date.year(),
+                        date.month(),
+                        date.day(),
+                        time.hour() as u32,
+                        time.minute() as u32,
+                        0,
+                    )
+                    .single();
+                if let Some(candidate) = candidate {
+                    let candidate_utc = candidate.with_timezone(&Utc);
+                    if candidate_utc > after_utc {
+                        return Ok(candidate_utc.timestamp_millis());
+                    }
+                }
+            }
+        }
+    }
+
+    Err("无法计算下一次 scheduler 触发时间".to_string())
+}
+
+fn compute_next_weekly_run_at(
+    timezone: &str,
+    day_of_week: u32,
+    time_text: &str,
+    after_ms: i64,
+) -> Result<i64, String> {
+    compute_next_calendar_run_at(timezone, time_text, after_ms, |date| {
+        date.weekday().number_from_monday() == day_of_week
+    })
+}
+
+fn compute_next_monthly_run_at(
+    timezone: &str,
+    day_of_month: u32,
+    time_text: &str,
+    after_ms: i64,
+) -> Result<i64, String> {
+    compute_next_calendar_run_at(timezone, time_text, after_ms, |date| {
+        date.day() == day_of_month
+    })
+}
+
+fn compute_next_calendar_run_at<F>(
+    timezone: &str,
+    time_text: &str,
+    after_ms: i64,
+    matcher: F,
+) -> Result<i64, String>
+where
+    F: Fn(chrono::NaiveDate) -> bool,
+{
+    let time = parse_daily_time(time_text)?;
+    let after_utc = DateTime::<Utc>::from_timestamp_millis(after_ms).unwrap_or_else(Utc::now);
+    match resolve_timezone(timezone) {
+        ResolvedTimezone::Named(tz) => {
+            let local_after = after_utc.with_timezone(&tz);
+            for day_offset in 0_i64..=370_i64 {
+                let date = local_after.date_naive() + ChronoDuration::days(day_offset);
+                if !matcher(date) {
+                    continue;
+                }
+                let naive = date.and_time(time);
+                match tz.from_local_datetime(&naive) {
+                    LocalResult::Single(candidate) => {
+                        let candidate_utc = candidate.with_timezone(&Utc);
+                        if candidate_utc > after_utc {
+                            return Ok(candidate_utc.timestamp_millis());
+                        }
+                    }
+                    LocalResult::Ambiguous(first, second) => {
+                        for candidate in [first, second] {
+                            let candidate_utc = candidate.with_timezone(&Utc);
+                            if candidate_utc > after_utc {
+                                return Ok(candidate_utc.timestamp_millis());
+                            }
+                        }
+                    }
+                    LocalResult::None => continue,
+                }
+            }
+        }
+        ResolvedTimezone::Fixed(offset) => {
+            let local_after = after_utc.with_timezone(&offset);
+            for day_offset in 0_i64..=370_i64 {
+                let date = local_after.date_naive() + ChronoDuration::days(day_offset);
+                if !matcher(date) {
+                    continue;
+                }
                 let candidate = offset
                     .with_ymd_and_hms(
                         date.year(),
@@ -2649,6 +2864,30 @@ mod tests {
         let next = compute_next_daily_run_at("Asia/Shanghai", "09:00", now).expect("next");
         let rendered = format_scheduled_for(next, "Asia/Shanghai");
         assert!(rendered.starts_with("2026-04-08 09:00"));
+    }
+
+    #[test]
+    fn compute_next_weekly_run_supports_weekday_trigger() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 8, 0, 30, 0)
+            .single()
+            .expect("utc now")
+            .timestamp_millis();
+        let next = compute_next_weekly_run_at("Asia/Shanghai", 5, "09:00", now).expect("next");
+        let rendered = format_scheduled_for(next, "Asia/Shanghai");
+        assert!(rendered.starts_with("2026-04-10 09:00"));
+    }
+
+    #[test]
+    fn compute_next_monthly_run_supports_day_of_month_trigger() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 8, 0, 30, 0)
+            .single()
+            .expect("utc now")
+            .timestamp_millis();
+        let next = compute_next_monthly_run_at("Asia/Shanghai", 20, "09:00", now).expect("next");
+        let rendered = format_scheduled_for(next, "Asia/Shanghai");
+        assert!(rendered.starts_with("2026-04-20 09:00"));
     }
 
     #[test]

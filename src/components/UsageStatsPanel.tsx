@@ -295,6 +295,9 @@ function UsageBreakdownShadcnTable({
   )
 }
 
+/** 柱状图轨道固定高度（px）。父级须为明确高度，百分比高度才能生效；用像素比例最稳妥 */
+const DAILY_BAR_TRACK_PX = 120
+
 function UsageDailyShadcnSection({ rows }: { rows: UsageBucket[] }) {
   const maxValue = rows.reduce((max, row) => Math.max(max, row.totalTokens), 0)
   const chronological = [...rows].sort((left, right) => left.label.localeCompare(right.label))
@@ -323,17 +326,22 @@ function UsageDailyShadcnSection({ rows }: { rows: UsageBucket[] }) {
             aria-label="按天 Token 趋势"
           >
             {chronological.map((row) => {
-              const height =
-                maxValue > 0 ? Math.max(12, Math.round((row.totalTokens / maxValue) * 100)) : 12
+              const barPx =
+                maxValue > 0
+                  ? Math.max(6, Math.round((row.totalTokens / maxValue) * DAILY_BAR_TRACK_PX))
+                  : 6
               return (
                 <div key={row.label} className="flex flex-col items-center gap-2">
                   <span className="text-[11px] tabular-nums text-muted-foreground">
                     {formatTokensTable(row.totalTokens)}
                   </span>
-                  <div className="flex w-full min-h-[100px] max-h-[140px] items-end rounded-xl bg-muted/30 px-1 pb-1 pt-2">
+                  <div
+                    className="flex w-full items-end rounded-xl bg-muted/30 px-1 pb-1 pt-2"
+                    style={{ height: DAILY_BAR_TRACK_PX }}
+                  >
                     <div
                       className="w-full rounded-lg bg-linear-to-b from-primary/90 to-primary/60"
-                      style={{ height: `${height}%`, minHeight: '6px' }}
+                      style={{ height: barPx }}
                     />
                   </div>
                   <span className="text-[11px] text-muted-foreground">{row.label.slice(5)}</span>
@@ -469,7 +477,6 @@ export function UsageStatsPanel() {
     <div className="usage-dashboard flex flex-col gap-6">
       <div className="usage-dashboard-toolbar flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <p className="usage-dashboard-lede m-0 max-w-[52ch] text-[13px] leading-relaxed text-muted-foreground">
-          数据来自本地 SQLite，按每条回复（turn）汇总；可用时间范围筛选后查看分布。表格样式对齐 shadcn/ui Table + Card。
         </p>
         <div className="flex shrink-0 flex-col items-stretch gap-3 sm:items-end">
           <button

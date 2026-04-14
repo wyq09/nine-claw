@@ -5,8 +5,137 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>NineClaw</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --boot-bg: #141413;
+        --boot-panel: rgba(28, 28, 26, 0.88);
+        --boot-border: rgba(240, 238, 230, 0.08);
+        --boot-text: rgba(250, 249, 245, 0.94);
+        --boot-muted: rgba(176, 174, 165, 0.92);
+        --boot-accent: #c96442;
+      }
+
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        background: var(--boot-bg);
+      }
+
+      body.boot-ready #boot-splash {
+        opacity: 0;
+        transform: scale(1.01);
+        pointer-events: none;
+      }
+
+      #boot-splash {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        background:
+          radial-gradient(circle at top, rgba(201, 100, 66, 0.14), transparent 38%),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 42%),
+          var(--boot-bg);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease;
+        z-index: 9999;
+      }
+
+      .boot-card {
+        display: grid;
+        gap: 14px;
+        min-width: min(360px, calc(100vw - 48px));
+        padding: 24px 26px;
+        border: 1px solid var(--boot-border);
+        border-radius: 22px;
+        background: var(--boot-panel);
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
+        color: var(--boot-text);
+        font-family:
+          "SF Pro Display",
+          "SF Pro Text",
+          "PingFang SC",
+          "Hiragino Sans GB",
+          "Microsoft YaHei",
+          system-ui,
+          sans-serif;
+      }
+
+      .boot-brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+
+      .boot-logo {
+        width: 42px;
+        height: 42px;
+        display: grid;
+        place-items: center;
+        border-radius: 12px;
+        background: linear-gradient(135deg, var(--boot-accent), #e59d7d);
+        color: #fffaf5;
+        font-size: 20px;
+        font-weight: 700;
+      }
+
+      .boot-title {
+        font-size: 18px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+
+      .boot-subtitle {
+        margin-top: 2px;
+        color: var(--boot-muted);
+        font-size: 13px;
+      }
+
+      .boot-progress {
+        position: relative;
+        overflow: hidden;
+        height: 4px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+      }
+
+      .boot-progress::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        width: 42%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, transparent, var(--boot-accent), transparent);
+        animation: boot-slide 1.1s ease-in-out infinite;
+      }
+
+      @keyframes boot-slide {
+        from {
+          transform: translateX(-160%);
+        }
+        to {
+          transform: translateX(320%);
+        }
+      }
+    </style>
   </head>
   <body>
+    <div id="boot-splash" aria-hidden="true">
+      <div class="boot-card">
+        <div class="boot-brand">
+          <div class="boot-logo">9</div>
+          <div>
+            <div class="boot-title">NineClaw</div>
+            <div class="boot-subtitle">正在准备多智能体工作台</div>
+          </div>
+        </div>
+        <div class="boot-progress"></div>
+      </div>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

@@ -6,6 +6,7 @@ use tauri::AppHandle;
 use uuid::Uuid;
 
 const DEFAULT_AGENT_STATE_KEY: &str = "default_agent_id";
+const REQUIRED_SYSTEM_SKILL_IDS: &[&str] = &["nineclaw-task-creator"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +24,9 @@ pub struct AgentScenarioLlmConfig {
     pub title_generation: Option<AgentScenarioLlmSlot>,
     #[serde(default)]
     pub memory_extraction: Option<AgentScenarioLlmSlot>,
+    /// 定时任务在任务中心 / 推送通知里展示的标题与一句话简介（同一次 LLM 调用生成）
+    #[serde(default)]
+    pub task_push_notification_copy: Option<AgentScenarioLlmSlot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -310,6 +314,22 @@ pub fn read_agent_workspace_bundle(
 
     try_ensure_workspace_for_record(&record, false, "读取智能体工作区");
     agent_workspace::read_agent_workspace_bundle(&agent_id)
+}
+
+pub fn read_agent_workspace_file(
+    app: &AppHandle,
+    agent_id: String,
+    relative_path: String,
+) -> Result<agent_workspace::AgentWorkspaceFile, String> {
+    let connection = crate::open_history_db(app)?;
+    ensure_agents_ready(&connection)?;
+
+    let Some(record) = get_active_agent_by_id(&connection, &agent_id)? else {
+        return Err("要查看的智能体不存在".to_string());
+    };
+
+    try_ensure_workspace_for_record(&record, false, "读取智能体工作区文件");
+    agent_workspace::read_agent_workspace_file(&agent_id, &relative_path)
 }
 
 pub fn write_agent_workspace_file(
@@ -1307,7 +1327,7 @@ fn normalize_agent_input(payload: AgentInput) -> Result<NormalizedAgentInput, St
         summary,
         description,
         system_prompt: payload.system_prompt.trim().to_string(),
-        skill_ids: dedupe_skill_ids(payload.skill_ids),
+        skill_ids: ensure_required_system_skill_ids(dedupe_skill_ids(payload.skill_ids)),
         default_provider_id,
         default_model,
         execution_mode: normalize_execution_mode(payload.execution_mode.as_deref()),
@@ -1372,6 +1392,16 @@ fn dedupe_skill_ids(skill_ids: Vec<String>) -> Vec<String> {
         }
     }
     normalized
+}
+
+fn ensure_required_system_skill_ids(mut skill_ids: Vec<String>) -> Vec<String> {
+    let mut seen = skill_ids.iter().cloned().collect::<HashSet<_>>();
+    for skill_id in REQUIRED_SYSTEM_SKILL_IDS {
+        if seen.insert((*skill_id).to_string()) {
+            skill_ids.push((*skill_id).to_string());
+        }
+    }
+    skill_ids
 }
 
 fn default_execution_mode() -> String {
@@ -1500,12 +1530,18 @@ fn normalize_scenario_llm_config(
     let config = config.unwrap_or_default();
     let title_generation = normalize_scenario_llm_slot(config.title_generation);
     let memory_extraction = normalize_scenario_llm_slot(config.memory_extraction);
-    if title_generation.is_none() && memory_extraction.is_none() {
+    let task_push_notification_copy =
+        normalize_scenario_llm_slot(config.task_push_notification_copy);
+    if title_generation.is_none()
+        && memory_extraction.is_none()
+        && task_push_notification_copy.is_none()
+    {
         None
     } else {
         Some(AgentScenarioLlmConfig {
             title_generation,
             memory_extraction,
+            task_push_notification_copy,
         })
     }
 }
@@ -1981,7 +2017,11 @@ mod tests {
 
         assert_eq!(
             created.skill_ids,
-            vec!["alpha".to_string(), "beta".to_string()]
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "nineclaw-task-creator".to_string()
+            ]
         );
         assert_eq!(created.name, "自定义助理");
 
@@ -2011,7 +2051,10 @@ mod tests {
         .expect("update agent");
 
         assert_eq!(updated.name, "自定义助理 v2");
-        assert_eq!(updated.skill_ids, vec!["gamma".to_string()]);
+        assert_eq!(
+            updated.skill_ids,
+            vec!["gamma".to_string(), "nineclaw-task-creator".to_string()]
+        );
         assert_eq!(updated.execution_mode, "supervisor");
         assert_eq!(
             updated
@@ -2020,6 +2063,35 @@ mod tests {
                 .map(|item| item.shared_context_policy.as_str()),
             Some("summary")
         );
+    }
+
+    #[test]
+    fn create_agent_auto_mounts_required_system_skill() {
+        let mut connection = connection();
+
+        let created = create_agent_with_connection(
+            &mut connection,
+            AgentInput {
+                name: "默认技能测试".to_string(),
+                summary: "负责综合处理".to_string(),
+                description: "更完整的说明".to_string(),
+                system_prompt: "".to_string(),
+                skill_ids: vec![],
+                default_provider_id: "openai".to_string(),
+                default_model: "gpt-4.1".to_string(),
+                execution_mode: Some("single".to_string()),
+                collaboration_config: None,
+                accent_color: None,
+                bot_configs: HashMap::new(),
+                heartbeat_config: AgentHeartbeatConfig::default(),
+                scenario_llm_config: None,
+            },
+        )
+        .expect("create agent");
+
+        assert!(created
+            .skill_ids
+            .contains(&"nineclaw-task-creator".to_string()));
     }
 
     #[test]

@@ -16,6 +16,7 @@ const SOURCE_INDEX_FILE: &str = "SOURCE_INDEX.md";
 const LOG_FILE: &str = "LOG.md";
 const LINT_FILE: &str = "LINT.md";
 const REVIEW_QUEUE_FILE: &str = "REVIEW_QUEUE.md";
+const DAILY_INDEX_FILE: &str = "DAILY_INDEX.md";
 const WIKI_DIR: &str = "wiki";
 const WIKI_INDEX_FILE: &str = "INDEX.md";
 const MEMORY_WIKI_FILES: &[&str] = &[
@@ -57,6 +58,10 @@ pub(super) fn ensure_memory_wiki_scaffold(agent_home: &Path) -> Result<(), Strin
             super::fallback_template("memory/REVIEW_QUEUE.md"),
         ),
         (
+            PathBuf::from("memory").join(DAILY_INDEX_FILE),
+            super::fallback_template("memory/DAILY_INDEX.md"),
+        ),
+        (
             PathBuf::from(WIKI_DIR).join(WIKI_INDEX_FILE),
             super::fallback_template("wiki/INDEX.md"),
         ),
@@ -84,8 +89,8 @@ pub(super) fn build_memory_wiki_snapshot(
 
     let mut sections = Vec::new();
     sections.push(format!(
-        "入口：先看 `memory/{}`；查来源看 `memory/{}`；查外部知识看 `wiki/{}`。",
-        MEMORY_INDEX_FILE, SOURCE_INDEX_FILE, WIKI_INDEX_FILE
+        "入口：先看 `memory/{}`；查来源看 `memory/{}`；**日记检索**看 `memory/{}`（`DAILY|` 行含 date/cats/summary，再下钻 `memory/YYYY-MM-DD.md`）；查外部知识看 `wiki/{}`。",
+        MEMORY_INDEX_FILE, SOURCE_INDEX_FILE, DAILY_INDEX_FILE, WIKI_INDEX_FILE
     ));
 
     let related_categories = super::select_memory_categories_for_query(current_prompt)
@@ -212,7 +217,7 @@ pub(super) fn read_memory_wiki_files(
     let agent_home = root.join("agents").join(agent_id);
     ensure_memory_wiki_scaffold(&agent_home)?;
 
-    Ok(MEMORY_WIKI_FILES
+    let mut files: Vec<AgentWorkspaceFile> = MEMORY_WIKI_FILES
         .iter()
         .map(|file_name| {
             let relative_path = PathBuf::from("agents")
@@ -226,9 +231,77 @@ pub(super) fn read_memory_wiki_files(
                 relative_path,
                 agent_home.join("memory").join(file_name),
                 false,
+                false,
             )
         })
-        .collect())
+        .collect();
+
+    let daily_index_path = agent_home.join("memory").join(DAILY_INDEX_FILE);
+    let daily_rel = PathBuf::from("agents")
+        .join(agent_id)
+        .join("memory")
+        .join(DAILY_INDEX_FILE);
+    files.push(read_workspace_file(
+        "agent",
+        "memoryIndex",
+        DAILY_INDEX_FILE,
+        daily_rel,
+        daily_index_path,
+        false,
+        true,
+    ));
+
+    Ok(files)
+}
+
+/// 每条 ingest 对应一行，供 `rg`/运行时按 `cats` 与摘要过滤，避免通读所有 `YYYY-MM-DD.md`。
+pub(super) fn append_daily_digest_index_line(
+    agent_home: &Path,
+    date_label: &str,
+    timestamp: &str,
+    user_id: &str,
+    summary: &str,
+    categories: &[MemoryCategoryDefinition],
+) -> Result<(), String> {
+    ensure_memory_wiki_scaffold(agent_home)?;
+    let path = agent_home.join("memory").join(DAILY_INDEX_FILE);
+    let existing = fs::read_to_string(&path)
+        .unwrap_or_else(|_| super::fallback_template("memory/DAILY_INDEX.md"));
+    let mut next = existing.trim_end().to_string();
+    if !next.contains("## Lines") {
+        next.push_str("\n\n## Lines\n");
+    }
+    let cats = if categories.is_empty() {
+        "general".to_string()
+    } else {
+        format_category_keys(categories)
+    };
+    let safe_user = sanitize_workspace_segment(user_id, "user");
+    let one_line = sanitize_daily_index_text(summary, 220);
+    let _ = writeln!(
+        next,
+        "DAILY|{}|{}|{}|{}|{}",
+        sanitize_daily_index_text(date_label, 12),
+        sanitize_daily_index_text(timestamp, 40),
+        safe_user,
+        sanitize_daily_index_text(&cats, 120),
+        one_line
+    );
+    fs::write(&path, next).map_err(|error| format!("写入 DAILY_INDEX.md 失败: {error}"))
+}
+
+fn sanitize_daily_index_text(value: &str, max_chars: usize) -> String {
+    let collapsed: String = value
+        .chars()
+        .map(|ch| {
+            if ch == '|' || ch.is_control() {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    truncate_for_memory(collapsed.trim(), max_chars)
 }
 
 pub(super) fn record_conversation_ingest(
@@ -464,7 +537,7 @@ fn build_memory_index_content(agent_home: &Path) -> Result<String, String> {
     let category_count = count_category_files(agent_home)?;
 
     let mut content = String::from(
-        "# INDEX.md\n\nThis is the root entry for the agent memory system. Use it to choose the right layer before reading or writing.\n\n## Read Order\n\n1. `MEMORY.md` for startup identity, core principles, and the most stable anchors.\n2. `WORKING.md` for current execution state, `Current Focus`, and `OPEN_LOOPS`.\n3. `DECISIONS.md` and `PITFALLS.md` for confirmed rules and high-risk mistakes.\n4. `USER_MODEL.md` and `RELATIONSHIP_MAP.md` for long-term human model and important people.\n5. `memory/categories/*.md` for curated long-term memory.\n6. `memory/REVIEW_QUEUE.md` for facts that need re-checking.\n7. `memory/YYYY-MM-DD.md` for daily summaries.\n8. `memory/SOURCE_INDEX.md` -> `memory/raw/...` or `inbox/...` for immutable evidence.\n9. `wiki/INDEX.md` for external knowledge, research notes, and methodology.\n\n## Fast Routes\n\n- 了解身份与稳定原则 -> `MEMORY.md`\n- 看当前执行态与未完成承诺 -> `WORKING.md`\n- 查已确认规则 -> `DECISIONS.md`\n- 查高风险坑点 -> `PITFALLS.md`\n- 看用户长期模型 -> `USER_MODEL.md`\n- 查重要人物关系 -> `RELATIONSHIP_MAP.md`\n- 看用户画像 -> `memory/categories/user_profile.md`\n- 看用户偏好 -> `memory/categories/preferences.md`\n- 看项目上下文 -> `memory/categories/projects.md`\n- 查承诺与待办 -> `memory/categories/commitments.md`\n- 查人物关系细节 -> `memory/categories/relationships.md`\n- 查坑点归档 -> `memory/categories/pitfalls.md`\n- 查推断但不要当成事实 -> `memory/categories/inferences.md`\n- 查复查队列 -> `memory/REVIEW_QUEUE.md`\n- 查原始来源 -> `memory/SOURCE_INDEX.md`\n- 查外部知识 -> `wiki/INDEX.md`\n\n## Query Route\n\n- 先判断是否真的需要查记忆。\n- 任务推进先看 `WORKING.md` 的 `Current Focus` / `OPEN_LOOPS`。\n- 规则与避免翻车先看 `DECISIONS.md` / `PITFALLS.md`。\n- 用户风格与隐含意图先看 `MEMORY.md` / `USER_MODEL.md`。\n- 人物身份和上下文先看 `RELATIONSHIP_MAP.md` / `memory/categories/relationships.md`。\n- 如果没有证据，就直接承认不记得。\n\n## Boundaries\n\n- Primary memory: `MEMORY.md`, `DECISIONS.md`, `PITFALLS.md`, `USER_MODEL.md`, `RELATIONSHIP_MAP.md`, `memory/categories/*.md`\n- Execution memory: `WORKING.md`, `memory/REVIEW_QUEUE.md`\n- Daily digest: `memory/YYYY-MM-DD.md`\n- Evidence layer: `memory/raw/...`, `memory/SOURCE_INDEX.md`, `inbox/...`\n- Knowledge wiki: `wiki/...`\n- Rule: raw is evidence, daily is digest, categories are curated memory, wiki is external knowledge.\n\n",
+        "# INDEX.md\n\nThis is the root entry for the agent memory system. Use it to choose the right layer before reading or writing.\n\n## Read Order\n\n1. `MEMORY.md` for startup identity, core principles, and the most stable anchors.\n2. `WORKING.md` for current execution state, `Current Focus`, and `OPEN_LOOPS`.\n3. `DECISIONS.md` and `PITFALLS.md` for confirmed rules and high-risk mistakes.\n4. `USER_MODEL.md` and `RELATIONSHIP_MAP.md` for long-term human model and important people.\n5. `memory/categories/*.md` for curated long-term memory.\n6. `memory/REVIEW_QUEUE.md` for facts that need re-checking.\n7. `memory/YYYY-MM-DD.md` for daily summaries (full text).\n7b. `memory/DAILY_INDEX.md` for **retrieval**: each `DAILY|` line lists date, ingest categories, and summary — filter here before opening a dated log.\n8. `memory/SOURCE_INDEX.md` -> `memory/raw/...` or `inbox/...` for immutable evidence.\n9. `wiki/INDEX.md` for external knowledge, research notes, and methodology.\n\n## Fast Routes\n\n- 了解身份与稳定原则 -> `MEMORY.md`\n- 看当前执行态与未完成承诺 -> `WORKING.md`\n- 查已确认规则 -> `DECISIONS.md`\n- 查高风险坑点 -> `PITFALLS.md`\n- 看用户长期模型 -> `USER_MODEL.md`\n- 查重要人物关系 -> `RELATIONSHIP_MAP.md`\n- 看用户画像 -> `memory/categories/user_profile.md`\n- 看用户偏好 -> `memory/categories/preferences.md`\n- 看项目上下文 -> `memory/categories/projects.md`\n- 查承诺与待办 -> `memory/categories/commitments.md`\n- 查人物关系细节 -> `memory/categories/relationships.md`\n- 查坑点归档 -> `memory/categories/pitfalls.md`\n- 查推断但不要当成事实 -> `memory/categories/inferences.md`\n- 查复查队列 -> `memory/REVIEW_QUEUE.md`\n- 按主题/分类检索历史日记摘要 -> `memory/DAILY_INDEX.md`（再打开对应 `memory/YYYY-MM-DD.md`）\n- 查原始来源 -> `memory/SOURCE_INDEX.md`\n- 查外部知识 -> `wiki/INDEX.md`\n\n## Query Route\n\n- 先判断是否真的需要查记忆。\n- 任务推进先看 `WORKING.md` 的 `Current Focus` / `OPEN_LOOPS`。\n- 规则与避免翻车先看 `DECISIONS.md` / `PITFALLS.md`。\n- 用户风格与隐含意图先看 `MEMORY.md` / `USER_MODEL.md`。\n- 人物身份和上下文先看 `RELATIONSHIP_MAP.md` / `memory/categories/relationships.md`。\n- 历史流水先用 `memory/DAILY_INDEX.md` 过滤，再读具体日期的日记文件。\n- 如果没有证据，就直接承认不记得。\n\n## Boundaries\n\n- Primary memory: `MEMORY.md`, `DECISIONS.md`, `PITFALLS.md`, `USER_MODEL.md`, `RELATIONSHIP_MAP.md`, `memory/categories/*.md`\n- Execution memory: `WORKING.md`, `memory/REVIEW_QUEUE.md`\n- Daily digest: `memory/YYYY-MM-DD.md` + retrieval index `memory/DAILY_INDEX.md`\n- Evidence layer: `memory/raw/...`, `memory/SOURCE_INDEX.md`, `inbox/...`\n- Knowledge wiki: `wiki/...`\n- Rule: raw is evidence, daily is digest, categories are curated memory, wiki is external knowledge.\n\n",
     );
 
     content.push_str("## Core Pages\n\n");

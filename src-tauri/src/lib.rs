@@ -1,3 +1,4 @@
+mod agent_task_schedule;
 mod agent_tasks;
 mod agent_workspace;
 mod agents;
@@ -57,9 +58,7 @@ fn build_http_client() -> reqwest::Client {
 }
 use tauri::{AppHandle, Emitter, Manager, PhysicalSize, Size};
 
-use agent_tasks::{
-    AgentTaskDeliveryRecord, AgentTaskListItem, AgentTaskPromptResult, AgentTaskUpdateInput,
-};
+use agent_tasks::{AgentTaskDeliveryRecord, AgentTaskListItem, AgentTaskUpdateInput};
 use agent_workspace::AgentWorkspaceBundle;
 use agents::{AgentInput, AgentRecord, ConversationAgentConfig};
 use channels::factory::ChannelConfig;
@@ -918,8 +917,8 @@ mod lib_tests {
             api_key: "secret".to_string(),
             model: "gpt-4.1".to_string(),
         };
-        let reason =
-            desktop_incomplete_reply_error(Some(&provider), true, true, true).expect("partial reply reason");
+        let reason = desktop_incomplete_reply_error(Some(&provider), true, true, true)
+            .expect("partial reply reason");
         assert!(reason.contains("部分 assistant 内容"));
     }
 
@@ -1808,8 +1807,8 @@ pub(crate) fn record_token_usage_for_scheduler_pi_completion(
     }
 
     let recorded_at = chrono_like_timestamp();
-    let mut usage_value =
-        serde_json::to_value(&usage_payload).map_err(|e| format!("序列化 scheduler usage 失败: {e}"))?;
+    let mut usage_value = serde_json::to_value(&usage_payload)
+        .map_err(|e| format!("序列化 scheduler usage 失败: {e}"))?;
     if let Some(meta) = usage_meta {
         if let serde_json::Value::Object(ref mut map) = usage_value {
             if let Some(ref v) = meta.api {
@@ -2150,6 +2149,15 @@ fn read_agent_workspace_bundle(
 }
 
 #[tauri::command]
+fn read_agent_workspace_file(
+    app: tauri::AppHandle,
+    agent_id: String,
+    relative_path: String,
+) -> Result<agent_workspace::AgentWorkspaceFile, String> {
+    agents::read_agent_workspace_file(&app, agent_id, relative_path)
+}
+
+#[tauri::command]
 fn write_agent_workspace_file(
     app: tauri::AppHandle,
     agent_id: String,
@@ -2199,16 +2207,6 @@ fn install_scheduler_service() -> Result<scheduler::SchedulerServiceStatus, Stri
 #[tauri::command]
 fn uninstall_scheduler_service() -> Result<scheduler::SchedulerServiceStatus, String> {
     scheduler::uninstall_service()
-}
-
-#[tauri::command]
-fn handle_agent_task_prompt(
-    app: tauri::AppHandle,
-    prompt: String,
-    session_id: String,
-    agent_id: String,
-) -> Result<AgentTaskPromptResult, String> {
-    agent_tasks::handle_prompt(&app, &prompt, &session_id, &agent_id)
 }
 
 #[tauri::command]
@@ -2266,7 +2264,28 @@ fn clamp_display_chars(value: &str, max_chars: usize) -> String {
     t.chars().take(max_chars).collect()
 }
 
-fn parse_agent_task_metadata_llm_output(raw: &str) -> Option<(String, String)> {
+const TASK_METADATA_GOAL_MAX_CHARS: usize = 4000;
+
+fn clamp_task_execution_body(value: &str, max_chars: usize) -> String {
+    let t = value.trim();
+    if t.is_empty() || max_chars == 0 {
+        return String::new();
+    }
+    if t.chars().count() <= max_chars {
+        return t.to_string();
+    }
+    format!(
+        "{}…",
+        t.chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>()
+    )
+}
+
+fn parse_agent_task_metadata_llm_output(
+    raw: &str,
+    fallback_goal: &str,
+) -> Option<(String, String, String)> {
     let trimmed = raw.trim();
     let start = trimmed.find('{')?;
     let end = trimmed.rfind('}')?;
@@ -2287,20 +2306,34 @@ fn parse_agent_task_metadata_llm_output(raw: &str) -> Option<(String, String)> {
         .map(str::trim)
         .filter(|s| !s.is_empty())?
         .to_string();
+    let goal_from_llm = v
+        .get("goal")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let goal = clamp_task_execution_body(
+        goal_from_llm.as_deref().unwrap_or(fallback_goal.trim()),
+        TASK_METADATA_GOAL_MAX_CHARS,
+    );
+    if goal.is_empty() {
+        return None;
+    }
     Some((
         clamp_display_chars(&title, 28),
         clamp_display_chars(&summary, 120),
+        goal,
     ))
 }
 
-/// 用智能体绑定的模型把任务正文改写成列表标题 + 一句话介绍；失败返回 `None`（由调用方回退）。
+/// 用智能体绑定的模型提炼列表标题、一句话介绍，以及到点执行用的任务正文（写入 payload，非原始聊天记录）；失败返回 `None`（由调用方回退）。
 pub(crate) fn refine_agent_task_metadata(
     app: &AppHandle,
     agent_id: &str,
     goal: &str,
     task_type: &str,
     schedule_hint: &str,
-) -> Option<(String, String)> {
+) -> Option<(String, String, String)> {
     if std::env::var("NINECLAW_SKIP_TASK_METADATA_LLM")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
@@ -2312,13 +2345,36 @@ pub(crate) fn refine_agent_task_metadata(
         return None;
     }
     let record = agents::get_agent_record(app, agent_id).ok().flatten()?;
-    let agent_config = agents::get_conversation_agent_config(app, agent_id).ok().flatten()?;
-    let runtime = resolve_im_llm_runtime(
-        app,
-        &record.default_provider_id,
-        &record.default_model,
-    )
-    .ok()?;
+    let agent_config = agents::get_conversation_agent_config(app, agent_id)
+        .ok()
+        .flatten()?;
+    let (provider_for_task_meta, model_for_task_meta) =
+        if let Some(ref sc) = record.scenario_llm_config {
+            if let Some(ref slot) = sc.task_push_notification_copy {
+                let p = slot.provider_id.trim();
+                let m = slot.model.trim();
+                if !p.is_empty() && !m.is_empty() {
+                    (p.to_string(), m.to_string())
+                } else {
+                    (
+                        record.default_provider_id.clone(),
+                        record.default_model.clone(),
+                    )
+                }
+            } else {
+                (
+                    record.default_provider_id.clone(),
+                    record.default_model.clone(),
+                )
+            }
+        } else {
+            (
+                record.default_provider_id.clone(),
+                record.default_model.clone(),
+            )
+        };
+    let runtime =
+        resolve_im_llm_runtime(app, &provider_for_task_meta, &model_for_task_meta).ok()?;
     let base_normalized = normalized_provider_runtime_base_url(
         &runtime.base_url,
         &runtime.api_format,
@@ -2342,19 +2398,20 @@ pub(crate) fn refine_agent_task_metadata(
         other => other,
     };
     let prompt = format!(
-        "你是 NineClaw 定时任务在列表里的展示文案编辑。根据「任务正文」生成 **title**（列表标题）和 **summary**（一句话介绍）。\n\
-不要执行任何任务、不要编造正文中没有的需求、不要输出思考过程。\n\
+        "你是 NineClaw 定时任务的文案编辑。用户原始表述可能含闲聊、重复或口语，请提炼为三部分，写入 JSON。\n\
+不要执行任何任务、不要编造用户未表达的需求、不要输出思考过程。\n\
 规则：\n\
-- title：4～20 个字左右的短名，不用书名号，不要用「定时任务」开头\n\
-- summary：20～100 字，概括要做什么或提醒什么；不要逐字复制正文开头；具体触发时间已在其它列展示，summary 里不必重复钟点\n\
+- title：4～20 个字的列表短标题，不用书名号，不要用「定时任务」开头\n\
+- summary：20～100 字的一句话说明（列表「描述」列）；不要逐字复制用户原话开头；具体触发时间已在调度里单独存储，summary 不必重复钟点\n\
+- goal：到点提醒或唤起智能体执行时使用的**任务正文**——简洁、可执行、用书面语重写；去掉无关闲聊与重复；保留用户真正要做的那件事；不要整段粘贴聊天记录\n\
 \n\
 任务类型：{task_type_label}\n\
 调度（帮助理解语境）：{schedule_hint}\n\
 \n\
-任务正文：\n\
+用户原始表述：\n\
 {goal}\n\
 \n\
-只输出一行合法 JSON，不要 markdown 代码块，格式：{{\"title\":\"...\",\"summary\":\"...\"}}"
+只输出一行合法 JSON，不要 markdown 代码块，格式：{{\"title\":\"...\",\"summary\":\"...\",\"goal\":\"...\"}}"
     );
     let outcome = bridge
         .process_message_interruptible(
@@ -2370,7 +2427,7 @@ pub(crate) fn refine_agent_task_metadata(
         PiProcessOutcome::Completed(r) => r.full_text,
         PiProcessOutcome::Aborted => return None,
     };
-    let parsed = parse_agent_task_metadata_llm_output(&text);
+    let parsed = parse_agent_task_metadata_llm_output(&text, goal);
     if parsed.is_none() {
         dev_trace(
             "task.meta",
@@ -2393,7 +2450,12 @@ fn clamp_chars_head(value: &str, max_chars: usize) -> String {
     if t.chars().count() <= max_chars {
         return t.to_string();
     }
-    format!("{}…", t.chars().take(max_chars.saturating_sub(1)).collect::<String>())
+    format!(
+        "{}…",
+        t.chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>()
+    )
 }
 
 fn parse_session_title_llm_output(raw: &str) -> Option<String> {
@@ -2464,22 +2526,30 @@ fn generate_conversation_session_title_llm(
         return Ok(String::new());
     };
 
-    let (provider_for_title, model_for_title) =
-        if let Some(ref sc) = record.scenario_llm_config {
-            if let Some(ref slot) = sc.title_generation {
-                let p = slot.provider_id.trim();
-                let m = slot.model.trim();
-                if !p.is_empty() && !m.is_empty() {
-                    (p.to_string(), m.to_string())
-                } else {
-                    (record.default_provider_id.clone(), record.default_model.clone())
-                }
+    let (provider_for_title, model_for_title) = if let Some(ref sc) = record.scenario_llm_config {
+        if let Some(ref slot) = sc.title_generation {
+            let p = slot.provider_id.trim();
+            let m = slot.model.trim();
+            if !p.is_empty() && !m.is_empty() {
+                (p.to_string(), m.to_string())
             } else {
-                (record.default_provider_id.clone(), record.default_model.clone())
+                (
+                    record.default_provider_id.clone(),
+                    record.default_model.clone(),
+                )
             }
         } else {
-            (record.default_provider_id.clone(), record.default_model.clone())
-        };
+            (
+                record.default_provider_id.clone(),
+                record.default_model.clone(),
+            )
+        }
+    } else {
+        (
+            record.default_provider_id.clone(),
+            record.default_model.clone(),
+        )
+    };
 
     let runtime = resolve_im_llm_runtime(app, &provider_for_title, &model_for_title)?;
     let base_normalized = normalized_provider_runtime_base_url(
@@ -2551,12 +2621,7 @@ fn generate_session_conversation_title(
     user_message: String,
     assistant_message: String,
 ) -> Result<String, String> {
-    generate_conversation_session_title_llm(
-        &app,
-        &agent_id,
-        &user_message,
-        &assistant_message,
-    )
+    generate_conversation_session_title_llm(&app, &agent_id, &user_message, &assistant_message)
 }
 
 pub(crate) fn chrono_like_timestamp() -> i64 {
@@ -3566,7 +3631,10 @@ fn usage_row_total_tokens(payload: &PiTokenUsagePayload) -> u64 {
     })
 }
 
-fn merge_pi_token_usage_payloads(left: &PiTokenUsagePayload, right: &PiTokenUsagePayload) -> PiTokenUsagePayload {
+fn merge_pi_token_usage_payloads(
+    left: &PiTokenUsagePayload,
+    right: &PiTokenUsagePayload,
+) -> PiTokenUsagePayload {
     let input = left.input_tokens.unwrap_or(0) + right.input_tokens.unwrap_or(0);
     let output = left.output_tokens.unwrap_or(0) + right.output_tokens.unwrap_or(0);
     let cache_read = left.cache_read_tokens.unwrap_or(0) + right.cache_read_tokens.unwrap_or(0);
@@ -3697,40 +3765,56 @@ fn assistant_text_fragment_to_append(emitted: &str, snapshot: &str) -> String {
 }
 
 fn resize_main_window_to_screen(app: &tauri::AppHandle) {
+    apply_main_window_size_and_center(app);
+
+    // macOS can ignore the first centering request if the native window is not
+    // fully realized yet, so retry shortly after startup on the main thread.
+    let app_handle = app.clone();
+    thread::spawn(move || {
+        for delay_ms in [150_u64, 450_u64] {
+            thread::sleep(Duration::from_millis(delay_ms));
+            let app_handle = app_handle.clone();
+            let main_thread_handle = app_handle.clone();
+            let _ = app_handle.run_on_main_thread(move || {
+                apply_main_window_size_and_center(&main_thread_handle);
+            });
+        }
+    });
+}
+
+fn apply_main_window_size_and_center(app: &tauri::AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
 
-    let monitor = match window.current_monitor() {
-        Ok(monitor) => monitor,
-        Err(error) => {
-            eprintln!("NineClaw: 读取显示器信息失败，跳过窗口自适应: {error}");
-            return;
+    match window.current_monitor() {
+        Ok(Some(monitor)) => {
+            let screen_size = monitor.size();
+            let max_width = screen_size.width.saturating_sub(48);
+            let max_height = screen_size.height.saturating_sub(64);
+            let desired_width = ((screen_size.width as f64) * 0.84).round() as u32;
+            let desired_height = ((screen_size.height as f64) * 0.82).round() as u32;
+            let width = if max_width >= 1260 {
+                desired_width.max(1260).min(max_width)
+            } else {
+                max_width
+            };
+            let height = if max_height >= 780 {
+                desired_height.max(780).min(max_height)
+            } else {
+                max_height
+            };
+
+            if let Err(error) = window.set_size(Size::Physical(PhysicalSize::new(width, height))) {
+                eprintln!("NineClaw: 设置窗口尺寸失败，保留默认尺寸: {error}");
+            }
         }
-    };
-
-    let Some(monitor) = monitor else {
-        return;
-    };
-
-    let screen_size = monitor.size();
-    let max_width = screen_size.width.saturating_sub(48);
-    let max_height = screen_size.height.saturating_sub(64);
-    let desired_width = ((screen_size.width as f64) * 0.84).round() as u32;
-    let desired_height = ((screen_size.height as f64) * 0.82).round() as u32;
-    let width = if max_width >= 1260 {
-        desired_width.max(1260).min(max_width)
-    } else {
-        max_width
-    };
-    let height = if max_height >= 780 {
-        desired_height.max(780).min(max_height)
-    } else {
-        max_height
-    };
-
-    if let Err(error) = window.set_size(Size::Physical(PhysicalSize::new(width, height))) {
-        eprintln!("NineClaw: 设置窗口尺寸失败，保留默认尺寸: {error}");
+        Ok(None) => {
+            eprintln!("NineClaw: 启动时尚未解析到当前显示器，跳过尺寸自适应，仍将尝试居中");
+        }
+        Err(error) => {
+            eprintln!("NineClaw: 读取显示器信息失败，跳过窗口尺寸自适应: {error}");
+        }
     }
 
     if let Err(error) = window.center() {
@@ -5785,6 +5869,7 @@ pub fn run() {
             delete_agent,
             set_default_agent,
             read_agent_workspace_bundle,
+            read_agent_workspace_file,
             write_agent_workspace_file,
             list_scheduled_jobs,
             list_scheduled_job_runs,
@@ -5793,7 +5878,6 @@ pub fn run() {
             get_scheduler_status,
             install_scheduler_service,
             uninstall_scheduler_service,
-            handle_agent_task_prompt,
             list_agent_task_deliveries,
             list_agent_tasks,
             pause_agent_task,

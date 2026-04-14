@@ -1,8 +1,24 @@
-import { StrictMode } from 'react'
+import { StrictMode, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
 import { ToastProvider } from './components/ToastProvider'
+
+function BootReadyMarker() {
+  useEffect(() => {
+    document.body.classList.add('boot-ready')
+    const splash = document.getElementById('boot-splash')
+    const timer = window.setTimeout(() => {
+      splash?.remove()
+    }, 220)
+
+    return () => {
+      window.clearTimeout(timer)
+    }
+  }, [])
+
+  return null
+}
 
 createRoot(document.getElementById('root')!, {
   onRecoverableError(error, errorInfo) {
@@ -12,6 +28,7 @@ createRoot(document.getElementById('root')!, {
   },
 }).render(
   <StrictMode>
+    <BootReadyMarker />
     <ToastProvider>
       <App />
     </ToastProvider>

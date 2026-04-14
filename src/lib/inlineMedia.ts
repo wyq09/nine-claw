@@ -298,3 +298,45 @@ export function extractInlineMediaAttachments(content: string): {
     attachments,
   }
 }
+
+/** 是否包含「文件」类附件（与打开/下载/复制同一工具行） */
+export function turnHasInlineFileAttachment(turn: {
+  answer: string
+  responseSegments?: Array<{ type: string; text?: string }>
+}): boolean {
+  const hasFile = (text: string) =>
+    extractInlineMediaAttachments(text).attachments.some((a) => a.kind === 'file')
+  if (hasFile(turn.answer || '')) {
+    return true
+  }
+  const segments = turn.responseSegments
+  if (!segments) {
+    return false
+  }
+  for (const seg of segments) {
+    if (seg.type === 'text' && seg.text && hasFile(seg.text)) {
+      return true
+    }
+  }
+  return false
+}
+
+/** 判断本轮回复正文中是否包含可展示的附件（用于与 Token 等元信息同一行排版） */
+export function turnHasInlineAttachments(turn: {
+  answer: string
+  responseSegments?: Array<{ type: string; text?: string }>
+}): boolean {
+  if (extractInlineMediaAttachments(turn.answer || '').attachments.length > 0) {
+    return true
+  }
+  const segments = turn.responseSegments
+  if (!segments) {
+    return false
+  }
+  for (const seg of segments) {
+    if (seg.type === 'text' && seg.text && extractInlineMediaAttachments(seg.text).attachments.length > 0) {
+      return true
+    }
+  }
+  return false
+}

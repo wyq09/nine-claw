@@ -2,24 +2,47 @@ import { AppIcon } from './AppIcon'
 import { useLocalMediaPreview } from '../hooks/useLocalMediaPreview'
 import { normalizeLocalAssetSource } from '../lib/inlineMedia'
 import { openLocalFile } from '../lib/piClient'
+import type { ReactNode } from 'react'
 import type { InlineMediaAttachment } from '../lib/inlineMedia'
 
 export function InlineMediaAttachmentList({
   attachments,
   onImageClick,
+  trailingSlot,
+  copyActionSlot,
 }: {
   attachments: InlineMediaAttachment[]
   onImageClick?: (src: string, alt: string) => void
+  /** 与文件附件 pill 同一行（如总 Token）；若最后一项为 file 则并入该卡片顶行 */
+  trailingSlot?: ReactNode
+  /** 与打开/下载同一行（复制）；若最后一项为 file 则并入该卡片工具行 */
+  copyActionSlot?: ReactNode
 }) {
+  const lastIndex = attachments.length - 1
+  const lastAtt = lastIndex >= 0 ? attachments[lastIndex] : undefined
+  const mergeTrailingIntoLastFile =
+    Boolean(trailingSlot) && lastAtt?.kind === 'file'
+  const mergeCopyIntoLastFile = Boolean(copyActionSlot) && lastAtt?.kind === 'file'
+
+  const listClass =
+    trailingSlot !== undefined && trailingSlot !== null && !mergeTrailingIntoLastFile
+      ? 'inline-media-list inline-media-list--with-trailing'
+      : 'inline-media-list'
+
   return (
-    <div className="inline-media-list">
+    <div className={listClass}>
       {attachments.map((attachment, index) => (
         <InlineMediaAttachmentCard
           key={`${attachment.kind}-${attachment.path || attachment.fileName}-${index}`}
           attachment={attachment}
           onImageClick={onImageClick}
+          trailingMetaSlot={mergeTrailingIntoLastFile && index === lastIndex ? trailingSlot : undefined}
+          copyActionSlot={mergeCopyIntoLastFile && index === lastIndex ? copyActionSlot : undefined}
         />
       ))}
+      {!mergeTrailingIntoLastFile && trailingSlot ? (
+        <div className="inline-media-trailing-meta">{trailingSlot}</div>
+      ) : null}
     </div>
   )
 }
@@ -27,9 +50,13 @@ export function InlineMediaAttachmentList({
 function InlineMediaAttachmentCard({
   attachment,
   onImageClick,
+  trailingMetaSlot,
+  copyActionSlot,
 }: {
   attachment: InlineMediaAttachment
   onImageClick?: (src: string, alt: string) => void
+  trailingMetaSlot?: ReactNode
+  copyActionSlot?: ReactNode
 }) {
   const title = attachment.fileName || attachment.label
   const normalizedLabel = attachment.label.trim()
@@ -109,7 +136,9 @@ function InlineMediaAttachmentCard({
   }
 
   const toolbar = (
-    <div className="inline-media-toolbar">
+    <div
+      className={`inline-media-toolbar${copyActionSlot ? ' inline-media-toolbar--with-copy' : ''}`}
+    >
       <button
         type="button"
         className="inline-media-action-button"
@@ -130,6 +159,7 @@ function InlineMediaAttachmentCard({
       >
         <AppIcon name="download" size={14} />
       </button>
+      {copyActionSlot}
     </div>
   )
 
@@ -144,20 +174,26 @@ function InlineMediaAttachmentCard({
         </div>
       ) : null}
       {attachment.kind === 'file' ? (
-        <div className="inline-media-file-row">
-          <button
-            type="button"
-            className="inline-media-file-card"
-            onClick={handleOpen}
-            aria-label={`打开附件 ${title}`}
-            title={`打开 ${title}`}
-            disabled={!canOpen}
-          >
-            <span className="inline-media-file-kind">{typeLabel}</span>
-            <div className="inline-media-file-copy">
-              <strong title={title}>{title}</strong>
-            </div>
-          </button>
+        <div className="inline-media-file-bundle">
+          <div className="inline-media-file-primary-row">
+            <button
+              type="button"
+              className="inline-media-file-card"
+              onClick={handleOpen}
+              aria-label={`打开附件 ${title}`}
+              title={`打开 ${title}`}
+              disabled={!canOpen}
+            >
+              <span className="inline-media-file-kind">{typeLabel}</span>
+              <div className="inline-media-file-copy">
+                <strong title={title}>{title}</strong>
+              </div>
+            </button>
+            {trailingMetaSlot ? (
+              <div className="inline-media-trailing-meta">{trailingMetaSlot}</div>
+            ) : null}
+          </div>
+          {toolbar}
         </div>
       ) : null}
       {attachment.kind === 'image' && canPreview ? (
@@ -185,7 +221,7 @@ function InlineMediaAttachmentCard({
       ) : null}
       {attachment.kind === 'file' && !canOpen ? <div className="inline-media-empty">文件已接收，但当前没有可用路径。</div> : null}
       {attachment.transcript ? <div className="inline-media-transcript">转写：{attachment.transcript}</div> : null}
-      {toolbar}
+      {attachment.kind !== 'file' ? toolbar : null}
     </div>
   )
 }
