@@ -60,6 +60,8 @@ export function TurnResponseBody({
   const segments = turn.responseSegments
   const isActiveStreamingTurn = streamLive && turn.id === activeTurnId
   const runningToolCount = turn.toolCalls.filter((toolCall) => toolCall.state === 'running').length
+  /** 流式未结束：等模型、思考流、工具执行等阶段均保留底部「处理中」动画 */
+  const showStreamWaitIndicator = isActiveStreamingTurn && !preparing
 
   if (segments && segments.length > 0) {
     const renderBlocks: Array<
@@ -198,6 +200,11 @@ export function TurnResponseBody({
             />
           )
         })}
+        {preparing && turn.id === activeTurnId ? (
+          <TurnPreparingIndicator />
+        ) : showStreamWaitIndicator ? (
+          <TurnWaitingIndicator startedAt={turn.createdAt} />
+        ) : null}
       </div>
     )
   }
@@ -244,12 +251,13 @@ export function TurnResponseBody({
           onImageClick={onImageClick}
         />
       ) : null}
-      {!turn.answer && !hasLegacyTools ? (
-        preparing && turn.id === activeTurnId ? (
-          <TurnPreparingIndicator />
-        ) : isActiveStreamingTurn ? (
-          <TurnWaitingIndicator startedAt={turn.createdAt} />
-        ) : turn.status === 'done' ? (
+      {preparing && turn.id === activeTurnId ? (
+        <TurnPreparingIndicator />
+      ) : showStreamWaitIndicator ? (
+        <TurnWaitingIndicator startedAt={turn.createdAt} />
+      ) : null}
+      {!preparing && !showStreamWaitIndicator && !turn.answer && !hasLegacyTools ? (
+        turn.status === 'done' ? (
           <p className="placeholder-copy">本轮已结束，但模型没有返回任何可渲染内容。</p>
         ) : turn.status === 'error' ? (
           <p className="placeholder-copy">本轮执行失败，未产出可渲染内容。</p>

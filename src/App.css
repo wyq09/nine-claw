@@ -2592,8 +2592,14 @@ button {
   box-shadow: none;
 }
 
+/* 与用户气泡 `.prompt-bubble` 同宽上限，左右留白一致 */
+.workspace-thread-state .assistant-message-shell {
+  gap: 8px;
+}
+
 .workspace-thread-state .assistant-message-stack {
   gap: 10px;
+  max-width: min(78%, 760px);
 }
 
 .workspace-thread-state .chat-turn-time-pill {
