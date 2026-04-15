@@ -212,8 +212,9 @@ export function ChatView({
         return
       }
 
+      /* 拖拽条在输入卡片底部：向下拖增高、向上拖减高 */
       const nextHeight = clampNumber(
-        resizeState.startHeight + (resizeState.startY - event.clientY),
+        resizeState.startHeight + (event.clientY - resizeState.startY),
         MIN_COMPOSER_HEIGHT,
         MAX_COMPOSER_HEIGHT,
       )
@@ -362,15 +363,6 @@ export function ChatView({
             multiple
             onChange={onComposerAttachmentInputChange}
           />
-          <div
-            className="composer-resize-handle"
-            role="separator"
-            aria-label="拖动调整输入框高度"
-            aria-orientation="horizontal"
-            onPointerDown={handleComposerResizeStart}
-          >
-            <span />
-          </div>
           {activeHistoryItem && showScrollToLatest ? (
             <button
               type="button"
@@ -449,6 +441,15 @@ export function ChatView({
                 {runtimeReady ? <AppIcon name="arrow-up" size={17} /> : <span className="composer-runtime-loading">⏳</span>}
               </button>
             </div>
+          </div>
+          <div
+            className="composer-resize-handle"
+            role="separator"
+            aria-label="拖动调整输入框高度"
+            aria-orientation="horizontal"
+            onPointerDown={handleComposerResizeStart}
+          >
+            <span />
           </div>
         </form>
         {isHomeState ? (

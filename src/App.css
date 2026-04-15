@@ -3439,9 +3439,11 @@ button {
   display: flex;
   justify-content: center;
   align-items: center;
-  height: 12px;
+  height: 10px;
   cursor: ns-resize;
   touch-action: none;
+  flex-shrink: 0;
+  border-top: 1px solid color-mix(in srgb, var(--chrome-border) 45%, transparent);
 }
 
 .composer-resize-handle span {
@@ -3776,7 +3778,7 @@ button {
 
 .workspace-thread-state .workspace-composer-shell {
   transform: translateY(0);
-  padding: 20px 25px 10px;
+  padding: 10px 25px 10px;
   border-top: 1px solid color-mix(in srgb, var(--chrome-border) 20%, transparent);
   background: linear-gradient(
     180deg,

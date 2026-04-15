@@ -1,3 +1,13 @@
+//! iLink Bot HTTP 客户端（`WeChatApi`）。
+//!
+//! **出站媒体（文件 / 图 / 视频）**：入口为 [`WeChatApi::send_binary_media`] —— 内部先
+//! `upload_media`（`get_upload_url` → POST 密文到微信 CDN → 读响应头 `x-encrypted-param`），
+//! 再 [`WeChatApi::send_media_message`]（`POST …/ilink/bot/sendmessage`）。音频与普通文件在通道侧均映射为
+//! `MSG_ITEM_TYPE_FILE`，走 `file_item`。
+//!
+//! 从 UI 到本模块的完整调用链、常量表与排错提示见仓库根目录
+//! `docs/WECHAT_OUTBOUND_MEDIA_FLOW.md`。
+
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as Base64Engine};
 use md5::{Digest, Md5};
 use openssl::symm::Cipher;
