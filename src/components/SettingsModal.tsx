@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useState } from 'react'
 import {
   getPeerGatewayInfo,
   loadPeerGatewaySettings,
@@ -17,8 +17,19 @@ import type {
   ProviderId,
   SettingsTab,
 } from '../types'
+import type { ResourcesViewProps, SkillsViewProps } from '../app/pages/LibraryAndTasks'
 import { AppIcon, type IconName } from './AppIcon'
 import { UsageStatsPanel } from './UsageStatsPanel'
+
+const SkillsViewLazy = lazy(async () => {
+  const module = await import('../app/pages/LibraryAndTasks')
+  return { default: module.SkillsView }
+})
+
+const ResourcesViewLazy = lazy(async () => {
+  const module = await import('../app/pages/LibraryAndTasks')
+  return { default: module.ResourcesView }
+})
 
 type SettingsModalProps = {
   activeProviderBadge: string
@@ -38,6 +49,8 @@ type SettingsModalProps = {
   setAppearanceSettings: (value: AppearanceSettings | ((previous: AppearanceSettings) => AppearanceSettings)) => void
   setGeneralSettings: (value: GeneralSettings | ((previous: GeneralSettings) => GeneralSettings)) => void
   tab: SettingsTab
+  skillsLibrary: SkillsViewProps
+  resourcesLibrary: ResourcesViewProps
 }
 
 function getProviderStatus(config: ProviderConfig, preserveVerifiedStatus = true): ProviderConfig['status'] {
@@ -156,6 +169,8 @@ export function SettingsModal({
   setAppearanceSettings,
   setGeneralSettings,
   tab,
+  skillsLibrary,
+  resourcesLibrary,
 }: SettingsModalProps) {
   const [providerAddMode, setProviderAddMode] = useState(false)
   const [customFormOpen, setCustomFormOpen] = useState(false)
@@ -265,18 +280,26 @@ export function SettingsModal({
           ? '模型提供方'
           : tab === 'usage'
             ? '用量统计'
-          : '快捷键'
+            : tab === 'skills'
+              ? '探索技能'
+              : tab === 'resources'
+                ? '资源库'
+                : '快捷键'
 
   const currentTabDescription =
     tab === 'general'
       ? '维护应用默认行为、语言偏好和对外接入配置。'
       : tab === 'appearance'
         ? '控制侧栏密度、执行轨迹和页面动态效果。'
-      : tab === 'providers'
-        ? '统一管理大模型接口、默认模型与连通性校验。'
-        : tab === 'usage'
-          ? '按模型、智能体与日期查看本地累计用量。'
-        : '配置发送方式与常用桌面快捷操作。'
+        : tab === 'providers'
+          ? '统一管理大模型接口、默认模型与连通性校验。'
+          : tab === 'usage'
+            ? '按模型、智能体与日期查看本地累计用量。'
+            : tab === 'skills'
+              ? '浏览已安装技能与系统技能库，通过链接安装或刷新目录。'
+              : tab === 'resources'
+                ? '模板、规范与可复用资产，统一检索与编排入口。'
+                : '配置发送方式与常用桌面快捷操作。'
   const selectedProviderFormatDefaults = getProviderFormatDefaults(selectedProviderConfig.apiFormat)
 
   return (
@@ -300,6 +323,8 @@ export function SettingsModal({
               <SettingsTabButton active={tab === 'appearance'} icon="sparkles" label="个性化" onClick={() => onSelectTab('appearance')} />
               <SettingsTabButton active={tab === 'providers'} icon="provider" label="大模型 Provider" onClick={() => onSelectTab('providers')} />
               <SettingsTabButton active={tab === 'usage'} icon="zap" label="用量统计" onClick={() => onSelectTab('usage')} />
+              <SettingsTabButton active={tab === 'skills'} icon="puzzle" label="探索技能" onClick={() => onSelectTab('skills')} />
+              <SettingsTabButton active={tab === 'resources'} icon="book" label="资源库" onClick={() => onSelectTab('resources')} />
               <SettingsTabButton active={tab === 'shortcuts'} icon="keyboard" label="快捷键" onClick={() => onSelectTab('shortcuts')} />
             </div>
           </div>
@@ -823,6 +848,23 @@ export function SettingsModal({
                       </label>
 
                       <label className="input-field">
+                        <span>最大上下文窗口 (tokens)</span>
+                        <input
+                          type="number"
+                          min={1}
+                          value={selectedProviderConfig.maxContextTokens ?? ''}
+                          onChange={(event) => {
+                            const raw = event.target.value.trim()
+                            const parsed = raw ? parseInt(raw, 10) : undefined
+                            onProviderConfigChange(selectedProviderId, {
+                              maxContextTokens: parsed && parsed > 0 ? parsed : undefined,
+                            })
+                          }}
+                          placeholder="如 128000，留空表示自动检测"
+                        />
+                      </label>
+
+                      <label className="input-field">
                         <span>备注</span>
                         <input
                           value={selectedProviderConfig.note}
@@ -930,8 +972,8 @@ export function SettingsModal({
                   <code>Cmd + ,</code>
                 </div>
                 <div className="shortcut-row">
-                  <span>切换技能页</span>
-                  <code>Cmd + 2</code>
+                  <span>探索技能 / 资源库</span>
+                  <code>设置侧栏进入</code>
                 </div>
                 <div className="shortcut-row">
                   <span>停止当前生成</span>
@@ -943,6 +985,22 @@ export function SettingsModal({
             {tab === 'usage' ? (
               <div className="settings-tab-body-scroll">
                 <UsageStatsPanel />
+              </div>
+            ) : null}
+
+            {tab === 'skills' ? (
+              <div className="settings-tab-body-scroll">
+                <Suspense fallback={<p className="settings-note">正在加载技能…</p>}>
+                  <SkillsViewLazy {...skillsLibrary} />
+                </Suspense>
+              </div>
+            ) : null}
+
+            {tab === 'resources' ? (
+              <div className="settings-tab-body-scroll">
+                <Suspense fallback={<p className="settings-note">正在加载资源库…</p>}>
+                  <ResourcesViewLazy {...resourcesLibrary} />
+                </Suspense>
               </div>
             ) : null}
 

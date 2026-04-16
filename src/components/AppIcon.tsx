@@ -125,7 +125,17 @@ export function AppIcon({ name, size = 20 }: { name: IconName; size?: number }) 
       ) : null}
       {name === 'attachment' ? <path d="M8.5 12.5 14 7a3 3 0 1 1 4.2 4.2l-6.8 6.8a5 5 0 1 1-7.1-7.1l7.1-7.1" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={stroke} /> : null}
       {name === 'send' ? <path d="m5 12 14-7-3 14-4.2-5.2L5 12Z" fill="currentColor" /> : null}
-      {name === 'stop' ? <rect x="8" y="8" width="8" height="8" rx="1.2" fill="currentColor" /> : null}
+      {name === 'stop' ? (
+        <rect
+          x="4.8"
+          y="4.8"
+          width="14.4"
+          height="14.4"
+          rx="2.88"
+          ry="2.88"
+          fill="currentColor"
+        />
+      ) : null}
       {name === 'search' ? (
         <>
           <circle cx="11" cy="11" r="5.5" stroke="currentColor" strokeWidth={stroke} />

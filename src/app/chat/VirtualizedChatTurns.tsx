@@ -298,8 +298,6 @@ export const VirtualizedChatTurns = forwardRef<VirtualizedChatTurnsHandle, Virtu
     },
     ref,
   ) {
-    const prevHistoryIdRef = useRef(activeHistoryId)
-    const firstScrollRef = useRef(true)
     const turnsRef = useRef(turns)
     turnsRef.current = turns
 
@@ -356,7 +354,7 @@ export const VirtualizedChatTurns = forwardRef<VirtualizedChatTurnsHandle, Virtu
     useImperativeHandle(
       ref,
       () => ({
-        scrollToLatest: (behavior = 'smooth') => {
+        scrollToLatest: (behavior: 'smooth' | 'auto' | 'instant' = 'instant') => {
           const len = turnsRef.current.length
           if (len === 0) {
             return
@@ -377,14 +375,11 @@ export const VirtualizedChatTurns = forwardRef<VirtualizedChatTurnsHandle, Virtu
       if (idx < 0) {
         return
       }
-      const switchedSession = prevHistoryIdRef.current !== activeHistoryId
-      prevHistoryIdRef.current = activeHistoryId
-      const useInstant = switchedSession || firstScrollRef.current
-      firstScrollRef.current = false
       markAutoScroll()
+      /* 与流式跟滚配合：须用 instant，避免 smooth 多帧 scroll 误判用户离底 */
       virtualizerRef.current.scrollToIndex(idx, {
         align: 'end',
-        behavior: useInstant ? 'instant' : 'smooth',
+        behavior: 'instant',
       })
     }, [activeHistoryId, activeTurnId, markAutoScroll])
 

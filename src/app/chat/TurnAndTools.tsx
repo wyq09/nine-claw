@@ -203,7 +203,7 @@ export function TurnResponseBody({
         {preparing && turn.id === activeTurnId ? (
           <TurnPreparingIndicator />
         ) : showStreamWaitIndicator ? (
-          <TurnWaitingIndicator startedAt={turn.createdAt} />
+          <TurnWaitingIndicator />
         ) : null}
       </div>
     )
@@ -254,7 +254,7 @@ export function TurnResponseBody({
       {preparing && turn.id === activeTurnId ? (
         <TurnPreparingIndicator />
       ) : showStreamWaitIndicator ? (
-        <TurnWaitingIndicator startedAt={turn.createdAt} />
+        <TurnWaitingIndicator />
       ) : null}
       {!preparing && !showStreamWaitIndicator && !turn.answer && !hasLegacyTools ? (
         turn.status === 'done' ? (
@@ -284,10 +284,7 @@ export function TurnPreparingIndicator() {
   )
 }
 
-export function TurnWaitingIndicator({ startedAt }: { startedAt: number }) {
-  const now = useLiveNow(true, 500)
-  const elapsed = Math.max(0, now - startedAt)
-
+export function TurnWaitingIndicator() {
   return (
     <div className="turn-waiting-indicator" role="status" aria-live="polite">
       <span className="turn-waiting-dots" aria-hidden="true">
@@ -296,7 +293,6 @@ export function TurnWaitingIndicator({ startedAt }: { startedAt: number }) {
         <span />
       </span>
       <span className="turn-waiting-label">处理中</span>
-      <span className="turn-waiting-time">已执行 {formatDurationLabel(elapsed)}</span>
     </div>
   )
 }

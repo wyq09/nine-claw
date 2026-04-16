@@ -15,6 +15,7 @@ import type {
   SettingsTab,
   ViewKey,
 } from '../../types'
+import type { ResourcesViewProps, SkillsViewProps } from '../pages/LibraryAndTasks'
 import {
   SIDEBAR_FOOTER_SHORTCUTS_ENABLED,
   formatHistoryAgeLabel,
@@ -117,6 +118,8 @@ export type NineClawAppChromeProps = {
   setAppearanceSettingsForModal: Dispatch<SetStateAction<AppearanceSettings>>
   setGeneralSettings: Dispatch<SetStateAction<GeneralSettings>>
   settingsTab: SettingsTab
+  settingsSkillsLibrary: SkillsViewProps
+  settingsResourcesLibrary: ResourcesViewProps
 }
 
 export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
@@ -195,6 +198,8 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
     setAppearanceSettingsForModal,
     setGeneralSettings,
     settingsTab,
+    settingsSkillsLibrary,
+    settingsResourcesLibrary,
   } = props
 
   useEffect(() => {
@@ -336,18 +341,6 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
                 icon="bot"
                 label="智能体管理"
                 onClick={() => onViewChange('agents')}
-              />
-              <SidebarButton
-                active={view === 'skills'}
-                icon="spark"
-                label="探索技能"
-                onClick={() => onViewChange('skills')}
-              />
-              <SidebarButton
-                active={view === 'resources'}
-                icon="book"
-                label="资源库"
-                onClick={() => onViewChange('resources')}
               />
               <SidebarButton
                 active={view === 'tasks'}
@@ -572,6 +565,8 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
           setAppearanceSettings={setAppearanceSettingsForModal}
           setGeneralSettings={setGeneralSettings}
           tab={settingsTab}
+          skillsLibrary={settingsSkillsLibrary}
+          resourcesLibrary={settingsResourcesLibrary}
         />
       ) : null}
     </>

@@ -8,6 +8,9 @@ import type {
   AgentRecord,
   AgentWorkspaceBundle,
   AgentWorkspaceFile,
+  ChatSessionDetail,
+  ChatSessionListItem,
+  ChatTurnRow,
   PeerGatewayInfo,
   PeerGatewaySettings,
   ConversationAgentSnapshot,
@@ -166,6 +169,104 @@ export async function saveHistoryState(payload: string): Promise<void> {
 
 export async function clearHistoryState(): Promise<void> {
   await invoke('clear_history_state')
+}
+
+// ── Structured Chat History API ──
+
+export async function chatListSessions(): Promise<ChatSessionListItem[]> {
+  return invoke<ChatSessionListItem[]>('chat_list_sessions')
+}
+
+export async function chatGetSessionDetail(
+  sessionId: string,
+): Promise<ChatSessionDetail | null> {
+  return invoke<ChatSessionDetail | null>('chat_get_session_detail', { sessionId })
+}
+
+export async function chatCreateSession(payload: {
+  id: string
+  title: string
+  status: string
+  agentId?: string | null
+  agentSnapshotJson?: string | null
+  botTargetJson?: string | null
+  sessionLlmProviderId?: string | null
+  sessionLlmModel?: string | null
+}): Promise<ChatSessionDetail> {
+  return invoke<ChatSessionDetail>('chat_create_session', {
+    id: payload.id,
+    title: payload.title,
+    status: payload.status,
+    agentId: payload.agentId ?? null,
+    agentSnapshotJson: payload.agentSnapshotJson ?? null,
+    botTargetJson: payload.botTargetJson ?? null,
+    sessionLlmProviderId: payload.sessionLlmProviderId ?? null,
+    sessionLlmModel: payload.sessionLlmModel ?? null,
+  })
+}
+
+export async function chatAppendTurn(payload: {
+  id: string
+  sessionId: string
+  turnIndex: number
+  prompt: string
+  answer?: string
+  thinking?: string
+  status: string
+  usageJson?: string | null
+  responseSegmentsJson?: string | null
+  toolCallsJson?: string | null
+  activityJson?: string | null
+}): Promise<ChatTurnRow> {
+  return invoke<ChatTurnRow>('chat_append_turn', {
+    id: payload.id,
+    sessionId: payload.sessionId,
+    turnIndex: payload.turnIndex,
+    prompt: payload.prompt,
+    answer: payload.answer ?? '',
+    thinking: payload.thinking ?? '',
+    status: payload.status,
+    usageJson: payload.usageJson ?? null,
+    responseSegmentsJson: payload.responseSegmentsJson ?? null,
+    toolCallsJson: payload.toolCallsJson ?? null,
+    activityJson: payload.activityJson ?? null,
+  })
+}
+
+export async function chatUpdateTurn(payload: {
+  id: string
+  answer?: string | null
+  thinking?: string | null
+  status?: string | null
+  completedAt?: number | null
+  usageJson?: string | null
+  responseSegmentsJson?: string | null
+  toolCallsJson?: string | null
+  activityJson?: string | null
+}): Promise<ChatTurnRow> {
+  return invoke<ChatTurnRow>('chat_update_turn', {
+    id: payload.id,
+    answer: payload.answer ?? null,
+    thinking: payload.thinking ?? null,
+    status: payload.status ?? null,
+    completedAt: payload.completedAt ?? null,
+    usageJson: payload.usageJson ?? null,
+    responseSegmentsJson: payload.responseSegmentsJson ?? null,
+    toolCallsJson: payload.toolCallsJson ?? null,
+    activityJson: payload.activityJson ?? null,
+  })
+}
+
+export async function chatDeleteSession(sessionId: string): Promise<void> {
+  await invoke('chat_delete_session', { sessionId })
+}
+
+export async function chatClearAllSessions(): Promise<void> {
+  await invoke('chat_clear_all_sessions')
+}
+
+export async function chatMigrateHistoryV1(): Promise<string> {
+  return invoke<string>('chat_migrate_history_v1')
 }
 
 export async function listTokenUsageRecords(): Promise<TokenUsageRecord[]> {
@@ -470,4 +571,22 @@ export async function botSendMedia(
     mediaType,
     filePath,
   })
+}
+
+// ── Context Window Guard ──
+
+export type SessionContextStatsPayload = {
+  sessionId: string
+  usedTokens: number
+  contextWindow: number | null
+  inputTokens: number
+  outputTokens: number
+  model: string | null
+  source: string
+}
+
+export async function getSessionContextStats(
+  sessionId: string,
+): Promise<SessionContextStatsPayload> {
+  return invoke<SessionContextStatsPayload>('get_session_context_stats', { sessionId })
 }

@@ -13,6 +13,7 @@ mod pi_timeouts;
 mod prompt_attachments;
 mod scheduler;
 mod skills;
+mod storage;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as _};
 use md5::{Digest, Md5};
@@ -756,6 +757,183 @@ fn finalize_desktop_outbound_reply(content: &str, agent_id: Option<&str>) -> Str
     build_desktop_outbound_display_text(&text_reply, &media_items)
 }
 
+// ── Context Window Guard ──
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionContextStats {
+    session_id: String,
+    used_tokens: u64,
+    context_window: Option<u64>,
+    input_tokens: u64,
+    output_tokens: u64,
+    model: Option<String>,
+    source: String,
+}
+
+fn parse_context_stats_from_rpc_response(value: &serde_json::Value) -> Option<SessionContextStats> {
+    let cu = value.get("contextUsage")?;
+    let used_tokens = cu.get("usedTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let raw_cw = cu.get("contextWindow").and_then(|v| v.as_u64()).unwrap_or(0);
+    let context_window = if raw_cw > 0 { Some(raw_cw) } else { None };
+    let input_tokens = cu.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let output_tokens = cu.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    Some(SessionContextStats {
+        session_id: String::new(),
+        used_tokens,
+        context_window,
+        input_tokens,
+        output_tokens,
+        model: None,
+        source: "auto".to_string(),
+    })
+}
+
+fn resolve_context_window_from_sources(
+    auto_detected: Option<u64>,
+    manual_config: Option<u64>,
+) -> (Option<u64>, &'static str) {
+    if let Some(auto) = auto_detected {
+        if auto > 0 {
+            return (Some(auto), "auto");
+        }
+    }
+    if let Some(manual) = manual_config {
+        if manual > 0 {
+            return (Some(manual), "manual");
+        }
+    }
+    (None, "unknown")
+}
+
+/// 与前端 `aggregateSessionUsageFromTurns` 一致：按 turn 累计 `usage`。
+fn aggregate_token_usage_from_history_turns(
+    turns: Option<&Vec<serde_json::Value>>,
+) -> Option<PiTokenUsagePayload> {
+    let turns = turns?;
+    let mut total: Option<PiTokenUsagePayload> = None;
+    for turn in turns {
+        let usage = turn.as_object().and_then(|obj| obj.get("usage"));
+        let step = extract_usage_payload(usage);
+        accumulate_pi_token_usage(&mut total, step);
+    }
+    total
+}
+
+fn session_context_stats_from_history(
+    app: &AppHandle,
+    session_id: &str,
+) -> Result<SessionContextStats, String> {
+    let connection = open_history_db(app)?;
+    let payload: Option<String> = connection
+        .query_row(
+            "SELECT value FROM app_state WHERE key = ?1",
+            params![HISTORY_STATE_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取历史快照失败: {error}"))?;
+
+    let Some(payload) = payload else {
+        return Ok(SessionContextStats {
+            session_id: session_id.to_string(),
+            used_tokens: 0,
+            context_window: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            model: None,
+            source: "unknown".to_string(),
+        });
+    };
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload).map_err(|error| format!("解析历史快照失败: {error}"))?;
+    let Some(items) = parsed.as_array() else {
+        return Ok(SessionContextStats {
+            session_id: session_id.to_string(),
+            used_tokens: 0,
+            context_window: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            model: None,
+            source: "unknown".to_string(),
+        });
+    };
+
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let Some(id) = json_string(obj.get("id")) else {
+            continue;
+        };
+        if id != session_id {
+            continue;
+        }
+
+        let merged = aggregate_token_usage_from_history_turns(obj.get("turns").and_then(|v| v.as_array()));
+
+        let model = json_string(obj.get("sessionLlmModel")).or_else(|| {
+            obj.get("agent")
+                .and_then(|value| value.as_object())
+                .and_then(|agent| json_string(agent.get("defaultModel")))
+        });
+
+        let (used_tokens, input_tokens, output_tokens) = merged
+            .map(|payload| {
+                let used = usage_row_total_tokens(&payload);
+                let input = payload.input_tokens.unwrap_or(0);
+                let output = payload.output_tokens.unwrap_or(0);
+                (used, input, output)
+            })
+            .unwrap_or((0, 0, 0));
+
+        return Ok(SessionContextStats {
+            session_id: session_id.to_string(),
+            used_tokens,
+            context_window: None,
+            input_tokens,
+            output_tokens,
+            model,
+            source: "history".to_string(),
+        });
+    }
+
+    Ok(SessionContextStats {
+        session_id: session_id.to_string(),
+        used_tokens: 0,
+        context_window: None,
+        input_tokens: 0,
+        output_tokens: 0,
+        model: None,
+        source: "unknown".to_string(),
+    })
+}
+
+#[tauri::command]
+async fn get_session_context_stats(
+    app: AppHandle,
+    session_id: String,
+) -> Result<SessionContextStats, String> {
+    let trimmed = session_id.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(SessionContextStats {
+            session_id: String::new(),
+            used_tokens: 0,
+            context_window: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            model: None,
+            source: "unknown".to_string(),
+        });
+    }
+
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || session_context_stats_from_history(&app, &trimmed))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 #[cfg(test)]
 fn desktop_incomplete_reply_error(
     provider_config: Option<&ProviderRuntimeConfig>,
@@ -822,13 +1000,15 @@ fn desktop_incomplete_reply_error(
 #[cfg(test)]
 mod lib_tests {
     use super::{
-        aggregate_usage_from_agent_messages, build_desktop_outbound_display_text,
-        desktop_incomplete_reply_error, desktop_media_reply_prompt, infer_media_mime_type,
+        aggregate_token_usage_from_history_turns, aggregate_usage_from_agent_messages,
+        build_desktop_outbound_display_text, desktop_incomplete_reply_error,
+        desktop_media_reply_prompt, infer_media_mime_type, parse_context_stats_from_rpc_response,
         prepend_multimodal_summary_context, record_multimodal_summary,
-        render_multimodal_summary_context, summary_file_path, DesktopParsedMediaItem,
-        ProviderRuntimeConfig,
+        render_multimodal_summary_context, resolve_context_window_from_sources, summary_file_path,
+        usage_row_total_tokens, DesktopParsedMediaItem, ProviderRuntimeConfig,
     };
     use crate::channels::types::MediaType;
+    use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
@@ -963,6 +1143,106 @@ mod lib_tests {
         assert_eq!(u.cache_read_tokens, Some(19840));
         assert_eq!(u.cache_write_tokens, Some(0));
         assert_eq!(u.total_tokens, Some(28678));
+    }
+
+    // ── Context Window Guard tests ──
+
+    #[test]
+    fn parse_context_stats_valid() {
+        let json = json!({
+            "contextUsage": {
+                "usedTokens": 5000,
+                "contextWindow": 128000,
+                "inputTokens": 3000,
+                "outputTokens": 2000
+            }
+        });
+        let stats = parse_context_stats_from_rpc_response(&json);
+        assert!(stats.is_some());
+        let s = stats.unwrap();
+        assert_eq!(s.used_tokens, 5000);
+        assert_eq!(s.context_window, Some(128000));
+        assert_eq!(s.input_tokens, 3000);
+        assert_eq!(s.output_tokens, 2000);
+    }
+
+    #[test]
+    fn parse_context_stats_missing_usage() {
+        let json = json!({});
+        let stats = parse_context_stats_from_rpc_response(&json);
+        assert!(stats.is_none());
+    }
+
+    #[test]
+    fn parse_context_stats_null_context_window() {
+        let json = json!({
+            "contextUsage": {
+                "usedTokens": 5000,
+                "contextWindow": null,
+                "inputTokens": 3000,
+                "outputTokens": 2000
+            }
+        });
+        let stats = parse_context_stats_from_rpc_response(&json);
+        assert!(stats.is_some());
+        assert_eq!(stats.unwrap().context_window, None);
+    }
+
+    #[test]
+    fn parse_context_stats_zero_tokens() {
+        let json = json!({
+            "contextUsage": {
+                "usedTokens": 0,
+                "contextWindow": 0,
+                "inputTokens": 0,
+                "outputTokens": 0
+            }
+        });
+        let stats = parse_context_stats_from_rpc_response(&json);
+        assert!(stats.is_some());
+        let s = stats.unwrap();
+        assert_eq!(s.used_tokens, 0);
+        assert_eq!(s.context_window, None); // 0 is treated as None
+    }
+
+    #[test]
+    fn resolve_context_window_prefers_auto() {
+        let (tokens, source) = resolve_context_window_from_sources(Some(128000), Some(64000));
+        assert_eq!(tokens, Some(128000));
+        assert_eq!(source, "auto");
+    }
+
+    #[test]
+    fn resolve_context_window_falls_back_to_manual() {
+        let (tokens, source) = resolve_context_window_from_sources(None, Some(64000));
+        assert_eq!(tokens, Some(64000));
+        assert_eq!(source, "manual");
+    }
+
+    #[test]
+    fn resolve_context_window_unknown_when_both_absent() {
+        let (tokens, source) = resolve_context_window_from_sources(None, None);
+        assert_eq!(tokens, None);
+        assert_eq!(source, "unknown");
+    }
+
+    #[test]
+    fn resolve_context_window_ignores_zero_auto() {
+        let (tokens, source) = resolve_context_window_from_sources(Some(0), Some(64000));
+        assert_eq!(tokens, Some(64000));
+        assert_eq!(source, "manual");
+    }
+
+    #[test]
+    fn aggregate_history_turns_sums_turn_usage() {
+        let turns = vec![json!({
+            "usage": {"inputTokens": 100, "outputTokens": 50, "totalTokens": 160}
+        })];
+        let merged = aggregate_token_usage_from_history_turns(Some(&turns));
+        let p = merged.expect("merged usage");
+        assert_eq!(p.input_tokens, Some(100));
+        assert_eq!(p.output_tokens, Some(50));
+        assert_eq!(usage_row_total_tokens(&p), 160);
     }
 }
 
@@ -1955,6 +2235,222 @@ fn clear_history_state(app: tauri::AppHandle) -> Result<(), String> {
         )
         .map_err(|error| format!("清空历史任务失败: {error}"))?;
     Ok(())
+}
+
+// ── Structured Chat History Commands ──────────────────────────────────
+
+fn storage_conn(app: &tauri::AppHandle) -> Result<rusqlite::Connection, String> {
+    let db_path = history_db_path(app)?;
+    storage::db::open_at(&db_path)
+}
+
+/// Session list item for the frontend — no turns included.
+#[derive(Serialize)]
+struct ChatSessionListItem {
+    id: String,
+    title: String,
+    status: String,
+    created_at: i64,
+    updated_at: i64,
+    agent_id: Option<String>,
+    agent_snapshot_json: Option<String>,
+    bot_target_json: Option<String>,
+    session_llm_provider_id: Option<String>,
+    session_llm_model: Option<String>,
+    turn_count: i64,
+}
+
+impl From<storage::chat_history::ChatSession> for ChatSessionListItem {
+    fn from(s: storage::chat_history::ChatSession) -> Self {
+        Self {
+            id: s.id,
+            title: s.title,
+            status: s.status,
+            created_at: s.created_at,
+            updated_at: s.updated_at,
+            agent_id: s.agent_id,
+            agent_snapshot_json: s.agent_snapshot_json,
+            bot_target_json: s.bot_target_json,
+            session_llm_provider_id: s.session_llm_provider_id,
+            session_llm_model: s.session_llm_model,
+            turn_count: 0,
+        }
+    }
+}
+
+/// Full session detail for the frontend — includes turns.
+#[derive(Serialize)]
+struct ChatSessionDetail {
+    id: String,
+    title: String,
+    status: String,
+    created_at: i64,
+    updated_at: i64,
+    agent_id: Option<String>,
+    agent_snapshot_json: Option<String>,
+    bot_target_json: Option<String>,
+    session_llm_provider_id: Option<String>,
+    session_llm_model: Option<String>,
+    turns: Vec<storage::chat_history::ChatTurn>,
+}
+
+impl From<storage::chat_history::ChatSession> for ChatSessionDetail {
+    fn from(s: storage::chat_history::ChatSession) -> Self {
+        Self {
+            id: s.id,
+            title: s.title,
+            status: s.status,
+            created_at: s.created_at,
+            updated_at: s.updated_at,
+            agent_id: s.agent_id,
+            agent_snapshot_json: s.agent_snapshot_json,
+            bot_target_json: s.bot_target_json,
+            session_llm_provider_id: s.session_llm_provider_id,
+            session_llm_model: s.session_llm_model,
+            turns: Vec::new(),
+        }
+    }
+}
+
+#[tauri::command]
+fn chat_list_sessions(app: tauri::AppHandle) -> Result<Vec<ChatSessionListItem>, String> {
+    let conn = storage_conn(&app)?;
+    let sessions = storage::chat_history::list_chat_sessions(&conn)?;
+    let mut items: Vec<ChatSessionListItem> = sessions
+        .into_iter()
+        .map(ChatSessionListItem::from)
+        .collect();
+    for item in &mut items {
+        item.turn_count = storage::chat_history::count_chat_turns(&conn, &item.id)?;
+    }
+    Ok(items)
+}
+
+#[tauri::command]
+fn chat_get_session_detail(
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<Option<ChatSessionDetail>, String> {
+    let conn = storage_conn(&app)?;
+    let Some(session) = storage::chat_history::get_chat_session(&conn, &session_id)? else {
+        return Ok(None);
+    };
+    let turns = storage::chat_history::list_chat_turns(&conn, &session_id)?;
+    let mut detail = ChatSessionDetail::from(session);
+    detail.turns = turns;
+    Ok(Some(detail))
+}
+
+#[tauri::command]
+fn chat_create_session(
+    app: tauri::AppHandle,
+    id: String,
+    title: String,
+    status: String,
+    agent_id: Option<String>,
+    agent_snapshot_json: Option<String>,
+    bot_target_json: Option<String>,
+    session_llm_provider_id: Option<String>,
+    session_llm_model: Option<String>,
+) -> Result<ChatSessionDetail, String> {
+    let conn = storage_conn(&app)?;
+    let session = storage::chat_history::create_chat_session(
+        &conn,
+        &storage::chat_history::CreateChatSessionInput {
+            id,
+            title,
+            status,
+            agent_id,
+            agent_snapshot_json,
+            bot_target_json,
+            session_llm_provider_id,
+            session_llm_model,
+        },
+    )?;
+    Ok(ChatSessionDetail::from(session))
+}
+
+#[tauri::command]
+fn chat_append_turn(
+    app: tauri::AppHandle,
+    id: String,
+    session_id: String,
+    turn_index: i32,
+    prompt: String,
+    answer: String,
+    thinking: String,
+    status: String,
+    usage_json: Option<String>,
+    response_segments_json: Option<String>,
+    tool_calls_json: Option<String>,
+    activity_json: Option<String>,
+) -> Result<storage::chat_history::ChatTurn, String> {
+    let conn = storage_conn(&app)?;
+    storage::chat_history::append_chat_turn(
+        &conn,
+        &storage::chat_history::AppendChatTurnInput {
+            id,
+            session_id,
+            turn_index,
+            prompt,
+            answer,
+            thinking,
+            status,
+            usage_json,
+            response_segments_json,
+            tool_calls_json,
+            activity_json,
+        },
+    )
+}
+
+#[tauri::command]
+fn chat_update_turn(
+    app: tauri::AppHandle,
+    id: String,
+    answer: Option<String>,
+    thinking: Option<String>,
+    status: Option<String>,
+    completed_at: Option<i64>,
+    usage_json: Option<String>,
+    response_segments_json: Option<String>,
+    tool_calls_json: Option<String>,
+    activity_json: Option<String>,
+) -> Result<storage::chat_history::ChatTurn, String> {
+    let conn = storage_conn(&app)?;
+    storage::chat_history::update_chat_turn(
+        &conn,
+        &storage::chat_history::UpdateChatTurnInput {
+            id,
+            answer,
+            thinking,
+            status,
+            completed_at,
+            usage_json,
+            response_segments_json,
+            tool_calls_json,
+            activity_json,
+        },
+    )
+}
+
+#[tauri::command]
+fn chat_delete_session(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
+    let conn = storage_conn(&app)?;
+    storage::chat_history::delete_chat_session(&conn, &session_id)
+}
+
+#[tauri::command]
+fn chat_clear_all_sessions(app: tauri::AppHandle) -> Result<(), String> {
+    let conn = storage_conn(&app)?;
+    storage::chat_history::clear_all_chat_sessions(&conn)
+}
+
+#[tauri::command]
+fn chat_migrate_history_v1(app: tauri::AppHandle) -> Result<String, String> {
+    let mut conn = storage_conn(&app)?;
+    let result = storage::migrations::migrate_history_v1_to_structured(&mut conn)?;
+    Ok(format!("{result:?}"))
 }
 
 #[tauri::command]
@@ -5851,6 +6347,14 @@ pub fn run() {
             load_history_state,
             save_history_state,
             clear_history_state,
+            chat_list_sessions,
+            chat_get_session_detail,
+            chat_create_session,
+            chat_append_turn,
+            chat_update_turn,
+            chat_delete_session,
+            chat_clear_all_sessions,
+            chat_migrate_history_v1,
             list_token_usage_records,
             load_provider_preferences,
             save_provider_preferences,
@@ -5903,7 +6407,8 @@ pub fn run() {
             bot_send_media,
             ensure_runtime_dependencies,
             test_llm_provider_connection,
-            generate_session_conversation_title
+            generate_session_conversation_title,
+            get_session_context_stats
         ])
         .run(app_context())
         .expect("error while running tauri application");

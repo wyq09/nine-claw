@@ -27,6 +27,8 @@ import {
 } from '../lib'
 
 export type SkillsViewProps = {
+  /** 嵌入设置页时去掉大标题与整页壳，避免与设置顶栏重复 */
+  variant?: 'page' | 'embedded'
   installedSkillCount: number
   installedSkills: InstalledSkillItem[]
   onChangeTab: (tab: SkillLibraryTab) => void
@@ -46,6 +48,7 @@ export type SkillsViewProps = {
 }
 
 export function SkillsView({
+  variant = 'page',
   installedSkillCount,
   installedSkills,
   onChangeTab,
@@ -64,12 +67,15 @@ export function SkillsView({
   visibleSystemSkills,
 }: SkillsViewProps) {
   const isInstalledTab = tab === 'installed'
+  const embedded = variant === 'embedded'
 
   return (
-    <div className="page-shell">
-      <header className="page-header">
-        <h1>技能</h1>
-      </header>
+    <div className={embedded ? 'library-view-embed' : 'page-shell'}>
+      {embedded ? null : (
+        <header className="page-header">
+          <h1>技能</h1>
+        </header>
+      )}
 
       <div className="page-toolbar">
         <div className="tab-row">
@@ -239,18 +245,28 @@ export function SkillsView({
 }
 
 export type ResourcesViewProps = {
+  variant?: 'page' | 'embedded'
   onSearch: (value: string) => void
   resourceSearch: string
   visibleResources: ResourceItem[]
 }
 
-export function ResourcesView({ onSearch, resourceSearch, visibleResources }: ResourcesViewProps) {
+export function ResourcesView({
+  variant = 'page',
+  onSearch,
+  resourceSearch,
+  visibleResources,
+}: ResourcesViewProps) {
+  const embedded = variant === 'embedded'
+
   return (
-    <div className="page-shell">
-      <header className="page-header">
-        <h1>资源库</h1>
-        <p>把模板、知识沉淀和可复用的交付资产放在同一个工作台里。</p>
-      </header>
+    <div className={embedded ? 'library-view-embed' : 'page-shell'}>
+      {embedded ? null : (
+        <header className="page-header">
+          <h1>资源库</h1>
+          <p>把模板、知识沉淀和可复用的交付资产放在同一个工作台里。</p>
+        </header>
+      )}
 
       <div className="resource-hero">
         <div>

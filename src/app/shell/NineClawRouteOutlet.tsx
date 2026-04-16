@@ -14,9 +14,7 @@ import type {
   HistoryItem,
   InstalledSkillItem,
   PersistedChatAttachment,
-  ResourceItem,
-  SkillLibraryTab,
-  SystemSkillCatalog,
+  ProviderConfig,
   ViewKey,
 } from '../../types'
 import type { BotStatusEvent } from '../../lib/piClient'
@@ -25,16 +23,6 @@ import { ChatView } from '../chat/ChatWorkspace'
 const AgentsView = lazy(async () => {
   const module = await import('../agents/AgentsView')
   return { default: module.AgentsView }
-})
-
-const SkillsView = lazy(async () => {
-  const module = await import('../pages/LibraryAndTasks')
-  return { default: module.SkillsView }
-})
-
-const ResourcesView = lazy(async () => {
-  const module = await import('../pages/LibraryAndTasks')
-  return { default: module.ResourcesView }
 })
 
 const TasksView = lazy(async () => {
@@ -78,24 +66,8 @@ export type NineClawRouteOutletProps = {
   sessionLlmSelectOptionsWithFallback: SessionLlmSelectOption[]
   runtimeReady: boolean
   runtimeBlockingReason: string | null
+  sessionContextProviderConfig: Pick<ProviderConfig, 'maxContextTokens'> | null
   installedSkills: InstalledSkillItem[]
-  visibleInstalledSkills: InstalledSkillItem[]
-  onSkillLibraryTabChange: (tab: SkillLibraryTab) => void
-  onOpenSkillInstallByLink: () => void
-  onInstallSystemSkill: (skillId: string) => void | Promise<void>
-  onRefreshSkillLibrary: () => void | Promise<void>
-  skillInstallLaunching: boolean
-  systemSkillInstallId: string
-  onSkillSearchChange: (value: string) => void
-  skillsError: string
-  skillsLoading: boolean
-  systemSkillCatalog: SystemSkillCatalog
-  skillLibraryTab: SkillLibraryTab
-  skillSearch: string
-  visibleSystemSkills: SystemSkillCatalog['skills']
-  onResourceSearchChange: (value: string) => void
-  resourceSearch: string
-  visibleResources: ResourceItem[]
   editableAgents: AgentRecord[]
   onOpenAgentEditor: (agentId: string) => void
   agentEditorDraft: AgentInput | null
@@ -204,24 +176,8 @@ export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
     sessionLlmSelectOptionsWithFallback,
     runtimeReady,
     runtimeBlockingReason,
+    sessionContextProviderConfig,
     installedSkills,
-    visibleInstalledSkills,
-    onSkillLibraryTabChange,
-    onOpenSkillInstallByLink,
-    onInstallSystemSkill,
-    onRefreshSkillLibrary,
-    skillInstallLaunching,
-    systemSkillInstallId,
-    onSkillSearchChange,
-    skillsError,
-    skillsLoading,
-    systemSkillCatalog,
-    skillLibraryTab,
-    skillSearch,
-    visibleSystemSkills,
-    onResourceSearchChange,
-    resourceSearch,
-    visibleResources,
     editableAgents,
     onOpenAgentEditor,
     agentEditorDraft,
@@ -342,44 +298,8 @@ export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
         activeHistoryItem={activeHistoryItem}
         runtimeReady={runtimeReady}
         runtimeBlockingReason={runtimeBlockingReason}
+        sessionContextProviderConfig={sessionContextProviderConfig}
       />
-    )
-  }
-
-  if (view === 'skills') {
-    return (
-      <Suspense fallback={routeFallback}>
-        <SkillsView
-          installedSkillCount={installedSkills.length}
-          installedSkills={visibleInstalledSkills}
-          onChangeTab={onSkillLibraryTabChange}
-          onInstallByLink={onOpenSkillInstallByLink}
-          onInstallSystemSkill={onInstallSystemSkill}
-          onRefresh={onRefreshSkillLibrary}
-          sessionBusy={skillInstallLaunching}
-          systemSkillInstallId={systemSkillInstallId}
-          setSearch={onSkillSearchChange}
-          skillsError={skillsError}
-          skillsLoading={skillsLoading}
-          systemSkillCount={systemSkillCatalog.skills.length}
-          systemSkillCatalog={systemSkillCatalog}
-          tab={skillLibraryTab}
-          skillSearch={skillSearch}
-          visibleSystemSkills={visibleSystemSkills}
-        />
-      </Suspense>
-    )
-  }
-
-  if (view === 'resources') {
-    return (
-      <Suspense fallback={routeFallback}>
-        <ResourcesView
-          onSearch={onResourceSearchChange}
-          resourceSearch={resourceSearch}
-          visibleResources={visibleResources}
-        />
-      </Suspense>
     )
   }
 

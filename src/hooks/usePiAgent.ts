@@ -91,6 +91,8 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
   const latestHistoryRef = useRef<HistoryItem[]>([])
   const latestHistorySerializedRef = useRef<string>('')
   const historyHydratedRef = useRef(false)
+  /** 仅在为 true 时允许把内存写回 SQLite：初始加载失败时必须为 false，否则会误用 [] 覆盖库内数据 */
+  const historyPersistAllowedRef = useRef(false)
 
   const updateHistoryItem = (id: string, updater: (item: HistoryItem) => HistoryItem) => {
     setHistory((previous) => previous.map((item) => (item.id === id ? updater(item) : item)))
@@ -313,6 +315,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
 
         setHistory(nextHistory)
         setActiveHistoryId((current) => (current && nextHistory.some((item) => item.id === current) ? current : (nextHistory[0]?.id ?? '')))
+        historyPersistAllowedRef.current = true
       } catch (loadError) {
         if (!isMounted) {
           return
@@ -338,8 +341,11 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       return
     }
 
-    clearLegacyHistoryStorage()
     latestHistoryRef.current = history
+    clearLegacyHistoryStorage()
+    if (!historyPersistAllowedRef.current && history.length === 0) {
+      return
+    }
     const delay = runningHistoryIds.length > 0 ? 1200 : 200
     const timer = window.setTimeout(() => {
       const serialized = JSON.stringify(history)
@@ -354,6 +360,9 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
   useEffect(() => {
     return () => {
       if (!historyHydratedRef.current) {
+        return
+      }
+      if (!historyPersistAllowedRef.current && latestHistoryRef.current.length === 0) {
         return
       }
       const payload =

@@ -11,19 +11,20 @@ import type {
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { AppIcon, type IconName } from '../../components/AppIcon'
 import { ComposerAttachmentStrip } from '../../components/ComposerAttachmentStrip'
+import { SessionContextBadge } from '../../components/SessionContextBadge'
 import type {
   AgentBuilderDraft,
   ConversationAgentSnapshot,
   ConversationTurn,
   HistoryItem,
   PersistedChatAttachment,
+  ProviderConfig,
   SubmitShortcut,
 } from '../../types'
 import {
   clampNumber,
   DEFAULT_COMPOSER_HEIGHT,
   getAgentColor,
-  getSubmitShortcutLabel,
   MAX_COMPOSER_HEIGHT,
   MIN_COMPOSER_HEIGHT,
   shouldSubmitWithShortcut,
@@ -31,6 +32,7 @@ import {
 } from '../lib'
 import { ImagePreviewModal } from './TurnAndTools'
 import { useChatTurnWindow } from './useChatTurnWindow'
+import { useSessionContextWindow } from '../../hooks/useSessionContextWindow'
 import { VirtualizedChatTurns, type VirtualizedChatTurnsHandle } from './VirtualizedChatTurns'
 
 function streamingTurnLayoutRevision(turn: ConversationTurn | undefined): number {
@@ -97,6 +99,8 @@ export type ChatViewProps = {
   runtimeReady: boolean
   /** 非空表示已确认 PI 不可用；`null` 且 `!runtimeReady` 表示仍在检测 */
   runtimeBlockingReason: string | null
+  /** 当前 session 对应的 provider 配置（仅 maxContextTokens），用于上下文窗口统计 */
+  sessionContextProviderConfig: Pick<ProviderConfig, 'maxContextTokens'> | null
 }
 
 export function ChatView({
@@ -131,9 +135,16 @@ export function ChatView({
   submitShortcut,
   runtimeReady,
   runtimeBlockingReason,
+  sessionContextProviderConfig,
 }: ChatViewProps) {
   /** 非受控：避免每键入一字就重渲染整页消息列表（长会话 Markdown 极重） */
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+
+  const { state: sessionContextState, loading: sessionContextLoading } = useSessionContextWindow({
+    sessionId: activeHistoryId,
+    providerConfig: sessionContextProviderConfig,
+    turns: activeHistoryItem?.turns,
+  })
 
   const [copiedTurnId, setCopiedTurnId] = useState('')
   const [copiedPromptTurnId, setCopiedPromptTurnId] = useState('')
@@ -141,12 +152,15 @@ export function ChatView({
   const [composerHeight, setComposerHeight] = useState(DEFAULT_COMPOSER_HEIGHT)
   const [isComposerResizing, setIsComposerResizing] = useState(false)
   const [showScrollToLatest, setShowScrollToLatest] = useState(false)
+  /** 与流式生成状态配合：空输入时主按钮显示「处理中」，有输入时再显示可发送 */
+  const [composerHasTypedContent, setComposerHasTypedContent] = useState(false)
   const resizeStateRef = useRef<{ startHeight: number; startY: number } | null>(null)
   const workspaceScrollRef = useRef<HTMLDivElement | null>(null)
   const virtualListRef = useRef<VirtualizedChatTurnsHandle | null>(null)
   /** 是否在智能体流式输出时自动滚到底；用户滚离底部后置 false，仅下次发送消息时恢复 */
   const followLatestOutputRef = useRef(true)
-  const lastAutoScrollAtRef = useRef(0)
+  /** 下一次 scroll 来自虚拟列表程序化滚底时跳过「用户离底」判定；无 scroll 时由 microtask 清掉 */
+  const programmaticScrollPendingRef = useRef(false)
 
   useLayoutEffect(() => {
     composerClearRef.current = () => {
@@ -175,13 +189,15 @@ export function ChatView({
   )
   const sessionStreaming = sessionRunning
   const lastTurn = turns.at(-1)
+
+  const syncComposerTypedPresence = useCallback(() => {
+    const el = composerTextareaRef.current
+    const raw = el?.value ?? ''
+    setComposerHasTypedContent(raw.trim().length > 0)
+  }, [])
   /** 纯数值：与 `turns` 引用解耦，复制状态变化时 revision 不变则子树不跟滚 */
   const streamingLayoutRevision =
     sessionRunning && lastTurn ? streamingTurnLayoutRevision(lastTurn) : 0
-
-  const markAutoScroll = useCallback(() => {
-    lastAutoScrollAtRef.current = Date.now()
-  }, [])
 
   /** 进入会话时恢复「跟到底」；具体滚动由 VirtualizedChatTurns 的 session 切换 / 首轮 layout 负责，避免与子组件重复 scrollToIndex 造成布局抖动 */
   useLayoutEffect(() => {
@@ -205,6 +221,14 @@ export function ChatView({
     setPreviewImage(null)
   }, [activeHistoryId])
 
+  useLayoutEffect(() => {
+    syncComposerTypedPresence()
+  }, [activeHistoryId, syncComposerTypedPresence])
+
+  useEffect(() => {
+    syncComposerTypedPresence()
+  }, [sessionStreaming, syncComposerTypedPresence])
+
   useEffect(() => {
     const handlePointerMove = (event: PointerEvent) => {
       const resizeState = resizeStateRef.current
@@ -212,9 +236,9 @@ export function ChatView({
         return
       }
 
-      /* 拖拽条在输入卡片底部：向下拖增高、向上拖减高 */
+      /* 拖拽条在输入区顶部：向上拖放大输入区、向下拖缩小 */
       const nextHeight = clampNumber(
-        resizeState.startHeight + (event.clientY - resizeState.startY),
+        resizeState.startHeight - (event.clientY - resizeState.startY),
         MIN_COMPOSER_HEIGHT,
         MAX_COMPOSER_HEIGHT,
       )
@@ -256,6 +280,16 @@ export function ChatView({
     setShowScrollToLatest(distanceToBottom > 180)
   }, [isHomeState])
 
+  const markAutoScroll = useCallback(() => {
+    programmaticScrollPendingRef.current = true
+    queueMicrotask(() => {
+      if (programmaticScrollPendingRef.current) {
+        programmaticScrollPendingRef.current = false
+        syncScrollToLatestVisibility()
+      }
+    })
+  }, [syncScrollToLatestVisibility])
+
   const handleMessagesScroll = useCallback(() => {
     const viewport = workspaceScrollRef.current
     if (!viewport || isHomeState) {
@@ -263,8 +297,12 @@ export function ChatView({
       return
     }
     const distanceToBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight
-    const autoScrollSettled = Date.now() - lastAutoScrollAtRef.current > 48
-    if (autoScrollSettled && distanceToBottom > 100) {
+    if (programmaticScrollPendingRef.current) {
+      programmaticScrollPendingRef.current = false
+      setShowScrollToLatest(distanceToBottom > 180)
+      return
+    }
+    if (distanceToBottom > 100) {
       followLatestOutputRef.current = false
     }
     setShowScrollToLatest(distanceToBottom > 180)
@@ -317,7 +355,7 @@ export function ChatView({
 
   const handleScrollToLatest = () => {
     if (virtualListRef.current) {
-      virtualListRef.current.scrollToLatest('smooth')
+      virtualListRef.current.scrollToLatest('instant')
       return
     }
     const viewport = workspaceScrollRef.current
@@ -354,6 +392,9 @@ export function ChatView({
             const text = el?.value ?? ''
             followLatestOutputRef.current = true
             void onSubmit(text)
+            requestAnimationFrame(() => {
+              syncComposerTypedPresence()
+            })
           }}
         >
           <input
@@ -374,9 +415,19 @@ export function ChatView({
               <AppIcon name="arrow-down" size={18} />
             </button>
           ) : null}
+          <div
+            className="composer-resize-handle"
+            role="separator"
+            aria-label="拖动调整输入框高度"
+            aria-orientation="horizontal"
+            onPointerDown={handleComposerResizeStart}
+          >
+            <span />
+          </div>
           <textarea
             ref={composerTextareaRef}
             defaultValue={composerDraftBackupRef.current}
+            onInput={syncComposerTypedPresence}
             onKeyDown={handleComposerKeyDown}
             onPaste={(event) => {
               if (attachmentError) {
@@ -420,36 +471,34 @@ export function ChatView({
               ) : null}
             </div>
             <div className="composer-toolbar-right">
-              {sessionStreaming ? (
+              {activeHistoryItem ? (
+                <SessionContextBadge state={sessionContextState} loading={sessionContextLoading} />
+              ) : null}
+              {!runtimeReady ? (
+                <button type="submit" className="submit-button" disabled aria-label="运行时未就绪">
+                  <span className="composer-runtime-loading">⏳</span>
+                </button>
+              ) : sessionStreaming && !composerHasTypedContent ? (
                 <button
                   type="button"
                   className="stop-button"
                   onClick={onAbort}
-                  aria-label="强制停止当前生成"
-                  title="强制停止当前生成"
+                  aria-label="立即停止当前生成"
+                  title="立即停止当前生成"
                 >
                   <AppIcon name="stop" size={16} />
                 </button>
-              ) : null}
-              <button
-                type="submit"
-                className="submit-button"
-                disabled={!runtimeReady}
-                aria-label={sessionStreaming ? '发送并中断当前回复' : '发送'}
-                title={sessionStreaming ? '发送新消息（将中断当前回复）' : undefined}
-              >
-                {runtimeReady ? <AppIcon name="arrow-up" size={17} /> : <span className="composer-runtime-loading">⏳</span>}
-              </button>
+              ) : (
+                <button
+                  type="submit"
+                  className="submit-button"
+                  aria-label={sessionStreaming ? '发送并中断当前回复' : '发送'}
+                  title={sessionStreaming ? '发送新消息（将中断当前回复）' : undefined}
+                >
+                  <AppIcon name="arrow-up" size={17} />
+                </button>
+              )}
             </div>
-          </div>
-          <div
-            className="composer-resize-handle"
-            role="separator"
-            aria-label="拖动调整输入框高度"
-            aria-orientation="horizontal"
-            onPointerDown={handleComposerResizeStart}
-          >
-            <span />
           </div>
         </form>
         {isHomeState ? (
@@ -464,6 +513,7 @@ export function ChatView({
                   if (el) {
                     el.value = chip
                     el.focus()
+                    syncComposerTypedPresence()
                   }
                 }}
               >
@@ -477,11 +527,10 @@ export function ChatView({
           {!runtimeReady
             ? runtimeBlockingReason ?? 'PI 运行时正在初始化，请稍候...'
             : sessionStreaming
-              ? `生成中仍可连续发送；新消息会中断当前回复（与 IM 渠道一致）。停止按钮可强制中止不发送。快捷键：${getSubmitShortcutLabel(submitShortcut)}。`
+              ? ''
               : globalBusy
                 ? '其他会话也在执行中；当前会话仍可继续发送。'
                 : ``}
-                {/* : `发送快捷键：${getSubmitShortcutLabel(submitShortcut)}。Shift + Enter 可换行。`} */}
         </div>
       </div>
     </div>

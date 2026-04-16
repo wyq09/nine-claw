@@ -777,7 +777,7 @@ export function NineClawApp() {
     return () => unsub?.()
   }, [selectedManagedAgent])
 
-  const refreshSkillLibrary = async () => {
+  const refreshSkillLibrary = useCallback(async () => {
     setSkillsLoading(true)
     setSkillsError('')
 
@@ -794,13 +794,13 @@ export function NineClawApp() {
     } finally {
       setSkillsLoading(false)
     }
-  }
+  }, [])
 
   useEffect(() => {
     void refreshSkillLibrary()
-  }, [])
+  }, [refreshSkillLibrary])
 
-  const handleInstallSystemSkill = async (skillId: string) => {
+  const handleInstallSystemSkill = useCallback(async (skillId: string) => {
     const trimmedId = skillId.trim()
     if (!trimmedId) {
       return
@@ -817,7 +817,57 @@ export function NineClawApp() {
     } finally {
       setSystemSkillInstallId('')
     }
-  }
+  }, [refreshSkillLibrary])
+
+  const settingsSkillsLibrary = useMemo(
+    (): import('../pages/LibraryAndTasks').SkillsViewProps => ({
+      variant: 'embedded',
+      installedSkillCount: installedSkills.length,
+      installedSkills: visibleInstalledSkills,
+      onChangeTab: setSkillLibraryTab,
+      onInstallByLink: () => {
+        setSkillInstallDialogOpen(true)
+        setSkillInstallError('')
+      },
+      onInstallSystemSkill: handleInstallSystemSkill,
+      onRefresh: refreshSkillLibrary,
+      sessionBusy: skillInstallLaunching,
+      setSearch: setSkillSearch,
+      skillsError,
+      skillsLoading,
+      systemSkillCount: systemSkillCatalog.skills.length,
+      systemSkillCatalog,
+      systemSkillInstallId,
+      tab: skillLibraryTab,
+      skillSearch,
+      visibleSystemSkills,
+    }),
+    [
+      installedSkills.length,
+      visibleInstalledSkills,
+      handleInstallSystemSkill,
+      refreshSkillLibrary,
+      skillInstallLaunching,
+      skillsError,
+      skillsLoading,
+      systemSkillCatalog,
+      systemSkillCatalog.skills.length,
+      systemSkillInstallId,
+      skillLibraryTab,
+      skillSearch,
+      visibleSystemSkills,
+    ],
+  )
+
+  const settingsResourcesLibrary = useMemo(
+    (): import('../pages/LibraryAndTasks').ResourcesViewProps => ({
+      variant: 'embedded',
+      onSearch: setResourceSearch,
+      resourceSearch,
+      visibleResources,
+    }),
+    [resourceSearch, visibleResources],
+  )
 
   const refreshAgents = useCallback(async (preferredAgentId?: string) => {
     setAgentsLoading(true)
@@ -1984,27 +2034,14 @@ export function NineClawApp() {
           sessionLlmSelectOptionsWithFallback={sessionLlmSelectOptionsWithFallback}
           runtimeReady={runtimeReady}
           runtimeBlockingReason={runtimeBlockingReason}
+          sessionContextProviderConfig={
+            activeHistoryItem?.sessionLlmProviderId
+              ? { maxContextTokens: providerConfigs[activeHistoryItem.sessionLlmProviderId]?.maxContextTokens }
+              : selectedProviderId
+                ? { maxContextTokens: providerConfigs[selectedProviderId]?.maxContextTokens }
+                : null
+          }
           installedSkills={installedSkills}
-          visibleInstalledSkills={visibleInstalledSkills}
-          onSkillLibraryTabChange={setSkillLibraryTab}
-          onOpenSkillInstallByLink={() => {
-            setSkillInstallDialogOpen(true)
-            setSkillInstallError('')
-          }}
-          onInstallSystemSkill={handleInstallSystemSkill}
-          onRefreshSkillLibrary={refreshSkillLibrary}
-          skillInstallLaunching={skillInstallLaunching}
-          systemSkillInstallId={systemSkillInstallId}
-          onSkillSearchChange={setSkillSearch}
-          skillsError={skillsError}
-          skillsLoading={skillsLoading}
-          systemSkillCatalog={systemSkillCatalog}
-          skillLibraryTab={skillLibraryTab}
-          skillSearch={skillSearch}
-          visibleSystemSkills={visibleSystemSkills}
-          onResourceSearchChange={setResourceSearch}
-          resourceSearch={resourceSearch}
-          visibleResources={visibleResources}
           editableAgents={editableAgents}
           onOpenAgentEditor={handleOpenAgentEditor}
           agentEditorDraft={agentEditorDraft}
@@ -2155,6 +2192,8 @@ export function NineClawApp() {
       setAppearanceSettingsForModal={setAppearanceSettings}
       setGeneralSettings={setGeneralSettings}
       settingsTab={settingsTab}
+      settingsSkillsLibrary={settingsSkillsLibrary}
+      settingsResourcesLibrary={settingsResourcesLibrary}
     />
   )
 }

@@ -221,9 +221,63 @@ export type HistoryItem = {
   sessionLlmModel?: string
 }
 
-export type ViewKey = 'chat' | 'skills' | 'resources' | 'agents' | 'tasks'
+/** Session list item returned from the structured chat API (no turns). */
+export type ChatSessionListItem = {
+  id: string
+  title: string
+  status: HistoryStatus
+  created_at: number
+  updated_at: number
+  agent_id: string | null
+  agent_snapshot_json: string | null
+  bot_target_json: string | null
+  session_llm_provider_id: string | null
+  session_llm_model: string | null
+  turn_count: number
+}
 
-export type SettingsTab = 'general' | 'appearance' | 'providers' | 'usage' | 'shortcuts'
+/** Full session detail with turns from the structured chat API. */
+export type ChatSessionDetail = {
+  id: string
+  title: string
+  status: HistoryStatus
+  created_at: number
+  updated_at: number
+  agent_id: string | null
+  agent_snapshot_json: string | null
+  bot_target_json: string | null
+  session_llm_provider_id: string | null
+  session_llm_model: string | null
+  turns: ChatTurnRow[]
+}
+
+/** Database row for a chat turn. */
+export type ChatTurnRow = {
+  id: string
+  session_id: string
+  turn_index: number
+  prompt: string
+  answer: string
+  thinking: string
+  status: HistoryStatus
+  created_at: number
+  completed_at: number | null
+  usage_json: string | null
+  response_segments_json: string | null
+  tool_calls_json: string | null
+  activity_json: string | null
+}
+
+export type ViewKey = 'chat' | 'agents' | 'tasks'
+
+export type SettingsTab =
+  | 'general'
+  | 'appearance'
+  | 'providers'
+  | 'usage'
+  | 'shortcuts'
+  | 'skills'
+  | 'resources'
 
 export type TokenUsageRecord = {
   turnId: string
@@ -462,6 +516,8 @@ export type ProviderConfig = {
   /** 界面展示名，空则用 Provider 预设名称 */
   displayName: string
   status: '未配置' | '已配置' | '测试通过'
+  /** 手动配置的最大上下文窗口（tokens），留空表示自动检测 */
+  maxContextTokens?: number
 }
 
 export type SubmitShortcut = 'enter' | 'mod_enter'
