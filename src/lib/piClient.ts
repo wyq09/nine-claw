@@ -27,6 +27,10 @@ import type {
   SchedulerSyncResult,
   SystemSkillCatalog,
   TokenUsageRecord,
+  WorkspaceMemoryRecord,
+  WorkspaceMemberView,
+  WorkspaceRecord,
+  WorkspaceResourceRecord,
 } from '../types'
 
 export type PiStreamUnsubscribe = () => void
@@ -38,6 +42,8 @@ export async function streamPiPrompt(
     providerConfig?: ProviderRuntimeConfig | null
     agentConfig?: ConversationAgentSnapshot | null
     attachments?: PersistedChatAttachment[]
+    workspaceId?: string | null
+    overrideAgentId?: string | null
   },
 ): Promise<void> {
   await invoke('stream_pi_prompt', {
@@ -46,6 +52,8 @@ export async function streamPiPrompt(
     providerConfig: options?.providerConfig ?? null,
     agentConfig: options?.agentConfig ?? null,
     attachments: options?.attachments ?? [],
+    workspaceId: options?.workspaceId ?? null,
+    overrideAgentId: options?.overrideAgentId ?? null,
   })
 }
 
@@ -192,6 +200,7 @@ export async function chatCreateSession(payload: {
   botTargetJson?: string | null
   sessionLlmProviderId?: string | null
   sessionLlmModel?: string | null
+  workspaceId?: string | null
 }): Promise<ChatSessionDetail> {
   return invoke<ChatSessionDetail>('chat_create_session', {
     id: payload.id,
@@ -202,6 +211,7 @@ export async function chatCreateSession(payload: {
     botTargetJson: payload.botTargetJson ?? null,
     sessionLlmProviderId: payload.sessionLlmProviderId ?? null,
     sessionLlmModel: payload.sessionLlmModel ?? null,
+    workspaceId: payload.workspaceId ?? null,
   })
 }
 
@@ -217,6 +227,7 @@ export async function chatAppendTurn(payload: {
   responseSegmentsJson?: string | null
   toolCallsJson?: string | null
   activityJson?: string | null
+  speakerAgentId?: string | null
 }): Promise<ChatTurnRow> {
   return invoke<ChatTurnRow>('chat_append_turn', {
     id: payload.id,
@@ -230,6 +241,7 @@ export async function chatAppendTurn(payload: {
     responseSegmentsJson: payload.responseSegmentsJson ?? null,
     toolCallsJson: payload.toolCallsJson ?? null,
     activityJson: payload.activityJson ?? null,
+    speakerAgentId: payload.speakerAgentId ?? null,
   })
 }
 
@@ -267,6 +279,208 @@ export async function chatClearAllSessions(): Promise<void> {
 
 export async function chatMigrateHistoryV1(): Promise<string> {
   return invoke<string>('chat_migrate_history_v1')
+}
+
+export async function workspaceList(includeArchived?: boolean): Promise<WorkspaceRecord[]> {
+  return invoke<WorkspaceRecord[]>('workspace_list', { includeArchived: includeArchived ?? false })
+}
+
+export async function workspaceCreate(payload: {
+  name: string
+  description: string
+  supervisorAgentId: string
+}): Promise<WorkspaceRecord> {
+  return invoke<WorkspaceRecord>('workspace_create', payload)
+}
+
+export async function workspaceUpdate(
+  workspaceId: string,
+  payload: { name?: string | null; description?: string | null },
+): Promise<WorkspaceRecord> {
+  return invoke<WorkspaceRecord>('workspace_update', { workspaceId, ...payload })
+}
+
+export async function workspaceSetArchived(workspaceId: string, archived: boolean): Promise<void> {
+  await invoke('workspace_set_archived', { workspaceId, archived })
+}
+
+export async function workspaceAddMember(
+  workspaceId: string,
+  agentId: string,
+  role?: string | null,
+): Promise<void> {
+  await invoke('workspace_add_member', { workspaceId, agentId, role: role ?? null })
+}
+
+export async function workspaceRemoveMember(workspaceId: string, agentId: string): Promise<void> {
+  await invoke('workspace_remove_member', { workspaceId, agentId })
+}
+
+export async function workspaceListMembers(workspaceId: string): Promise<WorkspaceMemberView[]> {
+  return invoke<WorkspaceMemberView[]>('workspace_list_members', { workspaceId })
+}
+
+export async function workspaceListResources(workspaceId: string): Promise<WorkspaceResourceRecord[]> {
+  return invoke<WorkspaceResourceRecord[]>('workspace_list_resources', { workspaceId })
+}
+
+export async function workspaceUploadResource(payload: {
+  workspaceId: string
+  fileName: string
+  dataBase64: string
+  mime?: string | null
+  uploaderAgentId?: string | null
+}): Promise<WorkspaceResourceRecord> {
+  return invoke<WorkspaceResourceRecord>('workspace_upload_resource', payload)
+}
+
+export async function workspaceReadResourceText(workspaceId: string, relPath: string): Promise<string> {
+  return invoke<string>('workspace_read_resource_text', { workspaceId, relPath })
+}
+
+export async function workspaceListMemories(
+  workspaceId: string,
+  limit?: number | null,
+): Promise<WorkspaceMemoryRecord[]> {
+  return invoke<WorkspaceMemoryRecord[]>('workspace_list_memories', {
+    workspaceId,
+    limit: limit ?? null,
+  })
+}
+
+export async function workspaceWriteMemory(payload: {
+  workspaceId: string
+  title: string
+  content: string
+  authorAgentId?: string | null
+  tags?: string[] | null
+}): Promise<WorkspaceMemoryRecord> {
+  return invoke<WorkspaceMemoryRecord>('workspace_write_memory', payload)
+}
+
+export async function workspaceDelegate(payload: {
+  workspaceId: string
+  targetAgentId: string
+  task: string
+  providerConfig: ProviderRuntimeConfig
+}): Promise<string> {
+  return invoke<string>('workspace_delegate', payload)
+}
+
+/** 从委派计划卡「下发一项」——后端会发 workspace.delegate.* 事件并返回最终结果。 */
+export async function workspaceRunDelegateTask(payload: {
+  workspaceId: string
+  sessionId?: string | null
+  assignee: string
+  task: string
+  providerConfig: ProviderRuntimeConfig
+}): Promise<{ runId: string; output: string; elapsedMs: number; status: 'done' | 'error' }> {
+  return invoke('workspace_run_delegate_task', {
+    workspaceId: payload.workspaceId,
+    sessionId: payload.sessionId ?? null,
+    assignee: payload.assignee,
+    task: payload.task,
+    providerConfig: payload.providerConfig,
+  })
+}
+
+export async function workspaceAbortDelegate(runId: string): Promise<void> {
+  await invoke('workspace_abort_delegate', { runId })
+}
+
+// ── Workspace delegate live events ──
+// 后端在 `run_delegate_with_provider_events` 中按 runId 发射下列事件：
+//   - workspace.delegate.progress  (派发开始) { runId, workspaceId, sessionId?, assignee, task }
+//   - workspace.delegate.turn      { runId, workspaceId, turnIndex, kind }
+//   - workspace.delegate.tool      { runId, workspaceId, toolIndex, toolCallId, toolName, argsDigest, status, isError? }
+//   - workspace.delegate.chunk     { runId, workspaceId, deltaText }
+//   - workspace.delegate.done      { runId, workspaceId, assignee, output, elapsedMs, status: 'done' }
+//   - workspace.delegate.error     { runId, workspaceId, assignee, error, status: 'error' }
+
+export type WorkspaceDelegateTurnEvent = {
+  runId: string
+  workspaceId?: string
+  turnIndex: number
+  kind: 'thinking' | 'agent'
+  summary?: string
+}
+
+export type WorkspaceDelegateToolEvent = {
+  runId: string
+  workspaceId?: string
+  toolIndex: number
+  toolCallId?: string
+  toolName: string
+  argsDigest?: string
+  status: 'running' | 'done' | 'error'
+  isError?: boolean
+}
+
+export type WorkspaceDelegateChunkEvent = {
+  runId: string
+  workspaceId?: string
+  deltaText: string
+}
+
+export type WorkspaceDelegateTerminalEvent = {
+  runId: string
+  workspaceId?: string
+  assignee?: string
+  output?: string
+  error?: string
+  elapsedMs?: number
+  status: 'done' | 'error' | 'aborted'
+}
+
+export async function subscribeWorkspaceDelegateTurn(
+  onEvent: (payload: WorkspaceDelegateTurnEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<WorkspaceDelegateTurnEvent>('workspace.delegate.turn', (event) => {
+    onEvent(event.payload)
+  })
+}
+
+export async function subscribeWorkspaceDelegateTool(
+  onEvent: (payload: WorkspaceDelegateToolEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<WorkspaceDelegateToolEvent>('workspace.delegate.tool', (event) => {
+    onEvent(event.payload)
+  })
+}
+
+export async function subscribeWorkspaceDelegateChunk(
+  onEvent: (payload: WorkspaceDelegateChunkEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<WorkspaceDelegateChunkEvent>('workspace.delegate.chunk', (event) => {
+    onEvent(event.payload)
+  })
+}
+
+export async function subscribeWorkspaceDelegateTerminal(
+  onEvent: (payload: WorkspaceDelegateTerminalEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  const unsubs: PiStreamUnsubscribe[] = []
+  unsubs.push(
+    await listen<WorkspaceDelegateTerminalEvent>('workspace.delegate.done', (event) => {
+      onEvent({ ...event.payload, status: 'done' })
+    }),
+  )
+  unsubs.push(
+    await listen<WorkspaceDelegateTerminalEvent>('workspace.delegate.error', (event) => {
+      onEvent({ ...event.payload, status: 'error' })
+    }),
+  )
+  return () => {
+    for (const un of unsubs) un()
+  }
+}
+
+export async function workspaceAugmentDelegate(payload: {
+  workspaceId: string
+  runId: string
+  note: string
+}): Promise<void> {
+  await invoke('workspace_augment_delegate', payload)
 }
 
 export async function listTokenUsageRecords(): Promise<TokenUsageRecord[]> {

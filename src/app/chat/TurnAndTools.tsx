@@ -8,6 +8,7 @@ import { extractInlineMediaAttachments, normalizeMarkdownImageSources } from '..
 import { openExternalUrl } from '../../lib/piClient'
 import { resolveReplyCardItems } from '../../lib/replyCardFormat'
 import type { AgentBuilderDraft, ConversationTurn, TokenUsage, ToolCallEntry } from '../../types'
+import { DelegateSegmentsBlock } from '../workspaces/chat/DelegateSegmentsBlock'
 import { LazyDetails } from './LazyDetails'
 import { TurnThinkingBlock } from './TurnThinkingBlock'
 import {
@@ -38,6 +39,7 @@ export function TurnResponseBody({
   showThinkingProcess,
   onImageClick,
   copyAnswerControlSlot,
+  resolveSpeaker,
 }: {
   turn: ConversationTurn
   agentBuilderActionBusyId: string
@@ -55,6 +57,13 @@ export function TurnResponseBody({
   onImageClick: (src: string, alt: string) => void
   /** 含文件附件时：复制按钮放入附件工具行，由父级传入 */
   copyAnswerControlSlot?: ReactNode
+  /** 团队空间：将 agentId 解析为展示名与色，用于委派卡等 */
+  resolveSpeaker?: (agentId: string) => {
+    name: string
+    role?: 'supervisor' | 'member'
+    accentColor?: string | null
+    avatarEmoji?: string | null
+  } | null
 }) {
   const toolById = new Map(turn.toolCalls.map((t) => [t.toolCallId, t]))
   const segments = turn.responseSegments
@@ -62,6 +71,11 @@ export function TurnResponseBody({
   const runningToolCount = turn.toolCalls.filter((toolCall) => toolCall.state === 'running').length
   /** 流式未结束：等模型、思考流、工具执行等阶段均保留底部「处理中」动画 */
   const showStreamWaitIndicator = isActiveStreamingTurn && !preparing
+
+  const delegateSegments = (segments ?? []).filter(
+    (s): s is Extract<typeof s, { type: 'delegate_plan' | 'delegation_run' }> =>
+      s.type === 'delegate_plan' || s.type === 'delegation_run',
+  )
 
   if (segments && segments.length > 0) {
     const renderBlocks: Array<
@@ -88,6 +102,11 @@ export function TurnResponseBody({
       if (segment.type === 'text') {
         flushGroupedToolCalls()
         renderBlocks.push({ type: 'text', text: segment.text, index })
+        return
+      }
+
+      if (segment.type === 'delegate_plan' || segment.type === 'delegation_run') {
+        // 委派卡片在正文之后统一渲染（见下方 DelegateSegmentsBlock）。
         return
       }
 
@@ -200,6 +219,13 @@ export function TurnResponseBody({
             />
           )
         })}
+        {delegateSegments.length > 0 ? (
+          <DelegateSegmentsBlock
+            segments={delegateSegments}
+            turnId={turn.id}
+            resolveSpeaker={resolveSpeaker}
+          />
+        ) : null}
         {preparing && turn.id === activeTurnId ? (
           <TurnPreparingIndicator />
         ) : showStreamWaitIndicator ? (
@@ -249,6 +275,13 @@ export function TurnResponseBody({
           showThinkingProcess={showThinkingProcess}
           runningToolCount={runningToolCount}
           onImageClick={onImageClick}
+        />
+      ) : null}
+      {delegateSegments.length > 0 ? (
+        <DelegateSegmentsBlock
+          segments={delegateSegments}
+          turnId={turn.id}
+          resolveSpeaker={resolveSpeaker}
         />
       ) : null}
       {preparing && turn.id === activeTurnId ? (
@@ -502,6 +535,9 @@ export function hasRenderableTurnContent(
       if (segment.type === 'text') {
         const t = segment.text.trim()
         return t.length > 0 && !isTurnPlaceholderNoOutputText(t)
+      }
+      if (segment.type === 'delegate_plan' || segment.type === 'delegation_run') {
+        return true
       }
       return showExecutionRail && turn.toolCalls.some((toolCall) => toolCall.toolCallId === segment.toolCallId)
     })

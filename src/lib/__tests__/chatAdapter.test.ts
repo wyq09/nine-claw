@@ -18,6 +18,7 @@ describe('turnRowToConversationTurn', () => {
       response_segments_json: '[{"type":"text","text":"Hi there!"}]',
       tool_calls_json: null,
       activity_json: '[]',
+      speaker_agent_id: null,
     }
 
     const turn = turnRowToConversationTurn(row)
@@ -54,6 +55,7 @@ describe('turnRowToConversationTurn', () => {
       response_segments_json: null,
       tool_calls_json: null,
       activity_json: null,
+      speaker_agent_id: null,
     }
 
     const turn = turnRowToConversationTurn(row)
@@ -80,6 +82,7 @@ describe('turnRowToConversationTurn', () => {
       response_segments_json: 'broken',
       tool_calls_json: '{invalid}',
       activity_json: null,
+      speaker_agent_id: null,
     }
 
     const turn = turnRowToConversationTurn(row)
@@ -108,6 +111,7 @@ describe('turnRowToConversationTurn', () => {
         '[{"id":"tc0","toolCallId":"tc1","toolName":"read_file","argsText":"{\\"path\\":\\"/test\\"}","resultText":"content","state":"done","createdAt":1700000000050,"completedAt":1700000000080}]',
       activity_json:
         '[{"id":"a1","label":"Reading file","detail":"/test","state":"done","createdAt":1700000000050,"completedAt":1700000000080}]',
+      speaker_agent_id: null,
     }
 
     const turn = turnRowToConversationTurn(row)
@@ -146,6 +150,7 @@ describe('sessionDetailToHistoryItem', () => {
       bot_target_json: null,
       session_llm_provider_id: 'openai',
       session_llm_model: 'gpt-4',
+      workspace_id: null,
       turns: [
         {
           id: 't1',
@@ -161,6 +166,7 @@ describe('sessionDetailToHistoryItem', () => {
           response_segments_json: null,
           tool_calls_json: null,
           activity_json: null,
+          speaker_agent_id: null,
         },
       ],
     }
@@ -194,6 +200,7 @@ describe('sessionDetailToHistoryItem', () => {
       bot_target_json: null,
       session_llm_provider_id: null,
       session_llm_model: null,
+      workspace_id: null,
       turns: [],
     }
 
@@ -218,6 +225,7 @@ describe('sessionDetailToHistoryItem', () => {
       bot_target_json: '{"channelId":"ch1","userId":"u1"}',
       session_llm_provider_id: null,
       session_llm_model: null,
+      workspace_id: null,
       turns: [],
     }
 

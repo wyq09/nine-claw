@@ -670,6 +670,7 @@ impl PiBridge {
             chunk_size,
             on_chunk,
             |_| {},
+            |_| {},
         )? {
             PiProcessOutcome::Completed(result) => Ok(result.full_text),
             PiProcessOutcome::Aborted => Err("pi 处理被中断".to_string()),
@@ -697,10 +698,40 @@ impl PiBridge {
             chunk_size,
             on_chunk,
             on_run_start,
+            |_| {},
         )
     }
 
-    pub fn process_message_with_attachments_interruptible<F, S>(
+    /// 与 `process_message_interruptible` 相同，但额外接收一个原始 JSONL 事件回调，
+    /// 供委派等需要看到 tool_execution_* / turn_end 等结构化事件的调用方使用。
+    pub fn process_message_interruptible_with_events<F, S, E>(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        prompt: &str,
+        chunk_size: usize,
+        on_chunk: F,
+        on_run_start: S,
+        on_event: E,
+    ) -> Result<PiProcessOutcome, String>
+    where
+        F: FnMut(&str),
+        S: FnOnce(Arc<PiRunHandle>),
+        E: FnMut(&serde_json::Value),
+    {
+        self.process_message_with_attachments_interruptible(
+            channel_id,
+            user_id,
+            prompt,
+            &[],
+            chunk_size,
+            on_chunk,
+            on_run_start,
+            on_event,
+        )
+    }
+
+    pub fn process_message_with_attachments_interruptible<F, S, E>(
         &self,
         channel_id: &str,
         user_id: &str,
@@ -709,10 +740,12 @@ impl PiBridge {
         chunk_size: usize,
         mut on_chunk: F,
         on_run_start: S,
+        mut on_event: E,
     ) -> Result<PiProcessOutcome, String>
     where
         F: FnMut(&str),
         S: FnOnce(Arc<PiRunHandle>),
+        E: FnMut(&serde_json::Value),
     {
         let key = self.session_key(channel_id, user_id);
         let fresh_multimodal_session = Self::has_multimodal_attachments(attachments);
@@ -1076,6 +1109,8 @@ impl PiBridge {
                     continue;
                 }
             };
+
+            on_event(&value);
 
             let line_type = value
                 .get("type")

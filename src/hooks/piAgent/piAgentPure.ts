@@ -521,9 +521,110 @@ export function parseResponseSegments(raw: unknown): ResponseSegment[] | undefin
       out.push({ type: 'tool', toolCallId: seg.toolCallId })
       continue
     }
+    if (
+      seg.type === 'delegate_plan' &&
+      typeof seg.planId === 'string' &&
+      Array.isArray(seg.items)
+    ) {
+      out.push({
+        type: 'delegate_plan',
+        planId: seg.planId,
+        items: seg.items as ResponseSegment extends { type: 'delegate_plan'; items: infer I }
+          ? I
+          : never,
+      })
+      continue
+    }
+    if (seg.type === 'delegation_run' && typeof seg.run === 'object' && seg.run !== null) {
+      const run = seg.run as Record<string, unknown>
+      if (typeof run.runId === 'string' && typeof run.assignee === 'string') {
+        const rawTurns = Array.isArray(run.turns) ? (run.turns as unknown[]) : []
+        const turns = rawTurns
+          .map((item) => {
+            if (typeof item !== 'object' || item === null) return null
+            const t = item as Record<string, unknown>
+            if (typeof t.index !== 'number') return null
+            const kind = t.kind === 'agent' ? 'agent' : 'thinking'
+            return {
+              index: t.index,
+              kind: kind as 'thinking' | 'agent',
+              summary: typeof t.summary === 'string' ? t.summary : undefined,
+            }
+          })
+          .filter((v): v is NonNullable<typeof v> => v !== null)
+
+        const rawCalls = Array.isArray(run.toolCalls) ? (run.toolCalls as unknown[]) : []
+        const toolCalls = rawCalls
+          .map((item) => {
+            if (typeof item !== 'object' || item === null) return null
+            const t = item as Record<string, unknown>
+            if (typeof t.index !== 'number' || typeof t.toolName !== 'string') return null
+            const status =
+              t.status === 'running' || t.status === 'error' ? t.status : 'done'
+            return {
+              index: t.index,
+              toolCallId: typeof t.toolCallId === 'string' ? t.toolCallId : '',
+              toolName: t.toolName,
+              argsDigest: typeof t.argsDigest === 'string' ? t.argsDigest : undefined,
+              status: status as 'running' | 'done' | 'error',
+              isError: typeof t.isError === 'boolean' ? t.isError : undefined,
+            }
+          })
+          .filter((v): v is NonNullable<typeof v> => v !== null)
+
+        out.push({
+          type: 'delegation_run',
+          run: {
+            runId: run.runId,
+            assignee: run.assignee,
+            task: typeof run.task === 'string' ? run.task : '',
+            status:
+              (run.status as 'pending' | 'running' | 'done' | 'aborted' | 'error') ?? 'pending',
+            output: typeof run.output === 'string' ? run.output : '',
+            startedAt: typeof run.startedAt === 'number' ? run.startedAt : undefined,
+            elapsedMs: typeof run.elapsedMs === 'number' ? run.elapsedMs : undefined,
+            error: typeof run.error === 'string' ? run.error : null,
+            ...(turns.length > 0 ? { turns } : {}),
+            ...(toolCalls.length > 0 ? { toolCalls } : {}),
+          },
+        })
+        continue
+      }
+    }
     return undefined
   }
   return out
+}
+
+/** 从 `turn.answer` 里解析 `<!--NC_DELEGATE_PLAN:{...}-->` 占位为 delegate_plan 片段。 */
+export function extractDelegatePlanSegmentsFromAnswer(answer: string): {
+  cleaned: string
+  segments: ResponseSegment[]
+} {
+  const re = /<!--NC_DELEGATE_PLAN:(\{[\s\S]*?\})-->/g
+  const segments: ResponseSegment[] = []
+  const cleaned = answer.replace(re, (_, jsonPart: string) => {
+    try {
+      const parsed = JSON.parse(jsonPart) as {
+        planId?: string
+        items?: unknown
+      }
+      if (parsed.planId && Array.isArray(parsed.items)) {
+        segments.push({
+          type: 'delegate_plan',
+          planId: parsed.planId,
+          items: parsed.items as ResponseSegment extends { type: 'delegate_plan'; items: infer I }
+            ? I
+            : never,
+        })
+      }
+    } catch {
+      // 忽略无效 JSON，原样落到正文
+      return jsonPart
+    }
+    return ''
+  })
+  return { cleaned, segments }
 }
 
 export function parseBotConversationTarget(value: unknown): BotConversationTarget | undefined {
@@ -672,12 +773,22 @@ export function parseHistorySnapshot(raw: string | null): HistoryItem[] {
             // 必须传整段 turn：用量可能在 `usage` 内，也可能与 pi 流式事件一样摊平在 turn 根上；
             // 仅传 current.usage 会在 usage 为 null/缺失时丢光 token。
             const usage = extractTokenUsage(current)
-            const parsedResponseSegments = parseResponseSegments(current.responseSegments)
+            const parsedResponseSegmentsStored = parseResponseSegments(current.responseSegments)
+
+            const rawAnswer = typeof current.answer === 'string' ? current.answer : ''
+            const { cleaned: cleanedAnswer, segments: planSegmentsFromAnswer } =
+              extractDelegatePlanSegmentsFromAnswer(rawAnswer)
+            const parsedResponseSegments =
+              planSegmentsFromAnswer.length > 0
+                ? [...(parsedResponseSegmentsStored ?? []), ...planSegmentsFromAnswer]
+                : parsedResponseSegmentsStored
+
+            const speakerAgentId = typeof current.speakerAgentId === 'string' ? current.speakerAgentId : undefined
 
             return {
               id: current.id,
               prompt: current.prompt,
-              answer: current.answer,
+              answer: cleanedAnswer,
               status: current.status,
               createdAt: current.createdAt,
               ...(typeof completedAt === 'number' ? { completedAt } : {}),
@@ -686,12 +797,14 @@ export function parseHistorySnapshot(raw: string | null): HistoryItem[] {
               thinking: current.thinking,
               toolCalls: parsedToolCalls,
               ...(parsedResponseSegments ? { responseSegments: parsedResponseSegments } : {}),
+              ...(speakerAgentId ? { speakerAgentId } : {}),
             } satisfies ConversationTurn
           })
           .filter((turn): turn is ConversationTurn => turn !== null)
 
         const sessionLlmProviderId = candidate.sessionLlmProviderId
         const sessionLlmModel = candidate.sessionLlmModel
+        const workspaceId = candidate.workspaceId
         const agent = parseConversationAgentSnapshot(candidate.agent)
         const botTarget = parseBotConversationTarget(candidate.botTarget)
 
@@ -708,6 +821,7 @@ export function parseHistorySnapshot(raw: string | null): HistoryItem[] {
             ? { sessionLlmProviderId }
             : {}),
           ...(typeof sessionLlmModel === 'string' ? { sessionLlmModel } : {}),
+          ...(typeof workspaceId === 'string' && workspaceId ? { workspaceId } : {}),
         } satisfies HistoryItem
       })
       .filter((item): item is HistoryItem => item !== null)
@@ -759,7 +873,7 @@ export function appendTextToSegments(segments: ResponseSegment[] | undefined, ch
   return [...base, { type: 'text', text: chunk }]
 }
 
-export function buildNewTurn(prompt: string): ConversationTurn {
+export function buildNewTurn(prompt: string, speakerAgentId?: string | null): ConversationTurn {
   return {
     id: createId(),
     prompt,
@@ -772,6 +886,7 @@ export function buildNewTurn(prompt: string): ConversationTurn {
     thinking: '',
     toolCalls: [],
     responseSegments: [],
+    ...(speakerAgentId ? { speakerAgentId } : {}),
   }
 }
 

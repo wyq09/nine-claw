@@ -348,6 +348,12 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
                 label="任务中心"
                 onClick={() => onViewChange('tasks')}
               />
+              <SidebarButton
+                active={view === 'workspaces'}
+                icon="users"
+                label="团队空间"
+                onClick={() => onViewChange('workspaces')}
+              />
             </div>
           </div>
 

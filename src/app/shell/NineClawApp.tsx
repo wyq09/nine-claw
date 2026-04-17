@@ -50,6 +50,8 @@ import {
   subscribeQrCode,
   subscribeBotStatus,
   updateAgent,
+  workspaceListMembers,
+  workspaceRunDelegateTask,
   writeAgentWorkspaceFile,
 } from '../../lib/piClient'
 import type { QrCodeEvent, BotStatusEvent } from '../../lib/piClient'
@@ -132,6 +134,7 @@ export function NineClawApp() {
   } = usePiAgent(composerClearRef)
 
   const [view, setView] = useState<ViewKey>('chat')
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('general')
   const [sidebarOverlayOpen, setSidebarOverlayOpen] = useState(false)
@@ -990,7 +993,64 @@ export function NineClawApp() {
       if (nextView !== 'chat') {
         setNewSessionDialogOpen(false)
       }
+      if (nextView !== 'workspaces') {
+        setActiveWorkspaceId(null)
+      }
     })
+  }
+
+  const handleSelectWorkspace = (id: string) => {
+    startTransition(() => {
+      setActiveWorkspaceId(id)
+      resetSessionDraft()
+    })
+  }
+
+  const handleBackToWorkspaces = () => {
+    startTransition(() => {
+      setActiveWorkspaceId(null)
+      resetSessionDraft()
+    })
+  }
+
+  const handleStartNewWorkspaceSession = () => {
+    startTransition(() => {
+      resetSessionDraft()
+    })
+  }
+
+  const handleWorkspaceSelectSession = (sessionId: string) => {
+    if (chatGateError) {
+      setChatGateError('')
+    }
+    setHistoryContextMenu(null)
+    selectHistoryItem(sessionId)
+  }
+
+  /** 委派计划卡"全部下发"：逐项调用 workspace_run_delegate_task，结果以后端事件为准由各卡片自渲染。 */
+  const handleDispatchDelegatePlan = async (payload: {
+    workspaceId: string
+    planId: string
+    items: Array<{ assignee: string; task: string }>
+  }) => {
+    if (!effectiveChatRuntime) {
+      setChatGateError('缺少可用的聊天模型配置，无法下发委派。')
+      return
+    }
+    for (const item of payload.items) {
+      try {
+        await workspaceRunDelegateTask({
+          workspaceId: payload.workspaceId,
+          sessionId: activeHistoryId ?? null,
+          assignee: item.assignee,
+          task: item.task,
+          providerConfig: effectiveChatRuntime,
+        })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        setChatGateError(`委派 ${item.assignee} 失败：${message}`)
+      }
+    }
   }
 
   const openSettings = (tab: SettingsTab) => {
@@ -1054,7 +1114,10 @@ export function NineClawApp() {
     handleSessionLlmChange(parsed.providerId, parsed.model)
   }
 
-  const handleSubmit = async (composerText: string) => {
+  const handleSubmit = async (
+    composerText: string,
+    extras?: { overrideAgentId?: string | null },
+  ) => {
     if (composerAttachmentUploading) {
       setChatGateError('附件仍在导入中，请稍等片刻再发送。')
       return
@@ -1101,11 +1164,45 @@ export function NineClawApp() {
     }
     const promptWithAttachments = buildPromptWithAttachments(composerText, composerAttachments)
     clearComposerAttachments()
+    const effectiveWorkspaceId =
+      activeHistoryItem?.workspaceId ??
+      (view === 'workspaces' ? activeWorkspaceId : null) ??
+      null
+    const overrideAgentId = extras?.overrideAgentId ?? null
+    /** 团队空间 @ 点名：用该成员的 agent 快照覆盖默认 agent，让 PI 以其身份回话。 */
+    const overrideAgent = overrideAgentId
+      ? agents.find((a) => a.id === overrideAgentId) ?? null
+      : null
+
+    // 团队边界双保险：若处于团队会话，且指定了发言 agent，则先在前端校验它属于成员名单。
+    // 非法 agent 直接提示，避免在后端被 `WORKSPACE_MEMBER_ONLY` 拒绝才看到错误。
+    if (effectiveWorkspaceId && overrideAgentId) {
+      try {
+        const members = await workspaceListMembers(effectiveWorkspaceId)
+        const ok = members.some((m) => m.agentId === overrideAgentId)
+        if (!ok) {
+          setChatGateError('该智能体不在团队内，无法在本团队会话中发言。')
+          return
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        setChatGateError(`校验团队成员失败：${message}`)
+        return
+      }
+    }
+
+    const effectiveAgent: ConversationAgentSnapshot | null = overrideAgent
+      ? buildConversationAgentSnapshot(overrideAgent)
+      : activeHistoryItem
+        ? activeHistoryItem.agent ?? null
+        : preferredComposerAgent
     void submitPrompt(promptWithAttachments, {
       providerConfig: effectiveChatRuntime,
-      agent: activeHistoryItem ? activeHistoryItem.agent ?? null : preferredComposerAgent,
+      agent: effectiveAgent,
       sessionLlm: sessionLlmDisplay,
       attachments: composerAttachments,
+      workspaceId: effectiveWorkspaceId,
+      overrideAgentId,
     })
   }
 
@@ -2115,6 +2212,15 @@ export function NineClawApp() {
           onSetBotLoading={setBotLoading}
           onSetQrDialogOpen={setQrDialogOpen}
           managedAgentId={managedAgentId}
+          activeWorkspaceId={activeWorkspaceId}
+          onSelectWorkspace={handleSelectWorkspace}
+          onBackToWorkspaces={handleBackToWorkspaces}
+          onStartNewWorkspaceSession={handleStartNewWorkspaceSession}
+          onSelectSession={handleWorkspaceSelectSession}
+          onDeleteSession={handleRequestDeleteHistoryItem}
+          history={history}
+          agents={agents}
+          onDispatchDelegatePlan={handleDispatchDelegatePlan}
         />
       }
       appearanceSettings={appearanceSettings}

@@ -30,6 +30,16 @@ const TasksView = lazy(async () => {
   return { default: module.TasksView }
 })
 
+const WorkspacesView = lazy(async () => {
+  const module = await import('../workspaces/WorkspacesView')
+  return { default: module.WorkspacesView }
+})
+
+const WorkspaceChatPage = lazy(async () => {
+  const module = await import('../workspaces/WorkspaceChatPage')
+  return { default: module.WorkspaceChatPage }
+})
+
 export type SessionLlmSelectOption = { value: string; label: string }
 
 export type NineClawRouteOutletProps = {
@@ -59,7 +69,10 @@ export type NineClawRouteOutletProps = {
   onComposerPickAttachment: () => void
   onComposerRemoveAttachment: (id: string) => void
   onComposerClearAttachmentError: () => void
-  onChatSubmit: (text: string) => void | Promise<void>
+  onChatSubmit: (
+    text: string,
+    extras?: { overrideAgentId?: string | null },
+  ) => void | Promise<void>
   activeChatAgent: ConversationAgentSnapshot | null
   submitShortcut: GeneralSettings['submitShortcut']
   activeHistoryItem: HistoryItem | null
@@ -139,6 +152,21 @@ export type NineClawRouteOutletProps = {
   onSetBotLoading: (value: boolean) => void
   onSetQrDialogOpen: (value: boolean) => void
   managedAgentId: string
+  /** 当前进入的团队空间 id。为空时显示团队列表；非空时渲染 WorkspaceChatPage。 */
+  activeWorkspaceId: string | null
+  onSelectWorkspace: (id: string) => void
+  onBackToWorkspaces: () => void
+  onStartNewWorkspaceSession: () => void
+  onSelectSession: (sessionId: string) => void
+  onDeleteSession?: (sessionId: string) => void
+  history: HistoryItem[]
+  agents: AgentRecord[]
+  /** 团队空间委派计划卡"全部下发"回调；由 NineClawApp 提供 provider runtime 实现 */
+  onDispatchDelegatePlan?: (payload: {
+    workspaceId: string
+    planId: string
+    items: Array<{ assignee: string; task: string }>
+  }) => Promise<void> | void
 }
 
 export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
@@ -249,6 +277,15 @@ export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
     onSetBotLoading,
     onSetQrDialogOpen,
     managedAgentId,
+    activeWorkspaceId,
+    onSelectWorkspace,
+    onBackToWorkspaces,
+    onStartNewWorkspaceSession,
+    onSelectSession,
+    onDeleteSession,
+    history,
+    agents,
+    onDispatchDelegatePlan,
   } = props
 
   const routeFallback = (
@@ -307,6 +344,62 @@ export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
     return (
       <Suspense fallback={routeFallback}>
         <TasksView agents={editableAgents} onOpenAgent={onOpenAgentEditor} />
+      </Suspense>
+    )
+  }
+
+  if (view === 'workspaces') {
+    if (activeWorkspaceId) {
+      return (
+        <Suspense fallback={routeFallback}>
+          <WorkspaceChatPage
+            workspaceId={activeWorkspaceId}
+            agents={agents}
+            onBackToWorkspaces={onBackToWorkspaces}
+            history={history}
+            onSelectSession={onSelectSession}
+            onStartNewSession={onStartNewWorkspaceSession}
+            onDeleteSession={onDeleteSession}
+            agentBuilderActionBusyId={agentBuilderActionBusyId}
+            agentBuilderActionError={agentBuilderActionError}
+            agentBuilderActionNotice={agentBuilderActionNotice}
+            agentBuilderActionTargetId={agentBuilderActionTargetId}
+            composerClearRef={composerClearRef}
+            composerDraftBackupRef={composerDraftBackupRef}
+            error={chatGateError || piError}
+            showExecutionRail={appearanceSettings.showExecutionRail}
+            showThinkingProcess={appearanceSettings.showThinkingProcess}
+            globalBusy={loading}
+            runningHistoryIds={runningHistoryIds}
+            streamingHistoryIds={streamingHistoryIds}
+            activeHistoryId={activeHistoryId ?? ''}
+            onAbort={onAbort}
+            attachmentError={composerAttachmentError}
+            attachmentInputRef={composerAttachmentInputRef}
+            attachmentUploading={composerAttachmentUploading}
+            composerAttachments={composerAttachments}
+            onCreateAgentDraft={onChatAgentBuilderCreate}
+            onComposerAttachmentInputChange={onComposerAttachmentInputChange}
+            onComposerClearAttachments={onComposerClearAttachments}
+            onComposerPaste={onComposerPaste}
+            onComposerPickAttachment={onComposerPickAttachment}
+            onComposerRemoveAttachment={onComposerRemoveAttachment}
+            onComposerClearAttachmentError={onComposerClearAttachmentError}
+            onChatSubmit={onChatSubmit}
+            onDispatchDelegatePlan={onDispatchDelegatePlan}
+            selectedAgent={activeChatAgent}
+            submitShortcut={submitShortcut}
+            activeHistoryItem={activeHistoryItem}
+            runtimeReady={runtimeReady}
+            runtimeBlockingReason={runtimeBlockingReason}
+            sessionContextProviderConfig={sessionContextProviderConfig}
+          />
+        </Suspense>
+      )
+    }
+    return (
+      <Suspense fallback={routeFallback}>
+        <WorkspacesView onSelectWorkspace={onSelectWorkspace} />
       </Suspense>
     )
   }

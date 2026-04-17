@@ -753,6 +753,7 @@ impl Channel for LarkChannel {
                                     }
                                 }
                             },
+                            |_| {},
                         );
 
                         let has_pending_followup = {

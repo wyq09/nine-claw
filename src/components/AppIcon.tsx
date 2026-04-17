@@ -36,6 +36,7 @@ export type IconName =
   | 'check'
   | 'eye'
   | 'eye-off'
+  | 'users'
 
 export function AppIcon({ name, size = 20 }: { name: IconName; size?: number }) {
   const stroke = 1.8
@@ -268,6 +269,18 @@ export function AppIcon({ name, size = 20 }: { name: IconName; size?: number }) 
             stroke="currentColor"
             strokeLinecap="round"
             strokeLinejoin="round"
+            strokeWidth={stroke}
+          />
+        </>
+      ) : null}
+      {name === 'users' ? (
+        <>
+          <circle cx="9" cy="9" r="3.2" stroke="currentColor" strokeWidth={stroke} />
+          <circle cx="17" cy="10" r="2.5" stroke="currentColor" strokeWidth={stroke} />
+          <path
+            d="M3 19c0-2.8 2.7-5 6-5s6 2.2 6 5M15 19c0-1.8 1.4-3.5 3.5-3.5S22 17.2 22 19"
+            stroke="currentColor"
+            strokeLinecap="round"
             strokeWidth={stroke}
           />
         </>

@@ -32,6 +32,7 @@ export function sessionDetailToHistoryItem(detail: ChatSessionDetail): HistoryIt
     botTarget: parseJsonField<HistoryItem['botTarget']>(detail.bot_target_json),
     sessionLlmProviderId: detail.session_llm_provider_id ?? undefined,
     sessionLlmModel: detail.session_llm_model ?? undefined,
+    workspaceId: detail.workspace_id ?? undefined,
   }
 }
 
@@ -49,6 +50,7 @@ export function turnRowToConversationTurn(row: ChatTurnRow): ConversationTurn {
     thinking: row.thinking,
     toolCalls: parseJsonField<ToolCallEntry[]>(row.tool_calls_json) ?? [],
     responseSegments: parseJsonField<ResponseSegment[]>(row.response_segments_json) ?? undefined,
+    speakerAgentId: row.speaker_agent_id ?? undefined,
   }
 }
 

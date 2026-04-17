@@ -5,6 +5,7 @@ import type {
   KeyboardEvent,
   MutableRefObject,
   PointerEvent as ReactPointerEvent,
+  ReactNode,
   RefObject,
   WheelEvent as ReactWheelEvent,
 } from 'react'
@@ -27,6 +28,7 @@ import {
   getAgentColor,
   MAX_COMPOSER_HEIGHT,
   MIN_COMPOSER_HEIGHT,
+  isFnLikeKeyboardEvent,
   shouldSubmitWithShortcut,
   STARTER_CHIPS,
 } from '../lib'
@@ -101,6 +103,30 @@ export type ChatViewProps = {
   runtimeBlockingReason: string | null
   /** 当前 session 对应的 provider 配置（仅 maxContextTokens），用于上下文窗口统计 */
   sessionContextProviderConfig: Pick<ProviderConfig, 'maxContextTokens'> | null
+  /** 可选：团队空间等外部调用方用来往输入框里填文本。 */
+  composerSetTextRef?: MutableRefObject<((text: string) => void) | null>
+  /** 可选：首屏（无会话）时在 hero 区下方渲染的额外内容，例如团队启动引导卡。 */
+  workspaceHomeSlot?: ReactNode
+  /** 可选：首屏（无会话）时替换默认 hero 标题/副标题。 */
+  workspaceHomeTitle?: ReactNode
+  /** 可选：渲染在输入框正上方的覆盖层（如 @ 成员补全浮层、@-chip 行）。 */
+  workspaceComposerOverlay?: ReactNode
+  /** 可选：输入事件回调，供外部实现 @ 补全、状态推断等。 */
+  onComposerInput?: (value: string) => void
+  /** 可选：将 `turn.speakerAgentId` 解析为带名字/色系的显示信息，团队空间使用。 */
+  resolveSpeaker?: (agentId: string) => {
+    name: string
+    role?: 'supervisor' | 'member'
+    accentColor?: string | null
+    avatarEmoji?: string | null
+  } | null
+  /**
+   * 团队「旁白」模式：此时应用户预期用 Enter 记录便签，不受全局「⌘+Enter 发送」影响。
+   * Shift+Enter 仍换行。
+   */
+  workspaceComposerNoteMode?: boolean
+  /** 覆盖输入框 placeholder（如旁白模式下的操作提示）。 */
+  workspaceComposerPlaceholder?: string | null
 }
 
 export function ChatView({
@@ -136,6 +162,14 @@ export function ChatView({
   runtimeReady,
   runtimeBlockingReason,
   sessionContextProviderConfig,
+  composerSetTextRef,
+  workspaceHomeSlot,
+  workspaceHomeTitle,
+  workspaceComposerOverlay,
+  onComposerInput,
+  resolveSpeaker,
+  workspaceComposerNoteMode = false,
+  workspaceComposerPlaceholder = null,
 }: ChatViewProps) {
   /** 非受控：避免每键入一字就重渲染整页消息列表（长会话 Markdown 极重） */
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null)
@@ -170,11 +204,31 @@ export function ChatView({
       }
       composerDraftBackupRef.current = ''
     }
+    if (composerSetTextRef) {
+      composerSetTextRef.current = (text: string) => {
+        const el = composerTextareaRef.current
+        if (el) {
+          el.value = text
+          el.focus()
+          try {
+            const end = text.length
+            el.setSelectionRange(end, end)
+          } catch {
+            /* 某些浏览器在非 text 输入上 setSelectionRange 会抛错，忽略即可 */
+          }
+        }
+        composerDraftBackupRef.current = text
+        setComposerHasTypedContent(text.trim().length > 0)
+      }
+    }
     return () => {
       composerDraftBackupRef.current = composerTextareaRef.current?.value ?? ''
       composerClearRef.current = null
+      if (composerSetTextRef) {
+        composerSetTextRef.current = null
+      }
     }
-  }, [composerClearRef, composerDraftBackupRef])
+  }, [composerClearRef, composerDraftBackupRef, composerSetTextRef])
   const turns = activeHistoryItem?.turns ?? []
   const { visibleTurns, visibleRangeStart, hasMoreAbove, loadMoreAbove } = useChatTurnWindow(
     turns,
@@ -339,6 +393,23 @@ export function ChatView({
   }
 
   const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (workspaceComposerNoteMode) {
+      if (event.nativeEvent.isComposing || event.key !== 'Enter' || event.shiftKey) {
+        return
+      }
+      if (isFnLikeKeyboardEvent(event.nativeEvent)) {
+        return
+      }
+      event.preventDefault()
+      const text = composerTextareaRef.current?.value ?? ''
+      followLatestOutputRef.current = true
+      void onSubmit(text)
+      requestAnimationFrame(() => {
+        syncComposerTypedPresence()
+      })
+      return
+    }
+
     if (!shouldSubmitWithShortcut(event, submitShortcut)) {
       return
     }
@@ -373,7 +444,9 @@ export function ChatView({
     setIsComposerResizing(true)
   }
 
-  const composerPlaceholder = activeHistoryItem ? '继续对话…' : "说吧，我听着呢。"
+  const composerPlaceholder =
+    workspaceComposerPlaceholder ??
+    (activeHistoryItem ? '继续对话…' : "说吧，我听着呢。")
   const composerInlineStyle = {
     '--composer-textarea-height': `${composerHeight}px`,
   } as CSSProperties
@@ -381,6 +454,10 @@ export function ChatView({
   const workspaceFooter = (
     <div className="workspace-footer-stack">
       {error && activeHistoryItem ? <div className="error-banner">{error}</div> : null}
+
+      {workspaceComposerOverlay ? (
+        <div className="workspace-composer-overlay">{workspaceComposerOverlay}</div>
+      ) : null}
 
       <div className={`workspace-composer-shell ${isComposerResizing ? 'is-resizing' : ''}`}>
         <form
@@ -427,7 +504,10 @@ export function ChatView({
           <textarea
             ref={composerTextareaRef}
             defaultValue={composerDraftBackupRef.current}
-            onInput={syncComposerTypedPresence}
+            onInput={(event) => {
+              syncComposerTypedPresence()
+              onComposerInput?.(event.currentTarget.value)
+            }}
             onKeyDown={handleComposerKeyDown}
             onPaste={(event) => {
               if (attachmentError) {
@@ -542,9 +622,12 @@ export function ChatView({
         <div ref={workspaceScrollRef} className="workspace-home-cluster">
           <section className="new-task-home">
             <div className="home-brand-block">
-              <div className="home-brand-mark">今天想让 NineClaw 帮你处理什么？</div>
+              <div className="home-brand-mark">
+                {workspaceHomeTitle ?? '今天想让 NineClaw 帮你处理什么？'}
+              </div>
             </div>
           </section>
+          {workspaceHomeSlot}
           {workspaceFooter}
         </div>
       ) : (
@@ -569,6 +652,7 @@ export function ChatView({
                 showExecutionRail={showExecutionRail}
                 showThinkingProcess={showThinkingProcess}
                 selectedAgent={selectedAgent}
+                resolveSpeaker={resolveSpeaker}
                 agentBuilderActionBusyId={agentBuilderActionBusyId}
                 agentBuilderActionError={agentBuilderActionError}
                 agentBuilderActionNotice={agentBuilderActionNotice}

@@ -1691,6 +1691,7 @@ impl Channel for WeChatChannel {
                                     }
                                 }
                             },
+                            |_| {},
                         );
 
                         let has_pending_followup = {

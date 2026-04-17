@@ -63,6 +63,13 @@ export type VirtualizedChatTurnsProps = {
   showExecutionRail: boolean
   showThinkingProcess: boolean
   selectedAgent: ConversationAgentSnapshot | null
+  /** 可选：团队空间等场景把 `turn.speakerAgentId` 映射为人类可读的展示信息。 */
+  resolveSpeaker?: (agentId: string) => {
+    name: string
+    role?: 'supervisor' | 'member'
+    accentColor?: string | null
+    avatarEmoji?: string | null
+  } | null
   agentBuilderActionBusyId: string
   agentBuilderActionError: string
   agentBuilderActionNotice: string
@@ -93,6 +100,7 @@ const ChatTurnRow = memo(function ChatTurnRow({
   isWaitingOnly,
   shouldShowActions,
   selectedAgent,
+  resolveSpeaker,
   agentBuilderActionBusyId,
   agentBuilderActionError,
   agentBuilderActionNotice,
@@ -117,6 +125,12 @@ const ChatTurnRow = memo(function ChatTurnRow({
   isWaitingOnly: boolean
   shouldShowActions: boolean
   selectedAgent: ConversationAgentSnapshot | null
+  resolveSpeaker?: (agentId: string) => {
+    name: string
+    role?: 'supervisor' | 'member'
+    accentColor?: string | null
+    avatarEmoji?: string | null
+  } | null
   agentBuilderActionBusyId: string
   agentBuilderActionError: string
   agentBuilderActionNotice: string
@@ -177,25 +191,72 @@ const ChatTurnRow = memo(function ChatTurnRow({
         <PromptBubbleContent content={turn.prompt} onImageClick={onImageClick} />
       </div>
 
-      {shouldRenderAssistantColumn(turn, showExecutionRail, showThinkingProcess, isStreamingTurn) ? (
+      {shouldRenderAssistantColumn(turn, showExecutionRail, showThinkingProcess, isStreamingTurn)
+        ? (() => {
+            const speakerInfo = (() => {
+              if (turn.speakerAgentId) {
+                return (
+                  resolveSpeaker?.(turn.speakerAgentId) ?? {
+                    name: turn.speakerAgentId,
+                    role: undefined,
+                    accentColor: null,
+                    avatarEmoji: null,
+                  }
+                )
+              }
+              if (selectedAgent) {
+                return {
+                  name: selectedAgent.name,
+                  role: undefined,
+                  accentColor: selectedAgent.accentColor,
+                  avatarEmoji: null,
+                }
+              }
+              return null
+            })()
+            const avatarAccent =
+              speakerInfo?.accentColor || selectedAgent?.accentColor || null
+            const avatarStyle = avatarAccent
+              ? {
+                  borderColor: `${avatarAccent}55`,
+                  background: `${avatarAccent}22`,
+                  color: avatarAccent,
+                }
+              : undefined
+            const showSpeakerRow = Boolean(resolveSpeaker && speakerInfo)
+            const avatarLetter =
+              speakerInfo?.name?.trim()?.charAt(0)?.toUpperCase() ?? ''
+            return (
         <div className="chat-response">
           <div className="assistant-message-shell">
-            <div
-              className="assistant-avatar"
-              style={
-                selectedAgent?.accentColor
-                  ? {
-                      borderColor: `${selectedAgent.accentColor}55`,
-                      background: `${selectedAgent.accentColor}22`,
-                      color: selectedAgent.accentColor,
-                    }
-                  : undefined
-              }
-              aria-hidden
-            >
-              <AppIcon name="bot" size={20} />
+            <div className="assistant-avatar" style={avatarStyle} aria-hidden>
+              {speakerInfo?.avatarEmoji ? (
+                <span className="assistant-avatar-emoji">{speakerInfo.avatarEmoji}</span>
+              ) : showSpeakerRow && avatarLetter ? (
+                <span className="assistant-avatar-initial">{avatarLetter}</span>
+              ) : (
+                <AppIcon name="bot" size={20} />
+              )}
             </div>
             <div className="assistant-message-stack">
+              {showSpeakerRow ? (
+                <div
+                  className={`assistant-speaker-chip${
+                    speakerInfo?.role === 'supervisor' ? ' is-supervisor' : ''
+                  }`}
+                  aria-label="当前发言智能体"
+                  style={avatarAccent ? { borderColor: `${avatarAccent}55` } : undefined}
+                >
+                  <span className="assistant-speaker-name">
+                    {speakerInfo?.name ?? '智能体'}
+                  </span>
+                  {speakerInfo?.role ? (
+                    <span className="assistant-speaker-role">
+                      {speakerInfo.role === 'supervisor' ? '主' : '成员'}
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
               {shouldShowActions ? <TurnExecutionDetails turn={turn} isStreaming={isStreamingTurn} /> : null}
               <div
                 className={`answer-result-card answer-result-card-chat${
@@ -216,6 +277,7 @@ const ChatTurnRow = memo(function ChatTurnRow({
                     showExecutionRail={showExecutionRail}
                     showThinkingProcess={showThinkingProcess}
                     onImageClick={onImageClick}
+                    resolveSpeaker={resolveSpeaker}
                     copyAnswerControlSlot={
                       shouldShowActions && inlineFileCopy ? (
                         <button
@@ -261,7 +323,9 @@ const ChatTurnRow = memo(function ChatTurnRow({
             </div>
           </div>
         </div>
-      ) : null}
+            )
+          })()
+        : null}
     </article>
   )
 })
@@ -280,6 +344,7 @@ export const VirtualizedChatTurns = forwardRef<VirtualizedChatTurnsHandle, Virtu
       showExecutionRail,
       showThinkingProcess,
       selectedAgent,
+      resolveSpeaker,
       agentBuilderActionBusyId,
       agentBuilderActionError,
       agentBuilderActionNotice,
@@ -470,6 +535,7 @@ export const VirtualizedChatTurns = forwardRef<VirtualizedChatTurnsHandle, Virtu
                   isWaitingOnly={isWaitingOnly}
                   shouldShowActions={shouldShowActions}
                   selectedAgent={selectedAgent}
+                  resolveSpeaker={resolveSpeaker}
                   agentBuilderActionBusyId={agentBuilderActionBusyId}
                   agentBuilderActionError={agentBuilderActionError}
                   agentBuilderActionNotice={agentBuilderActionNotice}

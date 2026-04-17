@@ -95,9 +95,67 @@ export type ToolCallEntry = {
 }
 
 /** 与 pi 流式事件顺序一致：文本块与工具块交错出现。 */
+/** 团队空间：主智能体提出的委派计划条目。 */
+export type DelegatePlanItem = {
+  /** 执行该子任务的成员 agentId */
+  assignee: string
+  /** 任务文案（用户可在下发前编辑） */
+  task: string
+  /** 主智能体给出的"为什么选他"的理由，可选 */
+  reason?: string
+  /** 是否启用，默认 true；用户可勾除不下发 */
+  enabled?: boolean
+}
+
+/** 团队空间：一次具体委派的运行态。 */
+export type DelegationTurnEntry = {
+  /** 0-based 顺序号 */
+  index: number
+  /** `thinking` 代表一次 turn_end（中间思考轮），`agent` 代表 agent_end */
+  kind: 'thinking' | 'agent'
+  /** 可选简介 */
+  summary?: string
+}
+
+export type DelegationToolCallEntry = {
+  /** 0-based 顺序号（按 toolCallId 去重递增） */
+  index: number
+  /** pi 侧 toolCallId，前端按它聚合 start/end */
+  toolCallId: string
+  /** 工具名，例如 `web_search` / `stock_price` / `list_dir` */
+  toolName: string
+  /** 入参摘要（截断到 ~120 字符），供展开时预览 */
+  argsDigest?: string
+  status: 'running' | 'done' | 'error'
+  /** 工具是否报错 */
+  isError?: boolean
+}
+
+export type DelegationRunSegment = {
+  /** 运行 id，前后端共享 */
+  runId: string
+  assignee: string
+  task: string
+  status: 'pending' | 'running' | 'done' | 'aborted' | 'error'
+  /** 已收集到的输出（flat text） */
+  output: string
+  /** 开始时间（ms） */
+  startedAt?: number
+  /** 已用时（ms） */
+  elapsedMs?: number
+  /** 错误信息 */
+  error?: string | null
+  /** 实时思考轮（turn_end / agent_end），按 `workspace.delegate.turn` 事件聚合 */
+  turns?: DelegationTurnEntry[]
+  /** 实时工具调用列表（tool_execution_start/end），按 `workspace.delegate.tool` 事件聚合 */
+  toolCalls?: DelegationToolCallEntry[]
+}
+
 export type ResponseSegment =
   | { type: 'text'; text: string }
   | { type: 'tool'; toolCallId: string }
+  | { type: 'delegate_plan'; planId: string; items: DelegatePlanItem[] }
+  | { type: 'delegation_run'; run: DelegationRunSegment }
 
 export type ChatAttachmentKind = 'image' | 'video' | 'audio' | 'file'
 
@@ -202,6 +260,13 @@ export type ConversationTurn = {
   toolCalls: ToolCallEntry[]
   /** 有值时按此顺序渲染正文与工具；缺省为旧版仅 answer + toolCalls */
   responseSegments?: ResponseSegment[]
+  /** 团队会话中该轮实际发言的智能体 */
+  speakerAgentId?: string
+  /**
+   * 轮类型。`'normal'`（默认）= 常规一来一回；`'note'` = 用户"旁白补充"，
+   * 不请求 LLM，仅落库并在下一次调用时作为 `[USER_NOTES]` 注入上下文。
+   */
+  kind?: 'normal' | 'note'
 }
 
 /** 内置 id 为固定字符串；自定义为 custom_ 前缀 */
@@ -219,6 +284,8 @@ export type HistoryItem = {
   /** 本会话单独指定的大模型（与全局默认无关，持久化） */
   sessionLlmProviderId?: ProviderId
   sessionLlmModel?: string
+  /** 非空表示本会话属于某团队工作空间（群聊 / 多智能体） */
+  workspaceId?: string
 }
 
 /** Session list item returned from the structured chat API (no turns). */
@@ -233,6 +300,7 @@ export type ChatSessionListItem = {
   bot_target_json: string | null
   session_llm_provider_id: string | null
   session_llm_model: string | null
+  workspace_id: string | null
   turn_count: number
 }
 
@@ -248,6 +316,7 @@ export type ChatSessionDetail = {
   bot_target_json: string | null
   session_llm_provider_id: string | null
   session_llm_model: string | null
+  workspace_id: string | null
   turns: ChatTurnRow[]
 }
 
@@ -266,9 +335,50 @@ export type ChatTurnRow = {
   response_segments_json: string | null
   tool_calls_json: string | null
   activity_json: string | null
+  speaker_agent_id: string | null
 }
 
-export type ViewKey = 'chat' | 'agents' | 'tasks'
+export type ViewKey = 'chat' | 'agents' | 'tasks' | 'workspaces'
+
+export type WorkspaceRecord = {
+  id: string
+  name: string
+  description: string
+  supervisorAgentId: string
+  createdAt: number
+  updatedAt: number
+  archived: number
+}
+
+export type WorkspaceMemberView = {
+  agentId: string
+  name: string
+  summary: string
+  role: string
+  skillIds: string[]
+}
+
+export type WorkspaceResourceRecord = {
+  id: string
+  workspaceId: string
+  fileName: string
+  relPath: string
+  mime: string
+  size: number
+  uploaderAgentId: string | null
+  createdAt: number
+}
+
+export type WorkspaceMemoryRecord = {
+  id: string
+  workspaceId: string
+  title: string
+  content: string
+  authorAgentId: string | null
+  tagsJson: string
+  createdAt: number
+  updatedAt: number
+}
 
 export type SettingsTab =
   | 'general'

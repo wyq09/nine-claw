@@ -62,6 +62,8 @@ pub struct ChatSession {
     pub bot_target_json: Option<String>,
     pub session_llm_provider_id: Option<String>,
     pub session_llm_model: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +81,8 @@ pub struct ChatTurn {
     pub response_segments_json: Option<String>,
     pub tool_calls_json: Option<String>,
     pub activity_json: Option<String>,
+    #[serde(default)]
+    pub speaker_agent_id: Option<String>,
 }
 
 /// Input for creating a new chat session.
@@ -92,6 +96,8 @@ pub struct CreateChatSessionInput {
     pub bot_target_json: Option<String>,
     pub session_llm_provider_id: Option<String>,
     pub session_llm_model: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }
 
 /// Input for appending a new turn to a session.
@@ -108,6 +114,8 @@ pub struct AppendChatTurnInput {
     pub response_segments_json: Option<String>,
     pub tool_calls_json: Option<String>,
     pub activity_json: Option<String>,
+    #[serde(default)]
+    pub speaker_agent_id: Option<String>,
 }
 
 /// Input for updating an existing turn.
@@ -145,6 +153,7 @@ fn row_to_chat_session(row: &rusqlite::Row) -> rusqlite::Result<ChatSession> {
         bot_target_json: row.get("bot_target_json")?,
         session_llm_provider_id: row.get("session_llm_provider_id")?,
         session_llm_model: row.get("session_llm_model")?,
+        workspace_id: row.get::<_, Option<String>>("workspace_id")?,
     })
 }
 
@@ -163,6 +172,7 @@ fn row_to_chat_turn(row: &rusqlite::Row) -> rusqlite::Result<ChatTurn> {
         response_segments_json: row.get("response_segments_json")?,
         tool_calls_json: row.get("tool_calls_json")?,
         activity_json: row.get("activity_json")?,
+        speaker_agent_id: row.get::<_, Option<String>>("speaker_agent_id")?,
     })
 }
 
@@ -170,8 +180,8 @@ fn row_to_chat_turn(row: &rusqlite::Row) -> rusqlite::Result<ChatTurn> {
 pub fn create_chat_session(conn: &Connection, input: &CreateChatSessionInput) -> Result<ChatSession, String> {
     let now = now_ms();
     conn.execute(
-        "INSERT INTO chat_sessions (id, title, status, created_at, updated_at, agent_id, agent_snapshot_json, bot_target_json, session_llm_provider_id, session_llm_model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO chat_sessions (id, title, status, created_at, updated_at, agent_id, agent_snapshot_json, bot_target_json, session_llm_provider_id, session_llm_model, workspace_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             input.id,
             input.title,
@@ -183,6 +193,7 @@ pub fn create_chat_session(conn: &Connection, input: &CreateChatSessionInput) ->
             input.bot_target_json,
             input.session_llm_provider_id,
             input.session_llm_model,
+            input.workspace_id,
         ],
     )
     .map_err(|e| format!("创建聊天会话失败: {e}"))?;
@@ -194,7 +205,7 @@ pub fn create_chat_session(conn: &Connection, input: &CreateChatSessionInput) ->
 pub fn list_chat_sessions(conn: &Connection) -> Result<Vec<ChatSession>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, status, created_at, updated_at, agent_id, agent_snapshot_json, bot_target_json, session_llm_provider_id, session_llm_model
+            "SELECT id, title, status, created_at, updated_at, agent_id, agent_snapshot_json, bot_target_json, session_llm_provider_id, session_llm_model, workspace_id
              FROM chat_sessions ORDER BY updated_at DESC",
         )
         .map_err(|e| format!("准备查询失败: {e}"))?;
@@ -213,7 +224,7 @@ pub fn list_chat_sessions(conn: &Connection) -> Result<Vec<ChatSession>, String>
 /// Get a single chat session by ID.
 pub fn get_chat_session(conn: &Connection, id: &str) -> Result<Option<ChatSession>, String> {
     conn.query_row(
-        "SELECT id, title, status, created_at, updated_at, agent_id, agent_snapshot_json, bot_target_json, session_llm_provider_id, session_llm_model
+        "SELECT id, title, status, created_at, updated_at, agent_id, agent_snapshot_json, bot_target_json, session_llm_provider_id, session_llm_model, workspace_id
          FROM chat_sessions WHERE id = ?1",
         params![id],
         row_to_chat_session,
@@ -226,8 +237,8 @@ pub fn get_chat_session(conn: &Connection, id: &str) -> Result<Option<ChatSessio
 pub fn append_chat_turn(conn: &Connection, input: &AppendChatTurnInput) -> Result<ChatTurn, String> {
     let now = now_ms();
     conn.execute(
-        "INSERT INTO chat_turns (id, session_id, turn_index, prompt, answer, thinking, status, created_at, completed_at, usage_json, response_segments_json, tool_calls_json, activity_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO chat_turns (id, session_id, turn_index, prompt, answer, thinking, status, created_at, completed_at, usage_json, response_segments_json, tool_calls_json, activity_json, speaker_agent_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             input.id,
             input.session_id,
@@ -243,6 +254,7 @@ pub fn append_chat_turn(conn: &Connection, input: &AppendChatTurnInput) -> Resul
             input.response_segments_json,
             input.tool_calls_json,
             input.activity_json,
+            input.speaker_agent_id,
         ],
     )
     .map_err(|e| format!("追加聊天轮次失败: {e}"))?;
@@ -260,7 +272,7 @@ pub fn append_chat_turn(conn: &Connection, input: &AppendChatTurnInput) -> Resul
 /// Get a single chat turn by ID.
 pub fn get_chat_turn(conn: &Connection, id: &str) -> Result<Option<ChatTurn>, String> {
     conn.query_row(
-        "SELECT id, session_id, turn_index, prompt, answer, thinking, status, created_at, completed_at, usage_json, response_segments_json, tool_calls_json, activity_json
+        "SELECT id, session_id, turn_index, prompt, answer, thinking, status, created_at, completed_at, usage_json, response_segments_json, tool_calls_json, activity_json, speaker_agent_id
          FROM chat_turns WHERE id = ?1",
         params![id],
         row_to_chat_turn,
@@ -273,7 +285,7 @@ pub fn get_chat_turn(conn: &Connection, id: &str) -> Result<Option<ChatTurn>, St
 pub fn list_chat_turns(conn: &Connection, session_id: &str) -> Result<Vec<ChatTurn>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, turn_index, prompt, answer, thinking, status, created_at, completed_at, usage_json, response_segments_json, tool_calls_json, activity_json
+            "SELECT id, session_id, turn_index, prompt, answer, thinking, status, created_at, completed_at, usage_json, response_segments_json, tool_calls_json, activity_json, speaker_agent_id
              FROM chat_turns WHERE session_id = ?1 ORDER BY turn_index ASC",
         )
         .map_err(|e| format!("准备查询失败: {e}"))?;
@@ -383,6 +395,7 @@ mod tests {
             bot_target_json: None,
             session_llm_provider_id: None,
             session_llm_model: None,
+            workspace_id: None,
         }
     }
 
@@ -399,6 +412,7 @@ mod tests {
             response_segments_json: None,
             tool_calls_json: None,
             activity_json: None,
+            speaker_agent_id: None,
         }
     }
 
@@ -635,6 +649,7 @@ mod tests {
             bot_target_json: None,
             session_llm_provider_id: Some("openai".to_string()),
             session_llm_model: Some("gpt-4".to_string()),
+            workspace_id: None,
         };
 
         let session = create_chat_session(&conn, &input).unwrap();

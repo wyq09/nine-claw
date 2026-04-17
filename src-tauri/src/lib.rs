@@ -2,6 +2,8 @@ mod agent_task_schedule;
 mod agent_tasks;
 mod agent_workspace;
 mod agents;
+mod team_workspace;
+mod workspace_fs;
 mod channels;
 mod chat_attachments;
 mod dev_trace;
@@ -421,14 +423,14 @@ struct TokenUsageRecordRow {
     recorded_at: i64,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ProviderRuntimeConfig {
-    provider_id: String,
-    api_format: String,
-    base_url: String,
-    api_key: String,
-    model: String,
+pub(crate) struct ProviderRuntimeConfig {
+    pub(crate) provider_id: String,
+    pub(crate) api_format: String,
+    pub(crate) base_url: String,
+    pub(crate) api_key: String,
+    pub(crate) model: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -2239,7 +2241,7 @@ fn clear_history_state(app: tauri::AppHandle) -> Result<(), String> {
 
 // ── Structured Chat History Commands ──────────────────────────────────
 
-fn storage_conn(app: &tauri::AppHandle) -> Result<rusqlite::Connection, String> {
+pub(crate) fn storage_conn(app: &tauri::AppHandle) -> Result<rusqlite::Connection, String> {
     let db_path = history_db_path(app)?;
     storage::db::open_at(&db_path)
 }
@@ -2257,6 +2259,7 @@ struct ChatSessionListItem {
     bot_target_json: Option<String>,
     session_llm_provider_id: Option<String>,
     session_llm_model: Option<String>,
+    workspace_id: Option<String>,
     turn_count: i64,
 }
 
@@ -2273,6 +2276,7 @@ impl From<storage::chat_history::ChatSession> for ChatSessionListItem {
             bot_target_json: s.bot_target_json,
             session_llm_provider_id: s.session_llm_provider_id,
             session_llm_model: s.session_llm_model,
+            workspace_id: s.workspace_id.clone(),
             turn_count: 0,
         }
     }
@@ -2291,6 +2295,7 @@ struct ChatSessionDetail {
     bot_target_json: Option<String>,
     session_llm_provider_id: Option<String>,
     session_llm_model: Option<String>,
+    workspace_id: Option<String>,
     turns: Vec<storage::chat_history::ChatTurn>,
 }
 
@@ -2307,6 +2312,7 @@ impl From<storage::chat_history::ChatSession> for ChatSessionDetail {
             bot_target_json: s.bot_target_json,
             session_llm_provider_id: s.session_llm_provider_id,
             session_llm_model: s.session_llm_model,
+            workspace_id: s.workspace_id,
             turns: Vec::new(),
         }
     }
@@ -2352,6 +2358,7 @@ fn chat_create_session(
     bot_target_json: Option<String>,
     session_llm_provider_id: Option<String>,
     session_llm_model: Option<String>,
+    workspace_id: Option<String>,
 ) -> Result<ChatSessionDetail, String> {
     let conn = storage_conn(&app)?;
     let session = storage::chat_history::create_chat_session(
@@ -2365,6 +2372,7 @@ fn chat_create_session(
             bot_target_json,
             session_llm_provider_id,
             session_llm_model,
+            workspace_id,
         },
     )?;
     Ok(ChatSessionDetail::from(session))
@@ -2384,6 +2392,7 @@ fn chat_append_turn(
     response_segments_json: Option<String>,
     tool_calls_json: Option<String>,
     activity_json: Option<String>,
+    speaker_agent_id: Option<String>,
 ) -> Result<storage::chat_history::ChatTurn, String> {
     let conn = storage_conn(&app)?;
     storage::chat_history::append_chat_turn(
@@ -2400,6 +2409,7 @@ fn chat_append_turn(
             response_segments_json,
             tool_calls_json,
             activity_json,
+            speaker_agent_id,
         },
     )
 }
@@ -2451,6 +2461,307 @@ fn chat_migrate_history_v1(app: tauri::AppHandle) -> Result<String, String> {
     let mut conn = storage_conn(&app)?;
     let result = storage::migrations::migrate_history_v1_to_structured(&mut conn)?;
     Ok(format!("{result:?}"))
+}
+
+#[tauri::command]
+fn workspace_list(app: tauri::AppHandle, include_archived: Option<bool>) -> Result<Vec<storage::workspaces::WorkspaceRecord>, String> {
+    let conn = storage_conn(&app)?;
+    storage::workspaces::list_workspaces(&conn, include_archived.unwrap_or(false))
+}
+
+#[tauri::command]
+fn workspace_create(
+    app: tauri::AppHandle,
+    name: String,
+    description: String,
+    supervisor_agent_id: String,
+) -> Result<storage::workspaces::WorkspaceRecord, String> {
+    team_workspace::create_workspace_with_fs(&app, name, description, supervisor_agent_id)
+}
+
+#[tauri::command]
+fn workspace_update(
+    app: tauri::AppHandle,
+    workspace_id: String,
+    name: Option<String>,
+    description: Option<String>,
+) -> Result<storage::workspaces::WorkspaceRecord, String> {
+    let conn = storage_conn(&app)?;
+    storage::workspaces::update_workspace(
+        &conn,
+        workspace_id.trim(),
+        name.as_deref(),
+        description.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn workspace_set_archived(app: tauri::AppHandle, workspace_id: String, archived: bool) -> Result<(), String> {
+    let conn = storage_conn(&app)?;
+    storage::workspaces::set_workspace_archived(&conn, workspace_id.trim(), archived)
+}
+
+#[tauri::command]
+fn workspace_add_member(
+    app: tauri::AppHandle,
+    workspace_id: String,
+    agent_id: String,
+    role: Option<String>,
+) -> Result<(), String> {
+    let role = role
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("member");
+    team_workspace::add_member_and_sync(&app, workspace_id.trim(), agent_id.trim(), role)
+}
+
+#[tauri::command]
+fn workspace_remove_member(app: tauri::AppHandle, workspace_id: String, agent_id: String) -> Result<(), String> {
+    team_workspace::remove_member_and_sync(&app, workspace_id.trim(), agent_id.trim())
+}
+
+#[tauri::command]
+fn workspace_list_members(
+    app: tauri::AppHandle,
+    workspace_id: String,
+) -> Result<Vec<team_workspace::WorkspaceMemberView>, String> {
+    team_workspace::list_team_member_views(&app, workspace_id.trim())
+}
+
+#[tauri::command]
+fn workspace_list_resources(
+    app: tauri::AppHandle,
+    workspace_id: String,
+) -> Result<Vec<storage::workspaces::WorkspaceResourceRecord>, String> {
+    let conn = storage_conn(&app)?;
+    storage::workspaces::list_workspace_resources(&conn, workspace_id.trim())
+}
+
+#[tauri::command]
+fn workspace_upload_resource(
+    app: tauri::AppHandle,
+    workspace_id: String,
+    file_name: String,
+    data_base64: String,
+    mime: Option<String>,
+    uploader_agent_id: Option<String>,
+) -> Result<storage::workspaces::WorkspaceResourceRecord, String> {
+    let conn = storage_conn(&app)?;
+    let wid = workspace_id.trim();
+    let _ = storage::workspaces::get_workspace(&conn, wid)?.ok_or_else(|| "工作空间不存在".to_string())?;
+    let bytes = BASE64_ENGINE
+        .decode(data_base64.trim())
+        .map_err(|e| format!("Base64 解码失败: {e}"))?;
+    let (_abs, rel) = workspace_fs::persist_team_doc_file(wid, &file_name, &bytes)?;
+    let mime_s = mime
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let id = uuid::Uuid::new_v4().to_string();
+    let size = bytes.len() as i64;
+    storage::workspaces::insert_workspace_resource(
+        &conn,
+        &id,
+        wid,
+        file_name.trim(),
+        &rel,
+        &mime_s,
+        size,
+        uploader_agent_id.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn workspace_read_resource_text(app: tauri::AppHandle, workspace_id: String, rel_path: String) -> Result<String, String> {
+    let _ = storage_conn(&app)?;
+    workspace_fs::read_team_file(workspace_id.trim(), &rel_path)
+}
+
+#[tauri::command]
+fn workspace_list_memories(
+    app: tauri::AppHandle,
+    workspace_id: String,
+    limit: Option<i64>,
+) -> Result<Vec<storage::workspaces::WorkspaceMemoryRecord>, String> {
+    let conn = storage_conn(&app)?;
+    storage::workspaces::list_workspace_memories(&conn, workspace_id.trim(), limit.unwrap_or(50))
+}
+
+#[tauri::command]
+fn workspace_write_memory(
+    app: tauri::AppHandle,
+    workspace_id: String,
+    title: String,
+    content: String,
+    author_agent_id: Option<String>,
+    tags: Option<Vec<String>>,
+) -> Result<storage::workspaces::WorkspaceMemoryRecord, String> {
+    team_workspace::write_team_memory_entry(
+        &app,
+        workspace_id.trim(),
+        title,
+        content,
+        author_agent_id,
+        tags.unwrap_or_default(),
+    )
+}
+
+#[tauri::command]
+fn workspace_delegate(
+    app: tauri::AppHandle,
+    workspace_id: String,
+    target_agent_id: String,
+    task: String,
+    provider_config: ProviderRuntimeConfig,
+) -> Result<String, String> {
+    team_workspace::run_delegate_with_provider(
+        &app,
+        workspace_id.trim(),
+        target_agent_id.trim(),
+        task.trim(),
+        &provider_config,
+    )
+}
+
+/// 用户请求中止某次委派。当前实现为"软中止"：仅广播状态事件，
+/// 让前端把 DelegationCard 置为 aborted；底层 `spawn_blocking` 任务
+/// 会自然结束。后续阶段可替换为真正 `AbortHandle`。
+#[tauri::command]
+async fn workspace_abort_delegate(app: tauri::AppHandle, run_id: String) -> Result<(), String> {
+    let _ = app.emit(
+        "workspace.delegate.done",
+        serde_json::json!({
+            "runId": run_id,
+            "status": "aborted",
+        }),
+    );
+    Ok(())
+}
+
+/// 用户向正在进行的委派追加补充说明。当前实现为"软追加"：只广播
+/// 事件，补充内容会在旁白机制（阶段 E）通过 `[USER_NOTES]` 注入下一轮。
+#[tauri::command]
+async fn workspace_augment_delegate(
+    app: tauri::AppHandle,
+    workspace_id: String,
+    run_id: String,
+    note: String,
+) -> Result<(), String> {
+    let _ = app.emit(
+        "workspace.delegate.progress",
+        serde_json::json!({
+            "runId": run_id,
+            "workspaceId": workspace_id,
+            "augmentNote": note,
+        }),
+    );
+    // 顺便写入团队记忆，后续 note/USER_NOTES 会读到。
+    let _ = team_workspace::write_team_memory_entry(
+        &app,
+        workspace_id.trim(),
+        format!("委派补充@{}", run_id),
+        note,
+        None,
+        vec!["delegate-note".to_string()],
+    );
+    Ok(())
+}
+
+/// 从委派计划卡片触发的"下发一项"。发出 `workspace.delegate.*` 事件
+/// 供前端 DelegationCard 渲染 running/done/error。
+///
+/// 返回: (run_id, output)。同步版本（阶段 D 再加 abort/augment）。
+#[tauri::command]
+async fn workspace_run_delegate_task(
+    app: tauri::AppHandle,
+    workspace_id: String,
+    session_id: Option<String>,
+    assignee: String,
+    task: String,
+    provider_config: ProviderRuntimeConfig,
+) -> Result<serde_json::Value, String> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let ws_id = workspace_id.trim().to_string();
+    let target = assignee.trim().to_string();
+    let task_text = task.trim().to_string();
+    let sess = session_id.unwrap_or_default();
+
+    let started_at = chrono::Utc::now().timestamp_millis();
+    let _ = app.emit(
+        "workspace.delegate.progress",
+        serde_json::json!({
+            "runId": run_id,
+            "workspaceId": ws_id,
+            "sessionId": sess,
+            "assignee": target,
+            "task": task_text,
+            "status": "running",
+            "startedAt": started_at,
+        }),
+    );
+
+    let run_id_clone = run_id.clone();
+    let ws_id_clone = ws_id.clone();
+    let target_clone = target.clone();
+    let task_clone = task_text.clone();
+    let app_clone = app.clone();
+    let sess_clone = sess.clone();
+
+    let run_id_for_events = run_id.clone();
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        team_workspace::run_delegate_with_provider_events(
+            &app_clone,
+            &ws_id_clone,
+            &target_clone,
+            &task_clone,
+            &provider_config,
+            Some(&run_id_for_events),
+        )
+    })
+    .await
+    .map_err(|e| format!("委派任务中断: {e}"))?;
+
+    let elapsed = chrono::Utc::now().timestamp_millis() - started_at;
+    match &out {
+        Ok(body) => {
+            let _ = app.emit(
+                "workspace.delegate.done",
+                serde_json::json!({
+                    "runId": run_id_clone,
+                    "workspaceId": ws_id,
+                    "sessionId": sess_clone,
+                    "assignee": target,
+                    "output": body,
+                    "elapsedMs": elapsed,
+                    "status": "done",
+                }),
+            );
+            Ok(serde_json::json!({
+                "runId": run_id_clone,
+                "output": body,
+                "elapsedMs": elapsed,
+                "status": "done",
+            }))
+        }
+        Err(e) => {
+            let _ = app.emit(
+                "workspace.delegate.error",
+                serde_json::json!({
+                    "runId": run_id_clone,
+                    "workspaceId": ws_id,
+                    "sessionId": sess_clone,
+                    "assignee": target,
+                    "error": e,
+                    "elapsedMs": elapsed,
+                    "status": "error",
+                }),
+            );
+            Err(e.clone())
+        }
+    }
 }
 
 #[tauri::command]
@@ -4510,6 +4821,39 @@ async fn load_local_media_preview(
     .map_err(|error| format!("加载本地媒体预览失败: {error}"))?
 }
 
+fn maybe_expand_team_delegates(
+    app: &tauri::AppHandle,
+    workspace_id: Option<&String>,
+    provider_config: &Option<ProviderRuntimeConfig>,
+    text: &mut String,
+) {
+    // 团队边界护栏：仅在"当前会话绑定了具体 workspace"时才展开委派标记。
+    // peer_gateway 的入站会话走 `process_message_interruptible`，不会调到这里；
+    // 即使将来有新路径误把 peer 文本喂到本函数，这里的空 workspace_id 早退出
+    // 也会让外部智能体无法借道 `NINECLAW_DELEGATE_JSON:` / `_PLAN_JSON:` 触发本地委派。
+    let Some(wid) = workspace_id.map(|s| s.as_str()).filter(|s| !s.is_empty()) else {
+        return;
+    };
+
+    if text.contains("NINECLAW_DELEGATE_PLAN_JSON:") {
+        match team_workspace::expand_delegate_plan_markers_in_text(text.as_str()) {
+            Ok(next) => *text = next,
+            Err(e) => text.push_str(&format!("\n\n[委派计划标记解析失败: {e}]\n")),
+        }
+    }
+
+    let Some(p) = provider_config.as_ref() else {
+        return;
+    };
+    if !text.contains("NINECLAW_DELEGATE_JSON:") {
+        return;
+    }
+    match team_workspace::expand_delegate_markers_in_text(app, wid, text.as_str(), Some(p)) {
+        Ok(next) => *text = next,
+        Err(e) => text.push_str(&format!("\n\n[委派标记解析失败: {e}]\n")),
+    }
+}
+
 #[tauri::command]
 async fn stream_pi_prompt(
     app: tauri::AppHandle,
@@ -4518,6 +4862,7 @@ async fn stream_pi_prompt(
     provider_config: Option<ProviderRuntimeConfig>,
     agent_config: Option<ConversationAgentConfig>,
     attachments: Option<Vec<prompt_attachments::PromptAttachmentInput>>,
+    workspace_id: Option<String>,
 ) -> Result<(), String> {
     let trimmed_prompt = prompt.trim().to_string();
     let attachments = attachments.unwrap_or_default();
@@ -4535,6 +4880,37 @@ async fn stream_pi_prompt(
     let prompt_with_summary = prepend_multimodal_summary_context(&trimmed_prompt, &summary_key)?;
     let prepared_input =
         prompt_attachments::prepare_prompt_input(&prompt_with_summary, &attachments)?;
+
+    let workspace_id_for_stream = workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+
+    // 团队边界硬校验：团队会话里当前 agent 必须是该工作空间的成员（含主智能体）。
+    // 这层兜住前端任意入口漏过滤的情况，防止"团队外智能体"被召唤到团队会话中。
+    if let (Some(wid), Some(cfg)) = (workspace_id_for_stream.as_deref(), agent_config.as_ref()) {
+        let agent_id = cfg.id.trim();
+        if !agent_id.is_empty() {
+            let conn = storage_conn(&app)?;
+            let ws = storage::workspaces::get_workspace(&conn, wid)?;
+            if let Some(ws) = ws {
+                let is_supervisor = ws.supervisor_agent_id == agent_id;
+                let is_member = if is_supervisor {
+                    true
+                } else {
+                    let members = storage::workspaces::list_workspace_members(&conn, wid)?;
+                    members.iter().any(|m| m.agent_id == agent_id)
+                };
+                if !is_member {
+                    return Err(format!(
+                        "WORKSPACE_MEMBER_ONLY: 智能体 `{}` 不是团队 `{}` 的成员，无法在该团队会话中发言",
+                        agent_id, wid
+                    ));
+                }
+            }
+        }
+    }
 
     tauri::async_runtime::spawn_blocking(move || {
         let session_stream_mutex = desktop_session_stream_mutex(&normalized_session_id);
@@ -4685,6 +5061,23 @@ async fn stream_pi_prompt(
                 "--append-system-prompt",
                 memory_isolation_prompt,
             ]);
+
+            if let Some(ref wid) = workspace_id_for_stream {
+                match team_workspace::build_workspace_preface(&app, wid) {
+                    Ok(preface) => {
+                        system_prompt_chars += preface.chars().count();
+                        system_prompt_sections.push(("workspace_team".into(), preface.clone()));
+                        command.env("NINECLAW_WORKSPACE_ID", wid);
+                        command.args(["--append-system-prompt", &preface]);
+                    }
+                    Err(error) => {
+                        dev_trace(
+                            "desktop.stream",
+                            format!("workspace preface skipped: session={} err={}", normalized_session_id, error),
+                        );
+                    }
+                }
+            }
 
             for skill_path in skills::resolve_skill_directories(&agent_config.skill_ids)? {
                 skill_count += 1;
@@ -5434,6 +5827,12 @@ async fn stream_pi_prompt(
             remove_runtime_handle(&normalized_session_id)?;
 
             if saw_agent_end || saw_message_done {
+                maybe_expand_team_delegates(
+                    &app,
+                    workspace_id_for_stream.as_ref(),
+                    &provider_config,
+                    &mut emitted_assistant_text,
+                );
                 emitted_assistant_text = finalize_desktop_outbound_reply(
                     &emitted_assistant_text,
                     agent_config.as_ref().map(|config| config.id.as_str()),
@@ -5585,6 +5984,12 @@ async fn stream_pi_prompt(
         }
 
         if saw_terminal_completion {
+            maybe_expand_team_delegates(
+                &app,
+                workspace_id_for_stream.as_ref(),
+                &provider_config,
+                &mut emitted_assistant_text,
+            );
             emitted_assistant_text = finalize_desktop_outbound_reply(
                 &emitted_assistant_text,
                 agent_config.as_ref().map(|config| config.id.as_str()),
@@ -6390,6 +6795,22 @@ pub fn run() {
             update_agent_task,
             run_agent_task_now,
             stream_pi_prompt,
+            workspace_list,
+            workspace_create,
+            workspace_update,
+            workspace_set_archived,
+            workspace_add_member,
+            workspace_remove_member,
+            workspace_list_members,
+            workspace_list_resources,
+            workspace_upload_resource,
+            workspace_read_resource_text,
+            workspace_list_memories,
+            workspace_write_memory,
+            workspace_delegate,
+            workspace_run_delegate_task,
+            workspace_abort_delegate,
+            workspace_augment_delegate,
             abort_pi_stream,
             persist_chat_attachments,
             open_local_file,

@@ -872,6 +872,8 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       agent?: ConversationAgentSnapshot | null
       sessionLlm?: { providerId: ProviderId; model: string } | null
       attachments?: PersistedChatAttachment[]
+      workspaceId?: string | null
+      overrideAgentId?: string | null
     },
     options?: { forceNewSession?: boolean },
   ) => {
@@ -881,7 +883,9 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       return false
     }
 
-    const turn = buildNewTurn(trimmedPrompt)
+    const speakerAgentIdForTurn =
+      context?.overrideAgentId?.trim() || context?.agent?.id?.trim() || null
+    const turn = buildNewTurn(trimmedPrompt, speakerAgentIdForTurn)
     const nextHistoryId = options?.forceNewSession ? createId() : (activeHistoryId || createId())
 
     const prevFly = desktopStreamFlyRef.current.get(nextHistoryId)
@@ -906,6 +910,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
             updatedAt: turn.createdAt,
             turns: [turn],
             ...(context?.agent ? { agent: context.agent } : {}),
+            ...(context?.workspaceId ? { workspaceId: context.workspaceId } : {}),
             ...(context?.sessionLlm
               ? {
                   sessionLlmProviderId: context.sessionLlm.providerId,
@@ -969,6 +974,8 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
           providerConfig: context?.providerConfig,
           agentConfig: context?.agent,
           attachments: context?.attachments ?? [],
+          workspaceId: context?.workspaceId ?? null,
+          overrideAgentId: context?.overrideAgentId ?? null,
         })
         desktopStreamFlyRef.current.set(nextHistoryId, streamFly)
         await streamFly
@@ -1017,6 +1024,8 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       agent?: ConversationAgentSnapshot | null
       sessionLlm?: { providerId: ProviderId; model: string } | null
       attachments?: PersistedChatAttachment[]
+      workspaceId?: string | null
+      overrideAgentId?: string | null
     },
   ) => submitPromptInternal(rawPrompt, context)
 
@@ -1027,6 +1036,8 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       agent?: ConversationAgentSnapshot | null
       sessionLlm?: { providerId: ProviderId; model: string } | null
       attachments?: PersistedChatAttachment[]
+      workspaceId?: string | null
+      overrideAgentId?: string | null
     },
   ) => submitPromptInternal(rawPrompt, context, { forceNewSession: true })
 

@@ -93,6 +93,7 @@ describe('chatCreateSession', () => {
       botTargetJson: null,
       sessionLlmProviderId: null,
       sessionLlmModel: 'gpt-4',
+      workspaceId: null,
     })
     expect(result).toEqual(mockResult)
   })
@@ -115,6 +116,7 @@ describe('chatCreateSession', () => {
       botTargetJson: null,
       sessionLlmProviderId: null,
       sessionLlmModel: null,
+      workspaceId: null,
     })
   })
 })
@@ -151,6 +153,7 @@ describe('chatAppendTurn', () => {
       responseSegmentsJson: null,
       toolCallsJson: null,
       activityJson: null,
+      speakerAgentId: null,
     })
     expect(result).toEqual(mockTurn)
   })
@@ -182,6 +185,7 @@ describe('chatAppendTurn', () => {
       responseSegmentsJson: null,
       toolCallsJson: null,
       activityJson: '[]',
+      speakerAgentId: null,
     })
   })
 })
