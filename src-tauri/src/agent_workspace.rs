@@ -892,6 +892,31 @@ pub fn persist_agent_inbound_artifact(
     Ok(path)
 }
 
+/// 团队会话：用户上传的聊天附件写入「项目成果」根下 `chat-inbox/<date>/`，便于在「成果」侧栏浏览。
+pub fn persist_team_artifacts_inbound_file(
+    artifacts_root: &Path,
+    scope: &str,
+    file_name: &str,
+    data: &[u8],
+) -> Result<PathBuf, String> {
+    let inbox_dir = artifacts_root
+        .join("chat-inbox")
+        .join(current_date_label());
+    fs::create_dir_all(&inbox_dir).map_err(|error| format!("创建团队成果收件目录失败: {error}"))?;
+
+    let safe_scope = sanitize_workspace_segment(scope, "session");
+    let safe_name = sanitize_workspace_file_name(file_name, "attachment.bin");
+    let path = inbox_dir.join(format!(
+        "{}-{}-{}",
+        current_timestamp_file_label(),
+        safe_scope,
+        safe_name
+    ));
+
+    fs::write(&path, data).map_err(|error| format!("写入团队成果附件失败: {error}"))?;
+    Ok(path)
+}
+
 pub fn persist_agent_outbound_artifact(
     agent_id: &str,
     user_id: &str,
@@ -1133,7 +1158,7 @@ pub fn register_agent_outbound_artifact_source(
     Ok(())
 }
 
-fn ensure_root_scaffold(root: &Path) -> Result<(), String> {
+pub(crate) fn ensure_root_scaffold(root: &Path) -> Result<(), String> {
     migrate_legacy_template_dir_if_needed(root)?;
     fs::create_dir_all(root.join(TEMPLATE_DIR))
         .map_err(|error| format!("创建 agent 模板目录失败: {error}"))?;
@@ -2211,7 +2236,7 @@ fn migrate_legacy_template_dir_if_needed(root: &Path) -> Result<(), String> {
         })
 }
 
-fn copy_dir_all(source: &Path, target: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_dir_all(source: &Path, target: &Path) -> std::io::Result<()> {
     fs::create_dir_all(target)?;
 
     for entry in fs::read_dir(source)? {
@@ -2227,6 +2252,16 @@ fn copy_dir_all(source: &Path, target: &Path) -> std::io::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// 将导出包中的智能体目录树合并覆盖到 `agents/<agent_id>/`。
+pub fn overlay_agent_home_from_export(agent_id: &str, source_home: &Path) -> Result<(), String> {
+    let root = resolve_workspace_root()?;
+    ensure_root_scaffold(&root)?;
+    let target = root.join("agents").join(agent_id);
+    fs::create_dir_all(&target).map_err(|error| format!("创建智能体目录失败: {error}"))?;
+    copy_dir_all(source_home, &target).map_err(|error| format!("合并工作区文件失败: {error}"))?;
     Ok(())
 }
 

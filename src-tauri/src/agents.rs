@@ -229,6 +229,21 @@ struct BuiltinAgentSeed {
     accent_color: &'static str,
 }
 
+pub(crate) fn ensure_agents_ready_conn(connection: &Connection) -> Result<(), String> {
+    ensure_agents_ready(connection)
+}
+
+pub(crate) fn fetch_active_agent(
+    connection: &Connection,
+    agent_id: &str,
+) -> Result<Option<AgentRecord>, String> {
+    get_active_agent_by_id(connection, agent_id)
+}
+
+pub(crate) fn sync_agent_workspaces_logged(connection: &Connection, context: &str) {
+    try_sync_active_agent_workspaces(connection, context);
+}
+
 pub fn list_agents(app: &AppHandle) -> Result<Vec<AgentRecord>, String> {
     let connection = crate::open_history_db(app)?;
     list_agents_with_connection(&connection)

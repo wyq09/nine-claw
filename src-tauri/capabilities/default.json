@@ -3,11 +3,15 @@
   "identifier": "default",
   "description": "enables the default permissions",
   "windows": [
-    "main"
+    "main",
+    "llm-trace-*"
   ],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
+    "core:webview:default",
+    "core:webview:allow-create-webview-window",
+    "dialog:default",
     "notification:default"
   ]
 }

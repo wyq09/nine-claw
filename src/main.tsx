@@ -3,6 +3,10 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
 import { ToastProvider } from './components/ToastProvider'
+import { LlmTraceStandaloneApp } from './app/workspaces/panels/LlmTraceStandaloneApp'
+
+const hash = window.location.hash || ''
+const isTraceStandalone = hash.startsWith('#/llm-trace')
 
 function BootReadyMarker() {
   useEffect(() => {
@@ -30,7 +34,7 @@ createRoot(document.getElementById('root')!, {
   <StrictMode>
     <BootReadyMarker />
     <ToastProvider>
-      <App />
+      {isTraceStandalone ? <LlmTraceStandaloneApp /> : <App />}
     </ToastProvider>
   </StrictMode>,
 )

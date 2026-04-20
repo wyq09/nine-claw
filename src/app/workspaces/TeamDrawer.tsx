@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ChangeEvent, type RefObject } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ChangeEvent, type RefObject } from 'react'
 import type {
   AgentRecord,
   WorkspaceMemberView,
@@ -8,6 +8,8 @@ import type {
 } from '../../types'
 import {
   workspaceAddMember,
+  workspaceDeleteMemory,
+  workspaceDeleteResource,
   workspaceListMembers,
   workspaceListMemories,
   workspaceListResources,
@@ -19,8 +21,9 @@ import { AppIcon, type IconName } from '../../components/AppIcon'
 import { TeamMembersPanel } from './panels/TeamMembersPanel'
 import { TeamResourcesPanel } from './panels/TeamResourcesPanel'
 import { TeamMemoryPanel } from './panels/TeamMemoryPanel'
+import { TeamArtifactsPanel } from './panels/TeamArtifactsPanel'
 
-export type TeamDrawerTab = 'members' | 'resources' | 'memory'
+export type TeamDrawerTab = 'members' | 'resources' | 'memory' | 'artifacts'
 
 export type TeamDrawerProps = {
   workspace: WorkspaceRecord
@@ -29,6 +32,7 @@ export type TeamDrawerProps = {
   activeTab: TeamDrawerTab
   onClose: () => void
   onMembersChanged?: (members: WorkspaceMemberView[]) => void
+  onWorkspaceUpdated?: (record: WorkspaceRecord) => void
 }
 
 function fileToBase64(file: File): Promise<string> {
@@ -52,6 +56,7 @@ const TABS: { id: TeamDrawerTab; label: string; icon: IconName }[] = [
   { id: 'members', label: '成员', icon: 'users' },
   { id: 'resources', label: '资料', icon: 'folder' },
   { id: 'memory', label: '记忆', icon: 'book' },
+  { id: 'artifacts', label: '成果', icon: 'spark' },
 ]
 
 export function TeamDrawer({
@@ -61,6 +66,7 @@ export function TeamDrawer({
   activeTab,
   onClose,
   onMembersChanged,
+  onWorkspaceUpdated,
 }: TeamDrawerProps) {
   const drawerTitleTab = TABS.find((t) => t.id === activeTab)
   const [members, setMembers] = useState<WorkspaceMemberView[]>([])
@@ -71,6 +77,11 @@ export function TeamDrawer({
   const [newMemberId, setNewMemberId] = useState('')
   const [newMemoTitle, setNewMemoTitle] = useState('')
   const [newMemoContent, setNewMemoContent] = useState('')
+
+  const delegateableMemberCount = useMemo(
+    () => members.filter((m) => m.agentId !== workspace.supervisorAgentId).length,
+    [members, workspace.supervisorAgentId],
+  )
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -156,6 +167,26 @@ export function TeamDrawer({
     }
   }
 
+  const onDeleteMemo = async (memoryId: string) => {
+    try {
+      await workspaceDeleteMemory(workspace.id, memoryId)
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+      throw e
+    }
+  }
+
+  const onDeleteResource = async (resourceId: string) => {
+    try {
+      await workspaceDeleteResource(workspace.id, resourceId)
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+      throw e
+    }
+  }
+
   return (
     <aside className={`team-drawer${open ? ' open' : ''}`} aria-hidden={!open}>
       <div className="team-drawer-head">
@@ -195,7 +226,15 @@ export function TeamDrawer({
           />
         ) : null}
         {activeTab === 'resources' ? (
-          <TeamResourcesPanel resources={resources} onPickFile={onPickFile} onUpload={onUpload} />
+          <TeamResourcesPanel
+            workspace={workspace}
+            delegateableMemberCount={delegateableMemberCount}
+            onWorkspaceUpdated={onWorkspaceUpdated}
+            resources={resources}
+            onPickFile={onPickFile}
+            onUpload={onUpload}
+            onDeleteResource={onDeleteResource}
+          />
         ) : null}
         {activeTab === 'memory' ? (
           <TeamMemoryPanel
@@ -205,8 +244,12 @@ export function TeamDrawer({
             onNewMemoTitleChange={setNewMemoTitle}
             onNewMemoContentChange={setNewMemoContent}
             onWriteMemo={() => void onWriteMemo()}
+            onDeleteMemory={onDeleteMemo}
             loading={loading}
           />
+        ) : null}
+        {activeTab === 'artifacts' ? (
+          <TeamArtifactsPanel workspace={workspace} onWorkspaceUpdated={onWorkspaceUpdated} onError={setError} />
         ) : null}
       </div>
     </aside>

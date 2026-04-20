@@ -2,6 +2,7 @@ use crate::agents::{self, ConversationAgentConfig};
 use crate::dev_trace::{dev_trace, dev_trace_block};
 use crate::pi_runtime::{self, PiRuntimeLocation};
 use crate::pi_timeouts;
+use crate::provider_stream_noise;
 use crate::prompt_attachments::{self, PreparedPromptInput, PromptAttachmentInput};
 use crate::skills;
 use md5::{Digest, Md5};
@@ -473,14 +474,20 @@ impl PiBridge {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .trim();
-        if !error_message.is_empty() {
-            return Some(error_message.to_string());
-        }
-
         let stop_reason = message
             .get("stopReason")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+
+        if !error_message.is_empty() {
+            if stop_reason != "error"
+                && provider_stream_noise::is_recoverable_provider_terminal_noise(error_message)
+            {
+                return None;
+            }
+            return Some(error_message.to_string());
+        }
+
         if stop_reason == "error" {
             return Some("assistant 返回了 error stopReason，但未提供错误详情".to_string());
         }
@@ -789,6 +796,7 @@ impl PiBridge {
             "rpc",
             "--session",
             &session_path.to_string_lossy(),
+            "--no-skills",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

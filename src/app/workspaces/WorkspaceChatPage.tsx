@@ -10,6 +10,7 @@ import { AppIcon } from '../../components/AppIcon'
 import { workspaceList } from '../../lib/piClient'
 import { WorkspaceSessionsSidebar } from './WorkspaceSessionsSidebar'
 import { TeamDrawer, type TeamDrawerTab } from './TeamDrawer'
+import { LlmTracePanel } from './panels/LlmTracePanel'
 import {
   DelegateSegmentsContext,
   type DelegateSegmentsContextValue,
@@ -54,6 +55,7 @@ export function WorkspaceChatPage({
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [drawerTab, setDrawerTab] = useState<TeamDrawerTab>('members')
   const [drawerMembers, setDrawerMembers] = useState<WorkspaceMemberView[]>([])
+  const [tracePanelOpen, setTracePanelOpen] = useState(false)
   const composerSetTextRef = useRef<((text: string) => void) | null>(null)
   const [mentionQuery, setMentionQuery] = useState<string | null>(null)
   const [composerRawText, setComposerRawText] = useState('')
@@ -364,6 +366,7 @@ export function WorkspaceChatPage({
               { id: 'members', label: '成员', icon: 'users' },
               { id: 'resources', label: '资料', icon: 'folder' },
               { id: 'memory', label: '记忆', icon: 'book' },
+              { id: 'artifacts', label: '成果', icon: 'spark' },
             ] as const
           ).map((tab) => {
             const active = drawerOpen && drawerTab === tab.id
@@ -386,6 +389,15 @@ export function WorkspaceChatPage({
               </button>
             )
           })}
+          <button
+            type="button"
+            className={`workspace-chat-topbar-button${tracePanelOpen ? ' active' : ''}`}
+            onClick={() => setTracePanelOpen((v) => !v)}
+            title="LLM 调用链调试：查看主 Agent↔模型、主 Agent↔子 Agent 的完整请求/响应"
+          >
+            <AppIcon name="wrench" size={14} />
+            <span>调试</span>
+          </button>
         </div>
       </header>
 
@@ -440,9 +452,18 @@ export function WorkspaceChatPage({
             activeTab={drawerTab}
             onClose={() => setDrawerOpen(false)}
             onMembersChanged={setDrawerMembers}
+            onWorkspaceUpdated={setWorkspace}
           />
         ) : null}
       </div>
+      {workspace ? (
+        <LlmTracePanel
+          workspaceId={workspace.id}
+          sessionId={chatProps.activeHistoryId || null}
+          open={tracePanelOpen}
+          onClose={() => setTracePanelOpen(false)}
+        />
+      ) : null}
     </div>
   )
 }

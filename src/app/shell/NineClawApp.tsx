@@ -3,6 +3,7 @@ import type { MouseEvent } from 'react'
 import { botDefinitions, createInitialBotConfigs, emptyProviderConfig, providerDefinitions, resourceSeed } from '../../mockData'
 import { useComposerAttachments } from '../../hooks/useComposerAttachments'
 import { usePiAgent } from '../../hooks/usePiAgent'
+import { useToast } from '../../hooks/useToast'
 import type {
   AgentBuilderDraft,
   AgentInput,
@@ -110,6 +111,7 @@ import { NineClawAppChrome } from './NineClawAppChrome'
 import { NineClawRouteOutlet } from './NineClawRouteOutlet'
 
 export function NineClawApp() {
+  const toast = useToast()
   const composerClearRef = useRef<(() => void) | null>(null)
   const composerDraftBackupRef = useRef('')
   const {
@@ -266,7 +268,7 @@ export function NineClawApp() {
     [composerAgent, defaultAgent],
   )
   const activeChatAgent = activeHistoryItem ? activeHistoryItem.agent ?? null : preferredComposerAgent
-  const composerAttachmentScopeKey = `${activeHistoryId || 'composer'}:${activeChatAgent?.id ?? 'no-agent'}`
+  const composerAttachmentScopeKey = `${activeHistoryId || 'composer'}:${activeChatAgent?.id ?? 'no-agent'}:${activeHistoryItem?.workspaceId ?? ''}`
   const {
     attachments: composerAttachments,
     uploading: composerAttachmentUploading,
@@ -281,6 +283,7 @@ export function NineClawApp() {
   } = useComposerAttachments({
     agentId: activeChatAgent?.id ?? '',
     sessionId: activeHistoryId || null,
+    workspaceId: activeHistoryItem?.workspaceId ?? null,
     scopeKey: composerAttachmentScopeKey,
   })
   const visibleInstalledSkills = installedSkills.filter((skill) => {
@@ -1579,7 +1582,7 @@ export function NineClawApp() {
       setManagedAgentId(savedAgent.id)
       setAgentEditorMode('edit')
       setAgentEditorDraft(createAgentDraftFromRecord(savedAgent))
-      setAgentFormNotice(agentEditorMode === 'create' ? '智能体已创建。' : '智能体已保存。')
+      toast.success(agentEditorMode === 'create' ? '智能体已创建。' : '智能体已保存。')
       handleCloseAgentSkillPicker()
       await refreshAgents(savedAgent.id)
     } catch (saveError) {

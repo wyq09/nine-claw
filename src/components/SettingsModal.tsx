@@ -962,6 +962,11 @@ export function SettingsModal({
                       <code>Enter 换行</code>
                     </button>
                   </div>
+                  <p className="settings-note">
+                    macOS 上 NineClaw 使用与 Safari 相同的 WebKit
+                    网页引擎；「按住 Fn 系统听写」在网页里可能与 Chrome
+                    不一致。聊天输入框旁提供「麦克风」网页语音转文字（需麦克风权限）；也可使用菜单「编辑 → 听写」或系统听写快捷键。
+                  </p>
                 </div>
                 <div className="shortcut-row">
                   <span>发送消息</span>

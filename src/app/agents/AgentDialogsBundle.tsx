@@ -472,7 +472,7 @@ export function AgentEditorDialog({
                   <input
                     value={agentDraft.name}
                     onChange={(event) => onDraftChange({ name: event.target.value })}
-                    placeholder="例如：诉讼项目助理"
+                    placeholder="例如：项目经理"
                   />
 	                </label>
 	              </div>

@@ -1,3 +1,5 @@
+import { useState } from 'react'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import { AppIcon } from '../../components/AppIcon'
 import type {
   AgentInput,
@@ -10,6 +12,7 @@ import type {
 } from '../../types'
 import type { BotStatusEvent } from '../../lib/piClient'
 import { botDefinitions } from '../../mockData'
+import { exportAgentPackage, importAgentPackage } from '../../lib/piClient'
 import { getAgentColor } from '../lib'
 import { AgentEditorDialog } from './AgentDialogsBundle'
 import { AgentBotBindingDialog, AgentWorkspaceDialog } from './AgentChannelDialogs'
@@ -165,6 +168,100 @@ export function AgentsView({
 }: AgentsViewProps) {
   const studioCountLabel = loading ? '正在同步智能体…' : '已保存智能体'
 
+  const [exportDialogOpen, setExportDialogOpen] = useState(false)
+  /** 本次导出目标（单个智能体）；与列表选中可能同步，但以该状态为准避免竞态 */
+  const [exportTargetAgent, setExportTargetAgent] = useState<AgentRecord | null>(null)
+  const [exportIncludeSecrets, setExportIncludeSecrets] = useState(false)
+  const [exportIncludeSharedRoot, setExportIncludeSharedRoot] = useState(false)
+  const [packageBusy, setPackageBusy] = useState(false)
+  const [packageNotice, setPackageNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
+
+  const safeDefaultExportName = (name: string) => {
+    const base = name.replace(/[\\/:*?"<>|]+/g, '_').trim() || 'agent'
+    return `${base}.nineclaw-agent.zip`
+  }
+
+  const closeExportDialog = () => {
+    if (packageBusy) {
+      return
+    }
+    setExportDialogOpen(false)
+    setExportTargetAgent(null)
+  }
+
+  const handleOpenExportDialog = () => {
+    setPackageNotice(null)
+    if (!selectedAgent) {
+      setPackageNotice({ kind: 'err', text: '请先在列表中点选要导出的那一个智能体，或使用该行「导出包」按钮。' })
+      return
+    }
+    setExportTargetAgent(selectedAgent)
+    setExportDialogOpen(true)
+  }
+
+  const handleOpenExportDialogForAgent = (agent: AgentRecord) => {
+    setPackageNotice(null)
+    onSelectAgent(agent.id)
+    setExportTargetAgent(agent)
+    setExportDialogOpen(true)
+  }
+
+  const handleConfirmExport = async () => {
+    if (!exportTargetAgent) {
+      return
+    }
+    const destPath = await save({
+      defaultPath: safeDefaultExportName(exportTargetAgent.name),
+      filters: [{ name: 'NineClaw 智能体包', extensions: ['zip'] }],
+    })
+    if (destPath == null) {
+      return
+    }
+    setPackageBusy(true)
+    setPackageNotice(null)
+    try {
+      await exportAgentPackage({
+        agentId: exportTargetAgent.id,
+        destPath,
+        includeSecrets: exportIncludeSecrets,
+        includeSharedRoot: exportIncludeSharedRoot,
+      })
+      setExportDialogOpen(false)
+      setExportTargetAgent(null)
+      setExportIncludeSecrets(false)
+      setExportIncludeSharedRoot(false)
+      setPackageNotice({ kind: 'ok', text: `已将「${exportTargetAgent.name}」导出到 ${destPath}` })
+    } catch (err) {
+      setPackageNotice({ kind: 'err', text: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setPackageBusy(false)
+    }
+  }
+
+  const handleImportPackage = async () => {
+    setPackageNotice(null)
+    const picked = await open({
+      multiple: false,
+      filters: [{ name: 'NineClaw 智能体包', extensions: ['zip'] }],
+    })
+    const packagePath = Array.isArray(picked) ? picked[0] : picked
+    if (packagePath == null) {
+      return
+    }
+    setPackageBusy(true)
+    try {
+      const result = await importAgentPackage(packagePath)
+      await onRefreshAgents()
+      onSelectAgent(result.agent.id)
+      const warnText = result.warnings.length > 0 ? `\n${result.warnings.join('\n')}` : ''
+      setPackageNotice({ kind: 'ok', text: `已导入「${result.agent.name}」${warnText}` })
+    } catch (err) {
+      setPackageNotice({ kind: 'err', text: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setPackageBusy(false)
+    }
+  }
+
   return (
     <div className={`agent-layout ${agentEditorOpen ? 'agent-layout-editor-open' : ''}`}>
       <div className="agent-studio-shell" hidden={agentEditorOpen}>
@@ -179,6 +276,27 @@ export function AgentsView({
             <button type="button" className="outline-button" onClick={() => void onRefreshAgents()} disabled={loading || agentRefreshing}>
               <AppIcon name="refresh" size={18} />
               <span>{agentRefreshing ? '刷新中…' : '刷新列表'}</span>
+            </button>
+
+            <button
+              type="button"
+              className="outline-button"
+              title="仅导出当前列表中选中的那一个智能体（含其 workspace 目录）"
+              onClick={() => void handleOpenExportDialog()}
+              disabled={loading || packageBusy || !selectedAgent}
+            >
+              <AppIcon name="download" size={18} />
+              <span>导出所选</span>
+            </button>
+
+            <button
+              type="button"
+              className="outline-button"
+              onClick={() => void handleImportPackage()}
+              disabled={loading || packageBusy}
+            >
+              <AppIcon name="upload" size={18} />
+              <span>导入</span>
             </button>
 
             <button type="button" className="create-agent-button agent-create-inline" onClick={onCreateAgent}>
@@ -205,6 +323,15 @@ export function AgentsView({
             <div className="skills-feedback error agent-feedback inline">
               <strong>智能体读取失败</strong>
               <span>{error}</span>
+            </div>
+          ) : null}
+
+          {packageNotice ? (
+            <div
+              className={`skills-feedback agent-feedback inline ${packageNotice.kind === 'err' ? 'error' : 'success'}`}
+            >
+              <strong>{packageNotice.kind === 'err' ? '包操作失败' : '包操作成功'}</strong>
+              <span className="agent-package-notice-text">{packageNotice.text}</span>
             </div>
           ) : null}
 
@@ -269,6 +396,16 @@ export function AgentsView({
                         className="agent-row-action"
                         onClick={(event) => {
                           event.stopPropagation()
+                          handleOpenExportDialogForAgent(agent)
+                        }}
+                      >
+                        导出包
+                      </button>
+                      <button
+                        type="button"
+                        className="agent-row-action"
+                        onClick={(event) => {
+                          event.stopPropagation()
                           onOpenEditor(agent.id)
                         }}
                       >
@@ -286,6 +423,64 @@ export function AgentsView({
             </div>
           </div>
         </section>
+
+        {exportDialogOpen ? (
+          <div
+            className="confirm-dialog-overlay"
+            role="presentation"
+            onClick={closeExportDialog}
+          >
+            <div
+              className="confirm-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="agent-export-title"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <h3 id="agent-export-title">导出单个智能体包</h3>
+              <p>
+                仅包含下方指定智能体在库中的配置及其 workspace 目录（记忆、raw、inbox 等），不会导出其他智能体或聊天记录。ZIP 默认不包含通道密钥。
+              </p>
+              {exportTargetAgent ? (
+                <p className="agent-export-target-meta">
+                  <strong>{exportTargetAgent.name}</strong>
+                  <span className="agent-inline-id">ID: {exportTargetAgent.id}</span>
+                </p>
+              ) : null}
+              <label className="input-field agent-export-option">
+                <input
+                  type="checkbox"
+                  checked={exportIncludeSecrets}
+                  onChange={(event) => setExportIncludeSecrets(event.target.checked)}
+                  disabled={packageBusy}
+                />
+                <span>包含通道凭证与 API 密钥（不安全，勿分享）</span>
+              </label>
+              <label className="input-field agent-export-option">
+                <input
+                  type="checkbox"
+                  checked={exportIncludeSharedRoot}
+                  onChange={(event) => setExportIncludeSharedRoot(event.target.checked)}
+                  disabled={packageBusy}
+                />
+                <span>同时打包工作区根目录共享策略文件（AGENTS / SOUL / USER 等）</span>
+              </label>
+              <div className="confirm-dialog-actions">
+                <button type="button" className="outline-button" onClick={closeExportDialog} disabled={packageBusy}>
+                  取消
+                </button>
+                <button
+                  type="button"
+                  className="create-agent-button"
+                  onClick={() => void handleConfirmExport()}
+                  disabled={packageBusy || !exportTargetAgent}
+                >
+                  {packageBusy ? '导出中…' : '选择保存位置'}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {agentEditorOpen && agentDraft ? (

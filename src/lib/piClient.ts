@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type {
+  AgentImportResult,
   AgentInput,
   AgentTaskDeliveryRecord,
   AgentTaskListItem,
@@ -29,6 +30,7 @@ import type {
   TokenUsageRecord,
   WorkspaceMemoryRecord,
   WorkspaceMemberView,
+  ArtifactsTreeEntry,
   WorkspaceRecord,
   WorkspaceResourceRecord,
 } from '../types'
@@ -106,11 +108,14 @@ export async function clearPiSessionForId(sessionId: string): Promise<void> {
 export async function persistChatAttachments(payload: {
   agentId: string
   sessionId?: string | null
+  /** 团队会话：附件写入该工作空间的「项目成果」根目录 */
+  workspaceId?: string | null
   attachments: ChatAttachmentUpload[]
 }): Promise<PersistedChatAttachment[]> {
   return invoke<PersistedChatAttachment[]>('persist_chat_attachments', {
     agentId: payload.agentId,
     sessionId: payload.sessionId ?? null,
+    workspaceId: payload.workspaceId ?? null,
     attachments: payload.attachments,
   })
 }
@@ -295,9 +300,139 @@ export async function workspaceCreate(payload: {
 
 export async function workspaceUpdate(
   workspaceId: string,
-  payload: { name?: string | null; description?: string | null },
+  payload: {
+    name?: string | null
+    description?: string | null
+    artifactsRoot?: string | null
+    supervisorOrchestrationPrompt?: string | null
+    llmTraceEnabled?: boolean | null
+  },
 ): Promise<WorkspaceRecord> {
-  return invoke<WorkspaceRecord>('workspace_update', { workspaceId, ...payload })
+  return invoke<WorkspaceRecord>('workspace_update', {
+    workspaceId,
+    name: payload.name ?? null,
+    description: payload.description ?? null,
+    artifactsRoot: payload.artifactsRoot === undefined ? null : payload.artifactsRoot,
+    supervisorOrchestrationPrompt:
+      payload.supervisorOrchestrationPrompt === undefined ? null : payload.supervisorOrchestrationPrompt,
+    llmTraceEnabled: payload.llmTraceEnabled === undefined ? null : payload.llmTraceEnabled,
+  })
+}
+
+export async function workspaceDefaultSupervisorOrchestrationPrompt(workspaceId: string): Promise<string> {
+  return invoke<string>('workspace_default_supervisor_orchestration_prompt', { workspaceId })
+}
+
+export type LlmTraceSystemPromptSection = { label: string; content: string }
+
+export type LlmTraceToolCall = {
+  toolCallId: string
+  toolName: string
+  argsJson: string
+  resultText: string
+  status: string
+  isError?: boolean | null
+  startedAt: number
+  finishedAt?: number | null
+}
+
+export type LlmTraceUsage = {
+  inputTokens?: number | null
+  outputTokens?: number | null
+  cacheReadTokens?: number | null
+  cacheWriteTokens?: number | null
+  totalTokens?: number | null
+}
+
+export type LlmTraceEntry = {
+  id: string
+  workspaceId: string
+  kind: 'main_pi' | 'delegate' | string
+  callerAgentId: string
+  callerAgentName: string
+  targetAgentId?: string | null
+  targetAgentName?: string | null
+  sessionId?: string | null
+  parentTraceId?: string | null
+  provider?: string | null
+  model?: string | null
+  responseId?: string | null
+  status: 'running' | 'done' | 'error' | 'aborted' | string
+  error?: string | null
+  startedAt: number
+  finishedAt?: number | null
+  durationMs?: number | null
+  usage?: LlmTraceUsage | null
+  systemPrompts: LlmTraceSystemPromptSection[]
+  userMessage: string
+  responseText: string
+  thinkingText: string
+  toolCalls: LlmTraceToolCall[]
+}
+
+export async function workspaceLlmTraceStatus(workspaceId: string): Promise<boolean> {
+  return invoke<boolean>('workspace_llm_trace_status', { workspaceId })
+}
+
+export async function workspaceLlmTraceSetEnabled(
+  workspaceId: string,
+  enabled: boolean,
+): Promise<WorkspaceRecord> {
+  return invoke<WorkspaceRecord>('workspace_llm_trace_set_enabled', {
+    workspaceId,
+    enabled,
+  })
+}
+
+export async function workspaceLlmTraceList(
+  workspaceId: string,
+  options?: { days?: number; limit?: number },
+): Promise<LlmTraceEntry[]> {
+  return invoke<LlmTraceEntry[]>('workspace_llm_trace_list', {
+    workspaceId,
+    days: options?.days ?? null,
+    limit: options?.limit ?? null,
+  })
+}
+
+export async function workspaceLlmTraceClear(workspaceId: string): Promise<void> {
+  await invoke('workspace_llm_trace_clear', { workspaceId })
+}
+
+export type LlmTraceEvent = {
+  phase: 'started' | 'updated' | 'finalized'
+  entry: LlmTraceEntry
+}
+
+export async function onLlmTraceEvent(
+  handler: (payload: LlmTraceEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  const un = await listen<LlmTraceEvent>('workspace.llm_trace', (event) => {
+    handler(event.payload)
+  })
+  return () => un()
+}
+
+export async function workspaceResolveArtifactsRoot(workspaceId: string): Promise<string> {
+  return invoke<string>('workspace_resolve_artifacts_root', { workspaceId })
+}
+
+export async function workspaceListArtifactsEntries(
+  workspaceId: string,
+  subPath?: string | null,
+): Promise<ArtifactsTreeEntry[]> {
+  return invoke<ArtifactsTreeEntry[]>('workspace_list_artifacts_entries', {
+    workspaceId,
+    subPath: subPath ?? null,
+  })
+}
+
+export async function workspaceReadArtifactText(workspaceId: string, relPath: string): Promise<string> {
+  return invoke<string>('workspace_read_artifact_text', { workspaceId, relPath })
+}
+
+export async function workspaceArtifactAbsolutePath(workspaceId: string, relPath: string): Promise<string> {
+  return invoke<string>('workspace_artifact_absolute_path', { workspaceId, relPath })
 }
 
 export async function workspaceSetArchived(workspaceId: string, archived: boolean): Promise<void> {
@@ -338,6 +473,14 @@ export async function workspaceReadResourceText(workspaceId: string, relPath: st
   return invoke<string>('workspace_read_resource_text', { workspaceId, relPath })
 }
 
+export async function workspaceResourceAbsolutePath(workspaceId: string, relPath: string): Promise<string> {
+  return invoke<string>('workspace_resource_absolute_path', { workspaceId, relPath })
+}
+
+export async function workspaceDeleteResource(workspaceId: string, resourceId: string): Promise<void> {
+  await invoke('workspace_delete_resource', { workspaceId, resourceId })
+}
+
 export async function workspaceListMemories(
   workspaceId: string,
   limit?: number | null,
@@ -356,6 +499,10 @@ export async function workspaceWriteMemory(payload: {
   tags?: string[] | null
 }): Promise<WorkspaceMemoryRecord> {
   return invoke<WorkspaceMemoryRecord>('workspace_write_memory', payload)
+}
+
+export async function workspaceDeleteMemory(workspaceId: string, memoryId: string): Promise<void> {
+  await invoke('workspace_delete_memory', { workspaceId, memoryId })
 }
 
 export async function workspaceDelegate(payload: {
@@ -582,6 +729,24 @@ export async function writeAgentWorkspaceFile(payload: {
   content: string
 }): Promise<AgentWorkspaceBundle> {
   return invoke<AgentWorkspaceBundle>('write_agent_workspace_file', payload)
+}
+
+export async function exportAgentPackage(payload: {
+  agentId: string
+  destPath: string
+  includeSecrets: boolean
+  includeSharedRoot: boolean
+}): Promise<void> {
+  await invoke('export_agent_package', {
+    agentId: payload.agentId,
+    destPath: payload.destPath,
+    includeSecrets: payload.includeSecrets,
+    includeSharedRoot: payload.includeSharedRoot,
+  })
+}
+
+export async function importAgentPackage(packagePath: string): Promise<AgentImportResult> {
+  return invoke<AgentImportResult>('import_agent_package', { packagePath })
 }
 
 export async function listScheduledJobs(): Promise<ScheduledJobRecord[]> {

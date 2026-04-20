@@ -1,0 +1,9 @@
+pub(crate) const HISTORY_DB_FILE: &str = "nineclaw.sqlite3";
+pub(crate) const LEGACY_HISTORY_DB_FILES: &[&str] = &["yqagent.sqlite3"];
+pub(crate) const PI_SESSION_FILE_PREFIX: &str = "nineclaw-pi-session-";
+pub(crate) const PI_SUMMARY_FILE_PREFIX: &str = "nineclaw-pi-summary-";
+pub(crate) const LEGACY_PI_SESSION_FILE_PREFIXES: &[&str] = &["yqagent-pi-session-"];
+pub(crate) const PI_RUNTIME_DIR_NAME: &str = "nineclaw-pi-runtime";
+pub(crate) const HISTORY_STATE_KEY: &str = "history_v1";
+pub(crate) const PROVIDER_CONFIGS_STATE_KEY: &str = "provider_configs_v1";
+pub(crate) const CUSTOM_PROVIDER_META_STATE_KEY: &str = "custom_provider_meta_v1";

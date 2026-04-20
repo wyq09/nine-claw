@@ -345,9 +345,26 @@ export type WorkspaceRecord = {
   name: string
   description: string
   supervisorAgentId: string
+  /** 空字符串：默认 `teams/<id>/artifacts`；非空：自定义绝对路径 */
+  artifactsRoot: string
+  /**
+   * 团队会话注入的「主智能体角色」Markdown。空 = 使用应用内置默认（随可委派成员数变化）；
+   * 非空则整段写入团队前言（建议以 `## 主智能体角色（MUST）` 开头）。
+   */
+  supervisorOrchestrationPrompt?: string
+  /** 1 = 启用 LLM 调用链调试模式（本工作空间内会把主 Agent↔Pi / 主 Agent↔子 Agent 的完整调用写入 `.debug/*.jsonl`） */
+  llmTraceEnabled?: number
   createdAt: number
   updatedAt: number
   archived: number
+}
+
+export type ArtifactsTreeEntry = {
+  name: string
+  relPath: string
+  isDir: boolean
+  size: number | null
+  modifiedMs: number | null
 }
 
 export type WorkspaceMemberView = {
@@ -486,6 +503,11 @@ export type AgentInput = {
   scenarioLlmConfig?: AgentScenarioLlmConfig
   botConfigs: AgentBotBindings
   heartbeatConfig: AgentHeartbeatConfig
+}
+
+export type AgentImportResult = {
+  agent: AgentRecord
+  warnings: string[]
 }
 
 export type AgentBuilderDraft = {

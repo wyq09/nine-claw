@@ -27,6 +27,7 @@ export function getSubmitShortcutLabel(shortcut: SubmitShortcut): string {
   return shortcut === 'enter' ? 'Enter' : 'Ctrl / Cmd + Enter'
 }
 
+/** Fn 键本身或系统标记的 Fn 修饰（用于 Escape 关闭弹窗等场景避免与系统快捷键冲突） */
 export function isFnLikeKeyboardEvent(event: Pick<globalThis.KeyboardEvent, 'code' | 'key' | 'location' | 'getModifierState'>): boolean {
   if (event.key === 'Fn' || event.key === 'Function' || event.code === 'Fn') {
     return true
@@ -36,6 +37,16 @@ export function isFnLikeKeyboardEvent(event: Pick<globalThis.KeyboardEvent, 'cod
     return true
   }
 
+  return false
+}
+
+/**
+ * macOS 上 Fn/地球键组合可能把 Return 报成「小键盘 Enter」；仅应对 Enter，避免把其它 NUMPAD 区按键一律当成 Fn 场景。
+ */
+export function isMacOSFnStyleEnterKey(event: Pick<globalThis.KeyboardEvent, 'code' | 'key' | 'location'>): boolean {
+  if (event.key !== 'Enter') {
+    return false
+  }
   return event.code === 'NumpadEnter' || event.location === globalThis.KeyboardEvent.DOM_KEY_LOCATION_NUMPAD
 }
 
@@ -202,7 +213,7 @@ export function shouldSubmitWithShortcut(
 
   // On macOS, Fn/Globe combinations can surface as keypad-style Enter events.
   // Keep submission bound to the standard Return key so those system behaviors stay untouched.
-  if (isFnLikeKeyboardEvent(event.nativeEvent)) {
+  if (isFnLikeKeyboardEvent(event.nativeEvent) || isMacOSFnStyleEnterKey(event.nativeEvent)) {
     return false
   }
 

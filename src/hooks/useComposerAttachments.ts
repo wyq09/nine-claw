@@ -11,12 +11,14 @@ import {
 type UseComposerAttachmentsOptions = {
   agentId: string
   sessionId?: string | null
+  workspaceId?: string | null
   scopeKey: string
 }
 
 export function useComposerAttachments({
   agentId,
   sessionId,
+  workspaceId,
   scopeKey,
 }: UseComposerAttachmentsOptions) {
   const [attachments, setAttachments] = useState<PersistedChatAttachment[]>([])
@@ -30,7 +32,7 @@ export function useComposerAttachments({
     if (fileInputRef.current) {
       fileInputRef.current.value = ''
     }
-  }, [scopeKey, agentId])
+  }, [scopeKey, agentId, workspaceId])
 
   const persistUploads = useCallback(
     async (uploads: Parameters<typeof persistChatAttachments>[0]['attachments']) => {
@@ -49,6 +51,7 @@ export function useComposerAttachments({
         const persisted = await persistChatAttachments({
           agentId: trimmedAgentId,
           sessionId: sessionId ?? null,
+          workspaceId: workspaceId?.trim() ? workspaceId : null,
           attachments: uploads,
         })
         setAttachments((previous) => {
@@ -65,7 +68,7 @@ export function useComposerAttachments({
         setUploading(false)
       }
     },
-    [agentId, sessionId],
+    [agentId, sessionId, workspaceId],
   )
 
   const handleFileInputChange = useCallback(

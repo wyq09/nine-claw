@@ -28,6 +28,7 @@ pub struct PersistedChatAttachment {
 pub fn persist_chat_attachments(
     agent_id: &str,
     session_id: Option<&str>,
+    team_artifacts_root: Option<&Path>,
     uploads: Vec<ChatAttachmentUpload>,
 ) -> Result<Vec<PersistedChatAttachment>, String> {
     let trimmed_agent_id = agent_id.trim();
@@ -46,12 +47,21 @@ pub fn persist_chat_attachments(
     let mut persisted = Vec::new();
     for upload in uploads {
         let prepared = prepare_upload(upload)?;
-        let path = agent_workspace::persist_agent_inbound_artifact(
-            trimmed_agent_id,
-            scope,
-            &prepared.file_name,
-            &prepared.data,
-        )?;
+        let path = if let Some(root) = team_artifacts_root {
+            agent_workspace::persist_team_artifacts_inbound_file(
+                root,
+                scope,
+                &prepared.file_name,
+                &prepared.data,
+            )?
+        } else {
+            agent_workspace::persist_agent_inbound_artifact(
+                trimmed_agent_id,
+                scope,
+                &prepared.file_name,
+                &prepared.data,
+            )?
+        };
         agent_workspace::register_agent_attachment_source(
             trimmed_agent_id,
             &prepared.file_name,

@@ -93,6 +93,19 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
 
     add_column_if_missing(conn, "chat_sessions", "workspace_id", "TEXT")?;
     add_column_if_missing(conn, "chat_turns", "speaker_agent_id", "TEXT")?;
+    add_column_if_missing(conn, "workspaces", "artifacts_root", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(
+        conn,
+        "workspaces",
+        "supervisor_orchestration_prompt",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "workspaces",
+        "llm_trace_enabled",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
 
     Ok(())
 }
@@ -104,6 +117,12 @@ pub struct WorkspaceRecord {
     pub name: String,
     pub description: String,
     pub supervisor_agent_id: String,
+    /// 空 = 使用 `teams/<id>/artifacts`；否则为自定义绝对路径
+    pub artifacts_root: String,
+    /// 空 = 使用应用内置「主智能体角色」默认 Markdown；非空则整段注入团队前言（需含标题行，建议 `## 主智能体角色（MUST）`）
+    pub supervisor_orchestration_prompt: String,
+    /// 开启后，主 Agent↔Pi 以及委派子会话会写入 `teams/<id>/.debug/YYYY-MM-DD.jsonl` 供调试面板查看。
+    pub llm_trace_enabled: i32,
     pub created_at: i64,
     pub updated_at: i64,
     pub archived: i32,
@@ -182,6 +201,9 @@ pub fn update_workspace(
     id: &str,
     name: Option<&str>,
     description: Option<&str>,
+    artifacts_root: Option<&str>,
+    supervisor_orchestration_prompt: Option<&str>,
+    llm_trace_enabled: Option<bool>,
 ) -> Result<WorkspaceRecord, String> {
     let mut rec = get_workspace(conn, id)?
         .ok_or_else(|| format!("工作空间 {id} 不存在"))?;
@@ -192,10 +214,31 @@ pub fn update_workspace(
     if let Some(d) = description {
         rec.description = d.to_string();
     }
+    if let Some(ar) = artifacts_root {
+        let trimmed = ar.trim().to_string();
+        if !trimmed.is_empty() {
+            crate::workspace_fs::resolve_artifacts_root_path(id, &trimmed)?;
+        }
+        rec.artifacts_root = trimmed;
+    }
+    if let Some(p) = supervisor_orchestration_prompt {
+        rec.supervisor_orchestration_prompt = p.to_string();
+    }
+    if let Some(flag) = llm_trace_enabled {
+        rec.llm_trace_enabled = if flag { 1 } else { 0 };
+    }
     rec.updated_at = now;
     conn.execute(
-        "UPDATE workspaces SET name = ?1, description = ?2, updated_at = ?3 WHERE id = ?4",
-        params![rec.name, rec.description, now, id],
+        "UPDATE workspaces SET name = ?1, description = ?2, artifacts_root = ?3, supervisor_orchestration_prompt = ?4, llm_trace_enabled = ?5, updated_at = ?6 WHERE id = ?7",
+        params![
+            rec.name,
+            rec.description,
+            rec.artifacts_root,
+            rec.supervisor_orchestration_prompt,
+            rec.llm_trace_enabled,
+            now,
+            id
+        ],
     )
     .map_err(|e| format!("更新工作空间失败: {e}"))?;
     get_workspace(conn, id)?.ok_or_else(|| "更新后查询失败".to_string())
@@ -217,6 +260,13 @@ fn row_workspace(row: &rusqlite::Row) -> rusqlite::Result<WorkspaceRecord> {
         name: row.get("name")?,
         description: row.get("description")?,
         supervisor_agent_id: row.get("supervisor_agent_id")?,
+        artifacts_root: row.get::<_, Option<String>>("artifacts_root")?.unwrap_or_default(),
+        supervisor_orchestration_prompt: row
+            .get::<_, Option<String>>("supervisor_orchestration_prompt")?
+            .unwrap_or_default(),
+        llm_trace_enabled: row
+            .get::<_, Option<i32>>("llm_trace_enabled")?
+            .unwrap_or(0),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         archived: row.get("archived")?,
@@ -225,7 +275,7 @@ fn row_workspace(row: &rusqlite::Row) -> rusqlite::Result<WorkspaceRecord> {
 
 pub fn get_workspace(conn: &Connection, id: &str) -> Result<Option<WorkspaceRecord>, String> {
     conn.query_row(
-        "SELECT id, name, description, supervisor_agent_id, created_at, updated_at, archived FROM workspaces WHERE id = ?1",
+        "SELECT id, name, description, supervisor_agent_id, artifacts_root, supervisor_orchestration_prompt, llm_trace_enabled, created_at, updated_at, archived FROM workspaces WHERE id = ?1",
         params![id],
         row_workspace,
     )
@@ -235,9 +285,9 @@ pub fn get_workspace(conn: &Connection, id: &str) -> Result<Option<WorkspaceReco
 
 pub fn list_workspaces(conn: &Connection, include_archived: bool) -> Result<Vec<WorkspaceRecord>, String> {
     let sql = if include_archived {
-        "SELECT id, name, description, supervisor_agent_id, created_at, updated_at, archived FROM workspaces ORDER BY updated_at DESC"
+        "SELECT id, name, description, supervisor_agent_id, artifacts_root, supervisor_orchestration_prompt, llm_trace_enabled, created_at, updated_at, archived FROM workspaces ORDER BY updated_at DESC"
     } else {
-        "SELECT id, name, description, supervisor_agent_id, created_at, updated_at, archived FROM workspaces WHERE archived = 0 ORDER BY updated_at DESC"
+        "SELECT id, name, description, supervisor_agent_id, artifacts_root, supervisor_orchestration_prompt, llm_trace_enabled, created_at, updated_at, archived FROM workspaces WHERE archived = 0 ORDER BY updated_at DESC"
     };
     let mut stmt = conn.prepare(sql).map_err(|e| format!("准备查询失败: {e}"))?;
     let rows = stmt
@@ -383,6 +433,48 @@ pub fn list_workspace_resources(conn: &Connection, workspace_id: &str) -> Result
     Ok(out)
 }
 
+/// `rel_path` 形如 `docs/...`。先删文件再调 `delete_workspace_resource_row`，避免库记录已无而文件仍在。
+pub fn get_workspace_resource_rel_path(
+    conn: &Connection,
+    workspace_id: &str,
+    resource_id: &str,
+) -> Result<String, String> {
+    let wid = workspace_id.trim();
+    let rid = resource_id.trim();
+    if wid.is_empty() || rid.is_empty() {
+        return Err("缺少工作空间或资料 id".to_string());
+    }
+    conn.query_row(
+        "SELECT rel_path FROM workspace_resources WHERE workspace_id = ?1 AND id = ?2",
+        params![wid, rid],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| format!("查询资料失败: {e}"))?
+    .ok_or_else(|| "资料不存在或已删除".to_string())
+}
+
+pub fn delete_workspace_resource_row(conn: &Connection, workspace_id: &str, resource_id: &str) -> Result<(), String> {
+    let wid = workspace_id.trim();
+    let rid = resource_id.trim();
+    let n = conn
+        .execute(
+            "DELETE FROM workspace_resources WHERE workspace_id = ?1 AND id = ?2",
+            params![wid, rid],
+        )
+        .map_err(|e| format!("删除资料记录失败: {e}"))?;
+    if n == 0 {
+        return Err("资料不存在或已删除".to_string());
+    }
+    let now = now_ms();
+    conn.execute(
+        "UPDATE workspaces SET updated_at = ?1 WHERE id = ?2",
+        params![now, wid],
+    )
+    .map_err(|e| format!("更新时间戳失败: {e}"))?;
+    Ok(())
+}
+
 fn row_memory(row: &rusqlite::Row) -> rusqlite::Result<WorkspaceMemoryRecord> {
     Ok(WorkspaceMemoryRecord {
         id: row.get("id")?,
@@ -484,4 +576,28 @@ pub fn update_workspace_memory(
         row_memory,
     )
     .map_err(|e| format!("查询记忆失败: {e}"))
+}
+
+pub fn delete_workspace_memory(conn: &Connection, workspace_id: &str, memory_id: &str) -> Result<(), String> {
+    let wid = workspace_id.trim();
+    let mid = memory_id.trim();
+    if wid.is_empty() || mid.is_empty() {
+        return Err("缺少工作空间或记忆 id".to_string());
+    }
+    let n = conn
+        .execute(
+            "DELETE FROM workspace_memories WHERE workspace_id = ?1 AND id = ?2",
+            params![wid, mid],
+        )
+        .map_err(|e| format!("删除共享记忆失败: {e}"))?;
+    if n == 0 {
+        return Err("记忆不存在或已被删除".to_string());
+    }
+    let now = now_ms();
+    conn.execute(
+        "UPDATE workspaces SET updated_at = ?1 WHERE id = ?2",
+        params![now, wid],
+    )
+    .map_err(|e| format!("更新时间戳失败: {e}"))?;
+    Ok(())
 }

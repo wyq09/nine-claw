@@ -9,8 +9,11 @@ import type {
   RefObject,
   WheelEvent as ReactWheelEvent,
 } from 'react'
+import { Mic } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { AppIcon, type IconName } from '../../components/AppIcon'
+import { useToast } from '../../hooks/useToast'
+import { useComposerSpeechToText } from '../../hooks/useComposerSpeechToText'
 import { ComposerAttachmentStrip } from '../../components/ComposerAttachmentStrip'
 import { SessionContextBadge } from '../../components/SessionContextBadge'
 import type {
@@ -29,6 +32,7 @@ import {
   MAX_COMPOSER_HEIGHT,
   MIN_COMPOSER_HEIGHT,
   isFnLikeKeyboardEvent,
+  isMacOSFnStyleEnterKey,
   shouldSubmitWithShortcut,
   STARTER_CHIPS,
 } from '../lib'
@@ -171,8 +175,14 @@ export function ChatView({
   workspaceComposerNoteMode = false,
   workspaceComposerPlaceholder = null,
 }: ChatViewProps) {
+  const toast = useToast()
   /** 非受控：避免每键入一字就重渲染整页消息列表（长会话 Markdown 极重） */
   const composerTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const { listening: speechListening, toggle: toggleSpeechToText, supported: speechToTextSupported } =
+    useComposerSpeechToText({
+      textareaRef: composerTextareaRef,
+      onError: (message) => toast.error(message),
+    })
 
   const { state: sessionContextState, loading: sessionContextLoading } = useSessionContextWindow({
     sessionId: activeHistoryId,
@@ -393,11 +403,16 @@ export function ChatView({
   }
 
   const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    // Fn 硬件键由系统处理（如按住 Fn 听写）；不在此处 preventDefault/stopPropagation。
+    if (event.key === 'Fn' || event.key === 'Function' || event.code === 'Fn') {
+      return
+    }
+
     if (workspaceComposerNoteMode) {
       if (event.nativeEvent.isComposing || event.key !== 'Enter' || event.shiftKey) {
         return
       }
-      if (isFnLikeKeyboardEvent(event.nativeEvent)) {
+      if (isFnLikeKeyboardEvent(event.nativeEvent) || isMacOSFnStyleEnterKey(event.nativeEvent)) {
         return
       }
       event.preventDefault()
@@ -539,6 +554,22 @@ export function ChatView({
                 disabled={attachmentUploading || !selectedAgent}
               >
                 <AppIcon name="attachment" size={18} />
+              </button>
+              <button
+                type="button"
+                className={`ghost-icon-button composer-speech-btn${speechListening ? ' composer-speech-btn--active' : ''}`}
+                aria-label={speechListening ? '停止语音输入' : '语音输入'}
+                title={
+                  speechToTextSupported
+                    ? speechListening
+                      ? '点击停止听写'
+                      : '语音输入（网页听写，需麦克风权限）'
+                    : '当前环境不支持网页语音识别'
+                }
+                disabled={!speechToTextSupported}
+                onClick={() => toggleSpeechToText()}
+              >
+                <Mic size={18} strokeWidth={1.75} aria-hidden />
               </button>
               <button type="button" className="ghost-icon-button" aria-label="技能">
                 <AppIcon name="spark" size={18} />

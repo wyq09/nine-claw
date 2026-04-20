@@ -28,7 +28,7 @@ pub async fn send(
         params,
     };
 
-    let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(30000) as u64);
+    let timeout = std::time::Duration::from_millis(timeout_ms.unwrap_or(300000) as u64);
 
     let request = reqwest::Client::builder()
         .build()?
