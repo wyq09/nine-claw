@@ -1,8 +1,9 @@
 import type { Dispatch, MouseEvent, ReactNode, SetStateAction } from 'react'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { AppIcon } from '../../components/AppIcon'
 import { SettingsModal } from '../../components/SettingsModal'
+import { llmTraceList, onLlmTraceEvent } from '../../lib/llmTraceClient'
 import type {
   AgentInput,
   AppearanceSettings,
@@ -27,6 +28,8 @@ import {
 import { SidebarButton } from '../chat/ChatWorkspace'
 import { NewSessionDialog, SkillInstallDialog } from '../pages/SessionDialogs'
 import { AgentSkillPickerDialog } from '../agents/AgentDialogsBundle'
+import { openLlmTracePopout } from '../lib/llmTracePopout'
+import { matchesTraceScope } from '../workspaces/panels/llmTraceModel'
 import type { SessionLlmSelectOption } from './NineClawRouteOutlet'
 
 export type NineClawAppChromeProps = {
@@ -120,6 +123,10 @@ export type NineClawAppChromeProps = {
   settingsTab: SettingsTab
   settingsSkillsLibrary: SkillsViewProps
   settingsResourcesLibrary: ResourcesViewProps
+  /** 当前可调试的会话 id（含团队空间内会话，与侧栏「单独会话」过滤无关） */
+  llmTraceSessionId: string
+  /** 在团队空间聊天页时传入工作空间 id，供调试窗口按作用域拉取 */
+  llmTraceWorkspaceId: string | null
 }
 
 export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
@@ -200,7 +207,11 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
     settingsTab,
     settingsSkillsLibrary,
     settingsResourcesLibrary,
+    llmTraceSessionId: llmTraceSessionIdProp,
+    llmTraceWorkspaceId,
   } = props
+  const [standaloneTraceCount, setStandaloneTraceCount] = useState(0)
+  const traceSessionId = llmTraceSessionIdProp.trim()
 
   useEffect(() => {
     const root = document.documentElement
@@ -212,6 +223,55 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
       root.classList.remove('platform-macos')
     }
   }, [])
+
+  useEffect(() => {
+    if (!traceSessionId) {
+      return
+    }
+
+    let mounted = true
+    let unsubscribe: (() => void) | null = null
+    void llmTraceList({
+      workspaceId: llmTraceWorkspaceId,
+      sessionId: traceSessionId,
+      days: 3,
+      limit: 200,
+    })
+      .then((list) => {
+        if (mounted) {
+          setStandaloneTraceCount(list.length)
+        }
+      })
+      .catch(() => {
+        if (mounted) {
+          setStandaloneTraceCount(0)
+        }
+      })
+
+    void onLlmTraceEvent((payload) => {
+      if (!matchesTraceScope(payload.entry, { workspaceId: llmTraceWorkspaceId, sessionId: traceSessionId })) {
+        return
+      }
+      void llmTraceList({ workspaceId: llmTraceWorkspaceId, sessionId: traceSessionId, days: 3, limit: 200 })
+        .then((list) => {
+          if (mounted) {
+            setStandaloneTraceCount(list.length)
+          }
+        })
+        .catch(() => {
+          if (mounted) {
+            setStandaloneTraceCount(0)
+          }
+        })
+    }).then((unlisten) => {
+      unsubscribe = unlisten
+    })
+
+    return () => {
+      mounted = false
+      unsubscribe?.()
+    }
+  }, [llmTraceWorkspaceId, traceSessionId])
 
   const handleTitlebarSidebarToggle = () => {
     if (shouldHideSidebar) {
@@ -290,6 +350,18 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
             {/* Tauri drag.js 只看 event.target，不向上找；此处必须自带属性，否则点中间空白不触发拖动 */}
             <div className="app-window-titlebar-drag-spacer" data-tauri-drag-region aria-hidden="true" />
             <div className="app-window-titlebar-end" data-tauri-drag-region="false" data-titlebar-no-drag="true">
+              {traceSessionId ? (
+                <button
+                  type="button"
+                  className="titlebar-trace-button"
+                  data-titlebar-no-drag="true"
+                  onClick={() => void openLlmTracePopout(llmTraceWorkspaceId, traceSessionId)}
+                  title="在独立窗口查看当前会话的 LLM 调用链"
+                >
+                  <AppIcon name="wrench" size={13} />
+                  <span>{standaloneTraceCount}</span>
+                </button>
+              ) : null}
               <div className="titlebar-model-wrap" title={chatProviderLabel} data-titlebar-no-drag="true">
                 <label className="titlebar-model-field" data-titlebar-no-drag="true">
                   <select
@@ -427,7 +499,9 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
           </div>
         </aside>
 
-        <section className="content-panel">{routeOutlet}</section>
+        <section className="content-panel">
+          {routeOutlet}
+        </section>
       </main>
 
       {skillInstallDialogOpen ? (

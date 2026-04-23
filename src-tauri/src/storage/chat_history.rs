@@ -177,7 +177,10 @@ fn row_to_chat_turn(row: &rusqlite::Row) -> rusqlite::Result<ChatTurn> {
 }
 
 /// Create a new chat session.
-pub fn create_chat_session(conn: &Connection, input: &CreateChatSessionInput) -> Result<ChatSession, String> {
+pub fn create_chat_session(
+    conn: &Connection,
+    input: &CreateChatSessionInput,
+) -> Result<ChatSession, String> {
     let now = now_ms();
     conn.execute(
         "INSERT INTO chat_sessions (id, title, status, created_at, updated_at, agent_id, agent_snapshot_json, bot_target_json, session_llm_provider_id, session_llm_model, workspace_id)
@@ -234,7 +237,10 @@ pub fn get_chat_session(conn: &Connection, id: &str) -> Result<Option<ChatSessio
 }
 
 /// Append a new turn to a session. Also bumps the session's updated_at.
-pub fn append_chat_turn(conn: &Connection, input: &AppendChatTurnInput) -> Result<ChatTurn, String> {
+pub fn append_chat_turn(
+    conn: &Connection,
+    input: &AppendChatTurnInput,
+) -> Result<ChatTurn, String> {
     let now = now_ms();
     conn.execute(
         "INSERT INTO chat_turns (id, session_id, turn_index, prompt, answer, thinking, status, created_at, completed_at, usage_json, response_segments_json, tool_calls_json, activity_json, speaker_agent_id)
@@ -302,15 +308,22 @@ pub fn list_chat_turns(conn: &Connection, session_id: &str) -> Result<Vec<ChatTu
 }
 
 /// Update an existing turn's mutable fields.
-pub fn update_chat_turn(conn: &Connection, input: &UpdateChatTurnInput) -> Result<ChatTurn, String> {
-    let existing = get_chat_turn(conn, &input.id)?
-        .ok_or_else(|| format!("轮次 {} 不存在", input.id))?;
+pub fn update_chat_turn(
+    conn: &Connection,
+    input: &UpdateChatTurnInput,
+) -> Result<ChatTurn, String> {
+    let existing =
+        get_chat_turn(conn, &input.id)?.ok_or_else(|| format!("轮次 {} 不存在", input.id))?;
 
     let answer = input.answer.as_ref().unwrap_or(&existing.answer);
     let thinking = input.thinking.as_ref().unwrap_or(&existing.thinking);
     let status = input.status.as_ref().unwrap_or(&existing.status);
     let completed_at = input.completed_at.or(existing.completed_at);
-    let usage_json = input.usage_json.as_ref().or(existing.usage_json.as_ref()).cloned();
+    let usage_json = input
+        .usage_json
+        .as_ref()
+        .or(existing.usage_json.as_ref())
+        .cloned();
     let response_segments_json = input
         .response_segments_json
         .as_ref()

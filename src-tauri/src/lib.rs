@@ -1,33 +1,43 @@
+mod agent_capabilities;
 mod agent_task_schedule;
 mod agent_tasks;
 mod agent_workspace;
 mod agents;
-mod llm_trace;
-mod team_workspace;
-mod workspace_fs;
 mod channels;
 mod chat_attachments;
 mod dev_trace;
 mod heartbeat;
+mod llm_log_export;
+mod llm_trace;
+mod managed_runtime;
+mod managed_runtime_extension;
 mod media_directives;
 mod peer_gateway;
 mod pi_runtime;
 mod pi_timeouts;
 mod prompt_attachments;
+mod proxy_settings;
 mod scheduler;
 mod skills;
 mod storage;
+mod team_supervisor;
+mod team_workspace;
+mod workspace_fs;
+mod workspace_memory_extraction;
 
-mod app_constants;
 mod agent_package;
+mod app_constants;
 mod commands_agents_skills;
 mod commands_chat_workspace;
+mod commands_llm_log_export;
+mod commands_llm_trace;
 mod history_app_state;
 mod pi_usage;
 mod prompts;
-mod provider_stream_noise;
 mod provider_runtime;
+mod provider_stream_noise;
 mod session_llm_titles;
+mod skill_broker;
 mod time_util;
 
 pub(crate) use app_constants::*;
@@ -42,16 +52,21 @@ pub(crate) use pi_usage::{
 };
 pub(crate) use provider_runtime::{
     anthropic_messages_url, load_provider_preferences, normalize_anthropic_base_url,
-    normalize_provider_api_format, normalize_provider_base_url, normalized_provider_runtime_base_url,
-    openai_pi_compat_supports_reasoning_effort, pi_runtime_dir, ProviderRuntimeConfig,
-    resolve_im_llm_runtime, save_provider_preferences,
+    normalize_provider_api_format, normalize_provider_base_url,
+    normalized_provider_runtime_base_url, openai_pi_compat_supports_reasoning_effort,
+    pi_runtime_dir, resolve_im_llm_runtime, save_provider_preferences, ProviderRuntimeConfig,
 };
+pub(crate) use proxy_settings::build_http_client;
 pub(crate) use session_llm_titles::refine_agent_task_metadata;
 pub(crate) use time_util::chrono_like_timestamp;
 
 use commands_agents_skills::*;
 use commands_chat_workspace::*;
-use history_app_state::{clear_history_state, list_token_usage_records, load_history_state, save_history_state};
+use commands_llm_log_export::*;
+use commands_llm_trace::*;
+use history_app_state::{
+    clear_history_state, list_token_usage_records, load_history_state, save_history_state,
+};
 use session_llm_titles::generate_session_conversation_title;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as _};
@@ -62,7 +77,6 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,32 +84,6 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-/// Build a reqwest client that auto-detects proxy availability.
-/// If proxy env vars are set and the proxy port is reachable, use proxy.
-/// Otherwise, skip proxy to avoid connecting to a dead port.
-fn build_http_client() -> reqwest::Client {
-    let proxy_available = std::env::var("http_proxy")
-        .or_else(|_| std::env::var("https_proxy"))
-        .or_else(|_| std::env::var("all_proxy"))
-        .ok()
-        .and_then(|proxy_url| {
-            // Extract host:port from proxy URL like "http://127.0.0.1:7890" or "socks5://127.0.0.1:7890"
-            let stripped = proxy_url
-                .trim_start_matches("http://")
-                .trim_start_matches("https://")
-                .trim_start_matches("socks5://")
-                .trim_start_matches("socks5h://");
-            TcpStream::connect_timeout(&stripped.parse().ok()?, Duration::from_millis(500)).ok()
-        })
-        .is_some();
-
-    let mut builder = reqwest::Client::builder();
-    if !proxy_available {
-        builder = builder.no_proxy();
-    }
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
-}
 use tauri::{AppHandle, Emitter, Manager, PhysicalSize, Size};
 
 use agents::ConversationAgentConfig;
@@ -381,6 +369,9 @@ struct PiStreamPayload {
     result_text: Option<String>,
     is_error: Option<bool>,
     reason: Option<String>,
+    strategy: Option<String>,
+    mounted_skill_ids: Option<Vec<String>>,
+    reasons: Option<Vec<String>>,
     #[serde(flatten)]
     usage: Option<PiTokenUsagePayload>,
     #[serde(flatten)]
@@ -400,9 +391,10 @@ struct MultimodalSummaryEntry {
 }
 
 const CHILD_KILL_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
+const DESKTOP_ABORT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// stdout 已关闭后等待 pi 进程自行退出的最长时间，超时后会 SIGKILL。
-/// 默认 30 秒；可通过环境变量 `NINECLAW_DESKTOP_PI_AFTER_STDOUT_EOF_WAIT_SECS` 覆盖（整数秒，范围 5～600）。
+/// 默认 600 秒；可通过环境变量 `NINECLAW_DESKTOP_PI_AFTER_STDOUT_EOF_WAIT_SECS` 覆盖（整数秒，范围 5～600）。
 fn desktop_pi_after_stdout_eof_exit_wait() -> Duration {
     const DEFAULT_SECS: u64 = 600;
     const MIN_SECS: u64 = 5;
@@ -413,6 +405,18 @@ fn desktop_pi_after_stdout_eof_exit_wait() -> Duration {
         .unwrap_or(DEFAULT_SECS)
         .clamp(MIN_SECS, MAX_SECS);
     Duration::from_secs(secs)
+}
+
+fn cleanup_aborted_desktop_child(
+    child: &mut Child,
+    stdin: &Arc<Mutex<Option<ChildStdin>>>,
+    session_id: &str,
+    reason: &str,
+) {
+    close_pi_stdin(stdin);
+    kill_child_with_trace(child, Some(session_id), reason);
+    let _ =
+        wait_for_child_exit_with_trace(child, DESKTOP_ABORT_WAIT_TIMEOUT, Some(session_id), reason);
 }
 
 fn spawn_pi_stdout_logger<R>(
@@ -453,7 +457,10 @@ struct DesktopParsedMediaItem {
     file_path: String,
 }
 
-fn desktop_media_reply_prompt(agent_home: Option<&Path>, team_artifacts_root: Option<&Path>) -> String {
+fn desktop_media_reply_prompt(
+    agent_home: Option<&Path>,
+    team_artifacts_root: Option<&Path>,
+) -> String {
     prompts::desktop_media_reply_prompt(agent_home, team_artifacts_root)
 }
 
@@ -713,7 +720,10 @@ struct SessionContextStats {
 fn parse_context_stats_from_rpc_response(value: &serde_json::Value) -> Option<SessionContextStats> {
     let cu = value.get("contextUsage")?;
     let used_tokens = cu.get("usedTokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let raw_cw = cu.get("contextWindow").and_then(|v| v.as_u64()).unwrap_or(0);
+    let raw_cw = cu
+        .get("contextWindow")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let context_window = if raw_cw > 0 { Some(raw_cw) } else { None };
     let input_tokens = cu.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
     let output_tokens = cu.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -810,7 +820,8 @@ fn session_context_stats_from_history(
             continue;
         }
 
-        let merged = aggregate_token_usage_from_history_turns(obj.get("turns").and_then(|v| v.as_array()));
+        let merged =
+            aggregate_token_usage_from_history_turns(obj.get("turns").and_then(|v| v.as_array()));
 
         let model = json_string(obj.get("sessionLlmModel")).or_else(|| {
             obj.get("agent")
@@ -2581,11 +2592,43 @@ fn emit_stream_event_with_meta(
             result_text,
             is_error,
             reason,
+            strategy: None,
+            mounted_skill_ids: None,
+            reasons: None,
             usage,
             usage_meta,
         },
     )
     .map_err(|emit_error| format!("发送事件失败: {emit_error}"))
+}
+
+fn emit_pi_stream_skill_selection_event(
+    app: &tauri::AppHandle,
+    session_id: Option<String>,
+    decision: &crate::skill_broker::SkillBrokerDecision,
+) -> Result<(), String> {
+    app.emit(
+        "pi://stream",
+        PiStreamPayload {
+            event: "skill_selection".to_string(),
+            session_id,
+            text: None,
+            error: None,
+            aborted_by: None,
+            tool_call_id: None,
+            tool_name: None,
+            args_text: None,
+            result_text: None,
+            is_error: None,
+            reason: None,
+            strategy: Some(decision.strategy.clone()),
+            mounted_skill_ids: Some(decision.mounted_skill_ids.clone()),
+            reasons: Some(decision.reasons.clone()),
+            usage: None,
+            usage_meta: None,
+        },
+    )
+    .map_err(|emit_error| format!("发送能力装配事件失败: {emit_error}"))
 }
 
 fn extract_text_content(value: Option<&serde_json::Value>) -> Option<String> {
@@ -2851,7 +2894,10 @@ async fn persist_chat_attachments(
     attachments: Vec<ChatAttachmentUpload>,
 ) -> Result<Vec<PersistedChatAttachment>, String> {
     let team_artifacts_root: Option<std::path::PathBuf> = {
-        let wid = workspace_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let wid = workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         if let Some(wid) = wid {
             Some(team_workspace::resolve_workspace_artifacts_root(&app, wid)?)
         } else {
@@ -2969,9 +3015,6 @@ async fn stream_pi_prompt(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "default".to_string());
     let summary_key = session_summary_key(&normalized_session_id);
-    let prompt_with_summary = prepend_multimodal_summary_context(&trimmed_prompt, &summary_key)?;
-    let prepared_input =
-        prompt_attachments::prepare_prompt_input(&prompt_with_summary, &attachments)?;
 
     let workspace_id_for_stream = workspace_id
         .as_deref()
@@ -3007,9 +3050,51 @@ async fn stream_pi_prompt(
     let team_artifacts_root_for_media: Option<std::path::PathBuf> = workspace_id_for_stream
         .as_deref()
         .and_then(|wid| team_workspace::resolve_workspace_artifacts_root(&app, wid).ok());
+    let desktop_agent_home_for_runtime = agent_config.as_ref().and_then(|config| {
+        agent_workspace::resolve_workspace_root()
+            .ok()
+            .map(|root| root.join("agents").join(&config.id))
+    });
+    let desktop_harness_for_retry = match (
+        desktop_agent_home_for_runtime.as_ref(),
+        agent_config.as_ref(),
+    ) {
+        (Some(agent_home), Some(config)) => managed_runtime::select_harness(
+            agent_home,
+            &config.execution_mode,
+            Some(trimmed_prompt.as_str()),
+        )
+        .ok(),
+        _ => None,
+    };
+    managed_runtime::append_session_event_quiet(
+        desktop_agent_home_for_runtime.as_deref(),
+        &normalized_session_id,
+        managed_runtime::SessionEventKind::Prompt,
+        trimmed_prompt.clone(),
+        None,
+    );
 
-    tauri::async_runtime::spawn_blocking(move || {
-        let session_stream_mutex = desktop_session_stream_mutex(&normalized_session_id);
+    let mut attempt_prompt = trimmed_prompt.clone();
+    for attempt in 0..=1 {
+        let app = app.clone();
+        let session_id_for_attempt = normalized_session_id.clone();
+        let normalized_session_id = session_id_for_attempt.clone();
+        let runtime_session_id = session_id_for_attempt.clone();
+        let provider_config = provider_config.clone();
+        let agent_config = agent_config.clone();
+        let attachments = attachments.clone();
+        let workspace_id_for_stream = workspace_id_for_stream.clone();
+        let team_artifacts_root_for_media = team_artifacts_root_for_media.clone();
+        let summary_key = summary_key.clone();
+        let trimmed_prompt = attempt_prompt.clone();
+        let prepared_input = prompt_attachments::prepare_prompt_input(
+            &prepend_multimodal_summary_context(&trimmed_prompt, &summary_key)?,
+            &attachments,
+        )?;
+
+        let attempt_result = tauri::async_runtime::spawn_blocking(move || {
+        let session_stream_mutex = desktop_session_stream_mutex(&runtime_session_id);
         let _session_stream_guard = session_stream_mutex.try_lock().map_err(|_| {
             "该会话已有进行中的生成，请等待完成或先中止后再发。".to_string()
         })?;
@@ -3017,7 +3102,7 @@ async fn stream_pi_prompt(
         emit_stream_event(
             &app,
             "start",
-            Some(normalized_session_id.clone()),
+            Some(runtime_session_id.clone()),
             None,
             None,
             None,
@@ -3056,25 +3141,56 @@ async fn stream_pi_prompt(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        let mut managed_runtime_prepared: Option<managed_runtime::PreparedManagedRuntime> = None;
         if let Some(provider_config) = provider_config.as_ref() {
             validate_desktop_provider_config(provider_config)?;
-            let runtime_dir = prepare_pi_runtime_dir(provider_config)?;
+            let runtime_dir = pi_runtime_dir();
+            fs::create_dir_all(&runtime_dir)
+                .map_err(|error| format!("创建 pi 运行目录失败: {error}"))?;
+            let auth_path = runtime_dir.join("auth.json");
+            fs::write(&auth_path, "{}")
+                .map_err(|error| format!("写入 pi auth 配置失败: {error}"))?;
+
+            if let Some(agent_config) = agent_config.as_ref() {
+                managed_runtime_prepared = Some(managed_runtime::prepare_managed_runtime(
+                    &pi_location.executable,
+                    &runtime_dir,
+                    agent_config,
+                    Some(trimmed_prompt.as_str()),
+                    &normalized_session_id,
+                    Some(provider_config),
+                )?);
+            }
+
+            let runtime_provider_config = provider_config.clone();
+
+            let models_path = runtime_dir.join("models.json");
+            if let Some(models_config) = build_provider_models_config(&runtime_provider_config) {
+                let content = serde_json::to_vec_pretty(&models_config)
+                    .map_err(|error| format!("序列化 provider 配置失败: {error}"))?;
+                fs::write(&models_path, content)
+                    .map_err(|error| format!("写入 provider models 配置失败: {error}"))?;
+            } else if models_path.exists() {
+                fs::remove_file(&models_path)
+                    .map_err(|error| format!("清理 provider models 配置失败: {error}"))?;
+            }
+
             command.env("PI_CODING_AGENT_DIR", &runtime_dir);
 
             if normalize_provider_api_format(
-                &provider_config.api_format,
-                provider_config.provider_id.trim(),
+                &runtime_provider_config.api_format,
+                runtime_provider_config.provider_id.trim(),
             ) == "anthropic"
             {
                 scrub_anthropic_process_env(&mut command);
             }
 
-            let compat_extension = if should_use_desktop_anthropic_compat_extension(provider_config)
+            let compat_extension = if should_use_desktop_anthropic_compat_extension(&runtime_provider_config)
             {
                 Some(prepare_desktop_anthropic_compat_extension(
                     &runtime_dir,
                     &pi_location.executable,
-                    provider_config,
+                    &runtime_provider_config,
                 )?)
             } else {
                 None
@@ -3082,7 +3198,7 @@ async fn stream_pi_prompt(
 
             if let Some(compat_extension) = compat_extension.as_ref() {
                 command
-                    .env(&compat_extension.api_key_env, provider_config.api_key.trim())
+                    .env(&compat_extension.api_key_env, runtime_provider_config.api_key.trim())
                     .args([
                         "--extension",
                         compat_extension.path.to_string_lossy().as_ref(),
@@ -3092,27 +3208,48 @@ async fn stream_pi_prompt(
                     format!(
                         "启用 Anthropic 兼容扩展: session={} provider={} compat_provider={} extension={}",
                         normalized_session_id,
-                        provider_config.provider_id.trim(),
+                        runtime_provider_config.provider_id.trim(),
                         compat_extension.provider_id,
                         compat_extension.path.display(),
                     ),
                 );
             }
 
+            if let Some(prepared) = managed_runtime_prepared.as_ref() {
+                command
+                    .args([
+                        "--extension",
+                        prepared.extension_path.to_string_lossy().as_ref(),
+                    ])
+                    .env(
+                        "NINECLAW_HARNESS_FILE",
+                        prepared.harness.file_path.to_string_lossy().as_ref(),
+                    )
+                    .env(
+                        "NINECLAW_PROXY_BASE_URL",
+                        prepared.proxy_base_url.as_deref().unwrap_or_default(),
+                    )
+                    .env(
+                        "NINECLAW_PROXY_SESSION_TOKEN",
+                        prepared.session_token.as_deref().unwrap_or_default(),
+                    )
+                    .env("NINECLAW_SESSION_ID", normalized_session_id.as_str());
+            }
+
             let runtime_provider_id = compat_extension
                 .as_ref()
                 .map(|item| item.provider_id.clone())
-                .unwrap_or_else(|| runtime_provider_id(provider_config.provider_id.trim()));
+                .unwrap_or_else(|| runtime_provider_id(runtime_provider_config.provider_id.trim()));
             if !runtime_provider_id.is_empty() {
                 command.args(["--provider", &runtime_provider_id]);
             }
 
-            if !provider_config.model.trim().is_empty() {
-                command.args(["--model", provider_config.model.trim()]);
+            if !runtime_provider_config.model.trim().is_empty() {
+                command.args(["--model", runtime_provider_config.model.trim()]);
             }
 
-            if !provider_config.api_key.trim().is_empty() {
-                command.args(["--api-key", provider_config.api_key.trim()]);
+            if !runtime_provider_config.api_key.trim().is_empty() {
+                command.args(["--api-key", runtime_provider_config.api_key.trim()]);
             }
         } else {
             dev_trace(
@@ -3128,6 +3265,7 @@ async fn stream_pi_prompt(
         let mut system_prompt_sections: Vec<(String, String)> = Vec::new();
         let mut skill_count = 0usize;
         let mut skill_paths: Vec<PathBuf> = Vec::new();
+        let mut selected_skill_ids: Vec<String> = Vec::new();
         let mut desktop_agent_home: Option<PathBuf> = None;
         if let Some(agent_config) = agent_config.as_ref() {
             if let Ok(workspace_root) = agent_workspace::resolve_workspace_root() {
@@ -3199,7 +3337,21 @@ async fn stream_pi_prompt(
                 }
             }
 
-            for skill_path in skills::resolve_skill_directories(&agent_config.skill_ids)? {
+            let skill_decision =
+                crate::skill_broker::select_skills_for_turn(agent_config, trimmed_prompt.as_str(), &[])?;
+            selected_skill_ids = skill_decision.mounted_skill_ids.clone();
+            let _ = emit_pi_stream_skill_selection_event(
+                &app,
+                Some(normalized_session_id.clone()),
+                &skill_decision,
+            );
+            if let Some(skill_prompt) = crate::skill_broker::runtime_skill_prompt(&skill_decision) {
+                system_prompt_chars += skill_prompt.chars().count();
+                system_prompt_sections.push(("runtime_skills".to_string(), skill_prompt.clone()));
+                command.args(["--append-system-prompt", &skill_prompt]);
+            }
+
+            for skill_path in skills::resolve_skill_directories(&selected_skill_ids)? {
                 skill_count += 1;
                 skill_paths.push(skill_path.clone());
                 let skill_path = skill_path.to_string_lossy().to_string();
@@ -3221,7 +3373,7 @@ async fn stream_pi_prompt(
         dev_trace(
             "desktop.stream",
             format!(
-                "准备启动 pi: session={} prompt_chars={} system_prompt_chars={} skill_count={} provider={} model={} agent={} pi_path={} images={} fresh_multimodal_session={} runtime_session={}",
+                "准备启动 pi: session={} prompt_chars={} system_prompt_chars={} skill_count={} provider={} model={} agent={} selected_skills={} pi_path={} images={} fresh_multimodal_session={} runtime_session={}",
                 normalized_session_id,
                 prepared_input.message.chars().count(),
                 system_prompt_chars,
@@ -3238,6 +3390,11 @@ async fn stream_pi_prompt(
                     .as_ref()
                     .map(|item| item.id.as_str())
                     .unwrap_or("(none)"),
+                if selected_skill_ids.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    selected_skill_ids.join(",")
+                },
                 resolved_pi_path,
                 prepared_input.images.len(),
                 fresh_multimodal_session,
@@ -3266,16 +3423,20 @@ async fn stream_pi_prompt(
             );
         }
 
-        // 调试模式：团队空间开启 `llm_trace_enabled` 时，给本次 Pi 调用开一条 trace。
-        // 系统提示词、用户输入、响应、用量最终会写入 `teams/<id>/.debug/YYYY-MM-DD.jsonl`。
+        // 调试模式：团队空间遵循 `llm_trace_enabled`；单独 session 则默认记录结构化 trace。
+        // 系统提示词、用户输入、响应、用量最终会写入 scope 对应的 `.debug/YYYY-MM-DD.jsonl`。
         let mut pi_trace_guard: Option<llm_trace::TraceGuard> = None;
-        if let (Some(wid), Some(cfg)) = (workspace_id_for_stream.as_deref(), agent_config.as_ref()) {
-            let trace_enabled = storage_conn(&app)
-                .and_then(|c| storage::workspaces::get_workspace(&c, wid))
-                .ok()
-                .flatten()
-                .map(|w| w.llm_trace_enabled != 0)
-                .unwrap_or(false);
+        if let Some(cfg) = agent_config.as_ref() {
+            let trace_enabled = if let Some(wid) = workspace_id_for_stream.as_deref() {
+                storage_conn(&app)
+                    .and_then(|c| storage::workspaces::get_workspace(&c, wid))
+                    .ok()
+                    .flatten()
+                    .map(|w| w.llm_trace_enabled != 0)
+                    .unwrap_or(false)
+            } else {
+                true
+            };
             if trace_enabled {
                 let sections: Vec<llm_trace::TraceSystemPromptSection> = system_prompt_sections
                     .iter()
@@ -3286,7 +3447,7 @@ async fn stream_pi_prompt(
                     .collect();
                 let trace_id = llm_trace::begin(
                     &app,
-                    wid,
+                    workspace_id_for_stream.as_deref(),
                     "main_pi",
                     cfg.id.trim(),
                     cfg.name.trim(),
@@ -3474,6 +3635,12 @@ async fn stream_pi_prompt(
                 Ok(Err(error)) => {
                     remove_runtime_handle(&normalized_session_id)?;
                     if abort_requested.load(Ordering::SeqCst) {
+                        cleanup_aborted_desktop_child(
+                            &mut child,
+                            &stdin,
+                            &normalized_session_id,
+                            "stream_pi_prompt:stdout_read_error_after_abort",
+                        );
                         emit_stream_event(
                             &app,
                             "aborted",
@@ -3545,6 +3712,12 @@ async fn stream_pi_prompt(
                 Err(error) => {
                     remove_runtime_handle(&normalized_session_id)?;
                     if abort_requested.load(Ordering::SeqCst) {
+                        cleanup_aborted_desktop_child(
+                            &mut child,
+                            &stdin,
+                            &normalized_session_id,
+                            "stream_pi_prompt:json_parse_error_after_abort",
+                        );
                         emit_stream_event(
                             &app,
                             "aborted",
@@ -3627,6 +3800,9 @@ async fn stream_pi_prompt(
                     if !delta_text.is_empty() {
                         _saw_assistant_activity = true;
                         emitted_assistant_text.push_str(&delta_text);
+                        if let Some(tid) = pi_trace_guard.as_ref().and_then(|g| g.id()) {
+                            llm_trace::append_response(&app, tid, &delta_text);
+                        }
                         emit_stream_event(
                             &app,
                             "delta",
@@ -3671,6 +3847,9 @@ async fn stream_pi_prompt(
                         .to_string();
 
                     if !thinking_text.is_empty() {
+                        if let Some(tid) = pi_trace_guard.as_ref().and_then(|g| g.id()) {
+                            llm_trace::append_thinking(&app, tid, &thinking_text);
+                        }
                         emit_stream_event(
                             &app,
                             "thinking_delta",
@@ -3717,6 +3896,9 @@ async fn stream_pi_prompt(
                             assistant_text_fragment_to_append(&emitted_assistant_text, &snapshot);
                         if !missing_text.is_empty() {
                             emitted_assistant_text.push_str(&missing_text);
+                            if let Some(tid) = pi_trace_guard.as_ref().and_then(|g| g.id()) {
+                                llm_trace::append_response(&app, tid, &missing_text);
+                            }
                             emit_stream_event(
                                 &app,
                                 "delta",
@@ -3774,6 +3956,9 @@ async fn stream_pi_prompt(
                             assistant_text_fragment_to_append(&emitted_assistant_text, &snapshot);
                         if !missing_text.is_empty() {
                             emitted_assistant_text.push_str(&missing_text);
+                            if let Some(tid) = pi_trace_guard.as_ref().and_then(|g| g.id()) {
+                                llm_trace::append_response(&app, tid, &missing_text);
+                            }
                             emit_stream_event(
                                 &app,
                                 "delta",
@@ -3836,6 +4021,22 @@ async fn stream_pi_prompt(
                         None,
                     );
                 }
+
+                managed_runtime::append_session_event_quiet(
+                    desktop_agent_home.as_deref(),
+                    &normalized_session_id,
+                    managed_runtime::SessionEventKind::ToolCall,
+                    format!(
+                        "{} {}",
+                        tool_name.as_deref().unwrap_or("unknown_tool"),
+                        args_text.as_deref().unwrap_or("")
+                    ),
+                    Some(serde_json::json!({
+                        "toolCallId": tool_call_id,
+                        "toolName": tool_name,
+                        "args": args_text,
+                    })),
+                );
 
                 emit_stream_event(
                     &app,
@@ -3910,6 +4111,24 @@ async fn stream_pi_prompt(
                     );
                 }
 
+                managed_runtime::append_session_event_quiet(
+                    desktop_agent_home.as_deref(),
+                    &normalized_session_id,
+                    managed_runtime::SessionEventKind::ToolResult,
+                    format!(
+                        "{} {}",
+                        tool_name.as_deref().unwrap_or("unknown_tool"),
+                        result_text.as_deref().unwrap_or("")
+                    ),
+                    Some(serde_json::json!({
+                        "toolCallId": tool_call_id,
+                        "toolName": tool_name,
+                        "args": args_text,
+                        "result": result_text,
+                        "isError": is_error,
+                    })),
+                );
+
                 emit_stream_event(
                     &app,
                     "tool_execution_end",
@@ -3940,6 +4159,9 @@ async fn stream_pi_prompt(
                                 assistant_text_fragment_to_append(&emitted_assistant_text, &snapshot);
                             if !missing_text.is_empty() {
                                 emitted_assistant_text.push_str(&missing_text);
+                                if let Some(tid) = pi_trace_guard.as_ref().and_then(|g| g.id()) {
+                                    llm_trace::append_response(&app, tid, &missing_text);
+                                }
                                 emit_stream_event(
                                     &app,
                                     "delta",
@@ -4061,6 +4283,22 @@ async fn stream_pi_prompt(
                     }
                 }
             }
+            if let Some(wid) = workspace_id_for_stream.as_deref() {
+                workspace_memory_extraction::spawn_workspace_memory_extraction(
+                    &app,
+                    wid,
+                    &normalized_session_id,
+                    &trimmed_prompt,
+                    &emitted_assistant_text,
+                    agent_config.as_ref().map(|config| config.id.as_str()),
+                    agent_config.as_ref().map(|config| config.name.as_str()),
+                );
+            }
+            managed_runtime::append_assistant_output_events(
+                desktop_agent_home.as_deref(),
+                &normalized_session_id,
+                &emitted_assistant_text,
+            );
 
             if !done_emitted {
                 emit_stream_event_with_meta(
@@ -4111,11 +4349,35 @@ async fn stream_pi_prompt(
             return Ok(());
         }
 
+        let aborting_now = abort_requested.load(Ordering::SeqCst) || saw_model_abort_event;
+        let exit_wait_reason = if abort_requested.load(Ordering::SeqCst) {
+            close_pi_stdin(&stdin);
+            kill_child_with_trace(
+                &mut child,
+                Some(&normalized_session_id),
+                "stream_pi_prompt:user_abort_fast_cleanup",
+            );
+            "stream_pi_prompt:user_abort_fast_cleanup"
+        } else if saw_model_abort_event {
+            close_pi_stdin(&stdin);
+            kill_child_with_trace(
+                &mut child,
+                Some(&normalized_session_id),
+                "stream_pi_prompt:model_abort_fast_cleanup",
+            );
+            "stream_pi_prompt:model_abort_fast_cleanup"
+        } else {
+            "stream_pi_prompt:post_stdout_eof_wait_exit"
+        };
         let exit_outcome = wait_for_child_exit_with_trace(
             &mut child,
-            desktop_pi_after_stdout_eof_exit_wait(),
+            if aborting_now {
+                DESKTOP_ABORT_WAIT_TIMEOUT
+            } else {
+                desktop_pi_after_stdout_eof_exit_wait()
+            },
             Some(&normalized_session_id),
-            "stream_pi_prompt:post_stdout_eof_wait_exit",
+            exit_wait_reason,
         )?;
         let status = exit_outcome.status;
 
@@ -4244,6 +4506,26 @@ async fn stream_pi_prompt(
                     eprintln!("NineClaw: 写入桌面聊天记忆失败: {error}");
                 }
             }
+        }
+        if saw_terminal_completion {
+            if let Some(wid) = workspace_id_for_stream.as_deref() {
+                workspace_memory_extraction::spawn_workspace_memory_extraction(
+                    &app,
+                    wid,
+                    &normalized_session_id,
+                    &trimmed_prompt,
+                    &emitted_assistant_text,
+                    agent_config.as_ref().map(|config| config.id.as_str()),
+                    agent_config.as_ref().map(|config| config.name.as_str()),
+                );
+            }
+        }
+        if saw_terminal_completion {
+            managed_runtime::append_assistant_output_events(
+                desktop_agent_home.as_deref(),
+                &normalized_session_id,
+                &emitted_assistant_text,
+            );
         }
 
         if fresh_multimodal_session && saw_terminal_completion {
@@ -4415,8 +4697,40 @@ async fn stream_pi_prompt(
         );
         Ok(())
     })
-    .await
-    .map_err(|error| format!("执行任务失败: {error}"))?
+        .await
+        .map_err(|error| format!("执行任务失败: {error}"))?;
+
+        match attempt_result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                managed_runtime::append_session_event_quiet(
+                    desktop_agent_home_for_runtime.as_deref(),
+                    &session_id_for_attempt,
+                    managed_runtime::SessionEventKind::RuntimeError,
+                    error.clone(),
+                    Some(serde_json::json!({ "attempt": attempt + 1 })),
+                );
+                if managed_runtime::should_auto_retry_runtime(
+                    desktop_harness_for_retry.as_ref(),
+                    attempt,
+                    &error,
+                ) {
+                    managed_runtime::append_session_event_quiet(
+                        desktop_agent_home_for_runtime.as_deref(),
+                        &session_id_for_attempt,
+                        managed_runtime::SessionEventKind::RuntimeRetry,
+                        format!("runtime failure on attempt {}, retrying once", attempt + 1),
+                        Some(serde_json::json!({ "attempt": attempt + 1, "error": error })),
+                    );
+                    attempt_prompt = managed_runtime::build_retry_prompt(&prompt);
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    Err("pi 自动重试后仍未完成".to_string())
 }
 
 // ── Bot Channel Commands ──
@@ -4638,6 +4952,28 @@ fn get_peer_gateway_info(app: AppHandle) -> peer_gateway::PeerGatewayInfo {
 #[tauri::command]
 fn load_peer_gateway_settings(app: AppHandle) -> Result<peer_gateway::PeerGatewaySettings, String> {
     peer_gateway::load_peer_gateway_settings(&app)
+}
+
+#[tauri::command]
+fn load_network_proxy_settings(
+    app: AppHandle,
+) -> Result<proxy_settings::NetworkProxySettings, String> {
+    proxy_settings::load_proxy_settings(&app)
+}
+
+#[tauri::command]
+fn save_network_proxy_settings(
+    app: AppHandle,
+    settings: proxy_settings::NetworkProxySettings,
+) -> Result<proxy_settings::NetworkProxySettings, String> {
+    proxy_settings::save_proxy_settings(&app, &settings)
+}
+
+#[tauri::command]
+async fn test_network_proxy_connection(
+    settings: proxy_settings::NetworkProxySettings,
+) -> Result<String, String> {
+    proxy_settings::test_proxy_connection(&settings).await
 }
 
 #[tauri::command]
@@ -4935,6 +5271,10 @@ pub fn run() {
         .setup(|app| {
             dev_trace("app", "NineClaw 启动");
             resize_main_window_to_screen(&app.handle());
+            if let Err(error) = proxy_settings::apply_saved_proxy_settings(&app.handle()) {
+                log::warn!("应用启动时载入代理设置失败: {error}");
+            }
+            llm_log_export::init(&app.handle());
 
             // Defer heavy runtime initialization to a background thread so the
             // window renders immediately.  The frontend listens for the
@@ -5003,8 +5343,11 @@ pub fn run() {
             update_agent,
             rotate_agent_peer_inbound_secret,
             get_peer_gateway_info,
+            load_network_proxy_settings,
             load_peer_gateway_settings,
+            save_network_proxy_settings,
             save_peer_gateway_settings,
+            test_network_proxy_connection,
             archive_agent,
             delete_agent,
             set_default_agent,
@@ -5034,8 +5377,11 @@ pub fn run() {
             workspace_default_supervisor_orchestration_prompt,
             workspace_llm_trace_status,
             workspace_llm_trace_set_enabled,
-            workspace_llm_trace_list,
-            workspace_llm_trace_clear,
+            llm_trace_list,
+            llm_trace_clear,
+            llm_log_export_get,
+            llm_log_export_set,
+            llm_log_export_preview,
             workspace_resolve_artifacts_root,
             workspace_list_artifacts_entries,
             workspace_read_artifact_text,

@@ -10,7 +10,9 @@ pub(crate) fn is_recoverable_provider_terminal_noise(message: &str) -> bool {
     if lower.contains("unexpected_state") {
         return true;
     }
-    if lower.contains("finish_reason") && (lower.contains("unexpected") || lower.contains("unknown")) {
+    if lower.contains("finish_reason")
+        && (lower.contains("unexpected") || lower.contains("unknown"))
+    {
         return true;
     }
     if lower.contains("provider") && lower.contains("unexpected") {

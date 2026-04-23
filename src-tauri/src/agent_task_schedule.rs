@@ -3,7 +3,7 @@ use chrono::{
     NaiveDateTime, NaiveTime, TimeZone, Utc,
 };
 use chrono_tz::Tz;
-use serde::{Deserialize, Serialize};
+use serde::{de::Deserializer, Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub const SCHEDULE_TYPE_INTERVAL: &str = "interval";
@@ -23,21 +23,51 @@ pub struct IntervalSchedule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyTimeSchedule {
+    #[serde(
+        default,
+        alias = "time",
+        deserialize_with = "deserialize_schedule_times"
+    )]
     pub times: Vec<String>,
+    #[serde(
+        default,
+        alias = "dayOfWeek",
+        deserialize_with = "deserialize_schedule_u32s"
+    )]
     pub days_of_week: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WeeklyTimeSchedule {
+    #[serde(
+        default,
+        alias = "time",
+        deserialize_with = "deserialize_schedule_times"
+    )]
     pub times: Vec<String>,
+    #[serde(
+        default,
+        alias = "dayOfWeek",
+        deserialize_with = "deserialize_schedule_u32s"
+    )]
     pub days_of_week: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MonthlyTimeSchedule {
+    #[serde(
+        default,
+        alias = "time",
+        deserialize_with = "deserialize_schedule_times"
+    )]
     pub times: Vec<String>,
+    #[serde(
+        default,
+        alias = "dayOfMonth",
+        deserialize_with = "deserialize_schedule_u32s"
+    )]
     pub days_of_month: Vec<u32>,
 }
 
@@ -50,6 +80,44 @@ pub struct OnceAtSchedule {
 enum ResolvedTimezone {
     Named(Tz),
     Fixed(FixedOffset),
+}
+
+fn deserialize_schedule_times<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RawTimes {
+        Many(Vec<String>),
+        Single(String),
+    }
+
+    let raw = Option::<RawTimes>::deserialize(deserializer)?;
+    Ok(match raw {
+        Some(RawTimes::Many(values)) => values,
+        Some(RawTimes::Single(value)) => vec![value],
+        None => Vec::new(),
+    })
+}
+
+fn deserialize_schedule_u32s<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RawValues {
+        Many(Vec<u32>),
+        Single(u32),
+    }
+
+    let raw = Option::<RawValues>::deserialize(deserializer)?;
+    Ok(match raw {
+        Some(RawValues::Many(values)) => values,
+        Some(RawValues::Single(value)) => vec![value],
+        None => Vec::new(),
+    })
 }
 
 pub fn normalize_time_values(values: &[String]) -> Vec<String> {
@@ -686,5 +754,21 @@ mod tests {
             extract_monthly_days("每个月 5 号和 20 号提醒我"),
             vec![5, 20]
         );
+    }
+
+    #[test]
+    fn daily_schedule_deserialization_accepts_missing_times() {
+        let schedule: DailyTimeSchedule =
+            serde_json::from_str(r#"{"daysOfWeek":[1,2,3,4,5,6,7]}"#).expect("schedule");
+        assert!(schedule.times.is_empty());
+        assert_eq!(schedule.days_of_week, vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn daily_schedule_deserialization_accepts_single_time_string() {
+        let schedule: DailyTimeSchedule =
+            serde_json::from_str(r#"{"time":"09:30","dayOfWeek":3}"#).expect("schedule");
+        assert_eq!(schedule.times, vec!["09:30"]);
+        assert_eq!(schedule.days_of_week, vec![3]);
     }
 }

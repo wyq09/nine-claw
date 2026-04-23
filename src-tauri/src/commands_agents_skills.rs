@@ -14,7 +14,10 @@ pub(crate) fn list_system_skill_catalog(app: AppHandle) -> Result<SystemSkillCat
 }
 
 #[tauri::command]
-pub(crate) fn install_system_skill(app: AppHandle, skill_id: String) -> Result<InstalledSkill, String> {
+pub(crate) fn install_system_skill(
+    app: AppHandle,
+    skill_id: String,
+) -> Result<InstalledSkill, String> {
     crate::skills::install_system_skill(&app, &skill_id)
 }
 

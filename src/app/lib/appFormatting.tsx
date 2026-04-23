@@ -3,6 +3,11 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { AppIcon } from '../../components/AppIcon'
 import { botDefinitions, createInitialBotConfigs } from '../../mockData'
 import type { BotStatusEvent } from '../../lib/piClient'
+import {
+  createDefaultAgentCapabilityPolicy,
+  createStaticAgentCapabilityPolicy,
+  normalizeAgentCapabilityPolicy,
+} from './agentCapabilities'
 import type {
   AgentBuilderDraft,
   AgentExecutionMode,
@@ -24,8 +29,6 @@ import type {
   SystemSkillCatalog,
   TokenUsage,
 } from '../../types'
-
-const REQUIRED_SYSTEM_SKILL_IDS = ['nineclaw-task-creator'] as const
 
 const ABSOLUTE_TIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
   year: 'numeric',
@@ -319,6 +322,7 @@ export function buildConversationAgentSnapshot(agent: AgentRecord): Conversation
     summary: agent.summary,
     description: agent.description,
     systemPrompt: agent.systemPrompt,
+    capabilityPolicy: normalizeAgentCapabilityPolicy(agent.capabilityPolicy, createStaticAgentCapabilityPolicy()),
     skillIds: [...agent.skillIds],
     defaultProviderId: agent.defaultProviderId,
     defaultModel: agent.defaultModel,
@@ -397,7 +401,8 @@ export function createEmptyAgentDraft(
     summary: '',
     description: '',
     systemPrompt: '',
-    skillIds: [...REQUIRED_SYSTEM_SKILL_IDS],
+    capabilityPolicy: createDefaultAgentCapabilityPolicy(),
+    skillIds: [],
     defaultProviderId: providerId,
     defaultModel: model,
     executionMode: 'single',
@@ -436,6 +441,7 @@ export function createAgentDraftFromRecord(agent: AgentRecord): AgentInput {
     summary: agent.summary,
     description: agent.description,
     systemPrompt: agent.systemPrompt,
+    capabilityPolicy: normalizeAgentCapabilityPolicy(agent.capabilityPolicy, createStaticAgentCapabilityPolicy()),
     skillIds: [...agent.skillIds],
     defaultProviderId: agent.defaultProviderId,
     defaultModel: agent.defaultModel,
@@ -479,11 +485,13 @@ export function normalizeAgentDraft(input: AgentInput): AgentInput {
     summary,
     description,
     systemPrompt: input.systemPrompt.trim(),
+    capabilityPolicy: normalizeAgentCapabilityPolicy(
+      input.capabilityPolicy,
+      createDefaultAgentCapabilityPolicy(),
+    ),
     defaultProviderId: input.defaultProviderId.trim(),
     defaultModel: input.defaultModel.trim(),
-    skillIds: Array.from(
-      new Set([...input.skillIds, ...REQUIRED_SYSTEM_SKILL_IDS].map((item) => item.trim()).filter(Boolean)),
-    ),
+    skillIds: Array.from(new Set(input.skillIds.map((item) => item.trim()).filter(Boolean))),
     botConfigs: createAgentBotConfigState(input.botConfigs),
     heartbeatConfig: normalizeHeartbeatConfig(input.heartbeatConfig),
     scenarioLlmConfig: normalizeAgentScenarioLlmConfigInDraft(input.scenarioLlmConfig),
@@ -664,6 +672,10 @@ export function parseAgentBuilderDraft(content: string): AgentBuilderDraft | nul
     const skillIds = Array.isArray(parsed.skillIds)
       ? Array.from(new Set(parsed.skillIds.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean)))
       : []
+    const capabilityPolicy = normalizeAgentCapabilityPolicy(
+      parsed.capabilityPolicy,
+      createDefaultAgentCapabilityPolicy(),
+    )
 
     if (!name || !normalizedDescription) {
       return null
@@ -674,6 +686,7 @@ export function parseAgentBuilderDraft(content: string): AgentBuilderDraft | nul
       summary: normalizedSummary,
       description: normalizedDescription,
       systemPrompt,
+      capabilityPolicy,
       skillIds,
       defaultProviderId,
       defaultModel,

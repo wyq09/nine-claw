@@ -1,9 +1,12 @@
 use crate::agents;
 use crate::channels::pi_bridge::{PiBridge, PiProcessOutcome};
 use crate::dev_trace::dev_trace;
+use crate::history_app_state::storage_conn;
+use crate::llm_trace;
 use crate::pi_runtime;
 use crate::prompts;
 use crate::provider_runtime::{normalized_provider_runtime_base_url, resolve_im_llm_runtime};
+use crate::storage;
 use tauri::AppHandle;
 
 const TASK_METADATA_LLM_CHUNK: usize = 512;
@@ -235,6 +238,7 @@ fn parse_session_title_llm_output(raw: &str) -> Option<String> {
 fn generate_conversation_session_title_llm(
     app: &AppHandle,
     agent_id: &str,
+    session_id: Option<&str>,
     user_message: &str,
     assistant_message: &str,
 ) -> Result<String, String> {
@@ -261,6 +265,10 @@ fn generate_conversation_session_title_llm(
     let Some(agent_config) = agents::get_conversation_agent_config(app, agent_id)? else {
         return Ok(String::new());
     };
+    let session_id = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
 
     let (provider_for_title, model_for_title) = if let Some(ref sc) = record.scenario_llm_config {
         if let Some(ref slot) = sc.title_generation {
@@ -294,6 +302,7 @@ fn generate_conversation_session_title_llm(
         &runtime.provider_id,
     );
     let pi_rt = pi_runtime::require_pi_runtime_location(app)?;
+    let trace_agent_system_prompt = crate::agents::build_agent_system_prompt(&agent_config);
     let bridge = PiBridge::new(
         pi_rt,
         &runtime.provider_id,
@@ -308,17 +317,111 @@ fn generate_conversation_session_title_llm(
     let um_snip = clamp_chars_head(um, 6000);
     let am_snip = clamp_chars_head(assistant_message.trim(), 8000);
     let prompt = prompts::build_session_title_prompt(&um_snip, &am_snip);
-    let outcome = bridge.process_message_interruptible(
+    let workspace_id = session_id.as_deref().and_then(|sid| {
+        storage_conn(app)
+            .ok()
+            .and_then(|conn| {
+                storage::chat_history::get_chat_session(&conn, sid)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|session| session.workspace_id)
+    });
+    let trace_enabled = if let Some(wid) = workspace_id.as_deref() {
+        storage_conn(app)
+            .ok()
+            .and_then(|conn| {
+                storage::workspaces::get_workspace(&conn, wid)
+                    .ok()
+                    .flatten()
+            })
+            .map(|workspace| workspace.llm_trace_enabled != 0)
+            .unwrap_or(false)
+    } else {
+        session_id.is_some()
+    };
+    let mut trace_guard = if trace_enabled {
+        let mut system_prompts = Vec::new();
+        if let Some(system_prompt) = trace_agent_system_prompt {
+            system_prompts.push(llm_trace::TraceSystemPromptSection {
+                label: "agent_system_prompt".to_string(),
+                content: system_prompt,
+            });
+        }
+        system_prompts.push(llm_trace::TraceSystemPromptSection {
+            label: "title_generation_action".to_string(),
+            content: "为当前 session 生成简短标题，只输出最终标题或 JSON 包裹的标题字段。"
+                .to_string(),
+        });
+        Some(llm_trace::TraceGuard::new(
+            app,
+            llm_trace::begin(
+                app,
+                workspace_id.as_deref(),
+                "action_llm",
+                "action:session_title",
+                "标题生成",
+                None,
+                Some("LLM"),
+                session_id.as_deref(),
+                Some(&runtime.provider_id),
+                Some(&runtime.model),
+                system_prompts,
+                &prompt,
+            ),
+        ))
+    } else {
+        None
+    };
+    let trace_id = trace_guard
+        .as_ref()
+        .and_then(|guard| guard.id())
+        .map(ToOwned::to_owned);
+    let trace_id_for_chunk = trace_id.clone();
+    let trace_id_for_event = trace_id.clone();
+    let outcome = bridge.process_message_interruptible_with_events(
         &channel_id,
         &user_id,
         &prompt,
         SESSION_TITLE_LLM_CHUNK,
+        |chunk| {
+            if let Some(tid) = trace_id_for_chunk.as_deref() {
+                llm_trace::append_response(app, tid, chunk);
+            }
+        },
         |_| {},
-        |_| {},
+        |event| {
+            let Some(tid) = trace_id_for_event.as_deref() else {
+                return;
+            };
+            if let Some(delta) = event.get("assistantMessageEvent").and_then(|evt| {
+                if evt.get("type").and_then(|value| value.as_str()) == Some("thinking_delta") {
+                    evt.get("delta").and_then(|value| value.as_str())
+                } else {
+                    None
+                }
+            }) {
+                llm_trace::append_thinking(app, tid, delta);
+            }
+        },
     )?;
     let text = match outcome {
-        PiProcessOutcome::Completed(r) => r.full_text,
+        PiProcessOutcome::Completed(r) => {
+            if let Some(guard) = trace_guard.as_mut() {
+                guard.finalize_done(
+                    Some(r.full_text.clone()),
+                    None,
+                    Some(runtime.provider_id.clone()),
+                    Some(runtime.model.clone()),
+                    None,
+                );
+            }
+            r.full_text
+        }
         PiProcessOutcome::Aborted => {
+            if let Some(guard) = trace_guard.as_mut() {
+                guard.finalize_error("标题生成被中断".to_string());
+            }
             return Err("生成会话标题时 pi 被中断".to_string());
         }
     };
@@ -339,8 +442,15 @@ fn generate_conversation_session_title_llm(
 pub(crate) fn generate_session_conversation_title(
     app: AppHandle,
     agent_id: String,
+    session_id: Option<String>,
     user_message: String,
     assistant_message: String,
 ) -> Result<String, String> {
-    generate_conversation_session_title_llm(&app, &agent_id, &user_message, &assistant_message)
+    generate_conversation_session_title_llm(
+        &app,
+        &agent_id,
+        session_id.as_deref(),
+        &user_message,
+        &assistant_message,
+    )
 }

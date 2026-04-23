@@ -1,10 +1,12 @@
 //! 多智能体工作空间：前言、委派执行、主智能体协作白名单同步。
 
-use crate::agents::{self, AgentCollaborationConfig, AgentInput, AgentRecord};
+use crate::agents::{self};
 use crate::channels::pi_bridge::{PiBridge, PiProcessOutcome};
 use crate::pi_runtime;
 use crate::storage::workspaces::{self, WorkspaceMemoryRecord, WorkspaceRecord};
+use crate::team_supervisor;
 use crate::workspace_fs;
+use chrono::Utc;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,7 +14,10 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
-pub fn resolve_workspace_artifacts_root(app: &AppHandle, workspace_id: &str) -> Result<PathBuf, String> {
+pub fn resolve_workspace_artifacts_root(
+    app: &AppHandle,
+    workspace_id: &str,
+) -> Result<PathBuf, String> {
     let conn = crate::storage_conn(app)?;
     let Some(ws) = workspaces::get_workspace(&conn, workspace_id.trim())? else {
         return Err("工作空间不存在".to_string());
@@ -30,7 +35,50 @@ pub struct WorkspaceMemberView {
     pub skill_ids: Vec<String>,
 }
 
-pub fn list_team_member_views(app: &AppHandle, workspace_id: &str) -> Result<Vec<WorkspaceMemberView>, String> {
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TeamManifestV1 {
+    schema_version: u32,
+    workspace_id: String,
+    name: String,
+    description: String,
+    supervisor_agent_id: String,
+    member_count: usize,
+    members: Vec<WorkspaceMemberView>,
+    generated_at: String,
+    /// 说明该文件用途（给人类与模型读）
+    sync_note: &'static str,
+}
+
+/// 将当前团队的 id、名称、主智能体与各成员写入 `teams/<id>/docs/_nineclaw_team.json`，
+/// 与 SQLite 保持一致，便于主 Agent 用文件工具读取（单靠目录列表看不到成员表）。
+pub fn sync_team_manifest_json(app: &AppHandle, workspace_id: &str) -> Result<(), String> {
+    let conn = crate::storage_conn(app)?;
+    let Some(ws) = workspaces::get_workspace(&conn, workspace_id)? else {
+        return Err("工作空间不存在".to_string());
+    };
+    let members = list_team_member_views(app, workspace_id)?;
+    let manifest = TeamManifestV1 {
+        schema_version: 1,
+        workspace_id: ws.id.clone(),
+        name: ws.name,
+        description: ws.description,
+        supervisor_agent_id: ws.supervisor_agent_id,
+        member_count: members.len(),
+        members,
+        generated_at: Utc::now().to_rfc3339(),
+        sync_note: "由 NineClaw 与数据库同步；委派 assignee 须与 members[].agentId 一致。",
+    };
+    let json =
+        serde_json::to_string_pretty(&manifest).map_err(|e| format!("序列化团队清单失败: {e}"))?;
+    workspace_fs::write_team_manifest_json(workspace_id, &json)?;
+    Ok(())
+}
+
+pub fn list_team_member_views(
+    app: &AppHandle,
+    workspace_id: &str,
+) -> Result<Vec<WorkspaceMemberView>, String> {
     let conn = crate::storage_conn(app)?;
     let members = workspaces::list_workspace_members(&conn, workspace_id)?;
     let mut out = Vec::new();
@@ -64,7 +112,9 @@ pub fn default_supervisor_orchestration_markdown(other_member_count: usize) -> S
     s.push_str("1. **评估**：先读成员名单与简介，判断本轮用户需求中的每一件子任务有无对口成员。只要名单里存在合理匹配的成员，就 **必须** 把该子任务委派给他，**即便你自认为也能做**。\n");
     s.push_str("2. **单回合只做一件事**：\n");
     s.push_str("   - 需要 **≥1 项委派** → 输出 **一次**「计划卡」`NINECLAW_DELEGATE_PLAN_JSON:...`（见协议 A），**随后立即结束本回合**。\n");
-    s.push_str("   - 全部子任务都没人可派（或用户只是闲聊/澄清）→ 你才可以直接回答，并保持**简短**。\n");
+    s.push_str(
+        "   - 全部子任务都没人可派（或用户只是闲聊/澄清）→ 你才可以直接回答，并保持**简短**。\n",
+    );
     s.push_str("3. **禁止混用**：**绝不**允许「一边列出计划卡、一边自己把方案/代码/内容写出来」这种行为；也 **绝不**写「我直接代劳了」「任务已下发但我先把这段补上」之类语句。若你发现自己已经在写具体交付物，**立刻删除**，改为补进计划卡由对应成员执行。\n");
     s.push_str("4. **等结果的下一轮**：委派结果（由 NineClaw 自动回注入到后续对话）返回后，你可在下一轮做**轻量汇总**——仅做：结构拼装、一致性检查、冲突调解、向用户复述要点与下一步选项。**不要替成员重写整份交付物**。若成员产出不够，再发一次补委派，而不是自己顶上。\n\n");
 
@@ -75,7 +125,9 @@ pub fn default_supervisor_orchestration_markdown(other_member_count: usize) -> S
 
     s.push_str("\n### 反例（发现则立刻停并改为计划卡）\n");
     s.push_str("- 列出一张「调度记录表」但自己同时产出了数据分析/配色/代码/文案。\n");
-    s.push_str("- 同一回合写了 `NINECLAW_DELEGATE_PLAN_JSON:...` 之后又把该子任务的答案自己写完。\n");
+    s.push_str(
+        "- 同一回合写了 `NINECLAW_DELEGATE_PLAN_JSON:...` 之后又把该子任务的答案自己写完。\n",
+    );
     s.push_str("- 使用了「我直接代劳了 / 我先顶一下 / 我顺手做了」之类描述。\n");
     s.push_str("- ❌ 用 `write` 工具往 `agents/<其他成员>/inbox/...` 写一份「任务说明 markdown」就当作委派——这只是文件操作，对方根本不会被触发。**唯一合法委派渠道**是协议 A/B 的 NINECLAW_ 文本标记。\n");
     s.push_str("- ❌ 在结尾说「任务已写入 @某某 的 inbox / 请你去 @某某 的会话发消息让它读取 / 要不要现在去戳它一下」——你在团队会话里**不需要**用户当中转，标记落地就是委派，子会话由 NineClaw 后端自动起、结果自动回注。出现这类话术意味着你应当改用协议 B（`NINECLAW_DELEGATE_JSON:`）重发。\n\n");
@@ -155,6 +207,12 @@ pub fn build_workspace_preface(
     workspace_id: &str,
     speaker_agent_id: &str,
 ) -> Result<String, String> {
+    if let Ok(root) = workspace_fs::team_root(workspace_id) {
+        let manifest = root.join("docs").join("_nineclaw_team.json");
+        if !manifest.is_file() {
+            let _ = sync_team_manifest_json(app, workspace_id);
+        }
+    }
     let conn = crate::storage_conn(app)?;
     let Some(ws) = workspaces::get_workspace(&conn, workspace_id)? else {
         return Err("工作空间不存在".to_string());
@@ -165,7 +223,14 @@ pub fn build_workspace_preface(
 
     let mut s = String::from("\n# NineClaw 团队工作空间上下文\n\n");
     s.push_str(&format!("- 工作空间: **{}** (id=`{}`)\n", ws.name, ws.id));
-    s.push_str(&format!("- 主智能体 agentId: `{}`\n\n", ws.supervisor_agent_id));
+    s.push_str(&format!(
+        "- 主智能体 agentId: `{}`\n",
+        ws.supervisor_agent_id
+    ));
+    s.push_str(&format!(
+        "- **磁盘镜像（与下方成员表一致）**：`{}` — 若你用文件/`nineclaw_read_team_resource` 核对人数与 agentId，请读此 JSON。\n\n",
+        workspace_fs::TEAM_MANIFEST_REL
+    ));
 
     s.push_str("## 团队范围硬约束（MUST）\n");
     s.push_str("- 本次会话被限制在下方 ## 成员 列出的智能体之内。\n");
@@ -236,7 +301,9 @@ pub fn build_workspace_preface(
 
     s.push_str("## 委派协议\n");
     if is_supervisor {
-        s.push_str("主智能体**默认**应通过下列方式把执行工作交给成员（而非自己在正文里完成）：\n\n");
+        s.push_str(
+            "主智能体**默认**应通过下列方式把执行工作交给成员（而非自己在正文里完成）：\n\n",
+        );
     } else {
         s.push_str("若要把工作交给其他成员，可通过下列方式发起委派：\n\n");
     }
@@ -289,7 +356,9 @@ pub fn build_delegate_preface(
         target.name, target.id
     ));
     s.push_str("\n## 子会话规则（MUST）\n");
-    s.push_str("- 这是一次独立的**子会话**，不会携带主会话的其它上下文，也不会污染主会话 history。\n");
+    s.push_str(
+        "- 这是一次独立的**子会话**，不会携带主会话的其它上下文，也不会污染主会话 history。\n",
+    );
     s.push_str("- 专注完成本次被委派的单一任务，任务完成即结束。\n");
     s.push_str("- 不要反向介绍团队其他成员、不要列举其他智能体；你看不到完整成员表，也不应该假设看到了。\n");
     s.push_str("- 直接输出可交付结果；避免寒暄、避免重复任务描述、避免再次委派给其他成员。\n");
@@ -313,26 +382,11 @@ pub fn build_delegate_preface(
     Ok(s)
 }
 
-fn agent_input_from_record(record: &AgentRecord) -> AgentInput {
-    AgentInput {
-        name: record.name.clone(),
-        summary: record.summary.clone(),
-        description: record.description.clone(),
-        system_prompt: record.system_prompt.clone(),
-        skill_ids: record.skill_ids.clone(),
-        default_provider_id: record.default_provider_id.clone(),
-        default_model: record.default_model.clone(),
-        execution_mode: Some(record.execution_mode.clone()),
-        collaboration_config: record.collaboration_config.clone(),
-        accent_color: record.accent_color.clone(),
-        scenario_llm_config: record.scenario_llm_config.clone(),
-        bot_configs: record.bot_configs.clone(),
-        heartbeat_config: record.heartbeat_config.clone(),
-    }
-}
-
 /// 将成员 agent id 写入主智能体的 `allowedDelegateAgentIds`。
-pub fn sync_supervisor_delegate_allowlist(app: &AppHandle, workspace_id: &str) -> Result<(), String> {
+pub fn sync_supervisor_delegate_allowlist(
+    app: &AppHandle,
+    workspace_id: &str,
+) -> Result<(), String> {
     let conn = crate::storage_conn(app)?;
     let Some(ws) = workspaces::get_workspace(&conn, workspace_id)? else {
         return Err("工作空间不存在".to_string());
@@ -344,19 +398,11 @@ pub fn sync_supervisor_delegate_allowlist(app: &AppHandle, workspace_id: &str) -
         .map(|m| m.agent_id.clone())
         .collect();
 
-    let Some(mut sup) = agents::get_agent_record(app, &ws.supervisor_agent_id)? else {
+    let Some(sup) = agents::get_agent_record(app, &ws.supervisor_agent_id)? else {
         return Err("主智能体不存在".to_string());
     };
 
-    let mut collab = sup.collaboration_config.clone().unwrap_or(AgentCollaborationConfig {
-        allowed_delegate_agent_ids: vec![],
-        handoff_prompt: String::new(),
-        shared_context_policy: "session".to_string(),
-    });
-    collab.allowed_delegate_agent_ids = delegate_ids;
-    sup.collaboration_config = Some(collab);
-
-    let input = agent_input_from_record(&sup);
+    let input = team_supervisor::build_supervisor_agent_input(&sup, delegate_ids);
     let _ = agents::update_agent(app, sup.id.clone(), input)?;
     Ok(())
 }
@@ -368,7 +414,15 @@ pub fn run_delegate_with_provider(
     task: &str,
     provider: &crate::ProviderRuntimeConfig,
 ) -> Result<String, String> {
-    run_delegate_with_provider_events(app, workspace_id, target_agent_id, task, provider, None, None)
+    run_delegate_with_provider_events(
+        app,
+        workspace_id,
+        target_agent_id,
+        task,
+        provider,
+        None,
+        None,
+    )
 }
 
 /// 与 `run_delegate_with_provider` 相同，但当 `run_id` 提供时会在整个子会话过程中
@@ -439,15 +493,13 @@ pub fn run_delegate_with_provider_events(
         let caller_name = agents::get_agent_record(app, &ws.supervisor_agent_id)?
             .map(|r| r.name)
             .unwrap_or_else(|| ws.supervisor_agent_id.clone());
-        let system_prompts = vec![
-            crate::llm_trace::TraceSystemPromptSection {
-                label: "delegate_preface".to_string(),
-                content: preface.clone(),
-            },
-        ];
+        let system_prompts = vec![crate::llm_trace::TraceSystemPromptSection {
+            label: "delegate_preface".to_string(),
+            content: preface.clone(),
+        }];
         Some(crate::llm_trace::begin(
             app,
-            workspace_id,
+            Some(workspace_id),
             "delegate",
             &ws.supervisor_agent_id,
             &caller_name,
@@ -501,19 +553,24 @@ pub fn run_delegate_with_provider_events(
         if let Some(tid) = trace_id_for_event.as_ref() {
             match line_type {
                 "tool_execution_start" | "tool_execution_end" => {
-                    let tool_call_id = value.get("toolCallId").and_then(|v| v.as_str()).unwrap_or("");
+                    let tool_call_id = value
+                        .get("toolCallId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let tool_name = value.get("toolName").and_then(|v| v.as_str()).unwrap_or("");
                     let args_json = value.get("args").map(|v| v.to_string());
-                    let result_text = value
-                        .get("result")
-                        .and_then(|v| {
-                            if let Some(s) = v.as_str() {
-                                Some(s.to_string())
-                            } else {
-                                Some(v.to_string())
-                            }
-                        });
-                    let status = if line_type == "tool_execution_start" { "running" } else { "done" };
+                    let result_text = value.get("result").and_then(|v| {
+                        if let Some(s) = v.as_str() {
+                            Some(s.to_string())
+                        } else {
+                            Some(v.to_string())
+                        }
+                    });
+                    let status = if line_type == "tool_execution_start" {
+                        "running"
+                    } else {
+                        "done"
+                    };
                     let is_error = value.get("isError").and_then(|v| v.as_bool());
                     crate::llm_trace::record_tool(
                         &app_for_event,
@@ -529,16 +586,13 @@ pub fn run_delegate_with_provider_events(
                 _ => {}
             }
             // thinking_delta 也抓一抓（Pi 部分 provider 会发）
-            if let Some(delta) = value
-                .get("assistantMessageEvent")
-                .and_then(|evt| {
-                    if evt.get("type").and_then(|t| t.as_str()) == Some("thinking_delta") {
-                        evt.get("delta").and_then(|d| d.as_str())
-                    } else {
-                        None
-                    }
-                })
-            {
+            if let Some(delta) = value.get("assistantMessageEvent").and_then(|evt| {
+                if evt.get("type").and_then(|t| t.as_str()) == Some("thinking_delta") {
+                    evt.get("delta").and_then(|d| d.as_str())
+                } else {
+                    None
+                }
+            }) {
                 crate::llm_trace::append_thinking(&app_for_event, tid, delta);
             }
         }
@@ -549,7 +603,11 @@ pub fn run_delegate_with_provider_events(
         match line_type {
             "turn_end" | "agent_end" => {
                 let idx = turn_counter.fetch_add(1, Ordering::SeqCst);
-                let kind = if line_type == "agent_end" { "agent" } else { "thinking" };
+                let kind = if line_type == "agent_end" {
+                    "agent"
+                } else {
+                    "thinking"
+                };
                 let _ = app_for_event.emit(
                     "workspace.delegate.turn",
                     serde_json::json!({
@@ -714,9 +772,7 @@ struct DelegatePlanPayload {
 /// `<!--NC_DELEGATE_PLAN:{"planId":"...","items":[...]}-->`。前端 `parseHistorySnapshot`
 /// 识别该占位后把这一段升级为 `responseSegment.kind='delegate_plan'`，**不**在 Rust 侧
 /// 执行任何委派。
-pub fn expand_delegate_plan_markers_in_text(
-    source_text: &str,
-) -> Result<String, String> {
+pub fn expand_delegate_plan_markers_in_text(source_text: &str) -> Result<String, String> {
     let prefix = "NINECLAW_DELEGATE_PLAN_JSON:";
     let mut out_lines: Vec<String> = Vec::new();
     for line in source_text.lines() {
@@ -729,8 +785,8 @@ pub fn expand_delegate_plan_markers_in_text(
                 "planId": plan_id,
                 "items": parsed.items,
             });
-            let payload_s = serde_json::to_string(&payload)
-                .map_err(|e| format!("序列化计划失败: {e}"))?;
+            let payload_s =
+                serde_json::to_string(&payload).map_err(|e| format!("序列化计划失败: {e}"))?;
             out_lines.push(format!("<!--NC_DELEGATE_PLAN:{}-->", payload_s));
             continue;
         }
@@ -766,10 +822,9 @@ pub fn expand_delegate_markers_in_text(
                     &parsed.task,
                     p,
                 ) {
-                    Ok(body) => format!(
-                        "\n\n---\n### 子智能体委派 · {}\n\n{}\n",
-                        target_label, body
-                    ),
+                    Ok(body) => {
+                        format!("\n\n---\n### 子智能体委派 · {}\n\n{}\n", target_label, body)
+                    }
                     Err(e) => format!("\n\n[委派失败: {}]\n", e),
                 },
             };
@@ -800,6 +855,7 @@ pub fn create_workspace_with_fs(
     )?;
     workspace_fs::ensure_team_layout(&id)?;
     sync_supervisor_delegate_allowlist(app, &id)?;
+    let _ = sync_team_manifest_json(app, &id);
     Ok(ws)
 }
 
@@ -812,13 +868,19 @@ pub fn add_member_and_sync(
     let conn = crate::storage_conn(app)?;
     workspaces::add_workspace_member(&conn, workspace_id, agent_id, role)?;
     sync_supervisor_delegate_allowlist(app, workspace_id)?;
+    let _ = sync_team_manifest_json(app, workspace_id);
     Ok(())
 }
 
-pub fn remove_member_and_sync(app: &AppHandle, workspace_id: &str, agent_id: &str) -> Result<(), String> {
+pub fn remove_member_and_sync(
+    app: &AppHandle,
+    workspace_id: &str,
+    agent_id: &str,
+) -> Result<(), String> {
     let conn = crate::storage_conn(app)?;
     workspaces::remove_workspace_member(&conn, workspace_id, agent_id)?;
     sync_supervisor_delegate_allowlist(app, workspace_id)?;
+    let _ = sync_team_manifest_json(app, workspace_id);
     Ok(())
 }
 
@@ -847,14 +909,22 @@ pub fn write_team_memory_entry(
     Ok(mem)
 }
 
-pub fn delete_team_memory_entry(app: &AppHandle, workspace_id: &str, memory_id: &str) -> Result<(), String> {
+pub fn delete_team_memory_entry(
+    app: &AppHandle,
+    workspace_id: &str,
+    memory_id: &str,
+) -> Result<(), String> {
     let conn = crate::storage_conn(app)?;
     workspaces::delete_workspace_memory(&conn, workspace_id, memory_id)?;
     let _ = workspace_fs::remove_memory_entry_md(workspace_id, memory_id);
     Ok(())
 }
 
-pub fn delete_team_resource(app: &AppHandle, workspace_id: &str, resource_id: &str) -> Result<(), String> {
+pub fn delete_team_resource(
+    app: &AppHandle,
+    workspace_id: &str,
+    resource_id: &str,
+) -> Result<(), String> {
     let conn = crate::storage_conn(app)?;
     let rel = workspaces::get_workspace_resource_rel_path(&conn, workspace_id, resource_id)?;
     workspace_fs::remove_team_resource_file(workspace_id, &rel)?;

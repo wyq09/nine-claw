@@ -1,3 +1,7 @@
+use crate::agent_capabilities::{
+    dedupe_skill_ids, new_agent_default_capability_policy, normalize_capability_policy,
+    static_capability_policy, AgentCapabilityPolicy,
+};
 use crate::agent_workspace::{self, AgentWorkspaceSeed};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -6,7 +10,9 @@ use tauri::AppHandle;
 use uuid::Uuid;
 
 const DEFAULT_AGENT_STATE_KEY: &str = "default_agent_id";
-const REQUIRED_SYSTEM_SKILL_IDS: &[&str] = &["nineclaw-task-creator"];
+
+/// 用户在「系统指令」中填写的内容会进入 `agent_system_prompt`；不应对其做过短截断，仅保留与模型侧类似的硬上限防误粘贴。
+const MAX_USER_SYSTEM_INSTRUCTION_CHARS: usize = 32_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +54,9 @@ pub struct AgentRecord {
     pub summary: String,
     pub description: String,
     pub system_prompt: String,
+    #[serde(default = "static_capability_policy")]
+    pub capability_policy: AgentCapabilityPolicy,
+    #[serde(default)]
     pub skill_ids: Vec<String>,
     pub default_provider_id: String,
     pub default_model: String,
@@ -74,6 +83,8 @@ pub struct AgentInput {
     pub description: String,
     #[serde(default)]
     pub system_prompt: String,
+    #[serde(default)]
+    pub capability_policy: Option<AgentCapabilityPolicy>,
     #[serde(default)]
     pub skill_ids: Vec<String>,
     pub default_provider_id: String,
@@ -201,6 +212,8 @@ pub struct ConversationAgentConfig {
     pub description: String,
     #[serde(default)]
     pub system_prompt: String,
+    #[serde(default = "static_capability_policy")]
+    pub capability_policy: AgentCapabilityPolicy,
     #[serde(default)]
     pub skill_ids: Vec<String>,
     #[serde(default)]
@@ -306,6 +319,7 @@ pub fn get_conversation_agent_config(
         summary: record.summary,
         description: record.description,
         system_prompt: record.system_prompt,
+        capability_policy: record.capability_policy,
         skill_ids: record.skill_ids,
         default_provider_id: record.default_provider_id,
         default_model: record.default_model,
@@ -404,6 +418,11 @@ pub fn build_agent_system_prompt_for_prompt(
         }
     }
 
+    sections.push(format!(
+        "能力策略：{}",
+        agent.capability_policy.strategy.trim()
+    ));
+
     if !agent.skill_ids.is_empty() {
         let listed = agent
             .skill_ids
@@ -417,15 +436,21 @@ pub fn build_agent_system_prompt_for_prompt(
         } else {
             String::new()
         };
-        sections.push(format!("已挂载技能：{}{}", listed, suffix));
+        sections.push(format!("偏好技能：{}{}", listed, suffix));
     }
 
     let system_prompt = agent.system_prompt.trim();
     if !system_prompt.is_empty() {
-        sections.push(format!(
-            "附加执行约束：{}",
-            trim_prompt_snippet(system_prompt, 320)
-        ));
+        let body = if system_prompt.chars().count() > MAX_USER_SYSTEM_INSTRUCTION_CHARS {
+            let head: String = system_prompt
+                .chars()
+                .take(MAX_USER_SYSTEM_INSTRUCTION_CHARS)
+                .collect();
+            format!("{head}…\n(已截断至约 {MAX_USER_SYSTEM_INSTRUCTION_CHARS} 字，见仓库文档 docs/AGENT_SYSTEM_PROMPT.md)")
+        } else {
+            system_prompt.to_string()
+        };
+        sections.push(format!("附加执行约束：\n{body}"));
     }
 
     if agent_workspace::runtime_sync_enabled() {
@@ -459,6 +484,7 @@ fn ensure_agents_schema(connection: &Connection) -> Result<(), String> {
                 execution_mode TEXT NOT NULL DEFAULT 'single',
                 collaboration_config_json TEXT,
                 heartbeat_config_json TEXT,
+                capability_policy_json TEXT,
                 accent_color TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -490,6 +516,7 @@ fn ensure_agents_schema(connection: &Connection) -> Result<(), String> {
 
     add_agents_column_if_missing(connection, "heartbeat_config_json", "TEXT")?;
     add_agents_column_if_missing(connection, "scenario_llm_config_json", "TEXT")?;
+    add_agents_column_if_missing(connection, "capability_policy_json", "TEXT")?;
     crate::heartbeat::ensure_heartbeat_schema(connection)?;
 
     Ok(())
@@ -534,13 +561,15 @@ fn ensure_agents_ready(connection: &Connection) -> Result<(), String> {
 
 fn seed_builtin_agents(connection: &Connection) -> Result<(), String> {
     for seed in builtin_agent_seeds() {
+        let capability_policy_json =
+            serialize_capability_policy(&new_agent_default_capability_policy())?;
         connection
             .execute(
                 "INSERT OR IGNORE INTO agents (
                 id, name, summary, description, system_prompt, default_provider_id,
                 default_model, is_builtin, is_archived, execution_mode,
-                collaboration_config_json, heartbeat_config_json, accent_color, scenario_llm_config_json, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, 'single', NULL, NULL, ?8, NULL, ?9, ?9)",
+                collaboration_config_json, heartbeat_config_json, capability_policy_json, accent_color, scenario_llm_config_json, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, 'single', NULL, NULL, ?8, ?9, NULL, ?10, ?10)",
                 params![
                     seed.id,
                     seed.name,
@@ -549,6 +578,7 @@ fn seed_builtin_agents(connection: &Connection) -> Result<(), String> {
                     seed.system_prompt,
                     seed.default_provider_id,
                     seed.default_model,
+                    capability_policy_json,
                     seed.accent_color,
                     1_735_689_600_000_i64,
                 ],
@@ -680,6 +710,7 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
                 summary: row.get(2)?,
                 description: row.get(3)?,
                 system_prompt: row.get(4)?,
+                capability_policy: static_capability_policy(),
                 skill_ids: Vec::new(),
                 default_provider_id: row.get(5)?,
                 default_model: row.get(6)?,
@@ -701,6 +732,13 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
     for row in rows {
         let mut agent = row.map_err(|error| format!("读取智能体数据失败: {error}"))?;
         agent.skill_ids = load_skill_ids_for_agent(connection, &agent.id)?;
+        agent.capability_policy = load_capability_policy_for_agent(
+            connection,
+            &agent.id,
+            &agent.execution_mode,
+            &agent.skill_ids,
+            agent.is_builtin,
+        )?;
         agent.bot_configs = load_bot_configs_for_agent(connection, &agent.id)?;
         agents.push(agent);
     }
@@ -782,6 +820,7 @@ fn get_active_agent_by_id(
                 summary: row.get(2)?,
                 description: row.get(3)?,
                 system_prompt: row.get(4)?,
+                capability_policy: static_capability_policy(),
                 skill_ids: Vec::new(),
                 default_provider_id: row.get(5)?,
                 default_model: row.get(6)?,
@@ -802,6 +841,13 @@ fn get_active_agent_by_id(
 
     if let Some(ref mut record) = agent {
         record.skill_ids = load_skill_ids_for_agent(connection, &record.id)?;
+        record.capability_policy = load_capability_policy_for_agent(
+            connection,
+            &record.id,
+            &record.execution_mode,
+            &record.skill_ids,
+            record.is_builtin,
+        )?;
         record.bot_configs = load_bot_configs_for_agent(connection, &record.id)?;
     }
 
@@ -830,6 +876,31 @@ fn load_skill_ids_for_agent(
         skill_ids.push(row.map_err(|error| format!("读取技能绑定失败: {error}"))?);
     }
     Ok(skill_ids)
+}
+
+fn load_capability_policy_for_agent(
+    connection: &Connection,
+    agent_id: &str,
+    execution_mode: &str,
+    skill_ids: &[String],
+    is_builtin: bool,
+) -> Result<AgentCapabilityPolicy, String> {
+    let raw = connection
+        .query_row(
+            "SELECT capability_policy_json FROM agents WHERE id = ?1",
+            params![agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取智能体能力策略失败: {error}"))?
+        .flatten();
+
+    Ok(deserialize_capability_policy(
+        raw,
+        execution_mode,
+        skill_ids,
+        is_builtin,
+    ))
 }
 
 fn load_bot_configs_for_agent(
@@ -880,6 +951,7 @@ fn create_agent_with_connection(
         serialize_collaboration_config(normalized.collaboration_config.as_ref())?;
     let heartbeat_json = serialize_heartbeat_config(&normalized.heartbeat_config)?;
     let scenario_json = serialize_scenario_llm_config(&normalized.scenario_llm_config)?;
+    let capability_policy_json = serialize_capability_policy(&normalized.capability_policy)?;
 
     let transaction = connection
         .transaction()
@@ -890,8 +962,8 @@ fn create_agent_with_connection(
             "INSERT INTO agents (
                 id, name, summary, description, system_prompt, default_provider_id,
                 default_model, is_builtin, is_archived, execution_mode,
-                collaboration_config_json, heartbeat_config_json, accent_color, scenario_llm_config_json, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                collaboration_config_json, heartbeat_config_json, capability_policy_json, accent_color, scenario_llm_config_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
             params![
                 agent_id.as_str(),
                 normalized.name.as_str(),
@@ -903,6 +975,7 @@ fn create_agent_with_connection(
                 normalized.execution_mode.as_str(),
                 collaboration_json,
                 heartbeat_json,
+                capability_policy_json,
                 normalized.accent_color.as_deref(),
                 scenario_json,
                 now,
@@ -943,6 +1016,7 @@ fn update_agent_with_connection(
         serialize_collaboration_config(normalized.collaboration_config.as_ref())?;
     let heartbeat_json = serialize_heartbeat_config(&normalized.heartbeat_config)?;
     let scenario_json = serialize_scenario_llm_config(&normalized.scenario_llm_config)?;
+    let capability_policy_json = serialize_capability_policy(&normalized.capability_policy)?;
 
     let transaction = connection
         .transaction()
@@ -961,9 +1035,10 @@ fn update_agent_with_connection(
                 execution_mode = ?8,
                 collaboration_config_json = ?9,
                 heartbeat_config_json = ?10,
-                accent_color = ?11,
-                scenario_llm_config_json = ?12,
-                updated_at = ?13
+                capability_policy_json = ?11,
+                accent_color = ?12,
+                scenario_llm_config_json = ?13,
+                updated_at = ?14
             WHERE id = ?1 AND is_archived = 0",
             params![
                 agent_id,
@@ -976,6 +1051,7 @@ fn update_agent_with_connection(
                 normalized.execution_mode,
                 collaboration_json,
                 heartbeat_json,
+                capability_policy_json,
                 normalized.accent_color,
                 scenario_json,
                 now,
@@ -1342,7 +1418,11 @@ fn normalize_agent_input(payload: AgentInput) -> Result<NormalizedAgentInput, St
         summary,
         description,
         system_prompt: payload.system_prompt.trim().to_string(),
-        skill_ids: ensure_required_system_skill_ids(dedupe_skill_ids(payload.skill_ids)),
+        capability_policy: normalize_capability_policy(
+            payload.capability_policy,
+            static_capability_policy(),
+        ),
+        skill_ids: dedupe_skill_ids(payload.skill_ids),
         default_provider_id,
         default_model,
         execution_mode: normalize_execution_mode(payload.execution_mode.as_deref()),
@@ -1392,31 +1472,6 @@ fn build_auto_agent_summary(description: &str, fallback_name: &str) -> String {
         .take(AUTO_AGENT_SUMMARY_MAX_CHARS.saturating_sub(1))
         .collect();
     format!("{truncated}…")
-}
-
-fn dedupe_skill_ids(skill_ids: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut normalized = Vec::new();
-    for skill_id in skill_ids {
-        let trimmed = skill_id.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if seen.insert(trimmed.to_string()) {
-            normalized.push(trimmed.to_string());
-        }
-    }
-    normalized
-}
-
-fn ensure_required_system_skill_ids(mut skill_ids: Vec<String>) -> Vec<String> {
-    let mut seen = skill_ids.iter().cloned().collect::<HashSet<_>>();
-    for skill_id in REQUIRED_SYSTEM_SKILL_IDS {
-        if seen.insert((*skill_id).to_string()) {
-            skill_ids.push((*skill_id).to_string());
-        }
-    }
-    skill_ids
 }
 
 fn default_execution_mode() -> String {
@@ -1506,6 +1561,29 @@ fn serialize_collaboration_config(
 
 fn deserialize_collaboration_config(raw: Option<String>) -> Option<AgentCollaborationConfig> {
     raw.and_then(|value| serde_json::from_str::<AgentCollaborationConfig>(&value).ok())
+}
+
+fn serialize_capability_policy(config: &AgentCapabilityPolicy) -> Result<Option<String>, String> {
+    let normalized = normalize_capability_policy(Some(config.clone()), static_capability_policy());
+    serde_json::to_string(&normalized)
+        .map(Some)
+        .map_err(|error| format!("序列化能力策略失败: {error}"))
+}
+
+fn deserialize_capability_policy(
+    raw: Option<String>,
+    _execution_mode: &str,
+    _skill_ids: &[String],
+    is_builtin: bool,
+) -> AgentCapabilityPolicy {
+    let fallback = if is_builtin {
+        new_agent_default_capability_policy()
+    } else {
+        static_capability_policy()
+    };
+    raw.and_then(|value| serde_json::from_str::<AgentCapabilityPolicy>(&value).ok())
+        .map(|value| normalize_capability_policy(Some(value), fallback.clone()))
+        .unwrap_or(fallback)
 }
 
 fn serialize_heartbeat_config(config: &AgentHeartbeatConfig) -> Result<Option<String>, String> {
@@ -1854,6 +1932,7 @@ struct NormalizedAgentInput {
     summary: String,
     description: String,
     system_prompt: String,
+    capability_policy: AgentCapabilityPolicy,
     skill_ids: Vec<String>,
     default_provider_id: String,
     default_model: String,
@@ -1963,6 +2042,7 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
                 summary: row.get(2)?,
                 description: row.get(3)?,
                 system_prompt: row.get(4)?,
+                capability_policy: static_capability_policy(),
                 skill_ids: Vec::new(),
                 default_provider_id: row.get(5)?,
                 default_model: row.get(6)?,
@@ -1982,7 +2062,16 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
 
     let mut agents = Vec::new();
     for row in rows {
-        agents.push(row.map_err(|error| format!("解析同步用 agent 数据失败: {error}"))?);
+        let mut agent = row.map_err(|error| format!("解析同步用 agent 数据失败: {error}"))?;
+        agent.skill_ids = load_skill_ids_for_agent(connection, &agent.id)?;
+        agent.capability_policy = load_capability_policy_for_agent(
+            connection,
+            &agent.id,
+            &agent.execution_mode,
+            &agent.skill_ids,
+            agent.is_builtin,
+        )?;
+        agents.push(agent);
     }
 
     Ok(agents)
@@ -2017,6 +2106,7 @@ mod tests {
                 summary: "负责综合处理".to_string(),
                 description: "更完整的说明".to_string(),
                 system_prompt: "先确认，再执行".to_string(),
+                capability_policy: None,
                 skill_ids: vec!["alpha".to_string(), "alpha".to_string(), "beta".to_string()],
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),
@@ -2032,12 +2122,9 @@ mod tests {
 
         assert_eq!(
             created.skill_ids,
-            vec![
-                "alpha".to_string(),
-                "beta".to_string(),
-                "nineclaw-task-creator".to_string()
-            ]
+            vec!["alpha".to_string(), "beta".to_string()]
         );
+        assert_eq!(created.capability_policy.strategy, "static");
         assert_eq!(created.name, "自定义助理");
 
         let updated = update_agent_with_connection(
@@ -2048,6 +2135,12 @@ mod tests {
                 summary: "负责复杂处理".to_string(),
                 description: "更新后的说明".to_string(),
                 system_prompt: "".to_string(),
+                capability_policy: Some(AgentCapabilityPolicy {
+                    strategy: "dynamic".to_string(),
+                    required_skill_ids: vec!["required".to_string()],
+                    forbidden_skill_ids: vec!["blocked".to_string()],
+                    max_dynamic_skills: 3,
+                }),
                 skill_ids: vec!["gamma".to_string()],
                 default_provider_id: "anthropic".to_string(),
                 default_model: "claude-sonnet-4-0".to_string(),
@@ -2066,11 +2159,13 @@ mod tests {
         .expect("update agent");
 
         assert_eq!(updated.name, "自定义助理 v2");
-        assert_eq!(
-            updated.skill_ids,
-            vec!["gamma".to_string(), "nineclaw-task-creator".to_string()]
-        );
+        assert_eq!(updated.skill_ids, vec!["gamma".to_string()]);
         assert_eq!(updated.execution_mode, "supervisor");
+        assert_eq!(updated.capability_policy.strategy, "dynamic");
+        assert_eq!(
+            updated.capability_policy.required_skill_ids,
+            vec!["required".to_string()]
+        );
         assert_eq!(
             updated
                 .collaboration_config
@@ -2081,7 +2176,7 @@ mod tests {
     }
 
     #[test]
-    fn create_agent_auto_mounts_required_system_skill() {
+    fn create_agent_keeps_preferred_skill_list_clean() {
         let mut connection = connection();
 
         let created = create_agent_with_connection(
@@ -2091,6 +2186,7 @@ mod tests {
                 summary: "负责综合处理".to_string(),
                 description: "更完整的说明".to_string(),
                 system_prompt: "".to_string(),
+                capability_policy: Some(new_agent_default_capability_policy()),
                 skill_ids: vec![],
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),
@@ -2104,9 +2200,8 @@ mod tests {
         )
         .expect("create agent");
 
-        assert!(created
-            .skill_ids
-            .contains(&"nineclaw-task-creator".to_string()));
+        assert!(created.skill_ids.is_empty());
+        assert_eq!(created.capability_policy.strategy, "hybrid");
     }
 
     #[test]
@@ -2120,6 +2215,7 @@ mod tests {
                 summary: "".to_string(),
                 description: "负责把复杂需求拆解成可执行步骤，并持续推进收尾。".to_string(),
                 system_prompt: "".to_string(),
+                capability_policy: None,
                 skill_ids: vec![],
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),
@@ -2161,6 +2257,7 @@ mod tests {
                 summary: "项目推进".to_string(),
                 description: "负责项目推进".to_string(),
                 system_prompt: "".to_string(),
+                capability_policy: None,
                 skill_ids: vec![],
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),
@@ -2201,6 +2298,12 @@ mod tests {
             summary: "负责项目推进".to_string(),
             description: "擅长拆解任务和协调执行".to_string(),
             system_prompt: "避免省略关键确认步骤".to_string(),
+            capability_policy: AgentCapabilityPolicy {
+                strategy: "hybrid".to_string(),
+                required_skill_ids: vec![],
+                forbidden_skill_ids: vec![],
+                max_dynamic_skills: 4,
+            },
             skill_ids: vec!["alpha".to_string(), "beta".to_string()],
             default_provider_id: "openai".to_string(),
             default_model: "gpt-4.1".to_string(),
@@ -2213,7 +2316,8 @@ mod tests {
 
         assert!(prompt.contains("项目助理"));
         assert!(prompt.contains("负责项目推进"));
-        assert!(prompt.contains("已挂载技能"));
+        assert!(prompt.contains("能力策略"));
+        assert!(prompt.contains("偏好技能"));
         assert!(prompt.contains("避免省略关键确认步骤"));
     }
 
@@ -2228,6 +2332,7 @@ mod tests {
                 summary: "会定时提醒".to_string(),
                 description: "负责晨会提醒和日报抓取".to_string(),
                 system_prompt: "".to_string(),
+                capability_policy: None,
                 skill_ids: vec![],
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),

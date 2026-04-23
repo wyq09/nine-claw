@@ -50,6 +50,10 @@ const AGENT_TEMPLATE_FILES: &[&str] = &[
     "memory/SOURCE_INDEX.md",
     "memory/DAILY_INDEX.md",
     "wiki/INDEX.md",
+    "harness/default.json",
+    "harness/chat.json",
+    "harness/code.json",
+    "harness/credentials.json",
 ];
 const SHARED_VIEW_FILES: &[&str] = &[
     "AGENTS.md",
@@ -462,6 +466,7 @@ pub fn ensure_agent_workspace(
 
     cleanup_generated_bootstrap(&agent_home, seed)?;
     memory_wiki::ensure_memory_wiki_scaffold(&agent_home)?;
+    crate::managed_runtime::ensure_agent_runtime_scaffold(&agent_home)?;
 
     Ok(agent_home)
 }
@@ -545,6 +550,11 @@ pub fn build_workspace_system_prompt_for_query(
         "历史日记：除非用户明确要求追溯，不要用工具通读全部 memory/YYYY-MM-DD.md；先用 memory/DAILY_INDEX.md（或 NineClaw 注入的「日记检索」摘要）按分类/关键词筛选，再打开对应 memory/YYYY-MM-DD.md 段落；今昨两天可直接读日记。"
             .to_string(),
     );
+    if let Some(session_snapshot) =
+        crate::managed_runtime::build_session_context_snapshot(&agent_home, 12, 520)?
+    {
+        sections.push(session_snapshot);
+    }
 
     if let Some(wiki_snapshot) =
         memory_wiki::build_memory_wiki_snapshot(&agent_home, current_prompt)?
@@ -899,9 +909,7 @@ pub fn persist_team_artifacts_inbound_file(
     file_name: &str,
     data: &[u8],
 ) -> Result<PathBuf, String> {
-    let inbox_dir = artifacts_root
-        .join("chat-inbox")
-        .join(current_date_label());
+    let inbox_dir = artifacts_root.join("chat-inbox").join(current_date_label());
     fs::create_dir_all(&inbox_dir).map_err(|error| format!("创建团队成果收件目录失败: {error}"))?;
 
     let safe_scope = sanitize_workspace_segment(scope, "session");
@@ -1783,7 +1791,6 @@ fn dedupe_review_queue_items(items: Vec<ReviewQueueItem>) -> Vec<ReviewQueueItem
     deduped
 }
 
-
 fn safe_read_trimmed(path: PathBuf, limit: usize) -> Result<String, String> {
     if !path.exists() {
         return Ok(String::new());
@@ -2663,13 +2670,22 @@ fn build_review_items_for_working(
     categories: &[MemoryCategoryDefinition],
     source_ref: &str,
 ) -> Vec<String> {
-    let items = build_review_queue_items(user_message, assistant_message, summary, categories, source_ref);
-    items.into_iter().map(|item| {
-        format!(
-            "[{}] {}（reason: {}，review_at: {}，source: `{}`）",
-            item.status, item.item, item.reason, item.review_at, item.source
-        )
-    }).collect()
+    let items = build_review_queue_items(
+        user_message,
+        assistant_message,
+        summary,
+        categories,
+        source_ref,
+    );
+    items
+        .into_iter()
+        .map(|item| {
+            format!(
+                "[{}] {}（reason: {}，review_at: {}，source: `{}`）",
+                item.status, item.item, item.reason, item.review_at, item.source
+            )
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -2880,6 +2896,22 @@ fn fallback_template(file_name: &str) -> String {
         "memory/SOURCE_INDEX.md" => "# SOURCE_INDEX.md\n\nThis file registers immutable raw sources and uploaded artifacts. The LLM should never rewrite the underlying source files; it should only update the curated memory around them.\n\nEach entry includes an `Index:` line (`type=… ts=… cats=…`) for quick filtering.\n\n## Entries\n".to_string(),
         "memory/DAILY_INDEX.md" => "# DAILY_INDEX.md\n\n**Retrieval index** for `memory/YYYY-MM-DD.md` digest lines. Each machine line starts with `DAILY|` then `date|timestamp|user|cats|summary` (fields must not contain `|`).\n\n- Use `rg` / editor search on `cats` (e.g. `projects`) or keywords before opening a full daily file.\n- Full context stays in the dated markdown files.\n\n## Lines\n".to_string(),
         "wiki/INDEX.md" => "# INDEX.md\n\nThis wiki stores external knowledge, research notes, and reusable methodology. Do not store user identity, promises, or live project status here.\n\n## Boundaries\n\n- Put `who we are / what we promised / what the user prefers` into memory, not wiki.\n- Put external articles, GitHub project notes, technical summaries, and methods into wiki.\n\n## Routes\n\n- New research note: create a page under `wiki/` and link it here.\n- Memory question: go back to `memory/INDEX.md`.\n\n## Pages\n\n- No wiki pages yet.\n".to_string(),
+        "harness/default.json" => crate::managed_runtime::default_harness_file(
+            "default",
+            "通用执行 harness，适合没有明显代码修改目标的对话。",
+            &[],
+        ),
+        "harness/chat.json" => crate::managed_runtime::default_harness_file(
+            "chat",
+            "聊天 / 规划 / 分析型 harness。少用写文件工具，优先结构化推理与检索。",
+            &["read", "bash", "web_search", "web_fetch", "write"],
+        ),
+        "harness/code.json" => crate::managed_runtime::default_harness_file(
+            "code",
+            "代码执行 harness。优先读代码、改代码、跑命令、验证结果。",
+            &["read", "write", "edit", "bash", "web_fetch"],
+        ),
+        "harness/credentials.json" => crate::managed_runtime::default_credentials_file(),
         _ => String::new(),
     }
 }
@@ -3019,6 +3051,11 @@ mod tests {
         assert!(!home.join("BOOTSTRAP.md").exists());
         assert!(home.join("memory").join("SOURCE_INDEX.md").exists());
         assert!(home.join("memory").join("DAILY_INDEX.md").exists());
+        assert!(home.join("memory").join("sessions").exists());
+        assert!(home.join("harness").join("default.json").exists());
+        assert!(home.join("harness").join("chat.json").exists());
+        assert!(home.join("harness").join("code.json").exists());
+        assert!(home.join("harness").join("credentials.json").exists());
         assert!(home.join("wiki").join("INDEX.md").exists());
         assert!(!home.join("memory").join("WIKI_INDEX.md").exists());
         assert!(root
@@ -3062,6 +3099,41 @@ mod tests {
             .any(|file| file.relative_path == "agents/test-agent/wiki/INDEX.md"));
 
         fs::remove_dir_all(&root).expect("cleanup");
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
+    fn workspace_prompt_includes_recent_session_events() {
+        let _guard = lock_workspace_test();
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+
+        let seed = AgentWorkspaceSeed {
+            id: "session-agent",
+            name: "Session Agent",
+            summary: "用于验证 session 注入",
+            description: "验证 session snapshot 是否进入 prompt",
+            accent_color: None,
+            is_builtin: false,
+        };
+
+        let home = ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        crate::managed_runtime::append_session_event(
+            &home,
+            "session-1",
+            crate::managed_runtime::SessionEventKind::ToolCall,
+            "调用 bash 运行 cargo test",
+            None,
+        )
+        .expect("append session event");
+
+        let prompt =
+            build_workspace_system_prompt_for_query("session-agent", Some("继续刚才的任务"))
+                .expect("workspace prompt");
+        assert!(prompt.contains("Recent Session Events:"));
+        assert!(prompt.contains("调用 bash 运行 cargo test"));
+
+        let _ = fs::remove_dir_all(root);
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
     }
 
@@ -3507,10 +3579,7 @@ mod tests {
                         "prompt points to wiki index",
                         prompt.contains("wiki/INDEX.md"),
                     ),
-                    (
-                        "prompt references WORKING",
-                        prompt.contains("WORKING"),
-                    ),
+                    ("prompt references WORKING", prompt.contains("WORKING")),
                     ("prompt includes query route", prompt.contains("检索顺序")),
                     ("prompt omits BOOTSTRAP", !prompt.contains("BOOTSTRAP.md")),
                     ("prompt omits WIKI_INDEX", !prompt.contains("WIKI_INDEX.md")),
@@ -3587,27 +3656,54 @@ mod tests {
         // 稳定档案层
         assert!(home.join("MEMORY.md").exists(), "MEMORY.md");
         assert!(home.join("USER_MODEL.md").exists(), "USER_MODEL.md");
-        assert!(home.join("RELATIONSHIP_MAP.md").exists(), "RELATIONSHIP_MAP.md");
+        assert!(
+            home.join("RELATIONSHIP_MAP.md").exists(),
+            "RELATIONSHIP_MAP.md"
+        );
         // 执行态层
         assert!(home.join("WORKING.md").exists(), "WORKING.md");
         // 规则层
         assert!(home.join("DECISIONS.md").exists(), "DECISIONS.md");
         assert!(home.join("PITFALLS.md").exists(), "PITFALLS.md");
         // 证据层
-        assert!(home.join("memory").join("SOURCE_INDEX.md").exists(), "SOURCE_INDEX.md");
+        assert!(
+            home.join("memory").join("SOURCE_INDEX.md").exists(),
+            "SOURCE_INDEX.md"
+        );
         assert!(home.join("memory").join("raw").exists(), "memory/raw/");
         // 历史检索层
-        assert!(home.join("memory").join("DAILY_INDEX.md").exists(), "DAILY_INDEX.md");
+        assert!(
+            home.join("memory").join("DAILY_INDEX.md").exists(),
+            "DAILY_INDEX.md"
+        );
         // 外部知识层
         assert!(home.join("wiki").join("INDEX.md").exists(), "wiki/INDEX.md");
 
         // ── Scaffold: 已下线文件不得存在 ──
-        assert!(!home.join("memory").join("LINT.md").exists(), "LINT.md should not exist");
-        assert!(!home.join("memory").join("LOG.md").exists(), "LOG.md should not exist");
-        assert!(!home.join("memory").join("REVIEW_QUEUE.md").exists(), "REVIEW_QUEUE.md should not exist");
-        assert!(!home.join("memory").join("INDEX.md").exists(), "memory/INDEX.md should not exist");
-        assert!(!home.join("memory").join("categories").exists(), "memory/categories/ should not exist");
-        assert!(!home.join("BOOTSTRAP.md").exists(), "BOOTSTRAP.md should not exist");
+        assert!(
+            !home.join("memory").join("LINT.md").exists(),
+            "LINT.md should not exist"
+        );
+        assert!(
+            !home.join("memory").join("LOG.md").exists(),
+            "LOG.md should not exist"
+        );
+        assert!(
+            !home.join("memory").join("REVIEW_QUEUE.md").exists(),
+            "REVIEW_QUEUE.md should not exist"
+        );
+        assert!(
+            !home.join("memory").join("INDEX.md").exists(),
+            "memory/INDEX.md should not exist"
+        );
+        assert!(
+            !home.join("memory").join("categories").exists(),
+            "memory/categories/ should not exist"
+        );
+        assert!(
+            !home.join("BOOTSTRAP.md").exists(),
+            "BOOTSTRAP.md should not exist"
+        );
 
         // ── Ingest: 写入只走保留层 ──
         append_agent_memory_entry(
@@ -3624,16 +3720,27 @@ mod tests {
         assert!(working.contains("OPEN_LOOPS"), "WORKING.md has open loops");
 
         let source_index = read_string(home.join("memory").join("SOURCE_INDEX.md"));
-        assert!(source_index.contains("memory/raw/"), "SOURCE_INDEX has raw ref");
+        assert!(
+            source_index.contains("memory/raw/"),
+            "SOURCE_INDEX has raw ref"
+        );
 
-        let daily_log_path = home.join("memory").join(format!("{}.md", current_date_label()));
+        let daily_log_path = home
+            .join("memory")
+            .join(format!("{}.md", current_date_label()));
         assert!(daily_log_path.exists(), "daily log created");
         let daily_log = read_string(daily_log_path);
         assert!(daily_log.contains("Summary:"), "daily log has summary");
 
         // 已下线文件不得被 ingest 创建
-        assert!(!home.join("memory").join("LINT.md").exists(), "LINT.md not created by ingest");
-        assert!(!home.join("memory").join("LOG.md").exists(), "LOG.md not created by ingest");
+        assert!(
+            !home.join("memory").join("LINT.md").exists(),
+            "LINT.md not created by ingest"
+        );
+        assert!(
+            !home.join("memory").join("LOG.md").exists(),
+            "LOG.md not created by ingest"
+        );
         assert!(
             !home.join("memory").join("REVIEW_QUEUE.md").exists(),
             "REVIEW_QUEUE.md not created by ingest"
@@ -3648,18 +3755,31 @@ mod tests {
         );
 
         // ── Prompt: 只引用保留层 ──
-        let prompt = build_workspace_system_prompt_for_query(
-            "simple-agent",
-            Some("继续这个项目的发布规划"),
-        )
-        .expect("prompt");
+        let prompt =
+            build_workspace_system_prompt_for_query("simple-agent", Some("继续这个项目的发布规划"))
+                .expect("prompt");
         // 保留层引用
-        assert!(prompt.contains("WORKING.md"), "prompt references WORKING.md");
-        assert!(prompt.contains("SOURCE_INDEX"), "prompt references SOURCE_INDEX");
-        assert!(prompt.contains("DAILY_INDEX"), "prompt references DAILY_INDEX");
+        assert!(
+            prompt.contains("WORKING.md"),
+            "prompt references WORKING.md"
+        );
+        assert!(
+            prompt.contains("SOURCE_INDEX"),
+            "prompt references SOURCE_INDEX"
+        );
+        assert!(
+            prompt.contains("DAILY_INDEX"),
+            "prompt references DAILY_INDEX"
+        );
         // 已下线引用不得出现
-        assert!(!prompt.contains("LINT.md"), "prompt must not reference LINT.md");
-        assert!(!prompt.contains("LOG.md"), "prompt must not reference LOG.md");
+        assert!(
+            !prompt.contains("LINT.md"),
+            "prompt must not reference LINT.md"
+        );
+        assert!(
+            !prompt.contains("LOG.md"),
+            "prompt must not reference LOG.md"
+        );
         assert!(
             !prompt.contains("REVIEW_QUEUE"),
             "prompt must not reference REVIEW_QUEUE"

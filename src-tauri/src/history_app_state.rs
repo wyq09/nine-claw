@@ -439,9 +439,7 @@ pub(crate) fn storage_conn(app: &AppHandle) -> Result<rusqlite::Connection, Stri
 }
 
 #[tauri::command]
-pub(crate) fn list_token_usage_records(
-    app: AppHandle,
-) -> Result<Vec<TokenUsageRecordRow>, String> {
+pub(crate) fn list_token_usage_records(app: AppHandle) -> Result<Vec<TokenUsageRecordRow>, String> {
     let connection = open_history_db(&app)?;
     let mut statement = connection
         .prepare(

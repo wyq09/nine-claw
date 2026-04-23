@@ -20,6 +20,20 @@ pub struct InstalledSkill {
     pub source_type: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SkillDefinition {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub path: PathBuf,
+    pub triggers: Vec<String>,
+    pub examples: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub requires_auth: bool,
+    pub side_effect_level: String,
+    pub modes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemSkillCatalog {
@@ -59,14 +73,41 @@ struct SkillLockEntry {
     source_type: Option<String>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SkillManifest {
     name: Option<String>,
     description: Option<String>,
+    triggers: Vec<String>,
+    examples: Vec<String>,
+    capabilities: Vec<String>,
+    requires_auth: bool,
+    side_effect_level: Option<String>,
+    modes: Vec<String>,
 }
 
 pub fn list_installed_skills() -> Result<Vec<InstalledSkill>, String> {
     scan_skill_roots(&candidate_skill_roots())
+}
+
+pub fn list_runtime_available_skills() -> Result<Vec<SkillDefinition>, String> {
+    let mut skills = scan_skill_definitions_from_roots(&candidate_skill_roots())?;
+    let mut seen_ids = skills
+        .iter()
+        .map(|skill| skill.id.clone())
+        .collect::<HashSet<_>>();
+
+    for (skill_id, path) in list_runtime_system_skill_directories()? {
+        if seen_ids.contains(&skill_id) {
+            continue;
+        }
+        if let Some(definition) = load_skill_definition("runtime", &skill_id, &path)? {
+            seen_ids.insert(skill_id);
+            skills.push(definition);
+        }
+    }
+
+    skills.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    Ok(skills)
 }
 
 pub fn resolve_skill_directories(skill_ids: &[String]) -> Result<Vec<PathBuf>, String> {
@@ -479,6 +520,90 @@ fn scan_skill_roots(roots: &[SkillRoot]) -> Result<Vec<InstalledSkill>, String> 
     Ok(skills)
 }
 
+fn scan_skill_definitions_from_roots(roots: &[SkillRoot]) -> Result<Vec<SkillDefinition>, String> {
+    let mut skills = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_paths = HashSet::new();
+
+    for root in roots {
+        if !root.path.exists() || !root.path.is_dir() {
+            continue;
+        }
+
+        let entries = fs::read_dir(&root.path)
+            .map_err(|error| format!("读取技能目录失败 {}: {error}", root.path.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!("读取技能目录条目失败 {}: {error}", root.path.display())
+            })?;
+            let skill_id = entry.file_name().to_string_lossy().trim().to_string();
+            if skill_id.is_empty()
+                || skill_id.starts_with('.')
+                || !seen_ids.insert(skill_id.clone())
+            {
+                continue;
+            }
+
+            let skill_path = entry.path();
+            let canonical_skill_path =
+                fs::canonicalize(&skill_path).unwrap_or_else(|_| skill_path.clone());
+            if !seen_paths.insert(canonical_skill_path) {
+                continue;
+            }
+
+            if let Some(definition) = load_skill_definition(root.scope, &skill_id, &skill_path)? {
+                skills.push(definition);
+            }
+        }
+    }
+
+    Ok(skills)
+}
+
+fn load_skill_definition(
+    _scope: &str,
+    skill_id: &str,
+    skill_path: &Path,
+) -> Result<Option<SkillDefinition>, String> {
+    let manifest_path = skill_path.join("SKILL.md");
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("读取技能说明失败 {}: {error}", manifest_path.display()))?;
+    let manifest = parse_skill_manifest(&manifest_text);
+    let name = manifest
+        .name
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| skill_id.to_string());
+    let description = manifest
+        .description
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "暂无描述".to_string());
+
+    Ok(Some(SkillDefinition {
+        id: skill_id.to_string(),
+        name,
+        description,
+        path: skill_path.to_path_buf(),
+        triggers: manifest.triggers,
+        examples: manifest.examples,
+        capabilities: manifest.capabilities,
+        requires_auth: manifest.requires_auth,
+        side_effect_level: manifest
+            .side_effect_level
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "low".to_string()),
+        modes: manifest
+            .modes
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+    }))
+}
+
 fn candidate_skill_roots() -> Vec<SkillRoot> {
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
@@ -627,7 +752,6 @@ fn parse_skill_manifest(content: &str) -> SkillManifest {
             if trimmed == "---" {
                 break;
             }
-
             if let Some((_, value)) = trimmed.split_once(':') {
                 let value = value.trim();
                 if matches!(value, "|" | "|-" | "|+" | ">" | ">-" | ">+") {
@@ -637,28 +761,8 @@ fn parse_skill_manifest(content: &str) -> SkillManifest {
             frontmatter_lines.push(line.to_string());
         }
 
-        let mut index = 0usize;
-        while index < frontmatter_lines.len() {
-            let line = &frontmatter_lines[index];
-            let trimmed = line.trim();
-            if let Some((key, value)) = trimmed.split_once(':') {
-                let key = key.trim();
-                let value = value.trim();
-                let (normalized, consumed) =
-                    parse_frontmatter_value(&frontmatter_lines, index, line, value);
-                match key {
-                    "name" if manifest.name.is_none() => {
-                        manifest.name = Some(normalized);
-                    }
-                    "description" if manifest.description.is_none() => {
-                        manifest.description = Some(normalized);
-                    }
-                    _ => {}
-                }
-                index += consumed;
-                continue;
-            }
-            index += 1;
+        if let Some(frontmatter) = parse_frontmatter(&frontmatter_lines.join("\n")) {
+            manifest = frontmatter;
         }
     }
 
@@ -699,124 +803,57 @@ fn parse_skill_manifest(content: &str) -> SkillManifest {
     manifest
 }
 
-fn parse_frontmatter_value(
-    lines: &[String],
-    start_index: usize,
-    original_line: &str,
-    raw_value: &str,
-) -> (String, usize) {
-    if !matches!(raw_value, "|" | "|-" | "|+" | ">" | ">-" | ">+") {
-        return (strip_wrapping_quotes(raw_value).to_string(), 1);
-    }
+fn parse_frontmatter(content: &str) -> Option<SkillManifest> {
+    let parsed = serde_yaml::from_str::<serde_yaml::Value>(content).ok()?;
+    let map = parsed.as_mapping()?;
+    Some(SkillManifest {
+        name: read_yaml_string(map, "name"),
+        description: read_yaml_string(map, "description"),
+        triggers: read_yaml_string_list(map, "triggers"),
+        examples: read_yaml_string_list(map, "examples"),
+        capabilities: read_yaml_string_list(map, "capabilities"),
+        requires_auth: read_yaml_bool(map, "requiresAuth"),
+        side_effect_level: read_yaml_string(map, "sideEffectLevel"),
+        modes: read_yaml_string_list(map, "modes"),
+    })
+}
 
-    let key_indent = original_line
-        .chars()
-        .take_while(|char| char.is_whitespace())
-        .count();
-    let mut block_lines = Vec::new();
-    let mut index = start_index + 1;
-    let mut block_indent: Option<usize> = None;
+fn read_yaml_string(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    map.get(&serde_yaml::Value::String(key.to_string()))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
-    while index < lines.len() {
-        let candidate = &lines[index];
-        let trimmed = candidate.trim();
-        let indent = candidate
-            .chars()
-            .take_while(|char| char.is_whitespace())
-            .count();
+fn read_yaml_bool(map: &serde_yaml::Mapping, key: &str) -> bool {
+    map.get(&serde_yaml::Value::String(key.to_string()))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
 
-        if trimmed.is_empty() {
-            if block_indent.is_some() {
-                block_lines.push(String::new());
-                index += 1;
-                continue;
-            }
-            index += 1;
-            continue;
-        }
-
-        let current_block_indent = block_indent.unwrap_or(indent);
-        if indent <= key_indent || indent < current_block_indent {
-            break;
-        }
-
-        block_indent = Some(current_block_indent);
-        let content = candidate
-            .get(current_block_indent..)
-            .unwrap_or(trimmed)
-            .trim_end()
-            .to_string();
-        block_lines.push(content);
-        index += 1;
-    }
-
-    let value = if raw_value.starts_with('>') {
-        fold_frontmatter_block_lines(&block_lines)
-    } else {
-        trim_frontmatter_block_lines(block_lines).join("\n")
+fn read_yaml_string_list(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {
+    let Some(value) = map.get(&serde_yaml::Value::String(key.to_string())) else {
+        return Vec::new();
     };
 
-    (value, index.saturating_sub(start_index))
-}
-
-fn trim_frontmatter_block_lines(lines: Vec<String>) -> Vec<String> {
-    let start = lines
-        .iter()
-        .position(|line| !line.trim().is_empty())
-        .unwrap_or(lines.len());
-    let end = lines
-        .iter()
-        .rposition(|line| !line.trim().is_empty())
-        .map(|index| index + 1)
-        .unwrap_or(start);
-
-    lines[start..end].to_vec()
-}
-
-fn fold_frontmatter_block_lines(lines: &[String]) -> String {
-    let trimmed = trim_frontmatter_block_lines(lines.to_vec());
-    let mut paragraphs = Vec::new();
-    let mut current = String::new();
-
-    for line in trimmed {
-        if line.trim().is_empty() {
-            if !current.is_empty() {
-                paragraphs.push(current.trim().to_string());
-                current.clear();
-            }
-            continue;
-        }
-
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(line.trim());
+    if let Some(single) = value.as_str() {
+        return vec![single.trim().to_string()]
+            .into_iter()
+            .filter(|item| !item.is_empty())
+            .collect();
     }
 
-    if !current.is_empty() {
-        paragraphs.push(current.trim().to_string());
-    }
-
-    paragraphs.join("\n")
-}
-
-fn strip_wrapping_quotes(value: &str) -> &str {
-    let trimmed = value.trim();
-    if trimmed.len() >= 2 {
-        if let Some(stripped) = trimmed
-            .strip_prefix('"')
-            .and_then(|item| item.strip_suffix('"'))
-        {
-            return stripped;
-        }
-        if let Some(stripped) = trimmed
-            .strip_prefix('\'')
-            .and_then(|item| item.strip_suffix('\''))
-        {
-            return stripped;
-        }
-    }
-    trimmed
+    value
+        .as_sequence()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn system_time_to_ms(time: SystemTime) -> i64 {
@@ -861,6 +898,7 @@ Fallback description
             SkillManifest {
                 name: Some("all-plan".to_string()),
                 description: Some("Collaborative planning using abstract roles.".to_string()),
+                ..SkillManifest::default()
             }
         );
     }
@@ -880,6 +918,7 @@ Automate browser interactions for data collection.
             SkillManifest {
                 name: Some("Browser Skill".to_string()),
                 description: Some("Automate browser interactions for data collection.".to_string()),
+                ..SkillManifest::default()
             }
         );
     }
@@ -904,6 +943,7 @@ metadata:
             SkillManifest {
                 name: Some("multiline-skill".to_string()),
                 description: Some("第一行简介\n---\n第二行才是补充说明".to_string()),
+                ..SkillManifest::default()
             }
         );
     }
@@ -927,7 +967,45 @@ description: >
             SkillManifest {
                 name: Some("folded-skill".to_string()),
                 description: Some("第一行简介 第二行继续补充\n第二段说明".to_string()),
+                ..SkillManifest::default()
             }
+        );
+    }
+
+    #[test]
+    fn parse_manifest_reads_dynamic_skill_metadata() {
+        let manifest = parse_skill_manifest(
+            r#"---
+name: pptx
+description: Create slides
+triggers:
+  - slides
+  - presentation
+examples:
+  - make a deck
+capabilities:
+  - export pptx
+requiresAuth: true
+sideEffectLevel: high
+modes:
+  - worker
+  - supervisor
+---
+"#,
+        );
+
+        assert_eq!(manifest.name.as_deref(), Some("pptx"));
+        assert_eq!(
+            manifest.triggers,
+            vec!["slides".to_string(), "presentation".to_string()]
+        );
+        assert_eq!(manifest.examples, vec!["make a deck".to_string()]);
+        assert_eq!(manifest.capabilities, vec!["export pptx".to_string()]);
+        assert!(manifest.requires_auth);
+        assert_eq!(manifest.side_effect_level.as_deref(), Some("high"));
+        assert_eq!(
+            manifest.modes,
+            vec!["worker".to_string(), "supervisor".to_string()]
         );
     }
 

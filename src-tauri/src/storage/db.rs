@@ -4,8 +4,7 @@ use std::path::PathBuf;
 /// Open an in-memory SQLite connection with all required schemas applied.
 /// Used for testing.
 pub fn open_in_memory() -> Result<Connection, String> {
-    let conn =
-        Connection::open_in_memory().map_err(|e| format!("打开内存数据库失败: {e}"))?;
+    let conn = Connection::open_in_memory().map_err(|e| format!("打开内存数据库失败: {e}"))?;
     apply_pragmas(&conn)?;
     ensure_all_schemas(&conn)?;
     Ok(conn)

@@ -1,4 +1,5 @@
 import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { llmLogExportGet, llmLogExportSet } from '../../lib/llmLogExportClient'
 import type { MouseEvent } from 'react'
 import { botDefinitions, createInitialBotConfigs, emptyProviderConfig, providerDefinitions, resourceSeed } from '../../mockData'
 import { useComposerAttachments } from '../../hooks/useComposerAttachments'
@@ -41,6 +42,7 @@ import {
   installSystemSkill,
   listInstalledSkills,
   listAgents,
+  loadNetworkProxySettings,
   loadProviderPreferences,
   listSystemSkillCatalog,
   readAgentWorkspaceBundle,
@@ -100,6 +102,9 @@ import {
   resolveEffectiveChatRuntime,
   resolveRuntimeFromAgentSnapshot,
   resolveRuntimeFromSessionFields,
+  filterStandaloneHistory,
+  resolveStandaloneActiveHistoryId,
+  resolveStandaloneActiveHistoryItem,
   sanitizeAgentInputModelReference,
   sessionLlmDecode,
   sessionLlmEncode,
@@ -267,8 +272,22 @@ export function NineClawApp() {
     () => composerAgent ?? (defaultAgent ? buildConversationAgentSnapshot(defaultAgent) : null),
     [composerAgent, defaultAgent],
   )
-  const activeChatAgent = activeHistoryItem ? activeHistoryItem.agent ?? null : preferredComposerAgent
-  const composerAttachmentScopeKey = `${activeHistoryId || 'composer'}:${activeChatAgent?.id ?? 'no-agent'}:${activeHistoryItem?.workspaceId ?? ''}`
+  const standaloneActiveHistoryItem = useMemo(
+    () => resolveStandaloneActiveHistoryItem(activeHistoryItem),
+    [activeHistoryItem],
+  )
+  const standaloneActiveHistoryId = useMemo(
+    () => resolveStandaloneActiveHistoryId(activeHistoryItem, activeHistoryId),
+    [activeHistoryId, activeHistoryItem],
+  )
+  const currentConversationHistoryItem =
+    view === 'chat' ? standaloneActiveHistoryItem : activeHistoryItem
+  const currentConversationHistoryId =
+    view === 'chat' ? standaloneActiveHistoryId : activeHistoryId
+  const activeChatAgent = currentConversationHistoryItem
+    ? currentConversationHistoryItem.agent ?? null
+    : preferredComposerAgent
+  const composerAttachmentScopeKey = `${currentConversationHistoryId || 'composer'}:${activeChatAgent?.id ?? 'no-agent'}:${currentConversationHistoryItem?.workspaceId ?? ''}`
   const {
     attachments: composerAttachments,
     uploading: composerAttachmentUploading,
@@ -282,8 +301,8 @@ export function NineClawApp() {
     clearError: clearComposerAttachmentError,
   } = useComposerAttachments({
     agentId: activeChatAgent?.id ?? '',
-    sessionId: activeHistoryId || null,
-    workspaceId: activeHistoryItem?.workspaceId ?? null,
+    sessionId: currentConversationHistoryId || null,
+    workspaceId: currentConversationHistoryItem?.workspaceId ?? null,
     scopeKey: composerAttachmentScopeKey,
   })
   const visibleInstalledSkills = installedSkills.filter((skill) => {
@@ -345,7 +364,8 @@ export function NineClawApp() {
         return left.name.localeCompare(right.name, 'zh-CN')
       })
   }, [agentEditorDraft?.skillIds, agentSkillSearch, builtinAgentSkillOptions, installedSkills])
-  const visibleHistory = history.filter((item) => {
+  const standaloneHistory = useMemo(() => filterStandaloneHistory(history), [history])
+  const visibleHistory = standaloneHistory.filter((item) => {
     if (!deferredHistorySearch) return true
 
     const searchableText = [
@@ -362,7 +382,7 @@ export function NineClawApp() {
   const effectiveChatRuntime = useMemo(
     () =>
       resolveEffectiveChatRuntime(
-        activeHistoryItem,
+        currentConversationHistoryItem,
         preferredComposerAgent,
         composerSessionLlm,
         selectedProviderId,
@@ -370,7 +390,7 @@ export function NineClawApp() {
         allProviderIds,
       ),
     [
-      activeHistoryItem,
+      currentConversationHistoryItem,
       preferredComposerAgent,
       composerSessionLlm,
       selectedProviderId,
@@ -385,10 +405,13 @@ export function NineClawApp() {
     const fallbackModel =
       globalRuntime?.model ?? providerConfigs[selectedProviderId]?.model?.trim() ?? ''
 
-    if (activeHistoryItem?.sessionLlmProviderId && activeHistoryItem.sessionLlmModel !== undefined) {
+    if (
+      currentConversationHistoryItem?.sessionLlmProviderId &&
+      currentConversationHistoryItem.sessionLlmModel !== undefined
+    ) {
       const resolved = resolveRuntimeFromSessionFields(
-        activeHistoryItem.sessionLlmProviderId,
-        activeHistoryItem.sessionLlmModel,
+        currentConversationHistoryItem.sessionLlmProviderId,
+        currentConversationHistoryItem.sessionLlmModel,
         providerConfigs,
       )
       if (resolved) {
@@ -398,8 +421,11 @@ export function NineClawApp() {
         }
       }
     }
-    if (activeHistoryItem) {
-      const resolvedFromAgent = resolveRuntimeFromAgentSnapshot(activeHistoryItem.agent ?? null, providerConfigs)
+    if (currentConversationHistoryItem) {
+      const resolvedFromAgent = resolveRuntimeFromAgentSnapshot(
+        currentConversationHistoryItem.agent ?? null,
+        providerConfigs,
+      )
       if (resolvedFromAgent) {
         return {
           providerId: resolvedFromAgent.providerId,
@@ -445,7 +471,7 @@ export function NineClawApp() {
     }
     return { providerId: fallbackPid, model: fallbackModel }
   }, [
-    activeHistoryItem,
+    currentConversationHistoryItem,
     preferredComposerAgent,
     composerSessionLlm,
     selectedProviderId,
@@ -481,10 +507,12 @@ export function NineClawApp() {
   const chatProviderDefinition = effectiveChatRuntime
     ? mergedProviderDefinitions.find((item) => item.id === effectiveChatRuntime.providerId) ?? null
     : null
-  const requiresConfiguredSessionModel = activeHistoryItem
+  const requiresConfiguredSessionModel = currentConversationHistoryItem
     ? Boolean(
-        (activeHistoryItem.sessionLlmProviderId && activeHistoryItem.sessionLlmModel?.trim()) ||
-          (activeHistoryItem.agent?.defaultProviderId && activeHistoryItem.agent.defaultModel?.trim()),
+        (currentConversationHistoryItem.sessionLlmProviderId &&
+          currentConversationHistoryItem.sessionLlmModel?.trim()) ||
+          (currentConversationHistoryItem.agent?.defaultProviderId &&
+            currentConversationHistoryItem.agent.defaultModel?.trim()),
       )
     : Boolean(composerSessionLlm || (preferredComposerAgent?.defaultProviderId && preferredComposerAgent.defaultModel.trim()))
   const runtimeResolutionError =
@@ -646,12 +674,56 @@ export function NineClawApp() {
   }, [])
 
   useEffect(() => {
+    let cancelled = false
+
+    void loadNetworkProxySettings()
+      .then((settings) => {
+        if (cancelled) {
+          return
+        }
+        setGeneralSettings((previous) => ({
+          ...previous,
+          useSystemProxy: settings.useSystemProxy,
+          customProxyUrl: settings.customProxyUrl,
+        }))
+      })
+      .catch(() => {
+        // Keep the local fallback if the backend state is temporarily unavailable.
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
     persistStoredStorageValue(
       GENERAL_SETTINGS_STORAGE_KEY,
       JSON.stringify(generalSettings),
       LEGACY_GENERAL_SETTINGS_STORAGE_KEYS,
     )
   }, [generalSettings])
+
+  useEffect(() => {
+    let cancelled = false
+    void llmLogExportGet()
+      .then((path) => {
+        if (cancelled || !path?.trim()) return
+        setGeneralSettings((prev) => {
+          if (prev.llmCallLogDir?.trim()) return prev
+          return { ...prev, llmCallLogDir: path }
+        })
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    const p = generalSettings.llmCallLogDir?.trim()
+    void llmLogExportSet(p ? p : null).catch(() => {})
+  }, [generalSettings.llmCallLogDir])
 
   useEffect(() => {
     persistStoredStorageValue(
@@ -1044,7 +1116,7 @@ export function NineClawApp() {
       try {
         await workspaceRunDelegateTask({
           workspaceId: payload.workspaceId,
-          sessionId: activeHistoryId ?? null,
+          sessionId: currentConversationHistoryId ?? null,
           assignee: item.assignee,
           task: item.task,
           providerConfig: effectiveChatRuntime,
@@ -1102,8 +1174,8 @@ export function NineClawApp() {
     if (chatGateError) {
       setChatGateError('')
     }
-    if (activeHistoryId) {
-      updateSessionLlm(activeHistoryId, nextProviderId, nextModel)
+    if (currentConversationHistoryId) {
+      updateSessionLlm(currentConversationHistoryId, nextProviderId, nextModel)
     } else {
       setComposerSessionLlm({ providerId: nextProviderId, model: nextModel })
     }
@@ -1126,7 +1198,7 @@ export function NineClawApp() {
       return
     }
 
-    const botTarget = activeHistoryItem?.botTarget ?? null
+    const botTarget = currentConversationHistoryItem?.botTarget ?? null
     const hasDirectBotAttachments = Boolean(botTarget && composerAttachments.length > 0)
 
     if (hasDirectBotAttachments && botTarget) {
@@ -1168,7 +1240,7 @@ export function NineClawApp() {
     const promptWithAttachments = buildPromptWithAttachments(composerText, composerAttachments)
     clearComposerAttachments()
     const effectiveWorkspaceId =
-      activeHistoryItem?.workspaceId ??
+      currentConversationHistoryItem?.workspaceId ??
       (view === 'workspaces' ? activeWorkspaceId : null) ??
       null
     const overrideAgentId = extras?.overrideAgentId ?? null
@@ -1196,8 +1268,8 @@ export function NineClawApp() {
 
     const effectiveAgent: ConversationAgentSnapshot | null = overrideAgent
       ? buildConversationAgentSnapshot(overrideAgent)
-      : activeHistoryItem
-        ? activeHistoryItem.agent ?? null
+      : currentConversationHistoryItem
+        ? currentConversationHistoryItem.agent ?? null
         : preferredComposerAgent
     void submitPrompt(promptWithAttachments, {
       providerConfig: effectiveChatRuntime,
@@ -2114,7 +2186,7 @@ export function NineClawApp() {
           loading={loading}
           runningHistoryIds={runningHistoryIds}
           streamingHistoryIds={streamingHistoryIds}
-          activeHistoryId={activeHistoryId}
+          activeHistoryId={view === 'chat' ? standaloneActiveHistoryId : activeHistoryId}
           onAbort={abortPrompt}
           composerAttachmentError={composerAttachmentError}
           composerAttachmentInputRef={composerAttachmentInputRef}
@@ -2130,13 +2202,18 @@ export function NineClawApp() {
           onChatSubmit={handleSubmit}
           activeChatAgent={activeChatAgent}
           submitShortcut={generalSettings.submitShortcut}
-          activeHistoryItem={activeHistoryItem}
+          activeHistoryItem={view === 'chat' ? standaloneActiveHistoryItem : activeHistoryItem}
           sessionLlmSelectOptionsWithFallback={sessionLlmSelectOptionsWithFallback}
           runtimeReady={runtimeReady}
           runtimeBlockingReason={runtimeBlockingReason}
           sessionContextProviderConfig={
-            activeHistoryItem?.sessionLlmProviderId
-              ? { maxContextTokens: providerConfigs[activeHistoryItem.sessionLlmProviderId]?.maxContextTokens }
+            (view === 'chat' ? standaloneActiveHistoryItem : activeHistoryItem)?.sessionLlmProviderId
+              ? {
+                  maxContextTokens:
+                    providerConfigs[
+                      (view === 'chat' ? standaloneActiveHistoryItem : activeHistoryItem)?.sessionLlmProviderId ?? ''
+                    ]?.maxContextTokens,
+                }
               : selectedProviderId
                 ? { maxContextTokens: providerConfigs[selectedProviderId]?.maxContextTokens }
                 : null
@@ -2235,13 +2312,13 @@ export function NineClawApp() {
       view={view}
       onNewSession={handleNewSession}
       onViewChange={handleViewChange}
-      history={history}
+      history={standaloneHistory}
       onClearHistory={clearHistory}
       historyBusy={loading}
       historySearch={historySearch}
       setHistorySearch={setHistorySearch}
       visibleHistory={visibleHistory}
-      activeHistoryId={activeHistoryId}
+      activeHistoryId={standaloneActiveHistoryId}
       onHistorySelect={handleHistorySelect}
       onHistoryContextMenu={handleHistoryContextMenu}
       onOpenSettings={openSettings}
@@ -2303,6 +2380,8 @@ export function NineClawApp() {
       settingsTab={settingsTab}
       settingsSkillsLibrary={settingsSkillsLibrary}
       settingsResourcesLibrary={settingsResourcesLibrary}
+      llmTraceSessionId={currentConversationHistoryId}
+      llmTraceWorkspaceId={view === 'workspaces' && activeWorkspaceId ? activeWorkspaceId : null}
     />
   )
 }

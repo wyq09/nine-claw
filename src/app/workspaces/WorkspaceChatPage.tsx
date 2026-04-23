@@ -10,7 +10,7 @@ import { AppIcon } from '../../components/AppIcon'
 import { workspaceList } from '../../lib/piClient'
 import { WorkspaceSessionsSidebar } from './WorkspaceSessionsSidebar'
 import { TeamDrawer, type TeamDrawerTab } from './TeamDrawer'
-import { LlmTracePanel } from './panels/LlmTracePanel'
+import { openLlmTracePopout } from '../lib/llmTracePopout'
 import {
   DelegateSegmentsContext,
   type DelegateSegmentsContextValue,
@@ -55,7 +55,6 @@ export function WorkspaceChatPage({
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [drawerTab, setDrawerTab] = useState<TeamDrawerTab>('members')
   const [drawerMembers, setDrawerMembers] = useState<WorkspaceMemberView[]>([])
-  const [tracePanelOpen, setTracePanelOpen] = useState(false)
   const composerSetTextRef = useRef<((text: string) => void) | null>(null)
   const [mentionQuery, setMentionQuery] = useState<string | null>(null)
   const [composerRawText, setComposerRawText] = useState('')
@@ -391,9 +390,13 @@ export function WorkspaceChatPage({
           })}
           <button
             type="button"
-            className={`workspace-chat-topbar-button${tracePanelOpen ? ' active' : ''}`}
-            onClick={() => setTracePanelOpen((v) => !v)}
-            title="LLM 调用链调试：查看主 Agent↔模型、主 Agent↔子 Agent 的完整请求/响应"
+            className="workspace-chat-topbar-button"
+            onClick={() => {
+              if (workspace) {
+                void openLlmTracePopout(workspace.id, chatProps.activeHistoryId || null)
+              }
+            }}
+            title="在独立窗口打开 LLM 调用链调试"
           >
             <AppIcon name="wrench" size={14} />
             <span>调试</span>
@@ -456,14 +459,6 @@ export function WorkspaceChatPage({
           />
         ) : null}
       </div>
-      {workspace ? (
-        <LlmTracePanel
-          workspaceId={workspace.id}
-          sessionId={chatProps.activeHistoryId || null}
-          open={tracePanelOpen}
-          onClose={() => setTracePanelOpen(false)}
-        />
-      ) : null}
     </div>
   )
 }

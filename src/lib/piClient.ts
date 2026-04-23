@@ -17,6 +17,7 @@ import type {
   ConversationAgentSnapshot,
   ChatAttachmentUpload,
   InstalledSkillItem,
+  NetworkProxySettings,
   PersistedChatAttachment,
   PiStreamPayload,
   ProviderRuntimeConfig,
@@ -156,6 +157,26 @@ export async function testLlmProviderConnection(payload: {
     baseUrl: payload.baseUrl,
     apiKey: payload.apiKey,
     model: payload.model,
+  })
+}
+
+export async function loadNetworkProxySettings(): Promise<NetworkProxySettings> {
+  return invoke<NetworkProxySettings>('load_network_proxy_settings')
+}
+
+export async function saveNetworkProxySettings(
+  settings: NetworkProxySettings,
+): Promise<NetworkProxySettings> {
+  return invoke<NetworkProxySettings>('save_network_proxy_settings', {
+    settings,
+  })
+}
+
+export async function testNetworkProxyConnection(
+  settings: NetworkProxySettings,
+): Promise<string> {
+  return invoke<string>('test_network_proxy_connection', {
+    settings,
   })
 }
 

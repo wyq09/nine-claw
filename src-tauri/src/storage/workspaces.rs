@@ -93,7 +93,12 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
 
     add_column_if_missing(conn, "chat_sessions", "workspace_id", "TEXT")?;
     add_column_if_missing(conn, "chat_turns", "speaker_agent_id", "TEXT")?;
-    add_column_if_missing(conn, "workspaces", "artifacts_root", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(
+        conn,
+        "workspaces",
+        "artifacts_root",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     add_column_if_missing(
         conn,
         "workspaces",
@@ -171,7 +176,10 @@ pub struct CreateWorkspaceInput {
     pub supervisor_agent_id: String,
 }
 
-pub fn create_workspace(conn: &Connection, input: &CreateWorkspaceInput) -> Result<WorkspaceRecord, String> {
+pub fn create_workspace(
+    conn: &Connection,
+    input: &CreateWorkspaceInput,
+) -> Result<WorkspaceRecord, String> {
     let now = now_ms();
     conn.execute(
         "INSERT INTO workspaces (id, name, description, supervisor_agent_id, created_at, updated_at, archived)
@@ -205,8 +213,7 @@ pub fn update_workspace(
     supervisor_orchestration_prompt: Option<&str>,
     llm_trace_enabled: Option<bool>,
 ) -> Result<WorkspaceRecord, String> {
-    let mut rec = get_workspace(conn, id)?
-        .ok_or_else(|| format!("工作空间 {id} 不存在"))?;
+    let mut rec = get_workspace(conn, id)?.ok_or_else(|| format!("工作空间 {id} 不存在"))?;
     let now = now_ms();
     if let Some(n) = name {
         rec.name = n.to_string();
@@ -260,13 +267,13 @@ fn row_workspace(row: &rusqlite::Row) -> rusqlite::Result<WorkspaceRecord> {
         name: row.get("name")?,
         description: row.get("description")?,
         supervisor_agent_id: row.get("supervisor_agent_id")?,
-        artifacts_root: row.get::<_, Option<String>>("artifacts_root")?.unwrap_or_default(),
+        artifacts_root: row
+            .get::<_, Option<String>>("artifacts_root")?
+            .unwrap_or_default(),
         supervisor_orchestration_prompt: row
             .get::<_, Option<String>>("supervisor_orchestration_prompt")?
             .unwrap_or_default(),
-        llm_trace_enabled: row
-            .get::<_, Option<i32>>("llm_trace_enabled")?
-            .unwrap_or(0),
+        llm_trace_enabled: row.get::<_, Option<i32>>("llm_trace_enabled")?.unwrap_or(0),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         archived: row.get("archived")?,
@@ -283,13 +290,18 @@ pub fn get_workspace(conn: &Connection, id: &str) -> Result<Option<WorkspaceReco
     .map_err(|e| format!("查询工作空间失败: {e}"))
 }
 
-pub fn list_workspaces(conn: &Connection, include_archived: bool) -> Result<Vec<WorkspaceRecord>, String> {
+pub fn list_workspaces(
+    conn: &Connection,
+    include_archived: bool,
+) -> Result<Vec<WorkspaceRecord>, String> {
     let sql = if include_archived {
         "SELECT id, name, description, supervisor_agent_id, artifacts_root, supervisor_orchestration_prompt, llm_trace_enabled, created_at, updated_at, archived FROM workspaces ORDER BY updated_at DESC"
     } else {
         "SELECT id, name, description, supervisor_agent_id, artifacts_root, supervisor_orchestration_prompt, llm_trace_enabled, created_at, updated_at, archived FROM workspaces WHERE archived = 0 ORDER BY updated_at DESC"
     };
-    let mut stmt = conn.prepare(sql).map_err(|e| format!("准备查询失败: {e}"))?;
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| format!("准备查询失败: {e}"))?;
     let rows = stmt
         .query_map([], row_workspace)
         .map_err(|e| format!("列出工作空间失败: {e}"))?;
@@ -309,7 +321,10 @@ fn row_member(row: &rusqlite::Row) -> rusqlite::Result<WorkspaceMemberRecord> {
     })
 }
 
-pub fn list_workspace_members(conn: &Connection, workspace_id: &str) -> Result<Vec<WorkspaceMemberRecord>, String> {
+pub fn list_workspace_members(
+    conn: &Connection,
+    workspace_id: &str,
+) -> Result<Vec<WorkspaceMemberRecord>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT workspace_id, agent_id, role, added_at FROM workspace_members WHERE workspace_id = ?1 ORDER BY added_at ASC",
@@ -347,7 +362,11 @@ pub fn add_workspace_member(
     Ok(())
 }
 
-pub fn remove_workspace_member(conn: &Connection, workspace_id: &str, agent_id: &str) -> Result<(), String> {
+pub fn remove_workspace_member(
+    conn: &Connection,
+    workspace_id: &str,
+    agent_id: &str,
+) -> Result<(), String> {
     let sup: String = conn
         .query_row(
             "SELECT supervisor_agent_id FROM workspaces WHERE id = ?1",
@@ -417,7 +436,10 @@ pub fn insert_workspace_resource(
     .map_err(|e| format!("查询资料失败: {e}"))
 }
 
-pub fn list_workspace_resources(conn: &Connection, workspace_id: &str) -> Result<Vec<WorkspaceResourceRecord>, String> {
+pub fn list_workspace_resources(
+    conn: &Connection,
+    workspace_id: &str,
+) -> Result<Vec<WorkspaceResourceRecord>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, workspace_id, file_name, rel_path, mime, size, uploader_agent_id, created_at FROM workspace_resources WHERE workspace_id = ?1 ORDER BY created_at DESC",
@@ -454,7 +476,11 @@ pub fn get_workspace_resource_rel_path(
     .ok_or_else(|| "资料不存在或已删除".to_string())
 }
 
-pub fn delete_workspace_resource_row(conn: &Connection, workspace_id: &str, resource_id: &str) -> Result<(), String> {
+pub fn delete_workspace_resource_row(
+    conn: &Connection,
+    workspace_id: &str,
+    resource_id: &str,
+) -> Result<(), String> {
     let wid = workspace_id.trim();
     let rid = resource_id.trim();
     let n = conn
@@ -517,7 +543,11 @@ pub fn insert_workspace_memory(
     .map_err(|e| format!("查询记忆失败: {e}"))
 }
 
-pub fn list_workspace_memories(conn: &Connection, workspace_id: &str, limit: i64) -> Result<Vec<WorkspaceMemoryRecord>, String> {
+pub fn list_workspace_memories(
+    conn: &Connection,
+    workspace_id: &str,
+    limit: i64,
+) -> Result<Vec<WorkspaceMemoryRecord>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, workspace_id, title, content, author_agent_id, tags_json, created_at, updated_at FROM workspace_memories WHERE workspace_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
@@ -578,7 +608,11 @@ pub fn update_workspace_memory(
     .map_err(|e| format!("查询记忆失败: {e}"))
 }
 
-pub fn delete_workspace_memory(conn: &Connection, workspace_id: &str, memory_id: &str) -> Result<(), String> {
+pub fn delete_workspace_memory(
+    conn: &Connection,
+    workspace_id: &str,
+    memory_id: &str,
+) -> Result<(), String> {
     let wid = workspace_id.trim();
     let mid = memory_id.trim();
     if wid.is_empty() || mid.is_empty() {

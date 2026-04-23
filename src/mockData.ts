@@ -240,7 +240,9 @@ export const defaultGeneralSettings: GeneralSettings = {
   language: '中文',
   launchOnStartup: true,
   useSystemProxy: false,
+  customProxyUrl: '',
   submitShortcut: 'mod_enter',
+  llmCallLogDir: '',
 }
 
 export const defaultAppearanceSettings: AppearanceSettings = {

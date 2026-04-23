@@ -1,8 +1,5 @@
-use crate::agent_tasks::{
-    self, AgentTaskDeliveryRecord, AgentTaskListItem, AgentTaskUpdateInput,
-};
+use crate::agent_tasks::{self, AgentTaskDeliveryRecord, AgentTaskListItem, AgentTaskUpdateInput};
 use crate::history_app_state::storage_conn;
-use crate::llm_trace;
 use crate::provider_runtime::ProviderRuntimeConfig;
 use crate::scheduler;
 use crate::storage;
@@ -259,7 +256,7 @@ pub(crate) fn workspace_update(
     llm_trace_enabled: Option<bool>,
 ) -> Result<storage::workspaces::WorkspaceRecord, String> {
     let conn = storage_conn(&app)?;
-    storage::workspaces::update_workspace(
+    let out = storage::workspaces::update_workspace(
         &conn,
         workspace_id.trim(),
         name.as_deref(),
@@ -267,7 +264,9 @@ pub(crate) fn workspace_update(
         artifacts_root.as_deref(),
         supervisor_orchestration_prompt.as_deref(),
         llm_trace_enabled,
-    )
+    )?;
+    let _ = team_workspace::sync_team_manifest_json(&app, workspace_id.trim());
+    Ok(out)
 }
 
 #[tauri::command]
@@ -276,52 +275,6 @@ pub(crate) fn workspace_default_supervisor_orchestration_prompt(
     workspace_id: String,
 ) -> Result<String, String> {
     team_workspace::workspace_default_supervisor_orchestration_prompt(&app, workspace_id.trim())
-}
-
-#[tauri::command]
-pub(crate) fn workspace_llm_trace_status(
-    app: AppHandle,
-    workspace_id: String,
-) -> Result<bool, String> {
-    let conn = storage_conn(&app)?;
-    let Some(ws) = storage::workspaces::get_workspace(&conn, workspace_id.trim())? else {
-        return Err("工作空间不存在".to_string());
-    };
-    Ok(ws.llm_trace_enabled != 0)
-}
-
-#[tauri::command]
-pub(crate) fn workspace_llm_trace_set_enabled(
-    app: AppHandle,
-    workspace_id: String,
-    enabled: bool,
-) -> Result<storage::workspaces::WorkspaceRecord, String> {
-    let conn = storage_conn(&app)?;
-    storage::workspaces::update_workspace(
-        &conn,
-        workspace_id.trim(),
-        None,
-        None,
-        None,
-        None,
-        Some(enabled),
-    )
-}
-
-#[tauri::command]
-pub(crate) fn workspace_llm_trace_list(
-    workspace_id: String,
-    days: Option<usize>,
-    limit: Option<usize>,
-) -> Result<Vec<llm_trace::TraceEntry>, String> {
-    let days = days.unwrap_or(3).clamp(1, 14);
-    let limit = limit.unwrap_or(100).clamp(1, 500);
-    Ok(llm_trace::list_recent(workspace_id.trim(), days, limit))
-}
-
-#[tauri::command]
-pub(crate) fn workspace_llm_trace_clear(workspace_id: String) -> Result<(), String> {
-    llm_trace::clear(workspace_id.trim())
 }
 
 #[tauri::command]
@@ -651,7 +604,11 @@ pub(crate) async fn workspace_run_delegate_task(
             &task_clone,
             &provider_config,
             Some(&run_id_for_events),
-            if sess_for_events.is_empty() { None } else { Some(&sess_for_events) },
+            if sess_for_events.is_empty() {
+                None
+            } else {
+                Some(&sess_for_events)
+            },
         )
     })
     .await
@@ -698,7 +655,9 @@ pub(crate) async fn workspace_run_delegate_task(
 }
 
 #[tauri::command]
-pub(crate) fn list_scheduled_jobs(app: AppHandle) -> Result<Vec<scheduler::ScheduledJobRecord>, String> {
+pub(crate) fn list_scheduled_jobs(
+    app: AppHandle,
+) -> Result<Vec<scheduler::ScheduledJobRecord>, String> {
     scheduler::list_jobs(&app)
 }
 
@@ -711,7 +670,9 @@ pub(crate) fn list_scheduled_job_runs(
 }
 
 #[tauri::command]
-pub(crate) fn sync_scheduler_jobs(app: AppHandle) -> Result<scheduler::SchedulerSyncResult, String> {
+pub(crate) fn sync_scheduler_jobs(
+    app: AppHandle,
+) -> Result<scheduler::SchedulerSyncResult, String> {
     scheduler::sync_materialized_jobs(&app)
 }
 

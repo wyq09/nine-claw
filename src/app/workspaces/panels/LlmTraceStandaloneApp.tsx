@@ -21,17 +21,17 @@ export function LlmTraceStandaloneApp() {
     return () => window.removeEventListener('hashchange', parse)
   }, [])
 
-  if (!workspaceId) {
+  if (!workspaceId && !sessionId) {
     return (
       <div style={{ padding: 32, color: '#9a9aa5', fontFamily: 'system-ui' }}>
-        缺少 <code>ws</code> 参数。示例：<code>#/llm-trace?ws=&lt;workspace_id&gt;</code>
+        缺少 <code>ws</code> 或 <code>ses</code> 参数。示例：<code>#/llm-trace?ses=&lt;session_id&gt;</code>
       </div>
     )
   }
 
   return (
     <LlmTracePanel
-      workspaceId={workspaceId}
+      workspaceId={workspaceId || null}
       sessionId={sessionId}
       open
       onClose={() => {}}

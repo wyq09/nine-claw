@@ -165,7 +165,9 @@ pub(crate) fn normalized_provider_runtime_base_url(
 }
 
 #[tauri::command]
-pub(crate) fn load_provider_preferences(app: AppHandle) -> Result<ProviderPreferencesPayload, String> {
+pub(crate) fn load_provider_preferences(
+    app: AppHandle,
+) -> Result<ProviderPreferencesPayload, String> {
     let connection = open_history_db(&app)?;
 
     let provider_configs = connection

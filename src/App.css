@@ -248,6 +248,28 @@ button {
   margin-left: 0;
 }
 
+.titlebar-trace-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  background: rgba(20, 20, 26, 0.72);
+  color: var(--chrome-muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.titlebar-trace-button:hover,
+.titlebar-trace-button.active {
+  color: var(--chrome-text);
+  border-color: rgba(122, 183, 255, 0.35);
+  background: rgba(50, 70, 120, 0.18);
+}
+
 .titlebar-model-wrap {
   max-width: min(300px, 46vw);
   min-width: 0;
@@ -10891,6 +10913,10 @@ select.task-edit-control {
   color: var(--chrome-text-muted, #9a9aa5);
   cursor: pointer;
   padding-right: 4px;
+}
+.llm-trace-switch-static {
+  cursor: default;
+  padding-right: 0;
 }
 .llm-trace-switch input { accent-color: #7ab7ff; }
 .llm-trace-hint {

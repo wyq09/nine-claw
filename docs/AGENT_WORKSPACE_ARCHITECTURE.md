@@ -125,6 +125,10 @@
    - `AGENTS.md`、当前 agent 私有 markdown、`LINT.md`
    - 定义 ingest / query / lint 的规则
 
+## 和「系统指令」怎么分工
+
+你在应用里为每个智能体填的**系统指令**（长约束、风格）是主入口；本目录下的 md 是记忆与持续身份。详见 [AGENT_SYSTEM_PROMPT.md](./AGENT_SYSTEM_PROMPT.md)。
+
 ## Runtime Integration
 
 NineClaw 在以下时机自动接入这套结构：

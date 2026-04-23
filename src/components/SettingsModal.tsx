@@ -1,11 +1,15 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from 'react'
 import {
   getPeerGatewayInfo,
+  loadNetworkProxySettings,
   loadPeerGatewaySettings,
+  saveNetworkProxySettings,
   savePeerGatewaySettings,
+  testNetworkProxyConnection,
   testLlmProviderConnection,
 } from '../lib/piClient'
 import { THEME_OPTIONS } from '../theme/themePresets'
+import { describeNetworkProxyMode } from '../app/lib'
 import type {
   AppearanceSettings,
   GeneralSettings,
@@ -20,6 +24,8 @@ import type {
 import type { ResourcesViewProps, SkillsViewProps } from '../app/pages/LibraryAndTasks'
 import { AppIcon, type IconName } from './AppIcon'
 import { UsageStatsPanel } from './UsageStatsPanel'
+import { open } from '@tauri-apps/plugin-dialog'
+import { llmLogExportPreview } from '../lib/llmLogExportClient'
 
 const SkillsViewLazy = lazy(async () => {
   const module = await import('../app/pages/LibraryAndTasks')
@@ -181,6 +187,9 @@ export function SettingsModal({
   const [providerTestNote, setProviderTestNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
   const [providerDeleteConfirmId, setProviderDeleteConfirmId] = useState<ProviderId | null>(null)
   const [showApiKey, setShowApiKey] = useState(false)
+  const [proxySaveError, setProxySaveError] = useState('')
+  const [proxyTestLoading, setProxyTestLoading] = useState(false)
+  const [proxyTestNote, setProxyTestNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
 
   const [peerGatewayDraft, setPeerGatewayDraft] = useState<PeerGatewaySettings | null>(null)
   const [peerGatewayInfo, setPeerGatewayInfo] = useState<PeerGatewayInfo | null>(null)
@@ -188,6 +197,9 @@ export function SettingsModal({
   const [peerGatewaySaveError, setPeerGatewaySaveError] = useState('')
   const [peerGatewaySaveNotice, setPeerGatewaySaveNotice] = useState('')
   const [peerGatewaySaving, setPeerGatewaySaving] = useState(false)
+  const [logPreviewFile, setLogPreviewFile] = useState<string | null>(null)
+  const [logPreviewTail, setLogPreviewTail] = useState('')
+  const [logPreviewBusy, setLogPreviewBusy] = useState(false)
 
   const refreshPeerGateway = useCallback(() => {
     setPeerGatewayLoadError('')
@@ -205,8 +217,90 @@ export function SettingsModal({
     refreshPeerGateway()
   }, [refreshPeerGateway])
 
+  const refreshLogPreview = useCallback(async () => {
+    setLogPreviewBusy(true)
+    try {
+      const p = await llmLogExportPreview()
+      setLogPreviewFile(p.file)
+      setLogPreviewTail(p.tail)
+    } catch (error) {
+      setLogPreviewFile(null)
+      setLogPreviewTail(error instanceof Error ? error.message : String(error))
+    } finally {
+      setLogPreviewBusy(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (tab === 'logs') {
+      void refreshLogPreview()
+    }
+  }, [tab, refreshLogPreview, generalSettings.llmCallLogDir])
+
+  useEffect(() => {
+    void loadNetworkProxySettings()
+      .then((settings) => {
+        setGeneralSettings((previous) => ({
+          ...previous,
+          useSystemProxy: settings.useSystemProxy,
+          customProxyUrl: settings.customProxyUrl,
+        }))
+      })
+      .catch(() => {
+        // Fall back to the local state when the backend is temporarily unavailable.
+      })
+  }, [setGeneralSettings])
+
   const addedProviders = allProviderDefinitions.filter((p) => providerConfigs[p.id]?.added)
   const availableProviders = allProviderDefinitions.filter((p) => !providerConfigs[p.id]?.added)
+  const proxyModeDescription = describeNetworkProxyMode({
+    useSystemProxy: generalSettings.useSystemProxy,
+    customProxyUrl: generalSettings.customProxyUrl,
+  })
+
+  const persistProxySettings = useCallback(
+    async (nextSettings: GeneralSettings) => {
+      setProxySaveError('')
+      try {
+        const saved = await saveNetworkProxySettings({
+          useSystemProxy: nextSettings.useSystemProxy,
+          customProxyUrl: nextSettings.customProxyUrl,
+        })
+        setGeneralSettings((previous) => {
+          if (
+            previous.useSystemProxy === saved.useSystemProxy &&
+            previous.customProxyUrl === saved.customProxyUrl
+          ) {
+            return previous
+          }
+          return {
+            ...previous,
+            useSystemProxy: saved.useSystemProxy,
+            customProxyUrl: saved.customProxyUrl,
+          }
+        })
+      } catch (error) {
+        setProxySaveError(error instanceof Error ? error.message : String(error))
+      }
+    },
+    [setGeneralSettings],
+  )
+
+  const updateProxySettings = useCallback(
+    (updates: Partial<Pick<GeneralSettings, 'useSystemProxy' | 'customProxyUrl'>>) => {
+      const nextSettings: GeneralSettings = {
+        ...generalSettings,
+        ...updates,
+      }
+      setGeneralSettings((previous) => ({
+        ...previous,
+        ...updates,
+      }))
+      setProxyTestNote(null)
+      void persistProxySettings(nextSettings)
+    },
+    [generalSettings, persistProxySettings, setGeneralSettings],
+  )
 
   const handleProviderSelect = (providerId: ProviderId) => {
     if (providerAddMode) {
@@ -284,7 +378,9 @@ export function SettingsModal({
               ? '探索技能'
               : tab === 'resources'
                 ? '资源库'
-                : '快捷键'
+                : tab === 'logs'
+                  ? '日志'
+                  : '快捷键'
 
   const currentTabDescription =
     tab === 'general'
@@ -299,7 +395,9 @@ export function SettingsModal({
               ? '浏览已安装技能与系统技能库，通过链接安装或刷新目录。'
               : tab === 'resources'
                 ? '模板、规范与可复用资产，统一检索与编排入口。'
-                : '配置发送方式与常用桌面快捷操作。'
+                : tab === 'logs'
+                  ? '将已完成的 LLM 调用链（与调试面板同源）额外写入你选择的目录，便于外部工具分析。'
+                  : '配置发送方式与常用桌面快捷操作。'
   const selectedProviderFormatDefaults = getProviderFormatDefaults(selectedProviderConfig.apiFormat)
 
   return (
@@ -325,6 +423,7 @@ export function SettingsModal({
               <SettingsTabButton active={tab === 'usage'} icon="zap" label="用量统计" onClick={() => onSelectTab('usage')} />
               <SettingsTabButton active={tab === 'skills'} icon="puzzle" label="探索技能" onClick={() => onSelectTab('skills')} />
               <SettingsTabButton active={tab === 'resources'} icon="book" label="资源库" onClick={() => onSelectTab('resources')} />
+              <SettingsTabButton active={tab === 'logs'} icon="folder" label="日志" onClick={() => onSelectTab('logs')} />
               <SettingsTabButton active={tab === 'shortcuts'} icon="keyboard" label="快捷键" onClick={() => onSelectTab('shortcuts')} />
             </div>
           </div>
@@ -376,15 +475,66 @@ export function SettingsModal({
 
                 <SettingSwitch
                   checked={generalSettings.useSystemProxy}
-                  description="开启后网络请求将跟随系统代理（保存后生效）"
+                  description="开启后网络请求将跟随系统代理；若填写下方地址，自定义代理会优先生效"
                   label="使用系统代理"
-                  onChange={() =>
-                    setGeneralSettings((previous) => ({
-                      ...previous,
-                      useSystemProxy: !previous.useSystemProxy,
-                    }))
-                  }
+                  onChange={() => updateProxySettings({ useSystemProxy: !generalSettings.useSystemProxy })}
                 />
+
+                <div className="settings-row">
+                  <div>
+                    <strong>自定义代理地址</strong>
+                    <p>支持 `127.0.0.1:7890`、`http://host:port` 或 `socks5://host:port`，填写后优先于系统代理。</p>
+                  </div>
+                  <label className="input-field settings-peer-field">
+                    <input
+                      value={generalSettings.customProxyUrl}
+                      placeholder="例如 127.0.0.1:7890"
+                      onChange={(event) => updateProxySettings({ customProxyUrl: event.target.value })}
+                    />
+                  </label>
+                </div>
+
+                <div className="settings-row stacked">
+                  <div>
+                    <strong>当前代理策略</strong>
+                    <p>{proxyModeDescription}</p>
+                  </div>
+                  <div className="settings-peer-actions">
+                    <button
+                      type="button"
+                      className="outline-button"
+                      disabled={proxyTestLoading}
+                      onClick={async () => {
+                        setProxyTestLoading(true)
+                        setProxyTestNote(null)
+                        try {
+                          const message = await testNetworkProxyConnection({
+                            useSystemProxy: generalSettings.useSystemProxy,
+                            customProxyUrl: generalSettings.customProxyUrl,
+                          })
+                          setProxyTestNote({ kind: 'ok', text: message })
+                        } catch (error) {
+                          setProxyTestNote({
+                            kind: 'err',
+                            text: error instanceof Error ? error.message : String(error),
+                          })
+                        } finally {
+                          setProxyTestLoading(false)
+                        }
+                      }}
+                    >
+                      <AppIcon name="broadcast" size={18} />
+                      <span>{proxyTestLoading ? '测试中…' : '测试代理网络'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                {proxySaveError ? <p className="settings-note error">{proxySaveError}</p> : null}
+                {proxyTestNote ? (
+                  <p className={`settings-note ${proxyTestNote.kind === 'err' ? 'error' : ''}`}>
+                    {proxyTestNote.text}
+                  </p>
+                ) : null}
 
                 <div className="settings-peer-gateway-block">
                   <div className="settings-peer-gateway-title">
@@ -926,6 +1076,79 @@ export function SettingsModal({
                       </p>
                     </>
                   )}
+                </div>
+              </div>
+            ) : null}
+
+            {tab === 'logs' ? (
+              <div className="settings-section-stack">
+                <div className="settings-row stacked">
+                  <div>
+                    <strong>LLM 调用日志目录</strong>
+                    <p>
+                      每条已完成的调用链会额外以 jsonl 追加到该目录下的 <code>llm-trace-日期.jsonl</code>（与团队空间内{' '}
+                      <code>.debug</code> 并行，不替代原文件）。
+                    </p>
+                  </div>
+                  <div className="settings-row-actions" style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                    <button
+                      type="button"
+                      className="outline-button primary"
+                      onClick={async () => {
+                        const dir = await open({ directory: true, multiple: false })
+                        if (typeof dir === 'string' && dir) {
+                          setGeneralSettings((previous) => ({ ...previous, llmCallLogDir: dir }))
+                        }
+                      }}
+                    >
+                      选择目录
+                    </button>
+                    <button
+                      type="button"
+                      className="outline-button"
+                      onClick={() => setGeneralSettings((previous) => ({ ...previous, llmCallLogDir: '' }))}
+                    >
+                      清除
+                    </button>
+                    <button
+                      type="button"
+                      className="outline-button"
+                      disabled={logPreviewBusy}
+                      onClick={() => void refreshLogPreview()}
+                    >
+                      {logPreviewBusy ? '刷新中…' : '刷新预览'}
+                    </button>
+                  </div>
+                  <label className="input-field settings-peer-field">
+                    <input
+                      readOnly
+                      value={generalSettings.llmCallLogDir}
+                      placeholder="未设置"
+                      aria-label="当前 LLM 日志导出目录"
+                    />
+                  </label>
+                </div>
+                <div className="settings-row stacked">
+                  <strong>最新文件预览</strong>
+                  {logPreviewFile ? (
+                    <p className="settings-note" style={{ wordBreak: 'break-all' }}>
+                      {logPreviewFile}
+                    </p>
+                  ) : null}
+                  <pre
+                    className="mono"
+                    style={{
+                      maxHeight: 280,
+                      overflow: 'auto',
+                      fontSize: 12,
+                      padding: 12,
+                      borderRadius: 8,
+                      background: 'var(--surface-elevated, rgba(0,0,0,0.2))',
+                      margin: 0,
+                    }}
+                  >
+                    {logPreviewTail || (logPreviewBusy ? '加载中…' : '')}
+                  </pre>
                 </div>
               </div>
             ) : null}

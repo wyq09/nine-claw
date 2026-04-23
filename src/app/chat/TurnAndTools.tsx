@@ -13,6 +13,7 @@ import { LazyDetails } from './LazyDetails'
 import { TurnThinkingBlock } from './TurnThinkingBlock'
 import {
   formatAgentExecutionModeLabel,
+  formatAgentSkillStrategyLabel,
   formatDurationLabel,
   getElapsedMs,
   hasUsageMetrics,
@@ -437,7 +438,8 @@ export function AgentBuilderDraftCard({
       <p className="agent-builder-card-summary">{draft.summary}</p>
       <div className="agent-builder-card-grid">
         <span>默认模型：{draft.defaultProviderId && draft.defaultModel ? `${draft.defaultProviderId} / ${draft.defaultModel}` : '将使用当前聊天模型'}</span>
-        <span>挂载技能：{draft.skillIds.length > 0 ? draft.skillIds.join('、') : '无'}</span>
+        <span>能力策略：{formatAgentSkillStrategyLabel(draft.capabilityPolicy?.strategy ?? 'static')}</span>
+        <span>偏好技能：{draft.skillIds.length > 0 ? draft.skillIds.join('、') : '无'}</span>
       </div>
       {draft.workspaceNotes ? <div className="agent-builder-card-notes">{draft.workspaceNotes}</div> : null}
       {actionError ? <div className="skills-feedback error">{actionError}</div> : null}

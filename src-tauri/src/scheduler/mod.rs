@@ -2853,6 +2853,7 @@ fn home_dir() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     #[test]
     fn compute_next_daily_run_supports_iana_timezone() {
@@ -2898,5 +2899,44 @@ mod tests {
 
         assert_eq!(text, "早上好");
         assert_eq!(media.len(), 2);
+    }
+
+    #[test]
+    fn materialize_daily_agent_task_accepts_legacy_schedule_without_times() {
+        let connection = Connection::open_in_memory().expect("memory db");
+        agent_tasks::ensure_agent_task_schema(&connection).expect("schema");
+
+        connection
+            .execute(
+                "INSERT INTO agent_tasks (
+                    id, agent_id, source_session_id, creator_user_id, title, intent_summary,
+                    task_type, schedule_type, timezone, payload_json, schedule_json, delivery_json,
+                    status, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    "task_legacy_daily",
+                    "agent_1",
+                    "session_1",
+                    "user_1",
+                    "旧每日任务",
+                    "兼容旧 schedule_json",
+                    "reminder",
+                    "daily_time",
+                    "Asia/Shanghai",
+                    r#"{"goal":"提醒我","reminderText":"提醒我","promptTemplate":""}"#,
+                    r#"{"daysOfWeek":[1,2,3,4,5,6,7]}"#,
+                    r#"{"kind":"desktop_session","sessionId":"session_1","resultInNewSession":false}"#,
+                    "active",
+                    0_i64,
+                    0_i64,
+                ],
+            )
+            .expect("insert task");
+
+        let jobs = materialize_jobs_from_agent_tasks(&connection).expect("materialize jobs");
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].trigger_type, "daily_time");
+        assert!(jobs[0].id.starts_with("task:task_legacy_daily:"));
     }
 }

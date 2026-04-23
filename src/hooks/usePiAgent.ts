@@ -7,7 +7,6 @@ import {
   clearPiSession,
   clearPiSessionForId,
   ensureRuntimeDependencies,
-  generateSessionConversationTitle,
   listAgentTaskDeliveries,
   loadHistoryState,
   saveHistoryState,
@@ -16,6 +15,7 @@ import {
   subscribePiStream,
 } from '../lib/piClient'
 import type { BotMessageEvent } from '../lib/piClient'
+import { generateSessionConversationTitle } from '../lib/sessionTitleClient'
 import {
   listenTaskDeliveryNotificationActions,
   showTaskDeliveryDesktopNotification,
@@ -233,7 +233,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
 
       void (async () => {
         try {
-          const raw = await generateSessionConversationTitle(agentId, userMsg, assistantMsg)
+          const raw = await generateSessionConversationTitle(agentId, historyId, userMsg, assistantMsg)
           const cleaned = cleanLlmSessionTitle(raw).trim()
           const nextTitle = cleaned.length > 0 ? truncateTitle(cleaned) : applyHeuristic()
           setHistory((p) => p.map((h) => (h.id === historyId ? { ...h, title: nextTitle } : h)))
@@ -388,6 +388,20 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
         '连接 pi 主脑',
         '正在建立本次 RPC 会话，并保持当前 session 以支持后续连续对话。',
         'running',
+      )
+      return
+    }
+
+    if (payload.event === 'skill_selection') {
+      const strategy = payload.strategy?.trim() || 'static'
+      const mounted = (payload.mountedSkillIds ?? payload.mounted_skill_ids ?? []).filter(Boolean)
+      const reasons = (payload.reasons ?? []).filter(Boolean)
+      appendActivity(
+        currentHistoryId,
+        currentTurnId,
+        '本轮能力装配',
+        `策略：${strategy}；技能：${mounted.length > 0 ? mounted.join('、') : '无'}${reasons.length > 0 ? `；理由：${reasons.join(' | ')}` : ''}`,
+        'done',
       )
       return
     }

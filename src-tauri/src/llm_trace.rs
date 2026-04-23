@@ -9,6 +9,7 @@
 //! - 文件按日切片，append-only，避免并发写冲突时覆盖历史；
 //! - 同时发出 `workspace.llm_trace` Tauri 事件，用于前端面板实时刷新。
 
+use crate::agent_workspace;
 use crate::pi_usage::PiTokenUsagePayload;
 use crate::workspace_fs;
 use chrono::{Local, TimeZone};
@@ -27,6 +28,28 @@ use uuid::Uuid;
 #[serde(rename_all = "camelCase")]
 pub struct TraceSystemPromptSection {
     /// 段落标签（如 `agent_system_prompt`、`workspace_team`、`delegate_preface`）。
+    pub label: String,
+    pub content: String,
+}
+
+/// 结构化消息块。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceMessageBlock {
+    pub id: String,
+    /// `system` / `user`
+    pub role: String,
+    pub label: String,
+    pub content: String,
+}
+
+/// 结构化响应块。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceResponseBlock {
+    pub id: String,
+    /// `thinking` / `output`
+    pub kind: String,
     pub label: String,
     pub content: String,
 }
@@ -53,9 +76,19 @@ pub struct TraceToolCall {
 #[serde(rename_all = "camelCase")]
 pub struct TraceEntry {
     pub id: String,
-    pub workspace_id: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     /// `main_pi`（主 Agent → Pi）或 `delegate`（主 Agent → 子 Agent）。
     pub kind: String,
+    /// `agent_llm` / `action_llm` / `agent_agent`
+    #[serde(default)]
+    pub trace_type: String,
+    /// `agent` / `action`
+    #[serde(default)]
+    pub caller_kind: String,
+    /// `model` / `agent`
+    #[serde(default)]
+    pub target_kind: String,
     /// 发起方智能体 id / 名称。
     pub caller_agent_id: String,
     pub caller_agent_name: String,
@@ -81,6 +114,10 @@ pub struct TraceEntry {
     pub user_message: String,
     pub response_text: String,
     pub thinking_text: String,
+    #[serde(default)]
+    pub message_blocks: Vec<TraceMessageBlock>,
+    #[serde(default)]
+    pub response_blocks: Vec<TraceResponseBlock>,
     pub tool_calls: Vec<TraceToolCall>,
 }
 
@@ -94,6 +131,69 @@ impl TraceEntry {
             self.duration_ms = Some((now.saturating_sub(self.started_at)).max(0) as u64);
         }
     }
+
+    fn sync_structured_blocks(&mut self) {
+        let mut message_blocks = Vec::with_capacity(self.system_prompts.len() + 1);
+        for (index, prompt) in self.system_prompts.iter().enumerate() {
+            message_blocks.push(TraceMessageBlock {
+                id: format!("system-{index}"),
+                role: "system".to_string(),
+                label: prompt.label.clone(),
+                content: prompt.content.clone(),
+            });
+        }
+        message_blocks.push(TraceMessageBlock {
+            id: "user-0".to_string(),
+            role: "user".to_string(),
+            label: "user_prompt".to_string(),
+            content: self.user_message.clone(),
+        });
+        self.message_blocks = message_blocks;
+
+        self.response_blocks = vec![
+            TraceResponseBlock {
+                id: "thinking-0".to_string(),
+                kind: "thinking".to_string(),
+                label: "thinking".to_string(),
+                content: self.thinking_text.clone(),
+            },
+            TraceResponseBlock {
+                id: "output-0".to_string(),
+                kind: "output".to_string(),
+                label: "assistant_reply".to_string(),
+                content: self.response_text.clone(),
+            },
+        ];
+    }
+
+    fn matches_scope(&self, workspace_id: Option<&str>, session_id: Option<&str>) -> bool {
+        let entry_workspace = self
+            .workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let desired_workspace = workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        match desired_workspace {
+            Some(wid) if entry_workspace != Some(wid) => return false,
+            None if entry_workspace.is_some() => return false,
+            _ => {}
+        }
+
+        if let Some(sid) = session_id.map(str::trim).filter(|value| !value.is_empty()) {
+            let entry_session = self
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if entry_session != Some(sid) {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 fn now_ms() -> i64 {
@@ -103,9 +203,59 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+fn append_response_delta(entry: &mut TraceEntry, delta: &str) -> bool {
+    if delta.is_empty() {
+        return false;
+    }
+    entry.response_text.push_str(delta);
+    true
+}
+
+fn append_thinking_delta(entry: &mut TraceEntry, delta: &str) -> bool {
+    if delta.is_empty() {
+        return false;
+    }
+    entry.thinking_text.push_str(delta);
+    true
+}
+
 fn registry() -> &'static Mutex<HashMap<String, TraceEntry>> {
     static REG: OnceLock<Mutex<HashMap<String, TraceEntry>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TraceStorageScope {
+    Workspace(String),
+    Standalone,
+}
+
+fn trace_type_meta(kind: &str) -> (&'static str, &'static str, &'static str) {
+    match kind {
+        "delegate" => ("agent_agent", "agent", "agent"),
+        "action_llm" => ("action_llm", "action", "model"),
+        _ => ("agent_llm", "agent", "model"),
+    }
+}
+
+fn storage_scope_for(
+    workspace_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Option<TraceStorageScope> {
+    if let Some(wid) = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(TraceStorageScope::Workspace(wid.to_string()));
+    }
+    if session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        return Some(TraceStorageScope::Standalone);
+    }
+    None
 }
 
 /// 记录每个 `(workspace_id, session_id)` 会话最近一次主 Pi trace 的 id。
@@ -116,31 +266,46 @@ fn last_main_registry() -> &'static Mutex<HashMap<(String, String), String>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn remember_main_trace(workspace_id: &str, session_id: &str, trace_id: &str) {
+fn scope_registry_key(workspace_id: Option<&str>, session_id: &str) -> (String, String) {
+    let bucket = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("workspace:{value}"))
+        .unwrap_or_else(|| "standalone".to_string());
+    (bucket, session_id.to_string())
+}
+
+fn remember_main_trace_for_scope(workspace_id: Option<&str>, session_id: &str, trace_id: &str) {
     if let Ok(mut map) = last_main_registry().lock() {
         map.insert(
-            (workspace_id.to_string(), session_id.to_string()),
+            scope_registry_key(workspace_id, session_id),
             trace_id.to_string(),
         );
     }
 }
 
-fn lookup_main_trace(workspace_id: &str, session_id: &str) -> Option<String> {
-    last_main_registry()
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&(workspace_id.to_string(), session_id.to_string())).cloned())
+fn lookup_main_trace_for_scope(workspace_id: Option<&str>, session_id: &str) -> Option<String> {
+    last_main_registry().lock().ok().and_then(|m| {
+        m.get(&scope_registry_key(workspace_id, session_id))
+            .cloned()
+    })
 }
 
-fn debug_dir(workspace_id: &str) -> Result<PathBuf, String> {
-    let root = workspace_fs::team_root(workspace_id)?;
-    let dir = root.join(".debug");
+fn debug_dir(scope: &TraceStorageScope) -> Result<PathBuf, String> {
+    let dir = match scope {
+        TraceStorageScope::Workspace(workspace_id) => {
+            workspace_fs::team_root(workspace_id)?.join(".debug")
+        }
+        TraceStorageScope::Standalone => agent_workspace::resolve_workspace_root()?
+            .join(".debug")
+            .join("standalone"),
+    };
     fs::create_dir_all(&dir).map_err(|e| format!("创建调试目录失败: {e}"))?;
     Ok(dir)
 }
 
-fn day_file(workspace_id: &str, ts_ms: i64) -> Result<PathBuf, String> {
-    let dir = debug_dir(workspace_id)?;
+fn day_file(scope: &TraceStorageScope, ts_ms: i64) -> Result<PathBuf, String> {
+    let dir = debug_dir(scope)?;
     let dt = Local
         .timestamp_millis_opt(ts_ms)
         .single()
@@ -159,7 +324,7 @@ fn emit_event(app: &AppHandle, phase: &str, entry: &TraceEntry) {
 /// 开始一条追踪。返回 `trace_id`，用于后续补充工具调用与结束时落盘。
 pub fn begin(
     app: &AppHandle,
-    workspace_id: &str,
+    workspace_id: Option<&str>,
     kind: &str,
     caller_agent_id: &str,
     caller_agent_name: &str,
@@ -172,23 +337,37 @@ pub fn begin(
     user_message: &str,
 ) -> String {
     let id = Uuid::new_v4().simple().to_string();
+    let (trace_type, caller_kind, target_kind) = trace_type_meta(kind);
+    let workspace_id = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let session_id = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
 
     // 委派 trace 自动挂载到同会话最近一次主 Pi trace 下，形成父子关系。
-    let parent_trace_id = if kind == "delegate" {
-        session_id.and_then(|sid| lookup_main_trace(workspace_id, sid))
-    } else {
+    let parent_trace_id = if kind == "main_pi" {
         None
+    } else {
+        session_id
+            .as_deref()
+            .and_then(|sid| lookup_main_trace_for_scope(workspace_id.as_deref(), sid))
     };
 
-    let entry = TraceEntry {
+    let mut entry = TraceEntry {
         id: id.clone(),
-        workspace_id: workspace_id.to_string(),
+        workspace_id: workspace_id.clone(),
         kind: kind.to_string(),
+        trace_type: trace_type.to_string(),
+        caller_kind: caller_kind.to_string(),
+        target_kind: target_kind.to_string(),
         caller_agent_id: caller_agent_id.to_string(),
         caller_agent_name: caller_agent_name.to_string(),
         target_agent_id: target_agent_id.map(ToOwned::to_owned),
         target_agent_name: target_agent_name.map(ToOwned::to_owned),
-        session_id: session_id.map(ToOwned::to_owned),
+        session_id: session_id.clone(),
         parent_trace_id,
         provider: provider.map(ToOwned::to_owned),
         model: model.map(ToOwned::to_owned),
@@ -203,14 +382,17 @@ pub fn begin(
         user_message: user_message.to_string(),
         response_text: String::new(),
         thinking_text: String::new(),
+        message_blocks: Vec::new(),
+        response_blocks: Vec::new(),
         tool_calls: Vec::new(),
     };
+    entry.sync_structured_blocks();
     if let Ok(mut map) = registry().lock() {
         map.insert(id.clone(), entry.clone());
     }
     if kind == "main_pi" {
-        if let Some(sid) = session_id {
-            remember_main_trace(workspace_id, sid, &id);
+        if let Some(sid) = session_id.as_deref() {
+            remember_main_trace_for_scope(workspace_id.as_deref(), sid, &id);
         }
     }
     emit_event(app, "started", &entry);
@@ -277,6 +459,7 @@ pub fn record_tool(
                 },
             });
         }
+        entry.sync_structured_blocks();
         entry.clone()
     };
     emit_event(app, "updated", &snapshot);
@@ -294,24 +477,34 @@ pub fn append_response(app: &AppHandle, trace_id: &str, delta: &str) {
         let Some(entry) = map.get_mut(trace_id) else {
             return;
         };
-        entry.response_text.push_str(delta);
+        if !append_response_delta(entry, delta) {
+            return;
+        }
+        entry.sync_structured_blocks();
         entry.clone()
     };
     emit_event(app, "updated", &snapshot);
 }
 
 /// 追加思考过程文本片段（thinking_delta）。
-pub fn append_thinking(_app: &AppHandle, trace_id: &str, delta: &str) {
+pub fn append_thinking(app: &AppHandle, trace_id: &str, delta: &str) {
     if trace_id.is_empty() || delta.is_empty() {
         return;
     }
-    let Ok(mut map) = registry().lock() else {
-        return;
+    let snapshot = {
+        let Ok(mut map) = registry().lock() else {
+            return;
+        };
+        let Some(entry) = map.get_mut(trace_id) else {
+            return;
+        };
+        if !append_thinking_delta(entry, delta) {
+            return;
+        }
+        entry.sync_structured_blocks();
+        entry.clone()
     };
-    let Some(entry) = map.get_mut(trace_id) else {
-        return;
-    };
-    entry.thinking_text.push_str(delta);
+    emit_event(app, "updated", &snapshot);
 }
 
 /// 结束一条追踪，落盘 + emit 事件。
@@ -364,41 +557,58 @@ pub fn finalize(
         }
         entry.finished_at = Some(now);
         entry.touch_duration(now);
+        entry.sync_structured_blocks();
         entry
     };
     // 写文件
-    if let Ok(path) = day_file(&entry.workspace_id, entry.started_at) {
-        if let Ok(line) = serde_json::to_string(&entry) {
-            let result = (|| -> std::io::Result<()> {
-                let mut f = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)?;
-                f.write_all(line.as_bytes())?;
-                f.write_all(b"\n")?;
-                Ok(())
-            })();
-            if let Err(e) = result {
-                eprintln!("[llm_trace] 写入 {} 失败: {}", path.display(), e);
+    if let Some(scope) =
+        storage_scope_for(entry.workspace_id.as_deref(), entry.session_id.as_deref())
+    {
+        if let Ok(path) = day_file(&scope, entry.started_at) {
+            if let Ok(line) = serde_json::to_string(&entry) {
+                let result = (|| -> std::io::Result<()> {
+                    let mut f = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)?;
+                    f.write_all(line.as_bytes())?;
+                    f.write_all(b"\n")?;
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    eprintln!("[llm_trace] 写入 {} 失败: {}", path.display(), e);
+                } else {
+                    crate::llm_log_export::mirror_line(&line, entry.started_at);
+                }
             }
         }
     }
     emit_event(app, "finalized", &entry);
 }
 
-/// 列出工作空间调试面板上可见的追踪：内存中 running 的 + 最近 `days` 天的归档文件。
-pub fn list_recent(workspace_id: &str, days: usize, limit: usize) -> Vec<TraceEntry> {
+/// 列出调试面板上可见的追踪：内存中 running 的 + 最近 `days` 天的归档文件。
+pub fn list_recent(
+    workspace_id: Option<&str>,
+    session_id: Option<&str>,
+    days: usize,
+    limit: usize,
+) -> Vec<TraceEntry> {
     let mut out: Vec<TraceEntry> = Vec::new();
 
     if let Ok(map) = registry().lock() {
         for entry in map.values() {
-            if entry.workspace_id == workspace_id {
+            if entry.matches_scope(workspace_id, session_id) {
                 out.push(entry.clone());
             }
         }
     }
 
-    let Ok(dir) = debug_dir(workspace_id) else {
+    let Some(scope) = storage_scope_for(workspace_id, session_id) else {
+        out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        out.truncate(limit);
+        return out;
+    };
+    let Ok(dir) = debug_dir(&scope) else {
         out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         out.truncate(limit);
         return out;
@@ -420,7 +630,7 @@ pub fn list_recent(workspace_id: &str, days: usize, limit: usize) -> Vec<TraceEn
                 continue;
             }
             if let Ok(entry) = serde_json::from_str::<TraceEntry>(line) {
-                if entry.workspace_id == workspace_id {
+                if entry.matches_scope(workspace_id, session_id) {
                     out.push(entry);
                 }
             }
@@ -510,11 +720,14 @@ impl<'a> Drop for TraceGuard<'a> {
     }
 }
 
-pub fn clear(workspace_id: &str) -> Result<(), String> {
+pub fn clear(workspace_id: Option<&str>, session_id: Option<&str>) -> Result<(), String> {
     if let Ok(mut map) = registry().lock() {
-        map.retain(|_, v| v.workspace_id != workspace_id);
+        map.retain(|_, v| !v.matches_scope(workspace_id, session_id));
     }
-    let Ok(dir) = debug_dir(workspace_id) else {
+    let Some(scope) = storage_scope_for(workspace_id, session_id) else {
+        return Ok(());
+    };
+    let Ok(dir) = debug_dir(&scope) else {
         return Ok(());
     };
     let Ok(iter) = fs::read_dir(&dir) else {
@@ -528,8 +741,115 @@ pub fn clear(workspace_id: &str) -> Result<(), String> {
             .map(|ext| ext.eq_ignore_ascii_case("jsonl"))
             .unwrap_or(false);
         if is_jsonl {
-            let _ = fs::remove_file(path);
+            if session_id.is_none() && workspace_id.is_some() {
+                let _ = fs::remove_file(path);
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut kept = Vec::new();
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_str::<TraceEntry>(trimmed) else {
+                    kept.push(trimmed.to_string());
+                    continue;
+                };
+                if !entry.matches_scope(workspace_id, session_id) {
+                    kept.push(trimmed.to_string());
+                }
+            }
+            if kept.is_empty() {
+                let _ = fs::remove_file(path);
+            } else {
+                let _ = fs::write(path, format!("{}\n", kept.join("\n")));
+            }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_entry() -> TraceEntry {
+        let mut entry = TraceEntry {
+            id: "trace-1".to_string(),
+            workspace_id: Some("ws-1".to_string()),
+            kind: "main_pi".to_string(),
+            trace_type: "agent_llm".to_string(),
+            caller_kind: "agent".to_string(),
+            target_kind: "model".to_string(),
+            caller_agent_id: "main".to_string(),
+            caller_agent_name: "Main".to_string(),
+            target_agent_id: None,
+            target_agent_name: None,
+            session_id: Some("session-1".to_string()),
+            parent_trace_id: None,
+            provider: Some("openai".to_string()),
+            model: Some("gpt-5.4".to_string()),
+            response_id: None,
+            status: "running".to_string(),
+            error: None,
+            started_at: 1,
+            finished_at: None,
+            duration_ms: None,
+            usage: None,
+            system_prompts: Vec::new(),
+            user_message: "hello".to_string(),
+            response_text: String::new(),
+            thinking_text: String::new(),
+            message_blocks: Vec::new(),
+            response_blocks: Vec::new(),
+            tool_calls: Vec::new(),
+        };
+        entry.sync_structured_blocks();
+        entry
+    }
+
+    #[test]
+    fn append_response_delta_appends_incrementally() {
+        let mut entry = sample_entry();
+
+        assert!(append_response_delta(&mut entry, "foo"));
+        assert!(append_response_delta(&mut entry, "bar"));
+        assert_eq!(entry.response_text, "foobar");
+        assert!(!append_response_delta(&mut entry, ""));
+    }
+
+    #[test]
+    fn append_thinking_delta_appends_incrementally() {
+        let mut entry = sample_entry();
+
+        assert!(append_thinking_delta(&mut entry, "step1"));
+        assert!(append_thinking_delta(&mut entry, " -> step2"));
+        assert_eq!(entry.thinking_text, "step1 -> step2");
+        assert!(!append_thinking_delta(&mut entry, ""));
+    }
+
+    #[test]
+    fn structured_blocks_fall_back_from_flat_fields() {
+        let entry = sample_entry();
+        assert_eq!(entry.message_blocks.len(), 1);
+        assert_eq!(entry.message_blocks[0].role, "user");
+        assert_eq!(entry.response_blocks.len(), 2);
+        assert_eq!(entry.response_blocks[0].kind, "thinking");
+        assert_eq!(entry.response_blocks[1].kind, "output");
+    }
+
+    #[test]
+    fn matches_scope_distinguishes_workspace_and_standalone() {
+        let workspace_entry = sample_entry();
+        let mut standalone_entry = sample_entry();
+        standalone_entry.workspace_id = None;
+
+        assert!(workspace_entry.matches_scope(Some("ws-1"), Some("session-1")));
+        assert!(!workspace_entry.matches_scope(None, Some("session-1")));
+        assert!(standalone_entry.matches_scope(None, Some("session-1")));
+        assert!(!standalone_entry.matches_scope(Some("ws-1"), Some("session-1")));
+    }
 }

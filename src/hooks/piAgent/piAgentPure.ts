@@ -1,7 +1,9 @@
 import type { BotMessageEvent } from '../../lib/piClient'
+import { createStaticAgentCapabilityPolicy, normalizeAgentCapabilityPolicy } from '../../app/lib/agentCapabilities'
 import type {
   ActivityEntry,
   ActivityState,
+  AgentCapabilityPolicy,
   AgentCollaborationConfig,
   AgentExecutionMode,
   AgentScenarioLlmConfig,
@@ -234,6 +236,10 @@ export function parseConversationAgentSnapshot(value: unknown): ConversationAgen
     summary: candidate.summary,
     description: candidate.description,
     systemPrompt: typeof candidate.systemPrompt === 'string' ? candidate.systemPrompt : '',
+    capabilityPolicy: normalizeAgentCapabilityPolicy(
+      candidate.capabilityPolicy as Partial<AgentCapabilityPolicy> | undefined,
+      createStaticAgentCapabilityPolicy(),
+    ),
     skillIds: parseStringArray(candidate.skillIds),
     defaultProviderId: typeof candidate.defaultProviderId === 'string' ? candidate.defaultProviderId : '',
     defaultModel: typeof candidate.defaultModel === 'string' ? candidate.defaultModel : '',

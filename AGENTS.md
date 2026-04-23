@@ -152,3 +152,5 @@ When reviewing plans or code changes, evaluate on these dimensions (1-10 scale):
 | Compatibility | Works across platforms (macOS, Linux, Windows)? |
 
 **Pass**: overall >= 7.0 AND no dimension <= 3.
+
+## 所有的功能开发前必须设计单元测试，覆盖所以修改到的功能，全部测试通过了，才算完成任务

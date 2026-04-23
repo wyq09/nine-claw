@@ -1,7 +1,7 @@
 //! 智能体包导入 / 导出（ZIP：`manifest.json` + `agent.json` + `workspace/...`）。
 
-use crate::agents::{AgentInput, AgentRecord};
 use crate::agent_workspace;
+use crate::agents::{AgentInput, AgentRecord};
 use crate::skills;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -70,7 +70,8 @@ fn collect_files_under(
     if !dir.is_dir() {
         return Ok(());
     }
-    for entry in fs::read_dir(dir).map_err(|e| format!("读取目录失败 {}: {e}", dir.display()))? {
+    for entry in fs::read_dir(dir).map_err(|e| format!("读取目录失败 {}: {e}", dir.display()))?
+    {
         let entry = entry.map_err(|e| format!("读取目录项失败: {e}"))?;
         let path = entry.path();
         let meta = fs::symlink_metadata(&path)
@@ -81,7 +82,9 @@ fn collect_files_under(
         if path.is_dir() {
             collect_files_under(&path, base, out)?;
         } else if path.is_file() {
-            let rel = path.strip_prefix(base).map_err(|e| format!("计算相对路径失败: {e}"))?;
+            let rel = path
+                .strip_prefix(base)
+                .map_err(|e| format!("计算相对路径失败: {e}"))?;
             out.push((rel.to_path_buf(), path));
         }
     }
@@ -105,10 +108,8 @@ fn zip_sanitize_relative(name: &str) -> Result<PathBuf, String> {
 }
 
 fn unzip_package(package_path: &Path, dest: &Path) -> Result<(), String> {
-    let file = fs::File::open(package_path)
-        .map_err(|e| format!("无法打开包文件: {e}"))?;
-    let mut archive =
-        ZipArchive::new(file).map_err(|e| format!("无法读取 ZIP: {e}"))?;
+    let file = fs::File::open(package_path).map_err(|e| format!("无法打开包文件: {e}"))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("无法读取 ZIP: {e}"))?;
 
     for index in 0..archive.len() {
         let mut entry = archive
@@ -121,8 +122,7 @@ fn unzip_package(package_path: &Path, dest: &Path) -> Result<(), String> {
         }
         let out_path = dest.join(&rel);
         if entry.is_dir() {
-            fs::create_dir_all(&out_path)
-                .map_err(|e| format!("创建目录失败: {e}"))?;
+            fs::create_dir_all(&out_path).map_err(|e| format!("创建目录失败: {e}"))?;
             continue;
         }
         if let Some(parent) = out_path.parent() {
@@ -130,8 +130,7 @@ fn unzip_package(package_path: &Path, dest: &Path) -> Result<(), String> {
         }
         let mut outfile = fs::File::create(&out_path)
             .map_err(|e| format!("创建文件失败 {}: {e}", out_path.display()))?;
-        std::io::copy(&mut entry, &mut outfile)
-            .map_err(|e| format!("解压写入失败: {e}"))?;
+        std::io::copy(&mut entry, &mut outfile).map_err(|e| format!("解压写入失败: {e}"))?;
     }
     Ok(())
 }
@@ -203,8 +202,7 @@ pub fn export_agent_package_to_path(
 ) -> Result<(), String> {
     let connection = crate::open_history_db(app)?;
     crate::agents::ensure_agents_ready_conn(&connection)?;
-    let Some(mut record) = crate::agents::fetch_active_agent(&connection, &agent_id)?
-    else {
+    let Some(mut record) = crate::agents::fetch_active_agent(&connection, &agent_id)? else {
         return Err("要导出的智能体不存在".to_string());
     };
 
@@ -264,7 +262,10 @@ fn read_agent_json_extracted(root: &Path) -> Result<AgentRecord, String> {
     serde_json::from_str(&raw).map_err(|e| format!("解析 agent.json 失败: {e}"))
 }
 
-fn resolve_exported_agent_home(extract_root: &Path, manifest: &AgentPackageManifest) -> Result<PathBuf, String> {
+fn resolve_exported_agent_home(
+    extract_root: &Path,
+    manifest: &AgentPackageManifest,
+) -> Result<PathBuf, String> {
     let base = extract_root.join("workspace").join("agents");
     if !base.is_dir() {
         return Err("包内缺少 workspace/agents 目录".to_string());
@@ -314,6 +315,7 @@ fn record_to_agent_input(record: AgentRecord, skill_ids: Vec<String>) -> AgentIn
         summary: record.summary,
         description: record.description,
         system_prompt: record.system_prompt,
+        capability_policy: Some(record.capability_policy),
         skill_ids,
         default_provider_id: record.default_provider_id,
         default_model: record.default_model,
@@ -333,7 +335,9 @@ fn apply_shared_root_import(extract_root: &Path) -> Result<(), String> {
     }
     let workspace_root = agent_workspace::resolve_workspace_root()?;
     agent_workspace::ensure_root_scaffold(&workspace_root)?;
-    for entry in fs::read_dir(&shared).map_err(|e| format!("读取 shared_workspace_root 失败: {e}"))? {
+    for entry in
+        fs::read_dir(&shared).map_err(|e| format!("读取 shared_workspace_root 失败: {e}"))?
+    {
         let entry = entry.map_err(|e| format!("读取条目失败: {e}"))?;
         let path = entry.path();
         if !path.is_file() {
@@ -345,13 +349,17 @@ fn apply_shared_root_import(extract_root: &Path) -> Result<(), String> {
             continue;
         }
         let dest = workspace_root.join(&name);
-        fs::copy(&path, &dest).map_err(|e| format!("写入工作区根文件失败 {}: {e}", dest.display()))?;
+        fs::copy(&path, &dest)
+            .map_err(|e| format!("写入工作区根文件失败 {}: {e}", dest.display()))?;
     }
     Ok(())
 }
 
 /// 从 ZIP 导入为新智能体（新 id），并合并工作区树。
-pub fn import_agent_package_from_path(app: &AppHandle, package_path: String) -> Result<AgentImportResult, String> {
+pub fn import_agent_package_from_path(
+    app: &AppHandle,
+    package_path: String,
+) -> Result<AgentImportResult, String> {
     let package = PathBuf::from(package_path.trim());
     if !package.is_file() {
         return Err("包文件不存在".to_string());
@@ -374,7 +382,9 @@ pub fn import_agent_package_from_path(app: &AppHandle, package_path: String) -> 
 
         let (skill_ids, mut warnings) = filter_skills_for_import(record.skill_ids.clone());
         if manifest.exported_from_builtin {
-            warnings.push("该包由内置智能体导出，已作为自定义智能体导入（isBuiltin=false）。".to_string());
+            warnings.push(
+                "该包由内置智能体导出，已作为自定义智能体导入（isBuiltin=false）。".to_string(),
+            );
         }
         if !manifest.includes_secrets {
             warnings.push("导出包未包含通道密钥，对等/IM 等需在本机重新配置凭证。".to_string());
@@ -383,7 +393,8 @@ pub fn import_agent_package_from_path(app: &AppHandle, package_path: String) -> 
         let input = record_to_agent_input(record, skill_ids);
         let created = crate::agents::create_agent(app, input)?;
 
-        if let Err(err) = agent_workspace::overlay_agent_home_from_export(&created.id, &exported_home)
+        if let Err(err) =
+            agent_workspace::overlay_agent_home_from_export(&created.id, &exported_home)
         {
             let _ = crate::agents::delete_agent(app, created.id.clone());
             return Err(err);

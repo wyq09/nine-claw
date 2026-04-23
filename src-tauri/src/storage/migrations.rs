@@ -69,12 +69,18 @@ pub fn migrate_history_v1_to_structured(conn: &mut Connection) -> Result<Migrati
         let status = json_string(obj.get("status")).unwrap_or_else(|| "done".to_string());
         let created_at = json_i64(obj.get("createdAt")).unwrap_or_else(now_ms);
         let updated_at = json_i64(obj.get("updatedAt")).unwrap_or_else(now_ms);
-        let agent_id = json_string(obj.get("agent")).and_then(|a| {
-            // agent is a nested object with its own id
-            serde_json::from_str::<serde_json::Value>(&format!("\"{a}\""))
-                .ok()
-                .and_then(|_| None) // agent is an object, not a string
-        }).or_else(|| obj.get("agent").and_then(|v| v.as_object()).and_then(|a| json_string(a.get("id"))));
+        let agent_id = json_string(obj.get("agent"))
+            .and_then(|a| {
+                // agent is a nested object with its own id
+                serde_json::from_str::<serde_json::Value>(&format!("\"{a}\""))
+                    .ok()
+                    .and_then(|_| None) // agent is an object, not a string
+            })
+            .or_else(|| {
+                obj.get("agent")
+                    .and_then(|v| v.as_object())
+                    .and_then(|a| json_string(a.get("id")))
+            });
 
         let agent_snapshot_json = obj
             .get("agent")
@@ -121,8 +127,7 @@ pub fn migrate_history_v1_to_structured(conn: &mut Connection) -> Result<Migrati
                 let thinking = json_string(turn_obj.get("thinking")).unwrap_or_default();
                 let turn_status =
                     json_string(turn_obj.get("status")).unwrap_or_else(|| "done".to_string());
-                let turn_created_at =
-                    json_i64(turn_obj.get("createdAt")).unwrap_or_else(now_ms);
+                let turn_created_at = json_i64(turn_obj.get("createdAt")).unwrap_or_else(now_ms);
                 let turn_completed_at = json_i64(turn_obj.get("completedAt"));
                 let usage_json = turn_obj
                     .get("usage")
@@ -169,8 +174,7 @@ pub fn migrate_history_v1_to_structured(conn: &mut Connection) -> Result<Migrati
 
     mark_migrated(&tx)?;
 
-    tx.commit()
-        .map_err(|e| format!("提交迁移事务失败: {e}"))?;
+    tx.commit().map_err(|e| format!("提交迁移事务失败: {e}"))?;
 
     Ok(MigrationResult::Migrated {
         sessions: sessions_count,
@@ -314,10 +318,7 @@ mod tests {
 
         let result = migrate_history_v1_to_structured(&mut conn).unwrap();
         match result {
-            MigrationResult::Migrated {
-                sessions,
-                turns,
-            } => {
+            MigrationResult::Migrated { sessions, turns } => {
                 assert_eq!(sessions, 1);
                 assert_eq!(turns, 2);
             }
@@ -331,10 +332,7 @@ mod tests {
         assert_eq!(sessions[0].title, "Test Session");
         assert_eq!(sessions[0].status, "done");
         assert_eq!(sessions[0].agent_id.as_deref(), Some("agent-1"));
-        assert_eq!(
-            sessions[0].session_llm_model.as_deref(),
-            Some("gpt-4")
-        );
+        assert_eq!(sessions[0].session_llm_model.as_deref(), Some("gpt-4"));
         assert!(sessions[0].agent_snapshot_json.is_some());
 
         // Verify turns.
@@ -383,9 +381,13 @@ mod tests {
 
         // First migration.
         let r1 = migrate_history_v1_to_structured(&mut conn).unwrap();
-        assert!(
-            matches!(r1, MigrationResult::Migrated { sessions: 1, turns: 1 })
-        );
+        assert!(matches!(
+            r1,
+            MigrationResult::Migrated {
+                sessions: 1,
+                turns: 1
+            }
+        ));
 
         // Second migration should be no-op.
         let r2 = migrate_history_v1_to_structured(&mut conn).unwrap();
@@ -448,10 +450,7 @@ mod tests {
 
         let result = migrate_history_v1_to_structured(&mut conn).unwrap();
         match result {
-            MigrationResult::Migrated {
-                sessions,
-                turns,
-            } => {
+            MigrationResult::Migrated { sessions, turns } => {
                 assert_eq!(sessions, 3);
                 assert_eq!(turns, 2);
             }
@@ -549,6 +548,9 @@ mod tests {
         migrate_history_v1_to_structured(&mut conn).unwrap();
 
         let sessions = list_chat_sessions(&conn).unwrap();
-        assert_eq!(sessions[0].bot_target_json.as_deref(), Some(r#"{"channelId":"ch-1","userId":"user-1"}"#));
+        assert_eq!(
+            sessions[0].bot_target_json.as_deref(),
+            Some(r#"{"channelId":"ch-1","userId":"user-1"}"#)
+        );
     }
 }

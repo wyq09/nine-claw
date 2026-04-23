@@ -1,9 +1,11 @@
 use crate::agents::{self, ConversationAgentConfig};
 use crate::dev_trace::{dev_trace, dev_trace_block};
+use crate::managed_runtime;
 use crate::pi_runtime::{self, PiRuntimeLocation};
 use crate::pi_timeouts;
-use crate::provider_stream_noise;
 use crate::prompt_attachments::{self, PreparedPromptInput, PromptAttachmentInput};
+use crate::provider_runtime::ProviderRuntimeConfig;
+use crate::provider_stream_noise;
 use crate::skills;
 use md5::{Digest, Md5};
 use serde_json::json;
@@ -401,10 +403,25 @@ impl PiBridge {
     }
 
     fn build_provider_models_config(&self) -> Option<serde_json::Value> {
-        let provider_id = self.provider_id.trim();
-        let base_url = self.normalized_runtime_base_url();
-        let model = self.model.trim();
-        let api_format = Self::normalize_provider_api_format(&self.api_format, provider_id);
+        Self::build_provider_models_config_from_config(&ProviderRuntimeConfig {
+            provider_id: self.provider_id.clone(),
+            api_format: self.api_format.clone(),
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+        })
+    }
+
+    fn build_provider_models_config_from_config(
+        config: &ProviderRuntimeConfig,
+    ) -> Option<serde_json::Value> {
+        let provider_id = config.provider_id.trim();
+        let base_url = match Self::normalize_provider_api_format(&config.api_format, provider_id) {
+            "anthropic" => Self::normalize_anthropic_base_url(&config.base_url),
+            _ => Self::normalize_provider_base_url(&config.base_url).to_string(),
+        };
+        let model = config.model.trim();
+        let api_format = Self::normalize_provider_api_format(&config.api_format, provider_id);
 
         if provider_id.is_empty() || base_url.is_empty() || model.is_empty() {
             return None;
@@ -414,10 +431,10 @@ impl PiBridge {
         provider.insert("baseUrl".to_string(), json!(base_url));
         provider.insert(
             "apiKey".to_string(),
-            json!(if self.api_key.trim().is_empty() {
+            json!(if config.api_key.trim().is_empty() {
                 "DUMMY_KEY"
             } else {
-                self.api_key.trim()
+                config.api_key.trim()
             }),
         );
         match api_format {
@@ -449,7 +466,12 @@ impl PiBridge {
         }
         let mut providers = serde_json::Map::new();
         providers.insert(
-            self.runtime_provider_id(),
+            if provider_id.is_empty() {
+                "nineclaw-runtime-provider".to_string()
+            } else {
+                let digest = format!("{:x}", Md5::digest(provider_id.as_bytes()));
+                format!("nineclaw-runtime-{}", &digest[..12])
+            },
             serde_json::Value::Object(provider),
         );
         Some(json!({ "providers": providers }))
@@ -765,6 +787,18 @@ impl PiBridge {
         let prompt_with_summary = crate::prepend_multimodal_summary_context(prompt, &key)?;
         let prepared_input =
             prompt_attachments::prepare_prompt_input(&prompt_with_summary, attachments)?;
+        let agent_home = self.agent_config.as_ref().and_then(|agent_config| {
+            crate::agent_workspace::resolve_workspace_root()
+                .ok()
+                .map(|root| root.join("agents").join(&agent_config.id))
+        });
+        managed_runtime::append_session_event_quiet(
+            agent_home.as_deref(),
+            &key,
+            managed_runtime::SessionEventKind::Prompt,
+            prompt.trim(),
+            None,
+        );
         Self::log_attachment_debug(channel_id, user_id, attachments);
         dev_trace(
             "bot.pi",
@@ -781,7 +815,38 @@ impl PiBridge {
 
         // Write models config if needed
         let models_path = runtime_dir.join("models.json");
-        if let Some(config) = self.build_provider_models_config() {
+        let mut managed_runtime_prepared: Option<managed_runtime::PreparedManagedRuntime> = None;
+        let runtime_provider_config = if self.provider_id.trim().is_empty()
+            || self.base_url.trim().is_empty()
+            || self.model.trim().is_empty()
+        {
+            None
+        } else {
+            Some(ProviderRuntimeConfig {
+                provider_id: self.provider_id.clone(),
+                api_format: self.api_format.clone(),
+                base_url: self.base_url.clone(),
+                api_key: self.api_key.clone(),
+                model: self.model.clone(),
+            })
+        };
+        if let (Some(agent_config), Some(provider_config)) =
+            (self.agent_config.as_ref(), runtime_provider_config.as_ref())
+        {
+            managed_runtime_prepared = Some(managed_runtime::prepare_managed_runtime(
+                &self.pi_runtime.executable,
+                &runtime_dir,
+                agent_config,
+                Some(prepared_input.message.as_str()),
+                &key,
+                Some(provider_config),
+            )?);
+        }
+
+        if let Some(config) = runtime_provider_config
+            .as_ref()
+            .and_then(Self::build_provider_models_config_from_config)
+        {
             let content = serde_json::to_vec_pretty(&config)
                 .map_err(|e| format!("序列化 models 配置失败: {e}"))?;
             fs::write(&models_path, content).map_err(|e| format!("写入 models.json 失败: {e}"))?;
@@ -803,21 +868,58 @@ impl PiBridge {
         .stderr(Stdio::piped())
         .env("PI_CODING_AGENT_DIR", &runtime_dir);
 
-        if Self::normalize_provider_api_format(&self.api_format, self.provider_id.trim())
-            == "anthropic"
+        if runtime_provider_config
+            .as_ref()
+            .map(|config| {
+                Self::normalize_provider_api_format(&config.api_format, config.provider_id.trim())
+                    == "anthropic"
+            })
+            .unwrap_or(false)
         {
             Self::scrub_anthropic_process_env(&mut cmd);
         }
 
-        let runtime_provider_id = self.runtime_provider_id();
+        let runtime_provider_id = runtime_provider_config
+            .as_ref()
+            .map(|config| {
+                let trimmed = config.provider_id.trim();
+                if trimmed.is_empty() {
+                    "nineclaw-runtime-provider".to_string()
+                } else {
+                    let digest = format!("{:x}", Md5::digest(trimmed.as_bytes()));
+                    format!("nineclaw-runtime-{}", &digest[..12])
+                }
+            })
+            .unwrap_or_else(|| self.runtime_provider_id());
         if !runtime_provider_id.is_empty() {
             cmd.args(["--provider", &runtime_provider_id]);
         }
-        if !self.model.is_empty() {
-            cmd.args(["--model", &self.model]);
+        if let Some(config) = runtime_provider_config.as_ref() {
+            if !config.model.is_empty() {
+                cmd.args(["--model", &config.model]);
+            }
+            if !config.api_key.is_empty() {
+                cmd.args(["--api-key", &config.api_key]);
+            }
         }
-        if !self.api_key.is_empty() {
-            cmd.args(["--api-key", &self.api_key]);
+        if let Some(prepared) = managed_runtime_prepared.as_ref() {
+            cmd.args([
+                "--extension",
+                prepared.extension_path.to_string_lossy().as_ref(),
+            ])
+            .env(
+                "NINECLAW_HARNESS_FILE",
+                prepared.harness.file_path.to_string_lossy().as_ref(),
+            )
+            .env(
+                "NINECLAW_PROXY_BASE_URL",
+                prepared.proxy_base_url.as_deref().unwrap_or_default(),
+            )
+            .env(
+                "NINECLAW_PROXY_SESSION_TOKEN",
+                prepared.session_token.as_deref().unwrap_or_default(),
+            )
+            .env("NINECLAW_SESSION_ID", key.as_str());
         }
 
         let mut skill_paths: Vec<PathBuf> = Vec::new();
@@ -855,7 +957,19 @@ impl PiBridge {
             ));
             cmd.args(["--append-system-prompt", memory_isolation_prompt]);
 
-            for skill_path in skills::resolve_skill_directories(&agent_config.skill_ids)? {
+            let skill_decision = crate::skill_broker::select_skills_for_turn(
+                agent_config,
+                prepared_input.message.as_str(),
+                &[],
+            )?;
+            if let Some(skill_prompt) = crate::skill_broker::runtime_skill_prompt(&skill_decision) {
+                system_prompt_chars += skill_prompt.chars().count();
+                system_prompt_sections.push(("runtime_skills".to_string(), skill_prompt.clone()));
+                cmd.args(["--append-system-prompt", &skill_prompt]);
+            }
+
+            for skill_path in skills::resolve_skill_directories(&skill_decision.mounted_skill_ids)?
+            {
                 skill_paths.push(skill_path.clone());
                 cmd.args(["--skill", &skill_path.to_string_lossy()]);
             }
@@ -1130,6 +1244,13 @@ impl PiBridge {
                 "message_start" | "message_end" | "turn_end" | "agent_end"
             ) {
                 if let Some(err) = Self::extract_assistant_error(&value) {
+                    managed_runtime::append_session_event_quiet(
+                        agent_home.as_deref(),
+                        &key,
+                        managed_runtime::SessionEventKind::RuntimeError,
+                        format!("pi assistant 错误: {err}"),
+                        None,
+                    );
                     dev_trace(
                         "bot.pi",
                         format!(
@@ -1222,6 +1343,13 @@ impl PiBridge {
                         saw_abort_event = true;
                         break;
                     }
+                    managed_runtime::append_session_event_quiet(
+                        agent_home.as_deref(),
+                        &key,
+                        managed_runtime::SessionEventKind::RuntimeError,
+                        format!("pi 流错误: {reason}"),
+                        None,
+                    );
                     dev_trace(
                         "bot.pi",
                         format!(
@@ -1251,6 +1379,69 @@ impl PiBridge {
                 break;
             }
 
+            if line_type == "tool_execution_start" {
+                let tool_call_id = value
+                    .get("toolCallId")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let tool_name = value
+                    .get("toolName")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("unknown_tool")
+                    .to_string();
+                let args_text = value
+                    .get("args")
+                    .map(|item| item.to_string())
+                    .unwrap_or_default();
+                managed_runtime::append_session_event_quiet(
+                    agent_home.as_deref(),
+                    &key,
+                    managed_runtime::SessionEventKind::ToolCall,
+                    format!("{tool_name} {args_text}"),
+                    Some(json!({
+                        "toolCallId": tool_call_id,
+                        "toolName": tool_name,
+                        "args": args_text,
+                    })),
+                );
+            }
+
+            if line_type == "tool_execution_end" {
+                let tool_call_id = value
+                    .get("toolCallId")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let tool_name = value
+                    .get("toolName")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("unknown_tool")
+                    .to_string();
+                let args_text = value
+                    .get("args")
+                    .map(|item| item.to_string())
+                    .unwrap_or_default();
+                let result_text = value
+                    .get("result")
+                    .and_then(|result| Self::extract_text_content_from_message(Some(result)))
+                    .unwrap_or_default();
+                let is_error = value.get("isError").and_then(|item| item.as_bool());
+                managed_runtime::append_session_event_quiet(
+                    agent_home.as_deref(),
+                    &key,
+                    managed_runtime::SessionEventKind::ToolResult,
+                    format!("{tool_name} {result_text}"),
+                    Some(json!({
+                        "toolCallId": tool_call_id,
+                        "toolName": tool_name,
+                        "args": args_text,
+                        "result": result_text,
+                        "isError": is_error,
+                    })),
+                );
+            }
+
             // Surface explicit error responses from pi
             if line_type == "response" {
                 let command = value
@@ -1273,6 +1464,13 @@ impl PiBridge {
                         saw_abort_event = true;
                         break;
                     }
+                    managed_runtime::append_session_event_quiet(
+                        agent_home.as_deref(),
+                        &key,
+                        managed_runtime::SessionEventKind::RuntimeError,
+                        format!("pi RPC 错误: {err}"),
+                        None,
+                    );
                     dev_trace(
                         "bot.pi",
                         format!(
@@ -1386,6 +1584,11 @@ impl PiBridge {
             if fresh_multimodal_session {
                 let _ = crate::record_multimodal_summary(&key, prompt, &full_text);
             }
+            managed_runtime::append_assistant_output_events(
+                agent_home.as_deref(),
+                &key,
+                &full_text,
+            );
             return Ok(PiProcessOutcome::Completed(PiProcessResult {
                 full_text,
                 usage: final_usage,
@@ -1415,6 +1618,13 @@ impl PiBridge {
                     channel_id, user_id, reason
                 ),
             );
+            managed_runtime::append_session_event_quiet(
+                agent_home.as_deref(),
+                &key,
+                managed_runtime::SessionEventKind::RuntimeError,
+                reason.clone(),
+                None,
+            );
             return Err(reason);
         }
 
@@ -1430,6 +1640,7 @@ impl PiBridge {
         if fresh_multimodal_session {
             let _ = crate::record_multimodal_summary(&key, prompt, &full_text);
         }
+        managed_runtime::append_assistant_output_events(agent_home.as_deref(), &key, &full_text);
         Ok(PiProcessOutcome::Completed(PiProcessResult {
             full_text,
             usage: final_usage,

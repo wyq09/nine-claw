@@ -16,11 +16,21 @@ pub fn team_root(workspace_id: &str) -> Result<PathBuf, String> {
     Ok(root.join("teams").join(trimmed))
 }
 
+/// 与数据库同步的团队基础信息（成员、主智能体等），供 `nineclaw_read_team_resource` 与终端查看。
+/// 固定在 `docs/` 下以免与用户自建的 `team.json` 冲突。
+pub const TEAM_MANIFEST_REL: &str = "docs/_nineclaw_team.json";
+
+pub fn write_team_manifest_json(workspace_id: &str, body: &str) -> Result<PathBuf, String> {
+    let root = ensure_team_layout(workspace_id)?;
+    let path = root.join("docs").join("_nineclaw_team.json");
+    fs::write(&path, body.as_bytes()).map_err(|e| format!("写入团队清单 JSON 失败: {e}"))?;
+    Ok(path)
+}
+
 pub fn ensure_team_layout(workspace_id: &str) -> Result<PathBuf, String> {
     let root = team_root(workspace_id)?;
     for rel in ["docs", "inbox", "memory/entries", "briefs", "artifacts"] {
-        fs::create_dir_all(root.join(rel))
-            .map_err(|e| format!("创建工作目录失败 {}: {e}", rel))?;
+        fs::create_dir_all(root.join(rel)).map_err(|e| format!("创建工作目录失败 {}: {e}", rel))?;
     }
     let index = root.join("memory").join("SHARED_NOTES.md");
     if !index.is_file() {
@@ -46,7 +56,8 @@ pub fn persist_team_doc_file(
     let safe = sanitize_filename(original_name);
     let dest = docs.join(&safe);
     let mut file = fs::File::create(&dest).map_err(|e| format!("写入资料文件失败: {e}"))?;
-    file.write_all(data).map_err(|e| format!("写入资料内容失败: {e}"))?;
+    file.write_all(data)
+        .map_err(|e| format!("写入资料内容失败: {e}"))?;
     let rel = format!("docs/{safe}");
     Ok((dest, rel))
 }
@@ -95,16 +106,28 @@ pub fn remove_team_resource_file(workspace_id: &str, rel_path: &str) -> Result<(
     }
 }
 
-pub fn write_team_brief(workspace_id: &str, agent_id: &str, content: &str) -> Result<PathBuf, String> {
+pub fn write_team_brief(
+    workspace_id: &str,
+    agent_id: &str,
+    content: &str,
+) -> Result<PathBuf, String> {
     let root = ensure_team_layout(workspace_id)?;
     let path = root.join("briefs").join(format!("{agent_id}.md"));
     fs::write(&path, content).map_err(|e| format!("写入简报失败: {e}"))?;
     Ok(path)
 }
 
-pub fn write_memory_entry_md(workspace_id: &str, memory_id: &str, title: &str, body: &str) -> Result<PathBuf, String> {
+pub fn write_memory_entry_md(
+    workspace_id: &str,
+    memory_id: &str,
+    title: &str,
+    body: &str,
+) -> Result<PathBuf, String> {
     let root = ensure_team_layout(workspace_id)?;
-    let path = root.join("memory").join("entries").join(format!("{memory_id}.md"));
+    let path = root
+        .join("memory")
+        .join("entries")
+        .join(format!("{memory_id}.md"));
     let md = format!("# {title}\n\n{body}\n");
     fs::write(&path, md).map_err(|e| format!("写入记忆文件失败: {e}"))?;
     Ok(path)
@@ -116,7 +139,10 @@ pub fn remove_memory_entry_md(workspace_id: &str, memory_id: &str) -> Result<(),
         return Err("无效的记忆 id".to_string());
     }
     let root = team_root(workspace_id)?;
-    let path = root.join("memory").join("entries").join(format!("{mid}.md"));
+    let path = root
+        .join("memory")
+        .join("entries")
+        .join(format!("{mid}.md"));
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
@@ -143,7 +169,10 @@ fn system_time_ms_ms(t: std::io::Result<std::time::SystemTime>) -> Option<i64> {
 }
 
 /// `artifacts_root_config` 为空时使用 `teams/<id>/artifacts`；否则为绝对路径（不存在则创建）。
-pub fn resolve_artifacts_root_path(workspace_id: &str, artifacts_root_config: &str) -> Result<PathBuf, String> {
+pub fn resolve_artifacts_root_path(
+    workspace_id: &str,
+    artifacts_root_config: &str,
+) -> Result<PathBuf, String> {
     let cfg = artifacts_root_config.trim();
     if !cfg.is_empty() {
         let p = PathBuf::from(cfg);
@@ -157,7 +186,8 @@ pub fn resolve_artifacts_root_path(workspace_id: &str, artifacts_root_config: &s
         let root = ensure_team_layout(workspace_id)?;
         let art = root.join("artifacts");
         fs::create_dir_all(&art).map_err(|e| format!("创建 artifacts 目录失败: {e}"))?;
-        art.canonicalize().map_err(|e| format!("解析 artifacts 路径失败: {e}"))
+        art.canonicalize()
+            .map_err(|e| format!("解析 artifacts 路径失败: {e}"))
     }
 }
 
@@ -192,7 +222,9 @@ pub fn list_artifacts_dir_entries(
     let mut entries = Vec::new();
     for item in fs::read_dir(&dir).map_err(|e| format!("读取目录失败: {e}"))? {
         let item = item.map_err(|e| format!("读取目录项失败: {e}"))?;
-        let meta = item.metadata().map_err(|e| format!("读取元数据失败: {e}"))?;
+        let meta = item
+            .metadata()
+            .map_err(|e| format!("读取元数据失败: {e}"))?;
         let name = item.file_name().to_string_lossy().to_string();
         let rel = if sub.is_empty() {
             name.clone()
@@ -203,7 +235,11 @@ pub fn list_artifacts_dir_entries(
             name,
             rel_path: rel.replace('\\', "/"),
             is_dir: meta.is_dir(),
-            size: if meta.is_file() { Some(meta.len() as i64) } else { None },
+            size: if meta.is_file() {
+                Some(meta.len() as i64)
+            } else {
+                None
+            },
             modified_ms: system_time_ms_ms(meta.modified()),
         });
     }
@@ -217,7 +253,11 @@ pub fn list_artifacts_dir_entries(
 
 const ARTIFACT_TEXT_PREVIEW_MAX: u64 = 4 * 1024 * 1024;
 
-pub fn read_artifact_text_preview(workspace_id: &str, artifacts_root_config: &str, rel: &str) -> Result<String, String> {
+pub fn read_artifact_text_preview(
+    workspace_id: &str,
+    artifacts_root_config: &str,
+    rel: &str,
+) -> Result<String, String> {
     let root = resolve_artifacts_root_path(workspace_id, artifacts_root_config)?;
     let rel = normalize_artifact_rel(rel)?;
     let path = root.join(&rel);
@@ -237,7 +277,11 @@ pub fn read_artifact_text_preview(workspace_id: &str, artifacts_root_config: &st
     fs::read_to_string(&path).map_err(|e| format!("按文本读取失败: {e}"))
 }
 
-pub fn artifact_file_absolute_path(workspace_id: &str, artifacts_root_config: &str, rel: &str) -> Result<PathBuf, String> {
+pub fn artifact_file_absolute_path(
+    workspace_id: &str,
+    artifacts_root_config: &str,
+    rel: &str,
+) -> Result<PathBuf, String> {
     let root = resolve_artifacts_root_path(workspace_id, artifacts_root_config)?;
     let rel = normalize_artifact_rel(rel)?;
     let path = root.join(&rel);

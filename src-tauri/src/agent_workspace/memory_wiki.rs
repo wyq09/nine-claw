@@ -78,9 +78,7 @@ pub(super) fn build_memory_wiki_snapshot(
             "follow-up",
         ],
     ) {
-        sections.push(
-            "涉及承诺或阻塞时，查看 `WORKING.md` 的 OPEN_LOOPS 与复查项。".to_string(),
-        );
+        sections.push("涉及承诺或阻塞时，查看 `WORKING.md` 的 OPEN_LOOPS 与复查项。".to_string());
     }
     if contains_any(
         &prompt,
@@ -130,9 +128,7 @@ pub(super) fn build_memory_wiki_snapshot(
             "error",
         ],
     ) {
-        sections.push(
-            "涉及容易犯错或纠正规则时，优先查 `PITFALLS.md`。".to_string(),
-        );
+        sections.push("涉及容易犯错或纠正规则时，优先查 `PITFALLS.md`。".to_string());
     }
     if contains_any(
         &prompt,

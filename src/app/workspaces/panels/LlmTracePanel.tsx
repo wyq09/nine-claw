@@ -1,59 +1,30 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  llmTraceClear,
+  llmTraceList,
   onLlmTraceEvent,
-  workspaceLlmTraceClear,
-  workspaceLlmTraceList,
   workspaceLlmTraceSetEnabled,
   workspaceLlmTraceStatus,
   type LlmTraceEntry,
   type LlmTraceEvent,
-} from '../../../lib/piClient'
+} from '../../../lib/llmTraceClient'
 import { AppIcon } from '../../../components/AppIcon'
+import {
+  getTraceKindLabel,
+  getTraceMessageBlocks,
+  getTraceResponseBlocks,
+  matchesTraceScope,
+} from './llmTraceModel'
+import { openLlmTracePopout } from '../../lib/llmTracePopout'
 
 export type LlmTracePanelProps = {
-  workspaceId: string
+  workspaceId?: string | null
   /** 当前会话 id：提供则只显示该会话产生的调试记录。 */
   sessionId?: string | null
   open: boolean
   onClose: () => void
   /** 独立窗口模式：填满视口，不可拖动，不显示弹出按钮。 */
   standalone?: boolean
-}
-
-async function popoutTraceWindow(workspaceId: string, sessionId: string | null | undefined) {
-  const sessionPart = sessionId ? `&ses=${encodeURIComponent(sessionId)}` : ''
-  const hashPath = `/llm-trace?ws=${encodeURIComponent(workspaceId)}${sessionPart}`
-  const labelSeed = `${workspaceId}-${sessionId ?? 'all'}`
-  const label = `llm-trace-${labelSeed.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48)}`
-  try {
-    const mod = await import('@tauri-apps/api/webviewWindow')
-    const existing = await mod.WebviewWindow.getByLabel(label)
-    if (existing) {
-      await existing.show()
-      await existing.setFocus()
-      return
-    }
-    const win = new mod.WebviewWindow(label, {
-      url: `index.html#${hashPath}`,
-      title: 'LLM 调用链 · 调试',
-      width: 960,
-      height: 720,
-      minWidth: 540,
-      minHeight: 360,
-      resizable: true,
-      decorations: true,
-    })
-    win.once('tauri://error', (e) => {
-      console.error('[llm-trace popout] 创建窗口失败', e)
-    })
-  } catch (err) {
-    console.error('[llm-trace popout] 失败，回退浏览器弹窗', err)
-    window.open(
-      `${window.location.origin}/#${hashPath}`,
-      label,
-      'width=960,height=720',
-    )
-  }
 }
 
 type DragState = { startX: number; startY: number; offsetX: number; offsetY: number } | null
@@ -94,12 +65,6 @@ const formatTime = (ts: number) => {
   return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
-const kindLabel = (kind: string) => {
-  if (kind === 'main_pi') return '主→Pi'
-  if (kind === 'delegate') return '主→子'
-  return kind
-}
-
 function useDraggable(initial: { x: number; y: number }) {
   const [pos, setPos] = useState(initial)
   const dragRef = useRef<DragState>(null)
@@ -131,7 +96,7 @@ function useDraggable(initial: { x: number; y: number }) {
 }
 
 type Expanded = { [id: string]: boolean }
-type Section = 'summary' | 'system' | 'response' | 'tools' | 'raw'
+type Section = 'messages' | 'responses' | 'tools' | 'raw'
 type ViewMode = 'tree' | 'flat'
 
 function TraceRow({
@@ -147,12 +112,17 @@ function TraceRow({
   depth?: number
   childCount?: number
 }) {
-  const [section, setSection] = useState<Section>('summary')
+  const [section, setSection] = useState<Section>('messages')
   const st = statusLabel(entry.status)
   const caller = entry.callerAgentName || entry.callerAgentId
-  const target = entry.targetAgentName || entry.targetAgentId || (entry.kind === 'main_pi' ? 'LLM' : '—')
+  const target =
+    entry.targetAgentName ||
+    entry.targetAgentId ||
+    (entry.targetKind === 'model' || entry.kind === 'main_pi' || entry.kind === 'action_llm' ? 'LLM' : '—')
   const input = entry.usage?.inputTokens ?? null
   const output = entry.usage?.outputTokens ?? null
+  const messageBlocks = useMemo(() => getTraceMessageBlocks(entry), [entry])
+  const responseBlocks = useMemo(() => getTraceResponseBlocks(entry), [entry])
 
   const rawJson = useMemo(() => JSON.stringify(entry, null, 2), [entry])
 
@@ -178,7 +148,7 @@ function TraceRow({
       <button type="button" className="llm-trace-row-head" onClick={onToggle}>
         {depth > 0 ? <span className="llm-trace-branch" aria-hidden>└</span> : null}
         <span className={`llm-trace-dot tone-${st.tone}`} />
-        <span className="llm-trace-row-kind">{kindLabel(entry.kind)}</span>
+        <span className="llm-trace-row-kind">{getTraceKindLabel(entry)}</span>
         <span className="llm-trace-row-agents">
           <span className="llm-trace-caller">{caller}</span>
           <span className="llm-trace-arrow">→</span>
@@ -241,24 +211,17 @@ function TraceRow({
           <nav className="llm-trace-tabs" role="tablist">
             <button
               type="button"
-              className={section === 'summary' ? 'active' : ''}
-              onClick={() => setSection('summary')}
+              className={section === 'messages' ? 'active' : ''}
+              onClick={() => setSection('messages')}
             >
-              概要
+              消息 ({messageBlocks.length})
             </button>
             <button
               type="button"
-              className={section === 'system' ? 'active' : ''}
-              onClick={() => setSection('system')}
+              className={section === 'responses' ? 'active' : ''}
+              onClick={() => setSection('responses')}
             >
-              系统提示词 ({entry.systemPrompts.length})
-            </button>
-            <button
-              type="button"
-              className={section === 'response' ? 'active' : ''}
-              onClick={() => setSection('response')}
-            >
-              响应
+              响应 ({responseBlocks.length})
             </button>
             <button
               type="button"
@@ -276,40 +239,51 @@ function TraceRow({
             </button>
           </nav>
 
-          {section === 'summary' ? (
+          {section === 'messages' ? (
             <div className="llm-trace-section">
-              <h4>用户输入</h4>
-              <pre className="llm-trace-pre">{entry.userMessage || '—'}</pre>
-              {entry.thinkingText ? (
-                <>
-                  <h4>思考过程</h4>
-                  <pre className="llm-trace-pre llm-trace-thinking">{entry.thinkingText}</pre>
-                </>
-              ) : null}
-            </div>
-          ) : null}
-
-          {section === 'system' ? (
-            <div className="llm-trace-section">
-              {entry.systemPrompts.length === 0 ? (
-                <div className="llm-trace-empty">（未记录系统提示词）</div>
+              {messageBlocks.length === 0 ? (
+                <div className="llm-trace-empty">（未记录消息块）</div>
               ) : (
-                entry.systemPrompts.map((part, i) => (
-                  <details key={`${part.label}-${i}`} className="llm-trace-prompt-part" open={i < 2}>
+                messageBlocks.map((block, index) => (
+                  <details
+                    key={block.id || `${block.role}-${index}`}
+                    className="llm-trace-prompt-part"
+                    open={index < 2}
+                  >
                     <summary>
-                      <span>{part.label}</span>
-                      <span className="llm-trace-muted"> · {part.content.length} 字</span>
+                      <span>{block.role.toUpperCase()}</span>
+                      <span className="llm-trace-muted"> · {block.label}</span>
                     </summary>
-                    <pre className="llm-trace-pre">{part.content}</pre>
+                    <pre className="llm-trace-pre">{block.content || '—'}</pre>
                   </details>
                 ))
               )}
             </div>
           ) : null}
 
-          {section === 'response' ? (
+          {section === 'responses' ? (
             <div className="llm-trace-section">
-              <pre className="llm-trace-pre">{entry.responseText || '（暂无响应文本）'}</pre>
+              {responseBlocks.length === 0 ? (
+                <div className="llm-trace-empty">（未记录响应块）</div>
+              ) : (
+                responseBlocks.map((block, index) => (
+                  <details
+                    key={block.id || `${block.kind}-${index}`}
+                    className="llm-trace-prompt-part"
+                    open={index < 2}
+                  >
+                    <summary>
+                      <span>{block.kind === 'thinking' ? '思考过程' : '回复内容'}</span>
+                      <span className="llm-trace-muted"> · {block.label}</span>
+                    </summary>
+                    <pre
+                      className={`llm-trace-pre${block.kind === 'thinking' ? ' llm-trace-thinking' : ''}`}
+                    >
+                      {block.content || '—'}
+                    </pre>
+                  </details>
+                ))
+              )}
             </div>
           ) : null}
 
@@ -373,6 +347,8 @@ export function LlmTracePanel({
   const [error, setError] = useState<string | null>(null)
   const [sessionOnly, setSessionOnly] = useState<boolean>(!!sessionId)
   const [viewMode, setViewMode] = useState<ViewMode>('tree')
+  const hasWorkspaceScope = Boolean(workspaceId?.trim())
+  const hasSessionScope = Boolean(sessionId?.trim())
 
   useEffect(() => {
     if (!sessionId) setSessionOnly(false)
@@ -387,10 +363,15 @@ export function LlmTracePanel({
   )
 
   const refresh = useCallback(async () => {
-    if (!workspaceId) return
+    if (!workspaceId && !sessionId) return
     setLoading(true)
     try {
-      const list = await workspaceLlmTraceList(workspaceId, { days: 3, limit: 200 })
+      const list = await llmTraceList({
+        workspaceId: workspaceId ?? null,
+        sessionId: sessionId ?? null,
+        days: 3,
+        limit: 200,
+      })
       setEntries(list)
       setError(null)
     } catch (e) {
@@ -398,14 +379,18 @@ export function LlmTracePanel({
     } finally {
       setLoading(false)
     }
-  }, [workspaceId])
+  }, [sessionId, workspaceId])
 
   useEffect(() => {
-    if (!open || !workspaceId) return
+    if (!open || (!workspaceId && !sessionId)) return
     let mounted = true
     void (async () => {
+      if (!hasWorkspaceScope) {
+        if (mounted) setEnabled(true)
+        return
+      }
       try {
-        const status = await workspaceLlmTraceStatus(workspaceId)
+        const status = await workspaceLlmTraceStatus(workspaceId!)
         if (mounted) setEnabled(status)
       } catch (e) {
         if (mounted) setError(String(e))
@@ -415,13 +400,13 @@ export function LlmTracePanel({
     return () => {
       mounted = false
     }
-  }, [open, workspaceId, refresh])
+  }, [hasWorkspaceScope, open, refresh, sessionId, workspaceId])
 
   useEffect(() => {
-    if (!open || !workspaceId) return
+    if (!open || (!workspaceId && !sessionId)) return
     let unsubscribe: (() => void) | null = null
     void onLlmTraceEvent((payload: LlmTraceEvent) => {
-      if (payload.entry.workspaceId !== workspaceId) return
+      if (!matchesTraceScope(payload.entry, { workspaceId, sessionId })) return
       setEntries((prev) => {
         const idx = prev.findIndex((e) => e.id === payload.entry.id)
         if (idx >= 0) {
@@ -437,9 +422,18 @@ export function LlmTracePanel({
     return () => {
       unsubscribe?.()
     }
-  }, [open, workspaceId])
+  }, [open, sessionId, workspaceId])
+
+  useEffect(() => {
+    if (!open || (!workspaceId && !sessionId)) return
+    const id = window.setInterval(() => {
+      void refresh()
+    }, 1000)
+    return () => clearInterval(id)
+  }, [open, workspaceId, sessionId, refresh])
 
   const toggle = useCallback(async () => {
+    if (!workspaceId) return
     try {
       const next = !enabled
       await workspaceLlmTraceSetEnabled(workspaceId, next)
@@ -450,14 +444,17 @@ export function LlmTracePanel({
   }, [enabled, workspaceId])
 
   const clear = useCallback(async () => {
-    if (!window.confirm('清空本团队的全部调试记录（仅影响本地 .debug 目录）？')) return
+    const confirmText = workspaceId
+      ? '清空当前作用域下的调试记录（仅影响本地 .debug 目录）？'
+      : '清空当前 session 的调试记录（仅影响本地 .debug 目录）？'
+    if (!window.confirm(confirmText)) return
     try {
-      await workspaceLlmTraceClear(workspaceId)
+      await llmTraceClear({ workspaceId: workspaceId ?? null, sessionId: sessionId ?? null })
       setEntries([])
     } catch (e) {
       setError(String(e))
     }
-  }, [workspaceId])
+  }, [sessionId, workspaceId])
 
   const visibleEntries = useMemo(
     () => entries.filter(matchesCurrentSession),
@@ -532,10 +529,14 @@ export function LlmTracePanel({
           ) : null}
         </div>
         <div className="llm-trace-head-actions">
-          <label className="llm-trace-switch" title="是否写入调试追踪">
-            <input type="checkbox" checked={enabled} onChange={() => void toggle()} />
-            <span>{enabled ? '记录中' : '未开启'}</span>
-          </label>
+          {hasWorkspaceScope ? (
+            <label className="llm-trace-switch" title="是否写入调试追踪">
+              <input type="checkbox" checked={enabled} onChange={() => void toggle()} />
+              <span>{enabled ? '记录中' : '未开启'}</span>
+            </label>
+          ) : hasSessionScope ? (
+            <span className="llm-trace-switch llm-trace-switch-static">当前 session</span>
+          ) : null}
           <button type="button" onClick={() => void refresh()} disabled={loading} title="刷新">
             <AppIcon name="refresh" size={13} />
           </button>
@@ -545,7 +546,7 @@ export function LlmTracePanel({
           {!standalone ? (
             <button
               type="button"
-              onClick={() => void popoutTraceWindow(workspaceId, sessionId ?? null)}
+              onClick={() => void openLlmTracePopout(workspaceId ?? null, sessionId ?? null)}
               title="在独立窗口打开"
             >
               <AppIcon name="panel" size={13} />
@@ -559,15 +560,20 @@ export function LlmTracePanel({
         </div>
       </header>
 
-      {!enabled ? (
+      {!enabled && hasWorkspaceScope ? (
         <div className="llm-trace-hint">
-          调试模式未开启：主 Agent↔Pi 与主 Agent↔子 Agent 的调用链不会被记录。点击右上「未开启」开启即可。
+          调试模式未开启：智能体→大模型、动作→大模型、智能体→智能体 的结构化调用链不会被记录。点击右上「未开启」开启即可。
+        </div>
+      ) : null}
+      {!hasWorkspaceScope && hasSessionScope ? (
+        <div className="llm-trace-hint">
+          当前单独 session 的结构化调试记录会按 session 作用域实时刷新。
         </div>
       ) : null}
       {error ? <div className="llm-trace-error">{error}</div> : null}
 
       <div className="llm-trace-filterbar">
-        {sessionId ? (
+        {hasWorkspaceScope && sessionId ? (
           <label className="llm-trace-switch">
             <input
               type="checkbox"

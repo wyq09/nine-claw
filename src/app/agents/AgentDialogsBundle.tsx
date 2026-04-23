@@ -12,11 +12,16 @@ import type {
 import { getPeerGatewayInfo } from '../../lib/piClient'
 import {
   buildAutoAgentSummary,
+  createDefaultAgentCapabilityPolicy,
+  dedupeSkillIds,
+  formatAgentSkillStrategyLabel,
+  formatSkillIdList,
   createAgentBotConfigState,
   formatAgentExecutionModeLabel,
   formatInstalledSkillScopeLabel,
   formatInstalledSkillSource,
   getAgentColor,
+  normalizeAgentCapabilityPolicy,
   normalizeAgentScenarioLlmConfigInDraft,
   sessionLlmDecode,
   sessionLlmEncode,
@@ -51,8 +56,8 @@ export function AgentSkillPickerDialog({
         aria-labelledby="agent-skill-picker-title"
         onClick={(event) => event.stopPropagation()}
       >
-        <h3 id="agent-skill-picker-title">添加挂载技能</h3>
-        <p>从本地已安装技能里搜索并选择。选中的技能会作为当前智能体的运行时能力注入。</p>
+        <h3 id="agent-skill-picker-title">添加偏好技能</h3>
+        <p>从本地已安装技能里搜索并选择。它们会作为 broker 的优先候选参与本轮运行时装配。</p>
 
         <label className="input-field skill-install-field">
           <span>搜索技能</span>
@@ -101,7 +106,7 @@ export function AgentSkillPickerDialog({
             <div className="agent-skill-picker-empty">
               <strong>{allSkillCount > 0 ? '没有匹配的技能' : '暂无已安装技能'}</strong>
               <span>
-                {allSkillCount > 0 ? '换个关键词继续搜索，或直接关闭弹窗。' : '先去技能库安装技能，再回到这里挂载。'}
+                {allSkillCount > 0 ? '换个关键词继续搜索，或直接关闭弹窗。' : '先去技能库安装技能，再回到这里选择偏好技能。'}
               </span>
             </div>
           )}
@@ -293,6 +298,10 @@ export function AgentEditorDialog({
     agentDraft?.defaultProviderId.trim() && agentDraft?.defaultModel.trim()
       ? sessionLlmEncode(agentDraft.defaultProviderId, agentDraft.defaultModel)
       : ''
+  const capabilityPolicy = normalizeAgentCapabilityPolicy(
+    agentDraft?.capabilityPolicy,
+    createDefaultAgentCapabilityPolicy(),
+  )
   const generatedSummary = buildAutoAgentSummary(agentDraft?.description ?? '', agentDraft?.name ?? '')
   const missingSkillIds = (agentDraft?.skillIds ?? []).filter((skillId) => !allSkills.some((skill) => skill.id === skillId))
   const mountedSkills = allSkills.filter((skill) => agentDraft?.skillIds.includes(skill.id) ?? false)
@@ -365,7 +374,7 @@ export function AgentEditorDialog({
                   <h2 id="agent-editor-title">{mode === 'create' ? '新建智能体' : selectedAgent?.name ?? '编辑智能体'}</h2>
                   <p>
                     {mode === 'create'
-                      ? '先填名字与角色说明并挂载技能；在「模型配置」「三方对接」「高级」中完成其余设置。'
+                      ? '先填名字与角色说明，再配置能力策略与偏好技能；在「模型配置」「三方对接」「高级」中完成其余设置。'
                       : selectedAgent?.summary ?? '用下方 Tab 切换分区：基本信息、模型、三方对接、高级。'}
                   </p>
                 </div>
@@ -394,7 +403,8 @@ export function AgentEditorDialog({
               {agentDraft.executionMode !== 'single' ? (
                 <span className="agent-hero-pill">{formatAgentExecutionModeLabel(agentDraft.executionMode)}</span>
               ) : null}
-              <span className="agent-hero-pill">{agentDraft.skillIds.length} 个挂载技能</span>
+              <span className="agent-hero-pill">{formatAgentSkillStrategyLabel(capabilityPolicy.strategy)}</span>
+              <span className="agent-hero-pill">{agentDraft.skillIds.length} 个偏好技能</span>
               {selectedAgent ? <span className="agent-hero-pill">ID: {selectedAgent.id}</span> : null}
               {selectedAgent?.id === defaultAgentId ? <span className="agent-hero-pill accent">当前默认</span> : null}
             </div>
@@ -493,13 +503,96 @@ export function AgentEditorDialog({
 	                  当前预览：{generatedSummary || '输入角色说明后会自动生成'}。若要手动改写摘要，请打开「高级」分页。定时类任务请在「任务中心」管理。
 	                </span>
 	              </div>
-	            </div>
+            </div>
 
             <div className="agent-section">
               <div className="agent-section-header">
                 <div>
-                  <strong>挂载技能</strong>
-                  <p>通过搜索弹窗选择已安装技能。挂载后会通过 pi 的 `--skill` 注入到当前智能体运行时。</p>
+                  <strong>能力策略</strong>
+                  <p>控制本轮运行时是静态装配、混合动态选择，还是完全按问题动态发现技能。</p>
+                </div>
+              </div>
+
+              <div className="agent-field-grid">
+                <label className="input-field">
+                  <span>装配策略</span>
+                  <select
+                    value={capabilityPolicy.strategy}
+                    onChange={(event) =>
+                      onDraftChange({
+                        capabilityPolicy: normalizeAgentCapabilityPolicy({
+                          ...capabilityPolicy,
+                          strategy: event.target.value as typeof capabilityPolicy.strategy,
+                        }, createDefaultAgentCapabilityPolicy()),
+                      })
+                    }
+                  >
+                    <option value="static">静态挂载</option>
+                    <option value="hybrid">混合动态</option>
+                    <option value="dynamic">全动态</option>
+                  </select>
+                </label>
+
+                <label className="input-field">
+                  <span>动态上限</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={8}
+                    value={capabilityPolicy.maxDynamicSkills}
+                    onChange={(event) =>
+                      onDraftChange({
+                        capabilityPolicy: normalizeAgentCapabilityPolicy({
+                          ...capabilityPolicy,
+                          maxDynamicSkills: Number(event.target.value) || capabilityPolicy.maxDynamicSkills,
+                        }, createDefaultAgentCapabilityPolicy()),
+                      })
+                    }
+                    disabled={capabilityPolicy.strategy === 'static'}
+                  />
+                </label>
+              </div>
+
+              <div className="agent-field-grid">
+                <label className="input-field agent-field-full">
+                  <span>必需技能 ID</span>
+                  <input
+                    value={formatSkillIdList(capabilityPolicy.requiredSkillIds)}
+                    onChange={(event) =>
+                      onDraftChange({
+                        capabilityPolicy: normalizeAgentCapabilityPolicy({
+                          ...capabilityPolicy,
+                          requiredSkillIds: dedupeSkillIds([event.target.value]),
+                        }, createDefaultAgentCapabilityPolicy()),
+                      })
+                    }
+                    placeholder="逗号分隔；始终装配。系统技能会自动补齐。"
+                  />
+                </label>
+
+                <label className="input-field agent-field-full">
+                  <span>禁用技能 ID</span>
+                  <input
+                    value={formatSkillIdList(capabilityPolicy.forbiddenSkillIds)}
+                    onChange={(event) =>
+                      onDraftChange({
+                        capabilityPolicy: normalizeAgentCapabilityPolicy({
+                          ...capabilityPolicy,
+                          forbiddenSkillIds: dedupeSkillIds([event.target.value]),
+                        }, createDefaultAgentCapabilityPolicy()),
+                      })
+                    }
+                    placeholder="逗号分隔；broker 不会选择这些技能。"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="agent-section">
+              <div className="agent-section-header">
+                <div>
+                  <strong>偏好技能</strong>
+                  <p>通过搜索弹窗选择已安装技能。它们不会强绑，而是作为动态装配的优先候选。</p>
                 </div>
 
                 <button
@@ -509,7 +602,7 @@ export function AgentEditorDialog({
                   disabled={allSkills.length === 0}
                 >
                   <AppIcon name="plus" size={16} />
-                  <span>添加技能</span>
+                  <span>添加偏好技能</span>
                 </button>
               </div>
 
@@ -557,18 +650,18 @@ export function AgentEditorDialog({
                 </div>
               ) : (
                 <div className="agent-empty-block">
-                  <strong>{allSkills.length > 0 ? '还没有挂载技能' : '暂无已安装技能'}</strong>
+                  <strong>{allSkills.length > 0 ? '还没有偏好技能' : '暂无已安装技能'}</strong>
                   <span>
                     {allSkills.length > 0
-                      ? '点击右上角“添加技能”，从已安装技能里搜索并挂载。'
-                      : '先去技能库安装技能，再回到这里进行挂载。'}
+                      ? '点击右上角“添加偏好技能”，从已安装技能里搜索并添加。'
+                      : '先去技能库安装技能，再回到这里配置偏好技能。'}
                   </span>
                 </div>
               )}
 
               {missingSkillIds.length > 0 ? (
                 <div className="agent-missing-skills">
-                  <strong>有技能记录当前未在本地找到：</strong>
+                  <strong>有偏好技能记录当前未在本地找到：</strong>
                   <span>{missingSkillIds.join('、')}</span>
                 </div>
               ) : null}
@@ -832,14 +925,19 @@ export function AgentEditorDialog({
 	                    </div>
 
 	                    <label className="input-field agent-field-full">
-	                      <span>高级指令（可选）</span>
+	                      <span>系统指令（主配置，可选）</span>
 	                      <textarea
 	                        value={agentDraft.systemPrompt}
 	                        onChange={(event) => onDraftChange({ systemPrompt: event.target.value })}
 	                        rows={6}
-	                        placeholder="补充额外执行约束、回答方式或边界要求。留空时会根据名字和角色说明自动生成角色上下文。"
+	                        placeholder="写清执行约束、输出风格、禁区；长文细则可配合工作区 ROLE.md 等。留空时仅用名称与角色说明等自动生成摘要段。"
 	                      />
 	                    </label>
+	                    <div className="agent-helper-copy subtle">
+	                      <span>
+	                        多段 system 的组装说明见仓库 <code>docs/AGENT_SYSTEM_PROMPT.md</code>；工作区 md 与注入段的关系见 <code>docs/AGENT_WORKSPACE_ARCHITECTURE.md</code>。
+	                      </span>
+	                    </div>
 	                  </div>
 	                </div>
 	            </div>

@@ -2,6 +2,7 @@ export type PiStreamEventName =
   | 'start'
   | 'delta'
   | 'final_text'
+  | 'skill_selection'
   | 'done'
   | 'error'
   | 'aborted'
@@ -52,6 +53,10 @@ export type PiStreamPayload = {
   isError?: boolean
   is_error?: boolean
   reason?: string
+  strategy?: string
+  mountedSkillIds?: string[]
+  mounted_skill_ids?: string[]
+  reasons?: string[]
   inputTokens?: number
   input_tokens?: number
   outputTokens?: number
@@ -177,6 +182,15 @@ export type PersistedChatAttachment = {
 
 export type AgentExecutionMode = 'single' | 'supervisor' | 'worker'
 
+export type AgentSkillStrategy = 'static' | 'hybrid' | 'dynamic'
+
+export type AgentCapabilityPolicy = {
+  strategy: AgentSkillStrategy
+  requiredSkillIds: string[]
+  forbiddenSkillIds: string[]
+  maxDynamicSkills: number
+}
+
 export type AgentSharedContextPolicy = 'session' | 'summary' | 'none'
 
 export type AgentCollaborationConfig = {
@@ -238,6 +252,7 @@ export type ConversationAgentSnapshot = {
   summary: string
   description: string
   systemPrompt: string
+  capabilityPolicy: AgentCapabilityPolicy
   skillIds: string[]
   defaultProviderId: ProviderId
   defaultModel: string
@@ -405,6 +420,7 @@ export type SettingsTab =
   | 'shortcuts'
   | 'skills'
   | 'resources'
+  | 'logs'
 
 export type TokenUsageRecord = {
   turnId: string
@@ -474,6 +490,7 @@ export type AgentRecord = {
   summary: string
   description: string
   systemPrompt: string
+  capabilityPolicy: AgentCapabilityPolicy
   skillIds: string[]
   defaultProviderId: ProviderId
   defaultModel: string
@@ -494,6 +511,7 @@ export type AgentInput = {
   summary: string
   description: string
   systemPrompt: string
+  capabilityPolicy?: AgentCapabilityPolicy
   skillIds: string[]
   defaultProviderId: ProviderId
   defaultModel: string
@@ -515,6 +533,7 @@ export type AgentBuilderDraft = {
   summary: string
   description: string
   systemPrompt: string
+  capabilityPolicy?: AgentCapabilityPolicy
   skillIds: string[]
   defaultProviderId: ProviderId
   defaultModel: string
@@ -654,11 +673,19 @@ export type ProviderConfig = {
 
 export type SubmitShortcut = 'enter' | 'mod_enter'
 
+export type NetworkProxySettings = {
+  useSystemProxy: boolean
+  customProxyUrl: string
+}
+
 export type GeneralSettings = {
   language: '中文' | 'English'
   launchOnStartup: boolean
   useSystemProxy: boolean
+  customProxyUrl: string
   submitShortcut: SubmitShortcut
+  /** 额外导出 LLM 调用链 jsonl 的目录，空则仅写入工作区/.debug */
+  llmCallLogDir: string
 }
 
 export type ThemeMode = 'dark' | 'light' | 'claude'
