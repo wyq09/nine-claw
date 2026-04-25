@@ -990,3 +990,130 @@ export async function getSessionContextStats(
 ): Promise<SessionContextStatsPayload> {
   return invoke<SessionContextStatsPayload>('get_session_context_stats', { sessionId })
 }
+
+// ── Agent Loop ─────────────────────────────────────────────
+
+export async function agentLoopRespondReview(
+  loopId: string,
+  approved: boolean,
+  extendTo?: number,
+): Promise<void> {
+  await invoke('agent_loop_respond_review', {
+    loopId,
+    approved,
+    extendTo: extendTo ?? null,
+  })
+}
+
+export async function agentLoopAbort(loopId: string): Promise<void> {
+  await invoke('agent_loop_abort', { loopId })
+}
+
+// ── Agent Loop Event Types ──
+
+export type AgentLoopStartedEvent = {
+  loopId: string
+  maxIterations: number
+  depth: number
+}
+
+export type AgentLoopIterationStartEvent = {
+  loopId: string
+  iteration: number
+  type: 'call' | 'batch'
+  agentId?: string
+  task?: string
+  agentCount?: number
+}
+
+export type AgentLoopIterationEndEvent = {
+  loopId: string
+  iteration: number
+  status: string
+  agentId?: string
+  type?: string
+  resultsCount?: number
+  durationMs?: number
+}
+
+export type AgentLoopReviewRequestEvent = {
+  loopId: string
+  iteration: number
+  reviewType: 'pause_for_review' | 'extend'
+  info: Record<string, unknown>
+}
+
+export type AgentLoopCompletedEvent = {
+  loopId: string
+  reason: string
+  totalIterations: number
+  durationMs: number
+}
+
+export type AgentLoopAbortedEvent = {
+  loopId: string
+  iterationsCompleted: number
+}
+
+export type AgentLoopErrorEvent = {
+  loopId: string
+  error: string
+}
+
+// ── Agent Loop Event Subscriptions ──
+
+export async function subscribeAgentLoopStarted(
+  onEvent: (payload: AgentLoopStartedEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<AgentLoopStartedEvent>('agent-loop://started', (event) => {
+    onEvent(event.payload)
+  })
+}
+
+export async function subscribeAgentLoopIterationStart(
+  onEvent: (payload: AgentLoopIterationStartEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<AgentLoopIterationStartEvent>('agent-loop://iteration/start', (event) => {
+    onEvent(event.payload)
+  })
+}
+
+export async function subscribeAgentLoopIterationEnd(
+  onEvent: (payload: AgentLoopIterationEndEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<AgentLoopIterationEndEvent>('agent-loop://iteration/end', (event) => {
+    onEvent(event.payload)
+  })
+}
+
+export async function subscribeAgentLoopReviewRequest(
+  onEvent: (payload: AgentLoopReviewRequestEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<AgentLoopReviewRequestEvent>('agent-loop://review/request', (event) => {
+    onEvent(event.payload)
+  })
+}
+
+export async function subscribeAgentLoopCompleted(
+  onEvent: (payload: AgentLoopCompletedEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<AgentLoopCompletedEvent>('agent-loop://completed', (event) => {
+    onEvent(event.payload)
+  })
+}
+
+export async function subscribeAgentLoopAborted(
+  onEvent: (payload: AgentLoopAbortedEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<AgentLoopAbortedEvent>('agent-loop://aborted', (event) => {
+    onEvent(event.payload)
+  })
+}
+
+export async function subscribeAgentLoopError(
+  onEvent: (payload: AgentLoopErrorEvent) => void,
+): Promise<PiStreamUnsubscribe> {
+  return listen<AgentLoopErrorEvent>('agent-loop://error', (event) => {
+    onEvent(event.payload)
+  })
+}
