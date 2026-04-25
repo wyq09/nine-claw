@@ -1,4 +1,5 @@
 mod agent_capabilities;
+mod agent_loop_types;
 mod agent_task_schedule;
 mod agent_tasks;
 mod agent_workspace;
