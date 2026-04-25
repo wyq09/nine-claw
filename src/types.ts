@@ -593,6 +593,7 @@ export type AgentInput = {
   scenarioLlmConfig?: AgentScenarioLlmConfig
   botConfigs: AgentBotBindings
   heartbeatConfig: AgentHeartbeatConfig
+  agentLoopConfig?: AgentLoopConfig
 }
 
 export type AgentImportResult = {
@@ -618,6 +619,7 @@ export type AgentBuilderDraft = {
   scenarioLlmConfig?: AgentScenarioLlmConfig
   botConfigs?: AgentBotBindings
   heartbeatConfig?: AgentHeartbeatConfig
+  agentLoopConfig?: AgentLoopConfig
   workspaceNotes?: string
 }
 

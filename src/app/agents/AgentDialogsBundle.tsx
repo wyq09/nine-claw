@@ -1,6 +1,7 @@
 import { AppIcon } from '../../components/AppIcon'
 import type {
   AgentInput,
+  AgentLoopConfig,
   AgentRecord,
   InstalledSkillItem,
 } from '../../types'
@@ -10,6 +11,17 @@ import {
   getAgentColor,
   SkillDescriptionDisclosure,
 } from '../lib'
+
+const DEFAULT_AGENT_LOOP_CONFIG: AgentLoopConfig = {
+  maxIterations: 50,
+  iterationTimeoutMs: 120000,
+  enableNested: true,
+  maxDepth: 3,
+  allowExtend: true,
+  maxExtendLimit: 200,
+  maxConcurrent: 5,
+  batchFailStrategy: 'WaitAll',
+}
 
 export type AgentSkillPickerDialogProps = {
   allSkillCount: number
@@ -295,6 +307,195 @@ export function AgentEditorDialog({
                   <small>开启后仅允许用户手动触发这个智能体。</small>
                 </span>
               </label>
+            </div>
+
+            <div className="agent-section">
+              <div className="agent-section-header">
+                <div>
+                  <strong>Agent Loop 循环配置</strong>
+                  <p>启用后此智能体可作为主 Agent 自主循环委派子 Agent 执行任务，直到任务完成。</p>
+                </div>
+              </div>
+
+              <label className="agent-toggle-row agent-field-full">
+                <input
+                  type="checkbox"
+                  checked={agentDraft.agentLoopConfig != null}
+                  onChange={(event) => {
+                    if (event.target.checked) {
+                      onDraftChange({ agentLoopConfig: { ...DEFAULT_AGENT_LOOP_CONFIG } })
+                    } else {
+                      onDraftChange({ agentLoopConfig: undefined as unknown as AgentLoopConfig })
+                    }
+                  }}
+                />
+                <span>
+                  <strong>启用 Agent Loop</strong>
+                  <small>开启后此智能体回复中的委派标记会被自动拦截并执行。</small>
+                </span>
+              </label>
+
+              {agentDraft.agentLoopConfig && (
+                <>
+                  <div className="agent-form-grid">
+                    <label className="input-field">
+                      <span>最大迭代次数</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={200}
+                        value={agentDraft.agentLoopConfig.maxIterations}
+                        onChange={(event) =>
+                          onDraftChange({
+                            agentLoopConfig: {
+                              ...agentDraft.agentLoopConfig!,
+                              maxIterations: Math.max(1, Math.min(200, Number(event.target.value) || 50)),
+                            },
+                          })
+                        }
+                      />
+                    </label>
+                    <label className="input-field">
+                      <span>单次超时（秒）</span>
+                      <input
+                        type="number"
+                        min={10}
+                        max={600}
+                        value={Math.round(agentDraft.agentLoopConfig.iterationTimeoutMs / 1000)}
+                        onChange={(event) =>
+                          onDraftChange({
+                            agentLoopConfig: {
+                              ...agentDraft.agentLoopConfig!,
+                              iterationTimeoutMs: Math.max(10, Math.min(600, Number(event.target.value) || 120)) * 1000,
+                            },
+                          })
+                        }
+                      />
+                    </label>
+                  </div>
+
+                  <div className="agent-form-grid">
+                    <label className="input-field">
+                      <span>最大并发数</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={20}
+                        value={agentDraft.agentLoopConfig.maxConcurrent}
+                        onChange={(event) =>
+                          onDraftChange({
+                            agentLoopConfig: {
+                              ...agentDraft.agentLoopConfig!,
+                              maxConcurrent: Math.max(1, Math.min(20, Number(event.target.value) || 5)),
+                            },
+                          })
+                        }
+                      />
+                    </label>
+                    <label className="input-field">
+                      <span>并发失败策略</span>
+                      <select
+                        value={agentDraft.agentLoopConfig.batchFailStrategy}
+                        onChange={(event) =>
+                          onDraftChange({
+                            agentLoopConfig: {
+                              ...agentDraft.agentLoopConfig!,
+                              batchFailStrategy: event.target.value as 'FailFast' | 'WaitAll',
+                            },
+                          })
+                        }
+                      >
+                        <option value="WaitAll">等待全部完成</option>
+                        <option value="FailFast">任一失败即停止</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <label className="agent-toggle-row agent-field-full">
+                    <input
+                      type="checkbox"
+                      checked={agentDraft.agentLoopConfig.enableNested}
+                      onChange={(event) =>
+                        onDraftChange({
+                          agentLoopConfig: {
+                            ...agentDraft.agentLoopConfig!,
+                            enableNested: event.target.checked,
+                          },
+                        })
+                      }
+                    />
+                    <span>
+                      <strong>允许嵌套委派</strong>
+                      <small>子 Agent 也可以有自己的 Agent Loop，递归执行。</small>
+                    </span>
+                  </label>
+
+                  {agentDraft.agentLoopConfig.enableNested && (
+                    <div className="agent-form-grid">
+                      <label className="input-field">
+                        <span>嵌套最大深度</span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={10}
+                          value={agentDraft.agentLoopConfig.maxDepth}
+                          onChange={(event) =>
+                            onDraftChange({
+                              agentLoopConfig: {
+                                ...agentDraft.agentLoopConfig!,
+                                maxDepth: Math.max(1, Math.min(10, Number(event.target.value) || 3)),
+                              },
+                            })
+                          }
+                        />
+                      </label>
+                      <div />
+                    </div>
+                  )}
+
+                  <label className="agent-toggle-row agent-field-full">
+                    <input
+                      type="checkbox"
+                      checked={agentDraft.agentLoopConfig.allowExtend}
+                      onChange={(event) =>
+                        onDraftChange({
+                          agentLoopConfig: {
+                            ...agentDraft.agentLoopConfig!,
+                            allowExtend: event.target.checked,
+                          },
+                        })
+                      }
+                    />
+                    <span>
+                      <strong>允许申请扩容</strong>
+                      <small>接近迭代上限时，主 Agent 可向用户申请增加循环次数。</small>
+                    </span>
+                  </label>
+
+                  {agentDraft.agentLoopConfig.allowExtend && (
+                    <div className="agent-form-grid">
+                      <label className="input-field">
+                        <span>扩容上限</span>
+                        <input
+                          type="number"
+                          min={50}
+                          max={1000}
+                          value={agentDraft.agentLoopConfig.maxExtendLimit}
+                          onChange={(event) =>
+                            onDraftChange({
+                              agentLoopConfig: {
+                                ...agentDraft.agentLoopConfig!,
+                                maxExtendLimit: Math.max(50, Math.min(1000, Number(event.target.value) || 200)),
+                              },
+                            })
+                          }
+                        />
+                      </label>
+                      <div />
+                    </div>
+                  )}
+                </>
+              )}
             </div>
 
             <div className="agent-section">
