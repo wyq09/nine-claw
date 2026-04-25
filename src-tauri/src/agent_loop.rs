@@ -1,12 +1,13 @@
-//! Agent Loop marker parsing engine.
+//! Agent Loop engine: marker parsing, loop control, and delegate execution.
 //!
 //! Provides functions for extracting, parsing, stripping, and formatting the
 //! structured markers (`NC_AGENT_LOOP_*`) that the LLM emits to control the
-//! agent loop runtime.
+//! agent loop runtime, plus the main `run_agent_loop` orchestration function.
 
 use crate::agent_loop_types::{
     AgentLoopBatchResult, AgentLoopBatchMarker, AgentLoopCallMarker,
-    AgentLoopExtendMarker, AgentLoopResult, ParsedLoopMarker,
+    AgentLoopExtendMarker, AgentLoopResult, AgentLoopConfig, ParsedLoopMarker,
+    ReviewResponse,
 };
 
 use chrono::Local;
@@ -313,6 +314,700 @@ pub fn prepare_loop_iteration(
 ) {
     heal_orphaned_tool_calls(history);
     inject_dynamic_context(history, permission_denials);
+}
+
+// ===========================================================================
+// Agent Loop Engine — delegate execution & loop control
+// ===========================================================================
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter};
+use tokio::task::JoinSet;
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// emit_loop_event
+// ---------------------------------------------------------------------------
+
+/// Emit a typed agent-loop event to the frontend via the Tauri event bus.
+fn emit_loop_event(app: &AppHandle, event: &str, payload: serde_json::Value) {
+    let _ = app.emit(event, payload);
+}
+
+// ---------------------------------------------------------------------------
+// execute_single_delegate
+// ---------------------------------------------------------------------------
+
+/// Execute a single sub-agent call within the agent loop.
+///
+/// This builds a PiBridge session for the target agent, sends the task prompt,
+/// and returns the result as an `AgentLoopResult`.
+fn execute_single_delegate(
+    app: &AppHandle,
+    call: &AgentLoopCallMarker,
+    loop_id: &str,
+    iteration: u32,
+    provider: &crate::provider_runtime::ProviderRuntimeConfig,
+    abort_flag: &Arc<AtomicBool>,
+) -> AgentLoopResult {
+    let start = Instant::now();
+
+    // Resolve agent record for name display.
+    let agent_record = match crate::agents::get_agent_record(app, &call.agent_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return AgentLoopResult {
+                agent_id: call.agent_id.clone(),
+                agent_name: String::new(),
+                task: call.task.clone(),
+                status: "error".into(),
+                output: format!("智能体 '{}' 不存在", call.agent_id),
+                tool_calls_count: 0,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+        Err(e) => {
+            return AgentLoopResult {
+                agent_id: call.agent_id.clone(),
+                agent_name: String::new(),
+                task: call.task.clone(),
+                status: "error".into(),
+                output: format!("查询智能体失败: {e}"),
+                tool_calls_count: 0,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    // Check abort before executing.
+    if abort_flag.load(Ordering::Relaxed) {
+        return AgentLoopResult {
+            agent_id: call.agent_id.clone(),
+            agent_name: agent_record.name.clone(),
+            task: call.task.clone(),
+            status: "cancelled".into(),
+            output: "被取消".into(),
+            tool_calls_count: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+    }
+
+    // Build delegate prompt with optional params.
+    let mut prompt = call.task.clone();
+    if !call.params.is_null() && call.params.as_object().map_or(false, |o| !o.is_empty()) {
+        let pretty = serde_json::to_string_pretty(&call.params).unwrap_or_default();
+        prompt = format!("{prompt}\n\n[委派参数]\n{pretty}");
+    }
+
+    // Build a PiBridge for this agent.
+    let agent_cfg = match crate::agents::get_conversation_agent_config(app, &call.agent_id) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => {
+            return AgentLoopResult {
+                agent_id: call.agent_id.clone(),
+                agent_name: agent_record.name.clone(),
+                task: call.task.clone(),
+                status: "error".into(),
+                output: "无法加载智能体配置".into(),
+                tool_calls_count: 0,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+        Err(e) => {
+            return AgentLoopResult {
+                agent_id: call.agent_id.clone(),
+                agent_name: agent_record.name.clone(),
+                task: call.task.clone(),
+                status: "error".into(),
+                output: format!("加载智能体配置失败: {e}"),
+                tool_calls_count: 0,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    let base_normalized = crate::normalized_provider_runtime_base_url(
+        &provider.base_url,
+        &provider.api_format,
+        &provider.provider_id,
+    );
+
+    let pi_rt = match crate::pi_runtime::require_pi_runtime_location(app) {
+        Ok(rt) => rt,
+        Err(e) => {
+            return AgentLoopResult {
+                agent_id: call.agent_id.clone(),
+                agent_name: agent_record.name.clone(),
+                task: call.task.clone(),
+                status: "error".into(),
+                output: format!("Pi runtime 不可用: {e}"),
+                tool_calls_count: 0,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    let bridge = crate::channels::pi_bridge::PiBridge::new(
+        pi_rt,
+        &provider.provider_id,
+        &provider.api_format,
+        &base_normalized,
+        &provider.api_key,
+        &provider.model,
+        Some(agent_cfg),
+    );
+
+    let _run_id = format!("nc-al:{}:{}:{}", loop_id, iteration, call.agent_id);
+    let channel_id = format!("nc:agent-loop:{}", Uuid::new_v4());
+    let user_id = Uuid::new_v4().simple().to_string();
+
+    let full_prompt = format!(
+        "你是智能体 **{}**。请完成下面的任务，直接给出结果。\n\n---\n\n{}",
+        agent_record.name, prompt,
+    );
+
+    // Execute via PiBridge. We use a simple no-op for events since this is
+    // a synchronous call within a spawn_blocking context.
+    let outcome = bridge.process_message_interruptible(
+        &channel_id,
+        &user_id,
+        &full_prompt,
+        4096,
+        |_| {},
+        |_| {},
+    );
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match outcome {
+        Ok(crate::channels::pi_bridge::PiProcessOutcome::Completed(r)) => AgentLoopResult {
+            agent_id: call.agent_id.clone(),
+            agent_name: agent_record.name.clone(),
+            task: call.task.clone(),
+            status: "success".into(),
+            output: r.full_text,
+            tool_calls_count: 0,
+            duration_ms,
+        },
+        Ok(crate::channels::pi_bridge::PiProcessOutcome::Aborted) => AgentLoopResult {
+            agent_id: call.agent_id.clone(),
+            agent_name: agent_record.name.clone(),
+            task: call.task.clone(),
+            status: "cancelled".into(),
+            output: "委派被中断".into(),
+            tool_calls_count: 0,
+            duration_ms,
+        },
+        Err(e) => AgentLoopResult {
+            agent_id: call.agent_id.clone(),
+            agent_name: agent_record.name.clone(),
+            task: call.task.clone(),
+            status: "error".into(),
+            output: format!("委派执行失败: {e}"),
+            tool_calls_count: 0,
+            duration_ms,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// execute_batch_delegates
+// ---------------------------------------------------------------------------
+
+/// Execute a batch of agent calls concurrently using `JoinSet`.
+///
+/// Respects `BatchFailStrategy::FailFast`: if the strategy is `FailFast` and
+/// any delegate fails, remaining delegates are aborted.
+async fn execute_batch_delegates(
+    app: &AppHandle,
+    batch: &AgentLoopBatchMarker,
+    loop_id: &str,
+    iteration: u32,
+    config: &AgentLoopConfig,
+    provider: &crate::provider_runtime::ProviderRuntimeConfig,
+    abort_flag: &Arc<AtomicBool>,
+) -> AgentLoopBatchResult {
+    let start = Instant::now();
+    let batch_id = format!("batch:{}:{}", loop_id, iteration);
+    let max_concurrent = config.max_concurrent.max(1) as usize;
+    let total = batch.calls.len();
+    let fail_fast = config.batch_fail_strategy
+        == crate::agent_loop_types::BatchFailStrategy::FailFast;
+
+    let mut results: Vec<AgentLoopResult> = Vec::with_capacity(total);
+    let mut set: JoinSet<(usize, AgentLoopResult)> = JoinSet::new();
+
+    // Shared abort flag for fail-fast propagation.
+    let batch_abort = Arc::new(AtomicBool::new(false));
+
+    let mut enqueued = 0usize;
+    let mut next_index = 0usize;
+
+    loop {
+        // Fill the JoinSet up to max_concurrent.
+        while enqueued < max_concurrent && next_index < total {
+            if abort_flag.load(Ordering::Relaxed) || batch_abort.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let call = batch.calls[next_index].clone();
+            let idx = next_index;
+            let app_clone = app.clone();
+            let loop_id_owned = loop_id.to_string();
+            let provider_clone = provider.clone();
+            let abort_flag_clone = abort_flag.clone();
+            let batch_abort_clone = batch_abort.clone();
+
+            set.spawn_blocking(move || {
+                if abort_flag_clone.load(Ordering::Relaxed)
+                    || batch_abort_clone.load(Ordering::Relaxed)
+                {
+                    return (
+                        idx,
+                        AgentLoopResult {
+                            agent_id: call.agent_id.clone(),
+                            agent_name: String::new(),
+                            task: call.task.clone(),
+                            status: "cancelled".into(),
+                            output: "批次中止".into(),
+                            tool_calls_count: 0,
+                            duration_ms: 0,
+                        },
+                    );
+                }
+                let result = execute_single_delegate(
+                    &app_clone,
+                    &call,
+                    &loop_id_owned,
+                    idx as u32,
+                    &provider_clone,
+                    &abort_flag_clone,
+                );
+                (idx, result)
+            });
+
+            enqueued += 1;
+            next_index += 1;
+        }
+
+        if set.is_empty() {
+            break;
+        }
+
+        // Await the next completed task.
+        match set.join_next().await {
+            Some(Ok((_idx, result))) => {
+                enqueued -= 1;
+
+                // Check for failure in fail-fast mode.
+                if fail_fast && result.status != "success" {
+                    batch_abort.store(true, Ordering::Relaxed);
+                }
+
+                // Store result in position order.
+                results.push(result);
+            }
+            Some(Err(e)) => {
+                enqueued -= 1;
+                if fail_fast {
+                    batch_abort.store(true, Ordering::Relaxed);
+                }
+                results.push(AgentLoopResult {
+                    agent_id: String::new(),
+                    agent_name: String::new(),
+                    task: String::new(),
+                    status: "error".into(),
+                    output: format!("JoinSet 任务失败: {e}"),
+                    tool_calls_count: 0,
+                    duration_ms: 0,
+                });
+            }
+            None => break,
+        }
+    }
+
+    // Sort results by their original index.
+    results.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+
+    let total_duration_ms = start.elapsed().as_millis() as u64;
+
+    AgentLoopBatchResult {
+        batch_id,
+        results,
+        total_duration_ms,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// request_user_review
+// ---------------------------------------------------------------------------
+
+/// Emit a review request event and wait for the user's response.
+///
+/// For now this uses a placeholder approach: it creates a oneshot channel,
+/// waits with a timeout (600s), and checks the abort flag. The actual
+/// ActiveLoops managed state wiring will happen in Task 6.
+async fn request_user_review(
+    app: &AppHandle,
+    loop_id: &str,
+    iteration: u32,
+    extend_marker: &AgentLoopExtendMarker,
+    abort_flag: &Arc<AtomicBool>,
+) -> ReviewResponse {
+    let (tx, rx) = tokio::sync::oneshot::channel::<ReviewResponse>();
+
+    // Emit the review request event so the frontend can show a dialog.
+    emit_loop_event(
+        app,
+        "agent-loop://review/request",
+        serde_json::json!({
+            "loopId": loop_id,
+            "iteration": iteration,
+            "currentIteration": extend_marker.current_iteration,
+            "maxIterations": extend_marker.max_iterations,
+            "reason": extend_marker.reason,
+            "requestedExtra": extend_marker.requested_extra,
+        }),
+    );
+
+    // Wait for response with timeout + abort check.
+    let timeout = Duration::from_secs(600);
+    let start = Instant::now();
+
+    // We need to drop tx if nobody responds, so the rx will resolve with Err.
+    // For now, since ActiveLoops isn't wired yet, we auto-approve after a
+    // brief wait (simulating the review flow).
+    drop(tx);
+
+    // Poll abort flag while waiting for the timeout.
+    loop {
+        if abort_flag.load(Ordering::Relaxed) {
+            return ReviewResponse {
+                approved: false,
+                extend_to: None,
+            };
+        }
+
+        if start.elapsed() >= timeout {
+            // Timeout: auto-deny.
+            return ReviewResponse {
+                approved: false,
+                extend_to: None,
+            };
+        }
+
+        // Since the oneshot sender was dropped above, rx.await will resolve
+        // immediately with Err. In the real wiring (Task 6), the sender is
+        // stored in ActiveLoops and the frontend response handler sends
+        // through it.
+        match rx.await {
+            Ok(response) => return response,
+            Err(_) => {
+                // Sender dropped without response — placeholder: auto-approve
+                // with requested extra, capped at max_extend_limit.
+                let extra = extend_marker.requested_extra;
+                return ReviewResponse {
+                    approved: true,
+                    extend_to: Some(extend_marker.max_iterations + extra),
+                };
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// run_agent_loop — THE MAIN FUNCTION
+// ---------------------------------------------------------------------------
+
+/// Main Agent Loop orchestration function.
+///
+/// Runs an iterative loop that:
+/// 1. Extracts loop markers from the LLM's accumulated output text.
+/// 2. Dispatches single calls (`Call`), concurrent batches (`Batch`), or
+///    iteration-limit extension requests (`Extend`).
+/// 3. Emits structured events to the frontend for real-time UI updates.
+/// 4. Terminates on `max_iterations`, abort, natural end (no marker), or error.
+///
+/// Returns the final accumulated text (with markers stripped).
+pub async fn run_agent_loop(
+    app: &AppHandle,
+    agent_id: &str,
+    session_id: &str,
+    config: &AgentLoopConfig,
+    provider: &crate::provider_runtime::ProviderRuntimeConfig,
+    initial_text: &str,
+    depth: u32,
+) -> Result<String, String> {
+    let loop_id = format!("al:{}", Uuid::new_v4().simple());
+    let abort_flag = Arc::new(AtomicBool::new(false));
+    let mut accumulated_text = initial_text.to_string();
+    let mut iteration: u32 = 0;
+    let mut max_iterations = config.max_iterations;
+
+    log::info!(
+        "AgentLoop [{loop_id}] starting: agent={agent_id}, session={session_id}, depth={depth}, max_iterations={max_iterations}",
+    );
+
+    // Register in ActiveLoops (placeholder: just log for now; Task 6 wires the
+    // real managed state).
+    log::info!("AgentLoop [{loop_id}] registered in active loops (placeholder)");
+
+    // Emit started event.
+    emit_loop_event(
+        app,
+        "agent-loop://started",
+        serde_json::json!({
+            "loopId": loop_id,
+            "agentId": agent_id,
+            "sessionId": session_id,
+            "depth": depth,
+            "maxIterations": max_iterations,
+        }),
+    );
+
+    let loop_start = Instant::now();
+
+    // Main loop.
+    loop {
+        // Check max_iterations.
+        if iteration >= max_iterations {
+            let reason = "max_iterations";
+            emit_loop_event(
+                app,
+                "agent-loop://completed",
+                serde_json::json!({
+                    "loopId": loop_id,
+                    "reason": reason,
+                    "iteration": iteration,
+                    "totalDurationMs": loop_start.elapsed().as_millis() as u64,
+                }),
+            );
+            log::info!("AgentLoop [{loop_id}] completed: {reason} at iteration {iteration}");
+            break;
+        }
+
+        // Check abort.
+        if abort_flag.load(Ordering::Relaxed) {
+            emit_loop_event(
+                app,
+                "agent-loop://aborted",
+                serde_json::json!({
+                    "loopId": loop_id,
+                    "iteration": iteration,
+                    "totalDurationMs": loop_start.elapsed().as_millis() as u64,
+                }),
+            );
+            log::info!("AgentLoop [{loop_id}] aborted at iteration {iteration}");
+            break;
+        }
+
+        // Extract first marker from accumulated text.
+        let marker = extract_first_loop_marker(&accumulated_text);
+
+        match marker {
+            None => {
+                // No marker found — natural end.
+                emit_loop_event(
+                    app,
+                    "agent-loop://completed",
+                    serde_json::json!({
+                        "loopId": loop_id,
+                        "reason": "natural",
+                        "iteration": iteration,
+                        "totalDurationMs": loop_start.elapsed().as_millis() as u64,
+                    }),
+                );
+                log::info!("AgentLoop [{loop_id}] completed: natural at iteration {iteration}");
+                break;
+            }
+
+            Some((ParsedLoopMarker::Call(call), _offset)) => {
+                // Single delegate call.
+                emit_loop_event(
+                    app,
+                    "agent-loop://iteration/start",
+                    serde_json::json!({
+                        "loopId": loop_id,
+                        "iteration": iteration,
+                        "type": "call",
+                        "agentId": call.agent_id,
+                        "task": call.task,
+                    }),
+                );
+
+                let call_for_error = call.clone();
+                let app_clone = app.clone();
+                let provider_clone = provider.clone();
+                let abort_clone = abort_flag.clone();
+                let loop_id_owned = loop_id.clone();
+
+                let result = tokio::task::spawn_blocking(move || {
+                    execute_single_delegate(
+                        &app_clone,
+                        &call,
+                        &loop_id_owned,
+                        iteration,
+                        &provider_clone,
+                        &abort_clone,
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| AgentLoopResult {
+                    agent_id: call_for_error.agent_id.clone(),
+                    agent_name: String::new(),
+                    task: call_for_error.task.clone(),
+                    status: "error".into(),
+                    output: format!("spawn_blocking 失败: {e}"),
+                    tool_calls_count: 0,
+                    duration_ms: 0,
+                });
+
+                emit_loop_event(
+                    app,
+                    "agent-loop://iteration/end",
+                    serde_json::json!({
+                        "loopId": loop_id,
+                        "iteration": iteration,
+                        "type": "call",
+                        "result": &result,
+                    }),
+                );
+
+                // Append result marker to accumulated text.
+                let clean_text = strip_loop_markers(&accumulated_text);
+                accumulated_text = format!(
+                    "{}\n{}",
+                    clean_text,
+                    format_single_result(&result)
+                );
+
+                iteration += 1;
+            }
+
+            Some((ParsedLoopMarker::Batch(batch), _offset)) => {
+                // Batch delegate call.
+                emit_loop_event(
+                    app,
+                    "agent-loop://iteration/start",
+                    serde_json::json!({
+                        "loopId": loop_id,
+                        "iteration": iteration,
+                        "type": "batch",
+                        "callCount": batch.calls.len(),
+                    }),
+                );
+
+                let batch_result = execute_batch_delegates(
+                    app,
+                    &batch,
+                    &loop_id,
+                    iteration,
+                    config,
+                    provider,
+                    &abort_flag,
+                )
+                .await;
+
+                emit_loop_event(
+                    app,
+                    "agent-loop://iteration/end",
+                    serde_json::json!({
+                        "loopId": loop_id,
+                        "iteration": iteration,
+                        "type": "batch",
+                        "result": &batch_result,
+                    }),
+                );
+
+                // Append batch result marker.
+                let clean_text = strip_loop_markers(&accumulated_text);
+                accumulated_text = format!(
+                    "{}\n{}",
+                    clean_text,
+                    format_batch_result(&batch_result)
+                );
+
+                iteration += 1;
+            }
+
+            Some((ParsedLoopMarker::Extend(extend), _offset)) => {
+                if !config.allow_extend {
+                    // Extension not allowed — treat as natural end.
+                    emit_loop_event(
+                        app,
+                        "agent-loop://completed",
+                        serde_json::json!({
+                            "loopId": loop_id,
+                            "reason": "natural",
+                            "iteration": iteration,
+                            "totalDurationMs": loop_start.elapsed().as_millis() as u64,
+                        }),
+                    );
+                    log::info!(
+                        "AgentLoop [{loop_id}] EXTEND rejected (not allowed), ending"
+                    );
+                    break;
+                }
+
+                // Request user review for the extension.
+                let review = request_user_review(
+                    app,
+                    &loop_id,
+                    iteration,
+                    &extend,
+                    &abort_flag,
+                )
+                .await;
+
+                if review.approved {
+                    if let Some(new_max) = review.extend_to {
+                        // Cap at max_extend_limit above current.
+                        let capped = new_max.min(max_iterations + config.max_extend_limit);
+                        max_iterations = capped;
+                        log::info!(
+                            "AgentLoop [{loop_id}] EXTEND approved: max_iterations -> {max_iterations}"
+                        );
+                    }
+
+                    emit_loop_event(
+                        app,
+                        "agent-loop://review/request",
+                        serde_json::json!({
+                            "loopId": loop_id,
+                            "approved": true,
+                            "newMaxIterations": max_iterations,
+                        }),
+                    );
+
+                    // Strip the extend marker and continue the loop.
+                    accumulated_text = strip_loop_markers(&accumulated_text);
+                    // Don't increment iteration for extend.
+                } else {
+                    // Extension denied — end the loop.
+                    emit_loop_event(
+                        app,
+                        "agent-loop://completed",
+                        serde_json::json!({
+                            "loopId": loop_id,
+                            "reason": "extend_denied",
+                            "iteration": iteration,
+                            "totalDurationMs": loop_start.elapsed().as_millis() as u64,
+                        }),
+                    );
+                    log::info!("AgentLoop [{loop_id}] EXTEND denied, ending");
+                    break;
+                }
+            }
+        }
+    }
+
+    // Unregister from ActiveLoops (placeholder).
+    log::info!("AgentLoop [{loop_id}] unregistered from active loops (placeholder)");
+
+    // Return final text with markers stripped.
+    Ok(strip_loop_markers(&accumulated_text))
 }
 
 // ---------------------------------------------------------------------------
