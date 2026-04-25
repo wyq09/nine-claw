@@ -21,8 +21,14 @@ import type {
   ProviderId,
   SettingsTab,
 } from '../types'
+import type {
+  ImageGenerationSystemConfig,
+  ImageProviderConfig,
+  ImageProviderDefinition,
+} from '../types/imageGeneration'
 import type { ResourcesViewProps, SkillsViewProps } from '../app/pages/LibraryAndTasks'
 import { AppIcon, type IconName } from './AppIcon'
+import { ImageGenerationSettingsSection } from './settings/ImageGenerationSettingsSection'
 import { UsageStatsPanel } from './UsageStatsPanel'
 import { open } from '@tauri-apps/plugin-dialog'
 import { llmLogExportPreview } from '../lib/llmLogExportClient'
@@ -42,7 +48,14 @@ type SettingsModalProps = {
   allProviderDefinitions: ProviderDefinition[]
   appearanceSettings: AppearanceSettings
   generalSettings: GeneralSettings
+  imageGenerationSystem: ImageGenerationSystemConfig
+  imageProviderConfigs: Record<string, ImageProviderConfig>
+  imageProviderDefinitions: ImageProviderDefinition[]
   onAddCustomProvider: (name: string, description: string, apiFormat: ProviderApiFormat) => void
+  onSaveImageGenerationSettings: (
+    imageProviderConfigs: Record<string, ImageProviderConfig>,
+    imageGenerationSystem: ImageGenerationSystemConfig,
+  ) => Promise<void>
   onProviderConfigChange: (providerId: ProviderId, updates: Partial<ProviderConfig>) => void
   onClose: () => void
   onRemoveCustomProvider: (providerId: ProviderId) => void
@@ -109,6 +122,28 @@ function SettingsTabButton({ active, icon, label, onClick }: SettingsTabButtonPr
   )
 }
 
+type ProviderSettingsMode = 'llm' | 'image'
+
+type ProviderSettingsModeButtonProps = {
+  active: boolean
+  label: string
+  onClick: () => void
+}
+
+function ProviderSettingsModeButton({ active, label, onClick }: ProviderSettingsModeButtonProps) {
+  return (
+    <button
+      type="button"
+      className={`provider-mode-tab ${active ? 'active' : ''}`}
+      role="tab"
+      aria-selected={active}
+      onClick={onClick}
+    >
+      <span>{label}</span>
+    </button>
+  )
+}
+
 type SettingSwitchProps = {
   checked: boolean
   description: string
@@ -162,7 +197,11 @@ export function SettingsModal({
   allProviderDefinitions,
   appearanceSettings,
   generalSettings,
+  imageGenerationSystem,
+  imageProviderConfigs,
+  imageProviderDefinitions,
   onAddCustomProvider,
+  onSaveImageGenerationSettings,
   onProviderConfigChange,
   onClose,
   onRemoveCustomProvider,
@@ -186,6 +225,14 @@ export function SettingsModal({
   const [providerTestLoading, setProviderTestLoading] = useState(false)
   const [providerTestNote, setProviderTestNote] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
   const [providerDeleteConfirmId, setProviderDeleteConfirmId] = useState<ProviderId | null>(null)
+  const [providerSettingsMode, setProviderSettingsMode] = useState<ProviderSettingsMode>('llm')
+  const [draftImageProviderConfigs, setDraftImageProviderConfigs] =
+    useState<Record<string, ImageProviderConfig>>(imageProviderConfigs)
+  const [draftImageGenerationSystem, setDraftImageGenerationSystem] =
+    useState<ImageGenerationSystemConfig>(imageGenerationSystem)
+  const [imageSaveBusy, setImageSaveBusy] = useState(false)
+  const [imageSaveNotice, setImageSaveNotice] = useState('')
+  const [imageSaveError, setImageSaveError] = useState('')
   const [showApiKey, setShowApiKey] = useState(false)
   const [proxySaveError, setProxySaveError] = useState('')
   const [proxyTestLoading, setProxyTestLoading] = useState(false)
@@ -343,6 +390,14 @@ export function SettingsModal({
     setShowApiKey(false)
     setProviderTestNote(null)
   }, [selectedProviderId])
+
+  useEffect(() => {
+    setDraftImageProviderConfigs(imageProviderConfigs)
+  }, [imageProviderConfigs])
+
+  useEffect(() => {
+    setDraftImageGenerationSystem(imageGenerationSystem)
+  }, [imageGenerationSystem])
 
   const handleSubmitCustomProvider = () => {
     const name = customName.trim()
@@ -768,315 +823,423 @@ export function SettingsModal({
             ) : null}
 
             {tab === 'providers' ? (
-              <div className="bot-settings-layout">
-                <div className="bot-channel-list">
-                  {providerAddMode ? (
-                    <>
-                      <div className="provider-add-header">
-                        <span>选择要添加的 Provider</span>
-                        <button
-                          type="button"
-                          className="link-button"
-                          onClick={() => {
-                            setProviderAddMode(false)
-                            setCustomFormOpen(false)
-                          }}
-                        >
-                          取消
-                        </button>
-                      </div>
-                      {customFormOpen ? (
-                        <div className="provider-custom-form">
-                          <label className="input-field">
-                            <span>供应商名称</span>
-                            <input
-                              value={customName}
-                              onChange={(event) => setCustomName(event.target.value)}
-                              placeholder="例如：公司内网网关"
-                            />
-                          </label>
-                          <label className="input-field">
-                            <span>说明（可选）</span>
-                            <input
-                              value={customDescription}
-                              onChange={(event) => setCustomDescription(event.target.value)}
-                              placeholder={customApiFormat === 'anthropic' ? 'Anthropic 兼容接口' : 'OpenAI 兼容接口'}
-                            />
-                          </label>
-                          <div className="input-field">
-                            <span>接口格式</span>
-                            <label className="select-field">
-                              <select
-                                value={customApiFormat}
-                                onChange={(event) => setCustomApiFormat(event.target.value as ProviderApiFormat)}
+              <div className="provider-settings-shell">
+                <div className="provider-mode-tabs" role="tablist" aria-label="Provider 设置类型">
+                  <ProviderSettingsModeButton
+                    active={providerSettingsMode === 'llm'}
+                    label="普通 LLM"
+                    onClick={() => setProviderSettingsMode('llm')}
+                  />
+                  <ProviderSettingsModeButton
+                    active={providerSettingsMode === 'image'}
+                    label="图片大模型"
+                    onClick={() => setProviderSettingsMode('image')}
+                  />
+                </div>
+
+                {providerSettingsMode === 'llm' ? (
+                  <div className="bot-settings-layout">
+                    <div className="bot-channel-list">
+                      {providerAddMode ? (
+                        <>
+                          <div className="provider-add-header">
+                            <span>选择要添加的 Provider</span>
+                            <button
+                              type="button"
+                              className="link-button"
+                              onClick={() => {
+                                setProviderAddMode(false)
+                                setCustomFormOpen(false)
+                              }}
+                            >
+                              取消
+                            </button>
+                          </div>
+                          {customFormOpen ? (
+                            <div className="provider-custom-form">
+                              <label className="input-field">
+                                <span>供应商名称</span>
+                                <input
+                                  value={customName}
+                                  onChange={(event) => setCustomName(event.target.value)}
+                                  placeholder="例如：公司内网网关"
+                                />
+                              </label>
+                              <label className="input-field">
+                                <span>说明（可选）</span>
+                                <input
+                                  value={customDescription}
+                                  onChange={(event) => setCustomDescription(event.target.value)}
+                                  placeholder={customApiFormat === 'anthropic' ? 'Anthropic 兼容接口' : 'OpenAI 兼容接口'}
+                                />
+                              </label>
+                              <div className="input-field">
+                                <span>接口格式</span>
+                                <label className="select-field">
+                                  <select
+                                    value={customApiFormat}
+                                    onChange={(event) => setCustomApiFormat(event.target.value as ProviderApiFormat)}
+                                  >
+                                    <option value="openai">OpenAI</option>
+                                    <option value="anthropic">Anthropic</option>
+                                  </select>
+                                </label>
+                              </div>
+                              <div className="provider-actions">
+                                <button type="button" className="outline-button" onClick={() => setCustomFormOpen(false)}>
+                                  返回
+                                </button>
+                                <button type="button" className="outline-button primary" onClick={handleSubmitCustomProvider}>
+                                  创建
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              <button
+                                type="button"
+                                className="provider-add-button subtle"
+                                onClick={() => setCustomFormOpen(true)}
                               >
-                                <option value="openai">OpenAI</option>
-                                <option value="anthropic">Anthropic</option>
-                              </select>
-                            </label>
-                          </div>
-                          <div className="provider-actions">
-                            <button type="button" className="outline-button" onClick={() => setCustomFormOpen(false)}>
-                              返回
-                            </button>
-                            <button type="button" className="outline-button primary" onClick={handleSubmitCustomProvider}>
-                              创建
-                            </button>
-                          </div>
-                        </div>
+                                <AppIcon name="plus" size={18} />
+                                <span>添加自定义供应商（OpenAI / Anthropic 兼容）</span>
+                              </button>
+                              {availableProviders.map((provider) => {
+                                return (
+                                  <button
+                                    key={provider.id}
+                                    type="button"
+                                    className={`bot-channel-card ${selectedProviderId === provider.id ? 'active' : ''}`}
+                                    onClick={() => handleProviderSelect(provider.id)}
+                                  >
+                                    <span className="bot-channel-copy">
+                                      <strong>{provider.name}</strong>
+                                      <span>{provider.description}</span>
+                                    </span>
+                                    <AppIcon name="plus" size={16} />
+                                  </button>
+                                )
+                              })}
+                              {availableProviders.length === 0 && (
+                                <p className="settings-note">预设已全部添加；你仍可使用上方「自定义供应商」。</p>
+                              )}
+                            </>
+                          )}
+                        </>
                       ) : (
                         <>
-                          <button type="button" className="provider-add-button subtle" onClick={() => setCustomFormOpen(true)}>
+                          <button
+                            type="button"
+                            className="provider-add-button"
+                            onClick={() => {
+                              setProviderAddMode(true)
+                              setCustomFormOpen(false)
+                            }}
+                          >
                             <AppIcon name="plus" size={18} />
-                            <span>添加自定义供应商（OpenAI / Anthropic 兼容）</span>
+                            <span>添加 Provider</span>
                           </button>
-                          {availableProviders.map((provider) => {
-                            return (
-                              <button
-                                key={provider.id}
-                                type="button"
-                                className={`bot-channel-card ${selectedProviderId === provider.id ? 'active' : ''}`}
-                                onClick={() => handleProviderSelect(provider.id)}
-                              >
-                                <span className="bot-channel-copy">
-                                  <strong>{provider.name}</strong>
-                                  <span>{provider.description}</span>
-                                </span>
-                                <AppIcon name="plus" size={16} />
-                              </button>
-                            )
-                          })}
-                          {availableProviders.length === 0 && (
-                            <p className="settings-note">预设已全部添加；你仍可使用上方「自定义供应商」。</p>
+                          {addedProviders.length === 0 ? (
+                            <p className="settings-note">暂未添加任何 Provider，请点击上方按钮添加。</p>
+                          ) : (
+                            addedProviders.map((provider) => {
+                              const config = providerConfigs[provider.id]
+                              return (
+                                <div
+                                  key={provider.id}
+                                  className={`bot-channel-card ${selectedProviderId === provider.id ? 'active' : ''}`}
+                                  role="button"
+                                  tabIndex={0}
+                                  onClick={() => handleProviderSelect(provider.id)}
+                                  onKeyDown={(event) => {
+                                    if (event.key === 'Enter' || event.key === ' ') {
+                                      event.preventDefault()
+                                      handleProviderSelect(provider.id)
+                                    }
+                                  }}
+                                >
+                                  <span className="bot-channel-copy">
+                                    <strong>{providerDisplayName(provider, config)}</strong>
+                                    <span>{config.status}</span>
+                                  </span>
+                                  <button
+                                    type="button"
+                                    className="provider-remove-button"
+                                    onClick={(event) => {
+                                      event.stopPropagation()
+                                      setProviderDeleteConfirmId(provider.id)
+                                    }}
+                                    aria-label={`移除 ${providerDisplayName(provider, config)}`}
+                                  >
+                                    <AppIcon name="close" size={14} />
+                                  </button>
+                                </div>
+                              )
+                            })
                           )}
                         </>
                       )}
-                    </>
-                  ) : (
-                    <>
-                      <button
-                        type="button"
-                        className="provider-add-button"
-                        onClick={() => {
-                          setProviderAddMode(true)
-                          setCustomFormOpen(false)
-                        }}
-                      >
-                        <AppIcon name="plus" size={18} />
-                        <span>添加 Provider</span>
-                      </button>
+                    </div>
+
+                    <div className="bot-detail-panel">
                       {addedProviders.length === 0 ? (
-                        <p className="settings-note">暂未添加任何 Provider，请点击上方按钮添加。</p>
+                        <div className="provider-empty-state">
+                          <AppIcon name="provider" size={48} />
+                          <p>请先添加一个 Provider</p>
+                        </div>
                       ) : (
-                        addedProviders.map((provider) => {
-                          const config = providerConfigs[provider.id]
-                          return (
-                            <div
-                              key={provider.id}
-                              className={`bot-channel-card ${selectedProviderId === provider.id ? 'active' : ''}`}
-                              role="button"
-                              tabIndex={0}
-                              onClick={() => handleProviderSelect(provider.id)}
-                              onKeyDown={(event) => {
-                                if (event.key === 'Enter' || event.key === ' ') {
-                                  event.preventDefault()
-                                  handleProviderSelect(provider.id)
+                        <>
+                          <div className="bot-detail-head provider-detail-head">
+                            <div className="bot-detail-title">
+                              <AppIcon name="provider" size={18} />
+                              <strong className="bot-detail-heading">
+                                {providerDisplayName(selectedProviderDefinition, selectedProviderConfig)} 配置
+                              </strong>
+                              <span className="bot-status-tag">{selectedProviderConfig.status}</span>
+                            </div>
+                            <div className="provider-runtime-badge">{activeProviderBadge}</div>
+                          </div>
+
+                          <p className="settings-note provider-note">{selectedProviderDefinition.description}</p>
+                          <p className="settings-note provider-note">
+                            当前接口格式：{selectedProviderFormatDefaults.label}
+                          </p>
+
+                          <label className="input-field">
+                            <span>接口格式</span>
+                            <label className="select-field">
+                              <select
+                                value={selectedProviderConfig.apiFormat}
+                                onChange={(event) =>
+                                  onProviderConfigChange(selectedProviderId, {
+                                    apiFormat: event.target.value as ProviderApiFormat,
+                                  })
+                                }
+                              >
+                                <option value="openai">OpenAI Chat Completions</option>
+                                <option value="anthropic">Anthropic Messages</option>
+                              </select>
+                            </label>
+                          </label>
+
+                          <label className="input-field">
+                            <span>显示名称</span>
+                            <input
+                              value={selectedProviderConfig.displayName}
+                              onChange={(event) =>
+                                onProviderConfigChange(selectedProviderId, { displayName: event.target.value })
+                              }
+                              placeholder={selectedProviderDefinition.name}
+                            />
+                          </label>
+
+                          <label className="input-field">
+                            <span>Base URL</span>
+                            <input
+                              value={selectedProviderConfig.baseUrl}
+                              onChange={(event) =>
+                                onProviderConfigChange(selectedProviderId, { baseUrl: event.target.value })
+                              }
+                              placeholder={selectedProviderFormatDefaults.baseUrl}
+                            />
+                          </label>
+
+                          <label className="input-field">
+                            <span>API Key</span>
+                            <div className="input-action-field">
+                              <input
+                                type={showApiKey ? 'text' : 'password'}
+                                value={selectedProviderConfig.apiKey}
+                                onChange={(event) =>
+                                  onProviderConfigChange(selectedProviderId, { apiKey: event.target.value })
+                                }
+                                placeholder="请输入 API Key"
+                              />
+                              <button
+                                type="button"
+                                className="input-action-button"
+                                onClick={() => setShowApiKey((previous) => !previous)}
+                                aria-label={showApiKey ? '隐藏 API Key' : '显示 API Key'}
+                                aria-pressed={showApiKey}
+                                title={showApiKey ? '隐藏 API Key' : '显示 API Key'}
+                              >
+                                <AppIcon name={showApiKey ? 'eye-off' : 'eye'} size={16} />
+                              </button>
+                            </div>
+                          </label>
+
+                          <label className="input-field">
+                            <span>默认模型</span>
+                            <input
+                              value={selectedProviderConfig.model}
+                              onChange={(event) => onProviderConfigChange(selectedProviderId, { model: event.target.value })}
+                              placeholder={selectedProviderFormatDefaults.model}
+                            />
+                          </label>
+
+                          <label className="input-field">
+                            <span>最大上下文窗口 (tokens)</span>
+                            <input
+                              type="number"
+                              min={1}
+                              value={selectedProviderConfig.maxContextTokens ?? ''}
+                              onChange={(event) => {
+                                const raw = event.target.value.trim()
+                                const parsed = raw ? parseInt(raw, 10) : undefined
+                                onProviderConfigChange(selectedProviderId, {
+                                  maxContextTokens: parsed && parsed > 0 ? parsed : undefined,
+                                })
+                              }}
+                              placeholder="如 128000，留空表示自动检测"
+                            />
+                          </label>
+
+                          <label className="input-field">
+                            <span>备注</span>
+                            <input
+                              value={selectedProviderConfig.note}
+                              onChange={(event) => onProviderConfigChange(selectedProviderId, { note: event.target.value })}
+                              placeholder="例如：用于后续替换默认模型路由"
+                            />
+                          </label>
+
+                          <div className="provider-actions">
+                            <button
+                              type="button"
+                              className="outline-button"
+                              onClick={() =>
+                                onProviderConfigChange(selectedProviderId, {
+                                  status: getProviderStatus(selectedProviderConfig, false),
+                                })
+                              }
+                            >
+                              <AppIcon name="refresh" size={18} />
+                              <span>校验配置</span>
+                            </button>
+                            <button
+                              type="button"
+                              className="outline-button"
+                              disabled={providerTestLoading}
+                              onClick={async () => {
+                                setProviderTestLoading(true)
+                                setProviderTestNote(null)
+                                try {
+                                  const message = await testLlmProviderConnection({
+                                    apiFormat: selectedProviderConfig.apiFormat,
+                                    baseUrl: selectedProviderConfig.baseUrl,
+                                    apiKey: selectedProviderConfig.apiKey,
+                                    model: selectedProviderConfig.model,
+                                  })
+                                  onProviderConfigChange(selectedProviderId, { status: '测试通过' })
+                                  setProviderTestNote({ kind: 'ok', text: message })
+                                } catch (error) {
+                                  onProviderConfigChange(selectedProviderId, { status: '已配置' })
+                                  setProviderTestNote({ kind: 'err', text: String(error) })
+                                } finally {
+                                  setProviderTestLoading(false)
                                 }
                               }}
                             >
-                              <span className="bot-channel-copy">
-                                <strong>{providerDisplayName(provider, config)}</strong>
-                                <span>{config.status}</span>
-                              </span>
-                              <button
-                                type="button"
-                                className="provider-remove-button"
-                                onClick={(event) => {
-                                  event.stopPropagation()
-                                  setProviderDeleteConfirmId(provider.id)
-                                }}
-                                aria-label={`移除 ${providerDisplayName(provider, config)}`}
-                              >
-                                <AppIcon name="close" size={14} />
-                              </button>
-                            </div>
-                          )
-                        })
+                              <AppIcon name="broadcast" size={18} />
+                              <span>{providerTestLoading ? '测试中…' : '测试连通性'}</span>
+                            </button>
+                          </div>
+
+                          {providerTestNote ? (
+                            <p className={`settings-note ${providerTestNote.kind === 'err' ? 'error' : ''}`}>
+                              {providerTestNote.text}
+                            </p>
+                          ) : null}
+
+                          <p className="settings-note">
+                            接口格式会直接影响请求协议；切换后可以立即点「测试连通性」验证当前 Base URL、API Key 和模型是否匹配。
+                          </p>
+                        </>
                       )}
-                    </>
-                  )}
-                </div>
-
-                <div className="bot-detail-panel">
-                  {addedProviders.length === 0 ? (
-                    <div className="provider-empty-state">
-                      <AppIcon name="provider" size={48} />
-                      <p>请先添加一个 Provider</p>
                     </div>
-                  ) : (
-                    <>
-                      <div className="bot-detail-head provider-detail-head">
-                        <div className="bot-detail-title">
-                          <AppIcon name="provider" size={18} />
-                          <strong className="bot-detail-heading">
-                            {providerDisplayName(selectedProviderDefinition, selectedProviderConfig)} 配置
-                          </strong>
-                          <span className="bot-status-tag">{selectedProviderConfig.status}</span>
-                        </div>
-                        <div className="provider-runtime-badge">{activeProviderBadge}</div>
-                      </div>
-
-                      <p className="settings-note provider-note">{selectedProviderDefinition.description}</p>
-                      <p className="settings-note provider-note">
-                        当前接口格式：{selectedProviderFormatDefaults.label}
-                      </p>
-
-                      <label className="input-field">
-                        <span>接口格式</span>
-                        <label className="select-field">
-                          <select
-                            value={selectedProviderConfig.apiFormat}
-                            onChange={(event) =>
-                              onProviderConfigChange(selectedProviderId, {
-                                apiFormat: event.target.value as ProviderApiFormat,
-                              })
+                  </div>
+                ) : (
+                  <ImageGenerationSettingsSection
+                    imageGenerationSystem={draftImageGenerationSystem}
+                    imageProviderConfigs={draftImageProviderConfigs}
+                    imageProviderDefinitions={imageProviderDefinitions}
+                    onAddImageProvider={(name, adapterType) => {
+                      const providerId = `custom_image_${crypto.randomUUID().replace(/-/g, '')}`
+                      const defaults =
+                        adapterType === 'openai_images'
+                          ? {
+                              baseUrl: 'https://api.openai.com/v1',
+                              model: 'gpt-image-1',
                             }
-                          >
-                            <option value="openai">OpenAI Chat Completions</option>
-                            <option value="anthropic">Anthropic Messages</option>
-                          </select>
-                        </label>
-                      </label>
-
-                      <label className="input-field">
-                        <span>显示名称</span>
-                        <input
-                          value={selectedProviderConfig.displayName}
-                          onChange={(event) => onProviderConfigChange(selectedProviderId, { displayName: event.target.value })}
-                          placeholder={selectedProviderDefinition.name}
-                        />
-                      </label>
-
-                      <label className="input-field">
-                        <span>Base URL</span>
-                        <input
-                          value={selectedProviderConfig.baseUrl}
-                          onChange={(event) => onProviderConfigChange(selectedProviderId, { baseUrl: event.target.value })}
-                          placeholder={selectedProviderFormatDefaults.baseUrl}
-                        />
-                      </label>
-
-                      <label className="input-field">
-                        <span>API Key</span>
-                        <div className="input-action-field">
-                          <input
-                            type={showApiKey ? 'text' : 'password'}
-                            value={selectedProviderConfig.apiKey}
-                            onChange={(event) => onProviderConfigChange(selectedProviderId, { apiKey: event.target.value })}
-                            placeholder="请输入 API Key"
-                          />
-                          <button
-                            type="button"
-                            className="input-action-button"
-                            onClick={() => setShowApiKey((previous) => !previous)}
-                            aria-label={showApiKey ? '隐藏 API Key' : '显示 API Key'}
-                            aria-pressed={showApiKey}
-                            title={showApiKey ? '隐藏 API Key' : '显示 API Key'}
-                          >
-                            <AppIcon name={showApiKey ? 'eye-off' : 'eye'} size={16} />
-                          </button>
-                        </div>
-                      </label>
-
-                      <label className="input-field">
-                        <span>默认模型</span>
-                        <input
-                          value={selectedProviderConfig.model}
-                          onChange={(event) => onProviderConfigChange(selectedProviderId, { model: event.target.value })}
-                          placeholder={selectedProviderFormatDefaults.model}
-                        />
-                      </label>
-
-                      <label className="input-field">
-                        <span>最大上下文窗口 (tokens)</span>
-                        <input
-                          type="number"
-                          min={1}
-                          value={selectedProviderConfig.maxContextTokens ?? ''}
-                          onChange={(event) => {
-                            const raw = event.target.value.trim()
-                            const parsed = raw ? parseInt(raw, 10) : undefined
-                            onProviderConfigChange(selectedProviderId, {
-                              maxContextTokens: parsed && parsed > 0 ? parsed : undefined,
-                            })
-                          }}
-                          placeholder="如 128000，留空表示自动检测"
-                        />
-                      </label>
-
-                      <label className="input-field">
-                        <span>备注</span>
-                        <input
-                          value={selectedProviderConfig.note}
-                          onChange={(event) => onProviderConfigChange(selectedProviderId, { note: event.target.value })}
-                          placeholder="例如：用于后续替换默认模型路由"
-                        />
-                      </label>
-
-                      <div className="provider-actions">
-                        <button
-                          type="button"
-                          className="outline-button"
-                          onClick={() =>
-                            onProviderConfigChange(selectedProviderId, {
-                              status: getProviderStatus(selectedProviderConfig, false),
-                            })
-                          }
-                        >
-                          <AppIcon name="refresh" size={18} />
-                          <span>校验配置</span>
-                        </button>
-                        <button
-                          type="button"
-                          className="outline-button"
-                          disabled={providerTestLoading}
-                          onClick={async () => {
-                            setProviderTestLoading(true)
-                            setProviderTestNote(null)
-                            try {
-                              const message = await testLlmProviderConnection({
-                                apiFormat: selectedProviderConfig.apiFormat,
-                                baseUrl: selectedProviderConfig.baseUrl,
-                                apiKey: selectedProviderConfig.apiKey,
-                                model: selectedProviderConfig.model,
-                              })
-                              onProviderConfigChange(selectedProviderId, { status: '测试通过' })
-                              setProviderTestNote({ kind: 'ok', text: message })
-                            } catch (error) {
-                              onProviderConfigChange(selectedProviderId, { status: '已配置' })
-                              setProviderTestNote({ kind: 'err', text: String(error) })
-                            } finally {
-                              setProviderTestLoading(false)
+                          : {
+                              baseUrl: 'https://api.example.com/v1',
+                              model: 'your-image-model',
                             }
-                          }}
-                        >
-                          <AppIcon name="broadcast" size={18} />
-                          <span>{providerTestLoading ? '测试中…' : '测试连通性'}</span>
-                        </button>
-                      </div>
-
-                      {providerTestNote ? (
-                        <p className={`settings-note ${providerTestNote.kind === 'err' ? 'error' : ''}`}>
-                          {providerTestNote.text}
-                        </p>
-                      ) : null}
-
-                      <p className="settings-note">
-                        接口格式会直接影响请求协议；切换后可以立即点「测试连通性」验证当前 Base URL、API Key 和模型是否匹配。
-                      </p>
-                    </>
-                  )}
-                </div>
+                      setDraftImageProviderConfigs((previous) => ({
+                        ...previous,
+                        [providerId]: {
+                          adapterType,
+                          baseUrl: defaults.baseUrl,
+                          apiKey: '',
+                          model: defaults.model,
+                          note: '',
+                          displayName: name.trim() || name,
+                          status: '未配置',
+                        },
+                      }))
+                      setImageSaveNotice('')
+                      setImageSaveError('')
+                      return providerId
+                    }}
+                    onImageGenerationSystemChange={(value) => {
+                      setDraftImageGenerationSystem((previous) =>
+                        typeof value === 'function' ? value(previous) : value,
+                      )
+                      setImageSaveNotice('')
+                      setImageSaveError('')
+                    }}
+                    onImageProviderConfigChange={(providerId, updates) => {
+                      setDraftImageProviderConfigs((previous) => {
+                        const base = previous[providerId] ?? imageProviderConfigs[providerId]
+                        if (!base) {
+                          return previous
+                        }
+                        const merged = { ...base, ...updates }
+                        return {
+                          ...previous,
+                          [providerId]: {
+                            ...merged,
+                            status:
+                              updates.status ??
+                              (merged.baseUrl.trim() && merged.apiKey.trim() && merged.model.trim() ? '已配置' : '未配置'),
+                          },
+                        }
+                      })
+                      setImageSaveNotice('')
+                      setImageSaveError('')
+                    }}
+                    onRemoveImageProvider={(providerId) => {
+                      setDraftImageProviderConfigs((previous) => {
+                        const next = { ...previous }
+                        delete next[providerId]
+                        return next
+                      })
+                      setDraftImageGenerationSystem((previous) => {
+                        if (previous.defaultProviderId !== providerId) {
+                          return previous
+                        }
+                        const fallbackProviderId =
+                          imageProviderDefinitions.find((definition) => definition.id !== providerId)?.id || 'openai_image'
+                        return {
+                          ...previous,
+                          defaultProviderId: fallbackProviderId,
+                        }
+                      })
+                      setImageSaveNotice('')
+                      setImageSaveError('')
+                    }}
+                  />
+                )}
               </div>
             ) : null}
 
@@ -1233,12 +1396,43 @@ export function SettingsModal({
             ) : null}
 
             <div className="settings-footer">
+              {tab === 'providers' && providerSettingsMode === 'image' ? (
+                <div className="settings-footer-copy">
+                  {imageSaveError ? <p className="settings-note error">{imageSaveError}</p> : null}
+                  {imageSaveNotice ? <p className="settings-note">{imageSaveNotice}</p> : null}
+                </div>
+              ) : (
+                <div />
+              )}
               <button type="button" className="outline-button settings-footer-button" onClick={onClose}>
                 关闭
               </button>
-              <button type="button" className="primary-dark-button settings-footer-button" onClick={onClose}>
-                完成
-              </button>
+              {tab === 'providers' && providerSettingsMode === 'image' ? (
+                <button
+                  type="button"
+                  className="primary-dark-button settings-footer-button"
+                  disabled={imageSaveBusy}
+                  onClick={async () => {
+                    setImageSaveBusy(true)
+                    setImageSaveError('')
+                    setImageSaveNotice('')
+                    try {
+                      await onSaveImageGenerationSettings(draftImageProviderConfigs, draftImageGenerationSystem)
+                      setImageSaveNotice('图片大模型配置已保存，重启后会自动恢复。')
+                    } catch (error) {
+                      setImageSaveError(error instanceof Error ? error.message : String(error))
+                    } finally {
+                      setImageSaveBusy(false)
+                    }
+                  }}
+                >
+                  {imageSaveBusy ? '保存中…' : '保存图片配置'}
+                </button>
+              ) : (
+                <button type="button" className="primary-dark-button settings-footer-button" onClick={onClose}>
+                  完成
+                </button>
+              )}
             </div>
           </div>
         </div>

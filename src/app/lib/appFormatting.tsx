@@ -321,6 +321,8 @@ export function buildConversationAgentSnapshot(agent: AgentRecord): Conversation
     name: agent.name,
     summary: agent.summary,
     description: agent.description,
+    triggerCondition: agent.triggerCondition,
+    manualTriggerOnly: agent.manualTriggerOnly,
     systemPrompt: agent.systemPrompt,
     capabilityPolicy: normalizeAgentCapabilityPolicy(agent.capabilityPolicy, createStaticAgentCapabilityPolicy()),
     skillIds: [...agent.skillIds],
@@ -397,11 +399,14 @@ export function createEmptyAgentDraft(
   accentColor?: string,
 ): AgentInput {
   return {
+    id: '',
     name: '',
     summary: '',
     description: '',
+    triggerCondition: '',
+    manualTriggerOnly: false,
     systemPrompt: '',
-    capabilityPolicy: createDefaultAgentCapabilityPolicy(),
+    capabilityPolicy: createStaticAgentCapabilityPolicy(),
     skillIds: [],
     defaultProviderId: providerId,
     defaultModel: model,
@@ -437,9 +442,12 @@ export function normalizeAgentScenarioLlmConfigInDraft(
 
 export function createAgentDraftFromRecord(agent: AgentRecord): AgentInput {
   return {
+    id: agent.id,
     name: agent.name,
     summary: agent.summary,
     description: agent.description,
+    triggerCondition: agent.triggerCondition,
+    manualTriggerOnly: agent.manualTriggerOnly,
     systemPrompt: agent.systemPrompt,
     capabilityPolicy: normalizeAgentCapabilityPolicy(agent.capabilityPolicy, createStaticAgentCapabilityPolicy()),
     skillIds: [...agent.skillIds],
@@ -475,20 +483,21 @@ export function buildAutoAgentSummary(description: string, fallbackName = ''): s
 }
 
 export function normalizeAgentDraft(input: AgentInput): AgentInput {
+  const id = input.id?.trim() ?? ''
   const name = input.name.trim()
   const explicitSummary = input.summary.trim()
   const description = input.description.trim() || explicitSummary
   const summary = explicitSummary || buildAutoAgentSummary(description, name)
   return {
     ...input,
+    id,
     name,
     summary,
     description,
+    triggerCondition: input.triggerCondition.trim(),
+    manualTriggerOnly: input.manualTriggerOnly === true,
     systemPrompt: input.systemPrompt.trim(),
-    capabilityPolicy: normalizeAgentCapabilityPolicy(
-      input.capabilityPolicy,
-      createDefaultAgentCapabilityPolicy(),
-    ),
+    capabilityPolicy: createStaticAgentCapabilityPolicy(),
     defaultProviderId: input.defaultProviderId.trim(),
     defaultModel: input.defaultModel.trim(),
     skillIds: Array.from(new Set(input.skillIds.map((item) => item.trim()).filter(Boolean))),
@@ -499,8 +508,12 @@ export function normalizeAgentDraft(input: AgentInput): AgentInput {
 }
 
 export function validateAgentDraft(input: AgentInput): string | null {
+  const id = input.id?.trim() ?? ''
+  if (id && !/^[A-Za-z0-9_-]+$/.test(id)) {
+    return 'Agent_ID 只能包含英文字母、数字、下划线和连字符。'
+  }
   if (!input.name.trim()) {
-    return '请输入智能体名称。'
+    return '请输入展示名称。'
   }
   if (!input.description.trim() && !input.summary.trim()) {
     return '请输入智能体角色说明。'
@@ -657,8 +670,12 @@ export function parseAgentBuilderDraft(content: string): AgentBuilderDraft | nul
     }
 
     const name = typeof parsed.name === 'string' ? parsed.name.trim() : ''
+    const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
     const summary = typeof parsed.summary === 'string' ? parsed.summary.trim() : ''
     const description = typeof parsed.description === 'string' ? parsed.description.trim() : ''
+    const triggerCondition =
+      typeof parsed.triggerCondition === 'string' ? parsed.triggerCondition.trim() : ''
+    const manualTriggerOnly = parsed.manualTriggerOnly === true
     const normalizedDescription = description || summary
     const normalizedSummary = summary || buildAutoAgentSummary(normalizedDescription, name)
     const systemPrompt = typeof parsed.systemPrompt === 'string' ? parsed.systemPrompt.trim() : ''
@@ -682,9 +699,12 @@ export function parseAgentBuilderDraft(content: string): AgentBuilderDraft | nul
     }
 
     return {
+      ...(id ? { id } : {}),
       name,
       summary: normalizedSummary,
       description: normalizedDescription,
+      triggerCondition,
+      manualTriggerOnly,
       systemPrompt,
       capabilityPolicy,
       skillIds,

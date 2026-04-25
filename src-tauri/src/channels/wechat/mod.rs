@@ -1713,6 +1713,7 @@ impl Channel for WeChatChannel {
                                 let full_text = result.full_text;
                                 let usage = result.usage;
                                 let usage_meta = result.usage_meta;
+                                let is_control_command = result.control_command.is_some();
                                 if has_pending_followup {
                                     emit_bot_status(
                                         &app_handle,
@@ -1778,19 +1779,21 @@ impl Channel for WeChatChannel {
                                     "done",
                                     &format!("回复 {} 字符完成", full_text.len()),
                                 );
-                                if let Some(agent_id) =
-                                    agent_config.as_ref().map(|config| config.id.as_str())
-                                {
-                                    let _ = agent_workspace::append_agent_memory_entry(
-                                        agent_id,
-                                        &user_id,
-                                        &prompt_text,
-                                        if display_reply.is_empty() {
-                                            &full_text
-                                        } else {
-                                            &display_reply
-                                        },
-                                    );
+                                if !is_control_command {
+                                    if let Some(agent_id) =
+                                        agent_config.as_ref().map(|config| config.id.as_str())
+                                    {
+                                        let _ = agent_workspace::append_agent_memory_entry(
+                                            agent_id,
+                                            &user_id,
+                                            &prompt_text,
+                                            if display_reply.is_empty() {
+                                                &full_text
+                                            } else {
+                                                &display_reply
+                                            },
+                                        );
+                                    }
                                 }
                                 if !cleaned_text_reply.is_empty() {
                                     let cards =

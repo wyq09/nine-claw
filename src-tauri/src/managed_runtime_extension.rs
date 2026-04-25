@@ -4,11 +4,17 @@ use std::path::{Path, PathBuf};
 const MANAGED_RUNTIME_EXTENSION_FILE: &str = "nineclaw-managed-runtime.mjs";
 const MANAGED_RUNTIME_WEB_SEARCH_FILE: &str = "nineclaw-web-search-tool.mjs";
 const MANAGED_RUNTIME_WEB_FETCH_FILE: &str = "nineclaw-web-fetch-tool.mjs";
+const MANAGED_RUNTIME_IMAGE_GENERATION_FILE: &str = "nineclaw-image-generation-tool.mjs";
+const MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE: &str = "nineclaw-image-task-query-tool.mjs";
 const MANAGED_RUNTIME_TOOL_RESULT_STORAGE_FILE: &str = "tool_result_storage.mjs";
 const MANAGED_RUNTIME_CURL_HTTP_FILE: &str = "curl_http.mjs";
 const MANAGED_RUNTIME_WEB_SEARCH_TRANSPORT_FILE: &str = "web_search_transport.mjs";
 const WEB_SEARCH_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/web_search_tool.mjs");
 const WEB_FETCH_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/web_fetch_tool.mjs");
+const IMAGE_GENERATION_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/image_generation_tool.mjs");
+const IMAGE_TASK_QUERY_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/image_task_query_tool.mjs");
 const TOOL_RESULT_STORAGE_SOURCE: &str =
     include_str!("../../src/runtime-tools/tool_result_storage.mjs");
 const CURL_HTTP_SOURCE: &str = include_str!("../../src/runtime-tools/curl_http.mjs");
@@ -66,6 +72,22 @@ pub(crate) fn write_managed_runtime_extension_files(
         )
     })?;
 
+    let image_generation_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_GENERATION_FILE);
+    fs::write(&image_generation_path, IMAGE_GENERATION_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 image_generation 运行时模块失败 {}: {error}",
+            image_generation_path.display()
+        )
+    })?;
+
+    let image_task_query_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE);
+    fs::write(&image_task_query_path, IMAGE_TASK_QUERY_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 image_task_query 运行时模块失败 {}: {error}",
+            image_task_query_path.display()
+        )
+    })?;
+
     let extension_source = build_managed_runtime_extension_source(typebox_import_path)?;
     let extension_path = runtime_dir.join(MANAGED_RUNTIME_EXTENSION_FILE);
     fs::write(&extension_path, extension_source).map_err(|error| {
@@ -97,6 +119,8 @@ import {{
 }} from "@mariozechner/pi-coding-agent";
 import {{ createWebSearchTool }} from "./{MANAGED_RUNTIME_WEB_SEARCH_FILE}";
 import {{ createWebFetchTool }} from "./{MANAGED_RUNTIME_WEB_FETCH_FILE}";
+import {{ createImageGenerationTool }} from "./{MANAGED_RUNTIME_IMAGE_GENERATION_FILE}";
+import {{ createImageTaskQueryTool }} from "./{MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE}";
 
 const execFile = promisify(execFileCallback);
 
@@ -121,10 +145,13 @@ function readHarness() {{
 
 function applyHarness(pi, harness) {{
   const active = Array.isArray(harness.activeTools) ? harness.activeTools.filter(Boolean) : [];
+  const hasExplicitActiveTools = active.length > 0;
+  active.push("image_generate");
+  active.push("image_task_query");
   if (harness.enableExternalApiProxy) {{
     active.push("nineclaw_external_api");
   }}
-  if (active.length > 0) {{
+  if (hasExplicitActiveTools) {{
     const unique = [...new Set(active)];
     pi.setActiveTools(unique);
   }}
@@ -141,6 +168,8 @@ export default function(pi) {{
   let externalToolRegistered = false;
   let webSearchToolRegistered = false;
   let webFetchToolRegistered = false;
+  let imageGenerationToolRegistered = false;
+  let imageTaskQueryToolRegistered = false;
 
   function ensureWebSearchTool() {{
     if (webSearchToolRegistered) return;
@@ -174,6 +203,40 @@ export default function(pi) {{
         fsPromises,
         fsConstants: fs.constants,
         fsSync: fs,
+        pathApi: path,
+        osApi: os,
+        cryptoApi: crypto,
+        processApi: process,
+        withFileMutationQueue,
+      }})
+    );
+  }}
+
+  function ensureImageGenerationTool() {{
+    if (imageGenerationToolRegistered) return;
+    imageGenerationToolRegistered = true;
+    pi.registerTool(
+      createImageGenerationTool({{
+        Type,
+        fetchImpl: fetch,
+        fsPromises,
+        pathApi: path,
+        osApi: os,
+        cryptoApi: crypto,
+        processApi: process,
+        withFileMutationQueue,
+      }})
+    );
+  }}
+
+  function ensureImageTaskQueryTool() {{
+    if (imageTaskQueryToolRegistered) return;
+    imageTaskQueryToolRegistered = true;
+    pi.registerTool(
+      createImageTaskQueryTool({{
+        Type,
+        fetchImpl: fetch,
+        fsPromises,
         pathApi: path,
         osApi: os,
         cryptoApi: crypto,
@@ -224,6 +287,8 @@ export default function(pi) {{
     const harness = readHarness();
     ensureWebSearchTool();
     ensureWebFetchTool();
+    ensureImageGenerationTool();
+    ensureImageTaskQueryTool();
     if (harness.enableExternalApiProxy) {{
       ensureExternalTool();
     }}
@@ -234,6 +299,8 @@ export default function(pi) {{
     const harness = readHarness();
     ensureWebSearchTool();
     ensureWebFetchTool();
+    ensureImageGenerationTool();
+    ensureImageTaskQueryTool();
     if (harness.enableExternalApiProxy) {{
       ensureExternalTool();
     }}
@@ -284,21 +351,36 @@ mod tests {
         let storage_helper_path = runtime_dir.join(MANAGED_RUNTIME_TOOL_RESULT_STORAGE_FILE);
         let curl_http_path = runtime_dir.join(MANAGED_RUNTIME_CURL_HTTP_FILE);
         let web_search_transport_path = runtime_dir.join(MANAGED_RUNTIME_WEB_SEARCH_TRANSPORT_FILE);
+        let image_task_query_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE);
+        let image_generation_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_GENERATION_FILE);
         let extension_source = fs::read_to_string(&extension_path).expect("read extension");
         let helper_source = fs::read_to_string(&helper_path).expect("read helper");
-        let fetch_helper_source = fs::read_to_string(&fetch_helper_path).expect("read fetch helper");
+        let fetch_helper_source =
+            fs::read_to_string(&fetch_helper_path).expect("read fetch helper");
         let storage_helper_source =
             fs::read_to_string(&storage_helper_path).expect("read storage helper");
         let curl_http_source = fs::read_to_string(&curl_http_path).expect("read curl http helper");
         let web_search_transport_source =
             fs::read_to_string(&web_search_transport_path).expect("read search transport helper");
+        let image_generation_source =
+            fs::read_to_string(&image_generation_path).expect("read image generation helper");
+        let image_task_query_source =
+            fs::read_to_string(&image_task_query_path).expect("read image task query helper");
 
         assert!(extension_source.contains("ensureWebSearchTool"));
         assert!(extension_source.contains("ensureWebFetchTool"));
+        assert!(extension_source.contains("ensureImageGenerationTool"));
+        assert!(extension_source.contains("ensureImageTaskQueryTool"));
+        assert!(extension_source.contains("createImageGenerationTool"));
+        assert!(extension_source.contains("createImageTaskQueryTool"));
         assert!(extension_source.contains("createWebSearchTool"));
         assert!(extension_source.contains("createWebFetchTool"));
+        assert!(extension_source.contains("const hasExplicitActiveTools = active.length > 0"));
+        assert!(extension_source.contains("if (hasExplicitActiveTools)"));
         assert!(helper_source.contains("name: \"web_search\""));
         assert!(fetch_helper_source.contains("name: \"web_fetch\""));
+        assert!(image_generation_source.contains("name: \"image_generate\""));
+        assert!(image_task_query_source.contains("name: \"image_task_query\""));
         assert!(helper_source.contains("tool_result_storage.mjs"));
         assert!(fetch_helper_source.contains("tool_result_storage.mjs"));
         assert!(fetch_helper_source.contains("curl_http.mjs"));
@@ -315,6 +397,8 @@ mod tests {
         let _ = fs::remove_file(storage_helper_path);
         let _ = fs::remove_file(curl_http_path);
         let _ = fs::remove_file(web_search_transport_path);
+        let _ = fs::remove_file(image_generation_path);
+        let _ = fs::remove_file(image_task_query_path);
         let _ = fs::remove_dir_all(runtime_dir);
     }
 }

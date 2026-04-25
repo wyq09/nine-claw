@@ -99,7 +99,10 @@ pub fn mirror_line(line: &str, ts_ms: i64) {
             .single()
             .unwrap_or_else(chrono::Local::now);
         let file = root.join(format!("llm-trace-{}.jsonl", dt.format("%Y-%m-%d")));
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(&file)?;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&file)?;
         f.write_all(line.as_bytes())?;
         f.write_all(b"\n")?;
         Ok(())
@@ -147,7 +150,8 @@ pub fn preview_latest() -> Result<LlmLogPreview, String> {
     let Some(path) = files.first() else {
         return Ok(LlmLogPreview {
             file: None,
-            tail: "目录中还没有 llm-trace-*.jsonl 文件（完成一次带追踪的 LLM 调用后会出现）。".to_string(),
+            tail: "目录中还没有 llm-trace-*.jsonl 文件（完成一次带追踪的 LLM 调用后会出现）。"
+                .to_string(),
         });
     };
     let meta = fs::metadata(path).map_err(|e| format!("读取文件信息失败: {e}"))?;

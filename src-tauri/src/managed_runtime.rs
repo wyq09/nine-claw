@@ -1,11 +1,14 @@
 use crate::agents::ConversationAgentConfig;
+use crate::image_generation::{
+    dispatch_image_generation, ImageGenerateProxyRequest, ImageGenerationRuntimeConfig,
+};
 use crate::provider_runtime::{
     normalize_provider_api_format, normalized_provider_runtime_base_url, ProviderRuntimeConfig,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode};
-use axum::routing::{any, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
@@ -103,6 +106,7 @@ pub struct PreparedManagedRuntime {
     pub extension_path: PathBuf,
     pub harness: SelectedHarness,
     pub llm_proxy: Option<LlmProxyBinding>,
+    pub image_proxy: Option<ImageGenerationRuntimeConfig>,
     pub proxy_base_url: Option<String>,
     pub session_token: Option<String>,
 }
@@ -119,6 +123,7 @@ pub struct LlmProxyBinding {
 #[derive(Debug, Clone)]
 struct ProxySessionConfig {
     llm: Option<LlmProxyBinding>,
+    image: Option<ImageGenerationRuntimeConfig>,
     external_apis: HashMap<String, ExternalApiCredential>,
 }
 
@@ -392,6 +397,18 @@ pub fn append_session_event_quiet(
             session_id,
             error
         );
+    }
+}
+
+pub fn clear_session_events(agent_home: &Path, session_id: &str) -> Result<(), String> {
+    let path = session_log_path(agent_home, session_id);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "删除 managed runtime session log 失败 {}: {error}",
+            path.display()
+        )),
     }
 }
 
@@ -672,6 +689,7 @@ pub fn prepare_managed_runtime(
     prompt: Option<&str>,
     session_id: &str,
     provider_config: Option<&ProviderRuntimeConfig>,
+    image_runtime_config: Option<&ImageGenerationRuntimeConfig>,
 ) -> Result<PreparedManagedRuntime, String> {
     let workspace_root = crate::agent_workspace::resolve_workspace_root()?;
     let agent_home = workspace_root.join("agents").join(&agent_config.id);
@@ -713,6 +731,7 @@ pub fn prepare_managed_runtime(
             proxy_session_token.clone(),
             ProxySessionConfig {
                 llm: llm_proxy.clone(),
+                image: image_runtime_config.cloned(),
                 external_apis,
             },
         );
@@ -729,6 +748,7 @@ pub fn prepare_managed_runtime(
         extension_path,
         harness,
         llm_proxy,
+        image_proxy: image_runtime_config.cloned(),
         proxy_base_url: Some(proxy_server.base_url.clone()),
         session_token: Some(proxy_session_token),
     })
@@ -756,6 +776,8 @@ fn credential_proxy_server() -> Result<&'static CredentialProxyServer, String> {
     let router = Router::new()
         .route("/llm/:token/*path", any(llm_proxy_handler))
         .route("/external/:token/dispatch", post(external_proxy_handler))
+        .route("/image/:token/generate", post(image_proxy_handler))
+        .route("/image/:token/task/:task_id", get(image_task_query_handler))
         .with_state(state.clone());
     tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::from_std(listener) {
@@ -947,6 +969,70 @@ async fn external_proxy_handler(
         body_text,
         headers,
     }))
+}
+
+async fn image_proxy_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(payload): Json<ImageGenerateProxyRequest>,
+) -> Result<Json<crate::image_generation::ImageGenerateProxyResponse>, (StatusCode, String)> {
+    let session = {
+        let guard = state.sessions.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credential proxy session lock poisoned".to_string(),
+            )
+        })?;
+        guard.get(&token).cloned()
+    };
+    let Some(session) = session else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "unknown credential proxy session".to_string(),
+        ));
+    };
+    let Some(image_runtime) = session.image else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "no image generation runtime configured".to_string(),
+        ));
+    };
+    let response = dispatch_image_generation(&state.client, &image_runtime, &payload)
+        .await
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(response))
+}
+
+async fn image_task_query_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath((token, task_id)): AxumPath<(String, String)>,
+) -> Result<Json<crate::image_generation::ImageTaskQueryResponse>, (StatusCode, String)> {
+    let session = {
+        let guard = state.sessions.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credential proxy session lock poisoned".to_string(),
+            )
+        })?;
+        guard.get(&token).cloned()
+    };
+    let Some(session) = session else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "unknown credential proxy session".to_string(),
+        ));
+    };
+    let Some(image_runtime) = session.image else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "no image generation runtime configured".to_string(),
+        ));
+    };
+    let response =
+        crate::image_generation::dispatch_image_task_query(&state.client, &image_runtime, &task_id)
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(response))
 }
 
 fn inject_external_auth(

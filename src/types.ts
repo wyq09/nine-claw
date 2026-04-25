@@ -251,6 +251,8 @@ export type ConversationAgentSnapshot = {
   name: string
   summary: string
   description: string
+  triggerCondition?: string
+  manualTriggerOnly?: boolean
   systemPrompt: string
   capabilityPolicy: AgentCapabilityPolicy
   skillIds: string[]
@@ -489,6 +491,8 @@ export type AgentRecord = {
   name: string
   summary: string
   description: string
+  triggerCondition: string
+  manualTriggerOnly: boolean
   systemPrompt: string
   capabilityPolicy: AgentCapabilityPolicy
   skillIds: string[]
@@ -507,9 +511,12 @@ export type AgentRecord = {
 }
 
 export type AgentInput = {
+  id?: string
   name: string
   summary: string
   description: string
+  triggerCondition: string
+  manualTriggerOnly: boolean
   systemPrompt: string
   capabilityPolicy?: AgentCapabilityPolicy
   skillIds: string[]
@@ -529,9 +536,12 @@ export type AgentImportResult = {
 }
 
 export type AgentBuilderDraft = {
+  id?: string
   name: string
   summary: string
   description: string
+  triggerCondition?: string
+  manualTriggerOnly?: boolean
   systemPrompt: string
   capabilityPolicy?: AgentCapabilityPolicy
   skillIds: string[]

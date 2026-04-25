@@ -193,10 +193,125 @@ impl PiRunHandle {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{BotSlashCommand, PiBridge, ProviderRuntimeConfig};
+    use crate::pi_runtime::{PiRuntimeLocation, PiRuntimeSource};
+    use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn bot_provider_models_config_filters_history_images_when_text_only() {
+        let config = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "custom-model".to_string(),
+        };
+
+        let with_images = PiBridge::build_provider_models_config_from_config(&config, false, false)
+            .expect("config");
+        let text_only = PiBridge::build_provider_models_config_from_config(&config, true, false)
+            .expect("config");
+
+        assert_eq!(
+            with_images["providers"]["nineclaw-runtime-8b9035807842"]["models"][0]["input"],
+            json!(["text", "image"])
+        );
+        assert_eq!(
+            text_only["providers"]["nineclaw-runtime-8b9035807842"]["models"][0]["input"],
+            json!(["text"])
+        );
+    }
+
+    #[test]
+    fn bot_provider_models_config_can_disable_reasoning_effort() {
+        let config = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "glm-4.6".to_string(),
+        };
+
+        let with_reasoning =
+            PiBridge::build_provider_models_config_from_config(&config, false, false)
+                .expect("config");
+        let without_reasoning =
+            PiBridge::build_provider_models_config_from_config(&config, false, true)
+                .expect("config");
+
+        assert_eq!(
+            with_reasoning["providers"]["nineclaw-runtime-8b9035807842"]["compat"]
+                ["supportsReasoningEffort"],
+            json!(true)
+        );
+        assert_eq!(
+            without_reasoning["providers"]["nineclaw-runtime-8b9035807842"]["compat"]
+                ["supportsReasoningEffort"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn bot_slash_command_parser_recognizes_new_help_and_unknown() {
+        assert_eq!(
+            PiBridge::parse_bot_slash_command("/new"),
+            Some(BotSlashCommand::New)
+        );
+        assert_eq!(
+            PiBridge::parse_bot_slash_command("/help anything"),
+            Some(BotSlashCommand::Help)
+        );
+        assert_eq!(
+            PiBridge::parse_bot_slash_command("/missing"),
+            Some(BotSlashCommand::Unknown("missing".to_string()))
+        );
+        assert_eq!(PiBridge::parse_bot_slash_command(" /new"), None);
+        assert_eq!(PiBridge::parse_bot_slash_command("/"), None);
+    }
+
+    #[test]
+    fn slash_new_deletes_existing_im_session_file() {
+        let bridge = PiBridge::new(
+            PiRuntimeLocation {
+                executable: PathBuf::from("/bin/echo"),
+                source: PiRuntimeSource::SystemPath,
+                resource_root: None,
+            },
+            "custom",
+            "openai",
+            "https://example.com/v1",
+            "secret",
+            "model",
+            None,
+        );
+        let channel_id = format!("test-channel-{}", std::process::id());
+        let user_id = "slash-new-user";
+        let key = bridge.session_key(&channel_id, user_id);
+        let session_path = PiBridge::session_file_path(&key);
+        fs::write(&session_path, "{\"type\":\"message\"}\n").expect("write session");
+
+        let outcome = bridge
+            .process_bot_slash_command(BotSlashCommand::New, &key, &channel_id, user_id)
+            .expect("slash new");
+
+        assert!(!session_path.exists());
+        let super::PiProcessOutcome::Completed(result) = outcome else {
+            panic!("expected completed outcome");
+        };
+        assert_eq!(result.full_text, "已开启一个新的会话。");
+        assert_eq!(result.control_command.as_deref(), Some("new"));
+    }
+}
+
 pub struct PiProcessResult {
     pub full_text: String,
     pub usage: Option<crate::PiTokenUsagePayload>,
     pub usage_meta: Option<crate::PiUsageMetadataPayload>,
+    pub control_command: Option<String>,
 }
 
 pub enum PiProcessOutcome {
@@ -207,6 +322,13 @@ pub enum PiProcessOutcome {
 struct ChildExitOutcome {
     status: Option<ExitStatus>,
     timed_out: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BotSlashCommand {
+    New,
+    Help,
+    Unknown(String),
 }
 
 /// Manages pi sessions for bot channel message processing.
@@ -261,6 +383,128 @@ impl PiBridge {
 
     fn session_file_path(key: &str) -> PathBuf {
         std::env::temp_dir().join(format!("nineclaw-bot-session-{key}.jsonl"))
+    }
+
+    fn parse_bot_slash_command(prompt: &str) -> Option<BotSlashCommand> {
+        if !prompt.starts_with('/') {
+            return None;
+        }
+
+        let trimmed = prompt.trim();
+        if trimmed == "/" {
+            return None;
+        }
+
+        let name = trimmed
+            .strip_prefix('/')?
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+
+        match name.as_str() {
+            "new" => Some(BotSlashCommand::New),
+            "help" => Some(BotSlashCommand::Help),
+            "" => None,
+            _ => Some(BotSlashCommand::Unknown(name)),
+        }
+    }
+
+    fn bot_slash_command_help() -> &'static str {
+        "/new - 开启一个新的会话\n/help - 显示可用指令"
+    }
+
+    fn reset_im_session_state(
+        &self,
+        key: &str,
+        channel_id: &str,
+        user_id: &str,
+    ) -> Result<(), String> {
+        let session_path = Self::session_file_path(key);
+        match fs::remove_file(&session_path) {
+            Ok(()) => dev_trace(
+                "bot.pi",
+                format!(
+                    "删除 IM session: channel={} user={} session={}",
+                    channel_id,
+                    user_id,
+                    session_path.display()
+                ),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "删除 IM session 失败（{}）: {error}",
+                    session_path.display()
+                ));
+            }
+        }
+
+        let pool_slot = {
+            let map = im_pi_pool()
+                .lock()
+                .map_err(|_| "锁定 IM pi 池失败".to_string())?;
+            map.get(key).cloned()
+        };
+        if let Some(pool_slot) = pool_slot {
+            let mut pool_guard = pool_slot
+                .lock()
+                .map_err(|_| "锁定 IM pi 会话槽失败".to_string())?;
+            if let Some(mut prev) = pool_guard.take() {
+                let prev_pid = prev.child.id();
+                let _ = prev.child.kill();
+                let _ = Self::wait_for_child_exit(&mut prev.child, CHILD_KILL_GRACE_TIMEOUT);
+                dev_trace(
+                    "bot.pi",
+                    format!(
+                        "清理旧池化 pi: channel={} user={} old_pid={} reason=slash_new",
+                        channel_id, user_id, prev_pid
+                    ),
+                );
+            }
+        }
+
+        crate::clear_multimodal_summary(key)?;
+
+        if let Some(agent_config) = self.agent_config.as_ref() {
+            if let Ok(workspace_root) = crate::agent_workspace::resolve_workspace_root() {
+                let agent_home = workspace_root.join("agents").join(&agent_config.id);
+                managed_runtime::clear_session_events(&agent_home, key)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_bot_slash_command(
+        &self,
+        command: BotSlashCommand,
+        key: &str,
+        channel_id: &str,
+        user_id: &str,
+    ) -> Result<PiProcessOutcome, String> {
+        let (full_text, command_name) = match command {
+            BotSlashCommand::New => {
+                self.reset_im_session_state(key, channel_id, user_id)?;
+                ("已开启一个新的会话。".to_string(), "new".to_string())
+            }
+            BotSlashCommand::Help => (
+                Self::bot_slash_command_help().to_string(),
+                "help".to_string(),
+            ),
+            BotSlashCommand::Unknown(name) => (
+                format!("未知指令 /{}。\n{}", name, Self::bot_slash_command_help()),
+                "unknown".to_string(),
+            ),
+        };
+
+        Ok(PiProcessOutcome::Completed(PiProcessResult {
+            full_text,
+            usage: None,
+            usage_meta: None,
+            control_command: Some(command_name),
+        }))
     }
 
     fn ephemeral_session_file_path(key: &str) -> PathBuf {
@@ -403,17 +647,23 @@ impl PiBridge {
     }
 
     fn build_provider_models_config(&self) -> Option<serde_json::Value> {
-        Self::build_provider_models_config_from_config(&ProviderRuntimeConfig {
-            provider_id: self.provider_id.clone(),
-            api_format: self.api_format.clone(),
-            base_url: self.base_url.clone(),
-            api_key: self.api_key.clone(),
-            model: self.model.clone(),
-        })
+        Self::build_provider_models_config_from_config(
+            &ProviderRuntimeConfig {
+                provider_id: self.provider_id.clone(),
+                api_format: self.api_format.clone(),
+                base_url: self.base_url.clone(),
+                api_key: self.api_key.clone(),
+                model: self.model.clone(),
+            },
+            false,
+            false,
+        )
     }
 
     fn build_provider_models_config_from_config(
         config: &ProviderRuntimeConfig,
+        text_only_input: bool,
+        disable_reasoning_effort: bool,
     ) -> Option<serde_json::Value> {
         let provider_id = config.provider_id.trim();
         let base_url = match Self::normalize_provider_api_format(&config.api_format, provider_id) {
@@ -428,6 +678,11 @@ impl PiBridge {
         }
 
         let mut provider = serde_json::Map::new();
+        let model_input = if text_only_input {
+            json!(["text"])
+        } else {
+            json!(["text", "image"])
+        };
         provider.insert("baseUrl".to_string(), json!(base_url));
         provider.insert(
             "apiKey".to_string(),
@@ -445,12 +700,13 @@ impl PiBridge {
                 provider.insert("authHeader".to_string(), json!(true));
                 provider.insert(
                     "models".to_string(),
-                    json!([{ "id": model, "api": "anthropic-messages", "input": ["text", "image"] }]),
+                    json!([{ "id": model, "api": "anthropic-messages", "input": model_input }]),
                 );
             }
             _ => {
                 provider.insert("api".to_string(), json!("openai-completions"));
-                let reasoning = crate::openai_pi_compat_supports_reasoning_effort(model);
+                let reasoning = !disable_reasoning_effort
+                    && crate::openai_pi_compat_supports_reasoning_effort(model);
                 provider.insert(
                     "compat".to_string(),
                     json!({
@@ -460,7 +716,7 @@ impl PiBridge {
                 );
                 provider.insert(
                     "models".to_string(),
-                    json!([{ "id": model, "api": "openai-completions", "input": ["text", "image"] }]),
+                    json!([{ "id": model, "api": "openai-completions", "input": model_input }]),
                 );
             }
         }
@@ -777,12 +1033,47 @@ impl PiBridge {
         E: FnMut(&serde_json::Value),
     {
         let key = self.session_key(channel_id, user_id);
+        if let Some(command) = Self::parse_bot_slash_command(prompt) {
+            dev_trace(
+                "bot.pi",
+                format!(
+                    "处理 IM 指令: channel={} user={} command={:?}",
+                    channel_id, user_id, command
+                ),
+            );
+            return self.process_bot_slash_command(command, &key, channel_id, user_id);
+        }
+
         let fresh_multimodal_session = Self::has_multimodal_attachments(attachments);
         let session_path = if fresh_multimodal_session {
             Self::ephemeral_session_file_path(&key)
         } else {
             Self::session_file_path(&key)
         };
+        if !fresh_multimodal_session {
+            match crate::sanitize_pi_session_replay_state(&session_path) {
+                Ok(true) => dev_trace(
+                    "bot.pi",
+                    format!(
+                        "sanitized reasoning replay state: channel={} user={} session={}",
+                        channel_id,
+                        user_id,
+                        session_path.display()
+                    ),
+                ),
+                Ok(false) => {}
+                Err(error) => dev_trace(
+                    "bot.pi",
+                    format!(
+                        "sanitize reasoning replay state failed: channel={} user={} session={} error={}",
+                        channel_id,
+                        user_id,
+                        session_path.display(),
+                        error
+                    ),
+                ),
+            }
+        }
         let runtime_dir = Self::prepare_runtime_dir()?;
         let prompt_with_summary = crate::prepend_multimodal_summary_context(prompt, &key)?;
         let prepared_input =
@@ -840,13 +1131,19 @@ impl PiBridge {
                 Some(prepared_input.message.as_str()),
                 &key,
                 Some(provider_config),
+                None,
             )?);
         }
 
-        if let Some(config) = runtime_provider_config
-            .as_ref()
-            .and_then(Self::build_provider_models_config_from_config)
-        {
+        let text_only_history_input = !fresh_multimodal_session;
+        let disable_reasoning_history = !fresh_multimodal_session;
+        if let Some(config) = runtime_provider_config.as_ref().and_then(|config| {
+            Self::build_provider_models_config_from_config(
+                config,
+                text_only_history_input,
+                disable_reasoning_history,
+            )
+        }) {
             let content = serde_json::to_vec_pretty(&config)
                 .map_err(|e| format!("序列化 models 配置失败: {e}"))?;
             fs::write(&models_path, content).map_err(|e| format!("写入 models.json 失败: {e}"))?;
@@ -1593,6 +1890,7 @@ impl PiBridge {
                 full_text,
                 usage: final_usage,
                 usage_meta: final_usage_meta,
+                control_command: None,
             }));
         }
 
@@ -1645,6 +1943,7 @@ impl PiBridge {
             full_text,
             usage: final_usage,
             usage_meta: final_usage_meta,
+            control_command: None,
         }))
     }
 }

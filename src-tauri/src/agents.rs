@@ -53,6 +53,10 @@ pub struct AgentRecord {
     pub name: String,
     pub summary: String,
     pub description: String,
+    #[serde(default)]
+    pub trigger_condition: String,
+    #[serde(default)]
+    pub manual_trigger_only: bool,
     pub system_prompt: String,
     #[serde(default = "static_capability_policy")]
     pub capability_policy: AgentCapabilityPolicy,
@@ -78,9 +82,15 @@ pub struct AgentRecord {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentInput {
+    #[serde(default)]
+    pub id: Option<String>,
     pub name: String,
     pub summary: String,
     pub description: String,
+    #[serde(default)]
+    pub trigger_condition: String,
+    #[serde(default)]
+    pub manual_trigger_only: bool,
     #[serde(default)]
     pub system_prompt: String,
     #[serde(default)]
@@ -211,6 +221,10 @@ pub struct ConversationAgentConfig {
     pub summary: String,
     pub description: String,
     #[serde(default)]
+    pub trigger_condition: String,
+    #[serde(default)]
+    pub manual_trigger_only: bool,
+    #[serde(default)]
     pub system_prompt: String,
     #[serde(default = "static_capability_policy")]
     pub capability_policy: AgentCapabilityPolicy,
@@ -318,6 +332,8 @@ pub fn get_conversation_agent_config(
         name: record.name,
         summary: record.summary,
         description: record.description,
+        trigger_condition: record.trigger_condition,
+        manual_trigger_only: record.manual_trigger_only,
         system_prompt: record.system_prompt,
         capability_policy: record.capability_policy,
         skill_ids: record.skill_ids,
@@ -418,10 +434,25 @@ pub fn build_agent_system_prompt_for_prompt(
         }
     }
 
+    let trigger_condition = agent.trigger_condition.trim();
+    if !trigger_condition.is_empty() {
+        sections.push(format!(
+            "触发条件：{}",
+            trim_prompt_snippet(trigger_condition, 240)
+        ));
+    }
+    if agent.manual_trigger_only {
+        sections.push("触发限制：禁止模型自动调用；仅允许用户手动触发。".to_string());
+    }
+
     sections.push(format!(
         "能力策略：{}",
         agent.capability_policy.strategy.trim()
     ));
+    sections.push(
+        "工具使用：如果要读取网页的内容，必须使用 web_fetch 工具；web_search 只用于搜索和发现网页。"
+            .to_string(),
+    );
 
     if !agent.skill_ids.is_empty() {
         let listed = agent
@@ -441,14 +472,17 @@ pub fn build_agent_system_prompt_for_prompt(
 
     let system_prompt = agent.system_prompt.trim();
     if !system_prompt.is_empty() {
-        let body = if system_prompt.chars().count() > MAX_USER_SYSTEM_INSTRUCTION_CHARS {
-            let head: String = system_prompt
+        let expanded_prompt = current_prompt
+            .map(|arg| system_prompt.replace("${ARG}", arg.trim()))
+            .unwrap_or_else(|| system_prompt.to_string());
+        let body = if expanded_prompt.chars().count() > MAX_USER_SYSTEM_INSTRUCTION_CHARS {
+            let head: String = expanded_prompt
                 .chars()
                 .take(MAX_USER_SYSTEM_INSTRUCTION_CHARS)
                 .collect();
             format!("{head}…\n(已截断至约 {MAX_USER_SYSTEM_INSTRUCTION_CHARS} 字，见仓库文档 docs/AGENT_SYSTEM_PROMPT.md)")
         } else {
-            system_prompt.to_string()
+            expanded_prompt
         };
         sections.push(format!("附加执行约束：\n{body}"));
     }
@@ -476,6 +510,8 @@ fn ensure_agents_schema(connection: &Connection) -> Result<(), String> {
                 name TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 description TEXT NOT NULL,
+                trigger_condition TEXT NOT NULL DEFAULT '',
+                manual_trigger_only INTEGER NOT NULL DEFAULT 0,
                 system_prompt TEXT NOT NULL DEFAULT '',
                 default_provider_id TEXT NOT NULL,
                 default_model TEXT NOT NULL,
@@ -517,6 +553,8 @@ fn ensure_agents_schema(connection: &Connection) -> Result<(), String> {
     add_agents_column_if_missing(connection, "heartbeat_config_json", "TEXT")?;
     add_agents_column_if_missing(connection, "scenario_llm_config_json", "TEXT")?;
     add_agents_column_if_missing(connection, "capability_policy_json", "TEXT")?;
+    add_agents_column_if_missing(connection, "trigger_condition", "TEXT NOT NULL DEFAULT ''")?;
+    add_agents_column_if_missing(connection, "manual_trigger_only", "INTEGER NOT NULL DEFAULT 0")?;
     crate::heartbeat::ensure_heartbeat_schema(connection)?;
 
     Ok(())
@@ -566,10 +604,10 @@ fn seed_builtin_agents(connection: &Connection) -> Result<(), String> {
         connection
             .execute(
                 "INSERT OR IGNORE INTO agents (
-                id, name, summary, description, system_prompt, default_provider_id,
+                id, name, summary, description, trigger_condition, manual_trigger_only, system_prompt, default_provider_id,
                 default_model, is_builtin, is_archived, execution_mode,
                 collaboration_config_json, heartbeat_config_json, capability_policy_json, accent_color, scenario_llm_config_json, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 0, 'single', NULL, NULL, ?8, ?9, NULL, ?10, ?10)",
+                ) VALUES (?1, ?2, ?3, ?4, '', 0, ?5, ?6, ?7, 1, 0, 'single', NULL, NULL, ?8, ?9, NULL, ?10, ?10)",
                 params![
                     seed.id,
                     seed.name,
@@ -680,6 +718,8 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
                 name,
                 summary,
                 description,
+                trigger_condition,
+                manual_trigger_only,
                 system_prompt,
                 default_provider_id,
                 default_model,
@@ -709,21 +749,23 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
                 name: row.get(1)?,
                 summary: row.get(2)?,
                 description: row.get(3)?,
-                system_prompt: row.get(4)?,
+                trigger_condition: row.get(4)?,
+                manual_trigger_only: row.get::<_, i64>(5)? != 0,
+                system_prompt: row.get(6)?,
                 capability_policy: static_capability_policy(),
                 skill_ids: Vec::new(),
-                default_provider_id: row.get(5)?,
-                default_model: row.get(6)?,
-                is_builtin: row.get::<_, i64>(7)? != 0,
-                is_archived: row.get::<_, i64>(8)? != 0,
-                execution_mode: row.get(9)?,
-                collaboration_config: deserialize_collaboration_config(row.get(10)?),
-                heartbeat_config: deserialize_heartbeat_config(row.get(11)?),
-                accent_color: row.get(12)?,
-                scenario_llm_config: deserialize_scenario_llm_config(row.get(13)?),
+                default_provider_id: row.get(7)?,
+                default_model: row.get(8)?,
+                is_builtin: row.get::<_, i64>(9)? != 0,
+                is_archived: row.get::<_, i64>(10)? != 0,
+                execution_mode: row.get(11)?,
+                collaboration_config: deserialize_collaboration_config(row.get(12)?),
+                heartbeat_config: deserialize_heartbeat_config(row.get(13)?),
+                accent_color: row.get(14)?,
+                scenario_llm_config: deserialize_scenario_llm_config(row.get(15)?),
                 bot_configs: HashMap::new(),
-                created_at: row.get(14)?,
-                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
+                updated_at: row.get(17)?,
             })
         })
         .map_err(|error| format!("解析智能体列表失败: {error}"))?;
@@ -795,6 +837,8 @@ fn get_active_agent_by_id(
                 name,
                 summary,
                 description,
+                trigger_condition,
+                manual_trigger_only,
                 system_prompt,
                 default_provider_id,
                 default_model,
@@ -819,21 +863,23 @@ fn get_active_agent_by_id(
                 name: row.get(1)?,
                 summary: row.get(2)?,
                 description: row.get(3)?,
-                system_prompt: row.get(4)?,
+                trigger_condition: row.get(4)?,
+                manual_trigger_only: row.get::<_, i64>(5)? != 0,
+                system_prompt: row.get(6)?,
                 capability_policy: static_capability_policy(),
                 skill_ids: Vec::new(),
-                default_provider_id: row.get(5)?,
-                default_model: row.get(6)?,
-                is_builtin: row.get::<_, i64>(7)? != 0,
-                is_archived: row.get::<_, i64>(8)? != 0,
-                execution_mode: row.get(9)?,
-                collaboration_config: deserialize_collaboration_config(row.get(10)?),
-                heartbeat_config: deserialize_heartbeat_config(row.get(11)?),
-                accent_color: row.get(12)?,
-                scenario_llm_config: deserialize_scenario_llm_config(row.get(13)?),
+                default_provider_id: row.get(7)?,
+                default_model: row.get(8)?,
+                is_builtin: row.get::<_, i64>(9)? != 0,
+                is_archived: row.get::<_, i64>(10)? != 0,
+                execution_mode: row.get(11)?,
+                collaboration_config: deserialize_collaboration_config(row.get(12)?),
+                heartbeat_config: deserialize_heartbeat_config(row.get(13)?),
+                accent_color: row.get(14)?,
+                scenario_llm_config: deserialize_scenario_llm_config(row.get(15)?),
                 bot_configs: HashMap::new(),
-                created_at: row.get(14)?,
-                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
+                updated_at: row.get(17)?,
             })
         })
         .optional()
@@ -937,7 +983,10 @@ fn create_agent_with_connection(
 ) -> Result<AgentRecord, String> {
     ensure_agents_ready(connection)?;
     let normalized = normalize_agent_input(payload)?;
-    let agent_id = format!("agent_{}", Uuid::new_v4().simple());
+    let agent_id = normalized
+        .id
+        .clone()
+        .unwrap_or_else(|| format!("agent_{}", Uuid::new_v4().simple()));
     let workspace_seed = AgentWorkspaceSeed {
         id: agent_id.as_str(),
         name: normalized.name.as_str(),
@@ -960,15 +1009,17 @@ fn create_agent_with_connection(
     transaction
         .execute(
             "INSERT INTO agents (
-                id, name, summary, description, system_prompt, default_provider_id,
+                id, name, summary, description, trigger_condition, manual_trigger_only, system_prompt, default_provider_id,
                 default_model, is_builtin, is_archived, execution_mode,
                 collaboration_config_json, heartbeat_config_json, capability_policy_json, accent_color, scenario_llm_config_json, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
             params![
                 agent_id.as_str(),
                 normalized.name.as_str(),
                 normalized.summary.as_str(),
                 normalized.description.as_str(),
+                normalized.trigger_condition.as_str(),
+                if normalized.manual_trigger_only { 1_i64 } else { 0_i64 },
                 normalized.system_prompt.as_str(),
                 normalized.default_provider_id.as_str(),
                 normalized.default_model.as_str(),
@@ -1011,6 +1062,23 @@ fn update_agent_with_connection(
         .ok_or_else(|| "要更新的智能体不存在".to_string())?;
 
     let normalized = normalize_agent_input(payload)?;
+    let next_agent_id = normalized
+        .id
+        .clone()
+        .unwrap_or_else(|| agent_id.to_string());
+    if next_agent_id.as_str() != agent_id {
+        let conflict = connection
+            .query_row(
+                "SELECT 1 FROM agents WHERE id = ?1",
+                params![next_agent_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("检查 Agent_ID 是否可用失败: {error}"))?;
+        if conflict.is_some() {
+            return Err("Agent_ID 已存在，请换一个。".to_string());
+        }
+    }
     let now = crate::chrono_like_timestamp();
     let collaboration_json =
         serialize_collaboration_config(normalized.collaboration_config.as_ref())?;
@@ -1021,30 +1089,41 @@ fn update_agent_with_connection(
     let transaction = connection
         .transaction()
         .map_err(|error| format!("更新智能体事务失败: {error}"))?;
+    if next_agent_id.as_str() != agent_id {
+        transaction
+            .execute_batch("PRAGMA defer_foreign_keys = ON;")
+            .map_err(|error| format!("启用 Agent_ID 更新事务约束延迟失败: {error}"))?;
+    }
 
     transaction
         .execute(
             "UPDATE agents
             SET
-                name = ?2,
-                summary = ?3,
-                description = ?4,
-                system_prompt = ?5,
-                default_provider_id = ?6,
-                default_model = ?7,
-                execution_mode = ?8,
-                collaboration_config_json = ?9,
-                heartbeat_config_json = ?10,
-                capability_policy_json = ?11,
-                accent_color = ?12,
-                scenario_llm_config_json = ?13,
-                updated_at = ?14
+                id = ?2,
+                name = ?3,
+                summary = ?4,
+                description = ?5,
+                trigger_condition = ?6,
+                manual_trigger_only = ?7,
+                system_prompt = ?8,
+                default_provider_id = ?9,
+                default_model = ?10,
+                execution_mode = ?11,
+                collaboration_config_json = ?12,
+                heartbeat_config_json = ?13,
+                capability_policy_json = ?14,
+                accent_color = ?15,
+                scenario_llm_config_json = ?16,
+                updated_at = ?17
             WHERE id = ?1 AND is_archived = 0",
             params![
                 agent_id,
+                next_agent_id.as_str(),
                 normalized.name,
                 normalized.summary,
                 normalized.description,
+                normalized.trigger_condition,
+                if normalized.manual_trigger_only { 1_i64 } else { 0_i64 },
                 normalized.system_prompt,
                 normalized.default_provider_id,
                 normalized.default_model,
@@ -1059,15 +1138,18 @@ fn update_agent_with_connection(
         )
         .map_err(|error| format!("更新智能体失败: {error}"))?;
 
-    replace_agent_skills(&transaction, agent_id, &normalized.skill_ids, now)?;
+    if next_agent_id.as_str() != agent_id {
+        rename_agent_references(&transaction, agent_id, &next_agent_id)?;
+    }
+    replace_agent_skills(&transaction, &next_agent_id, &normalized.skill_ids, now)?;
     let mut bot_configs = normalized.bot_configs;
     apply_peer_inbound_defaults(&mut bot_configs, existing.bot_configs.get("peer"));
-    replace_agent_bot_bindings(&transaction, agent_id, &bot_configs, now)?;
+    replace_agent_bot_bindings(&transaction, &next_agent_id, &bot_configs, now)?;
     transaction
         .commit()
         .map_err(|error| format!("提交智能体更新失败: {error}"))?;
 
-    let record = get_active_agent_by_id(connection, agent_id)?
+    let record = get_active_agent_by_id(connection, &next_agent_id)?
         .ok_or_else(|| "更新智能体后读取结果失败".to_string())?;
     try_ensure_workspace_for_record(&record, false, "更新智能体工作区");
     try_sync_active_agent_workspaces(connection, "更新后同步智能体工作区");
@@ -1204,6 +1286,85 @@ fn persist_default_agent_id(connection: &Connection, agent_id: &str) -> Result<(
         .map_err(|error| format!("保存默认智能体失败: {error}"))?;
 
     Ok(())
+}
+
+fn rename_agent_references(
+    connection: &Connection,
+    old_agent_id: &str,
+    new_agent_id: &str,
+) -> Result<(), String> {
+    let now = crate::chrono_like_timestamp();
+    for (table, statement, uses_now) in [
+        (
+            "agent_skills",
+            "UPDATE agent_skills SET agent_id = ?2 WHERE agent_id = ?1",
+            false,
+        ),
+        (
+            "agent_bot_bindings",
+            "UPDATE agent_bot_bindings SET agent_id = ?2, updated_at = ?3 WHERE agent_id = ?1",
+            true,
+        ),
+        (
+            "chat_sessions",
+            "UPDATE chat_sessions SET agent_id = ?2 WHERE agent_id = ?1",
+            false,
+        ),
+        (
+            "workspace_members",
+            "UPDATE workspace_members SET agent_id = ?2 WHERE agent_id = ?1",
+            false,
+        ),
+        (
+            "workspaces",
+            "UPDATE workspaces SET supervisor_agent_id = ?2, updated_at = ?3 WHERE supervisor_agent_id = ?1",
+            true,
+        ),
+        (
+            "workspace_resources",
+            "UPDATE workspace_resources SET uploader_agent_id = ?2 WHERE uploader_agent_id = ?1",
+            false,
+        ),
+        (
+            "workspace_memories",
+            "UPDATE workspace_memories SET author_agent_id = ?2, updated_at = ?3 WHERE author_agent_id = ?1",
+            true,
+        ),
+    ] {
+        if !table_exists(connection, table)? {
+            continue;
+        }
+        if uses_now {
+            connection
+                .execute(statement, params![old_agent_id, new_agent_id, now])
+                .map_err(|error| format!("更新 Agent_ID 引用失败: {error}"))?;
+        } else {
+            connection
+                .execute(statement, params![old_agent_id, new_agent_id])
+                .map_err(|error| format!("更新 Agent_ID 引用失败: {error}"))?;
+        }
+    }
+
+    connection
+        .execute(
+            "UPDATE app_state SET value = ?2, updated_at = ?3 WHERE key = ?4 AND value = ?1",
+            params![old_agent_id, new_agent_id, now, DEFAULT_AGENT_STATE_KEY],
+        )
+        .map_err(|error| format!("更新默认智能体引用失败: {error}"))?;
+
+    Ok(())
+}
+
+fn table_exists(connection: &Connection, table_name: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table_name],
+            |_| Ok(true),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .map_err(|error| format!("检查数据表是否存在失败: {error}"))
 }
 
 fn replace_agent_skills(
@@ -1395,6 +1556,7 @@ fn replace_agent_bot_bindings(
 }
 
 fn normalize_agent_input(payload: AgentInput) -> Result<NormalizedAgentInput, String> {
+    let id = normalize_agent_id(payload.id)?;
     let name = trim_required(payload.name, "智能体名称")?;
     let explicit_summary = payload.summary.trim().to_string();
     let explicit_description = payload.description.trim().to_string();
@@ -1414,9 +1576,12 @@ fn normalize_agent_input(payload: AgentInput) -> Result<NormalizedAgentInput, St
     let default_model = trim_required(payload.default_model, "默认模型")?;
 
     Ok(NormalizedAgentInput {
+        id,
         name,
         summary,
         description,
+        trigger_condition: payload.trigger_condition.trim().to_string(),
+        manual_trigger_only: payload.manual_trigger_only,
         system_prompt: payload.system_prompt.trim().to_string(),
         capability_policy: normalize_capability_policy(
             payload.capability_policy,
@@ -1445,6 +1610,23 @@ fn trim_required(value: String, field_name: &str) -> Result<String, String> {
         return Err(format!("{field_name}不能为空"));
     }
     Ok(trimmed)
+}
+
+fn normalize_agent_id(value: Option<String>) -> Result<Option<String>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err("Agent_ID 只能包含英文字母、数字、下划线和连字符".to_string());
+    }
+    Ok(Some(trimmed))
 }
 
 fn normalize_inline_text(value: &str) -> String {
@@ -1928,9 +2110,12 @@ fn deserialize_bot_config(raw: &str) -> Result<AgentBotConfig, String> {
 }
 
 struct NormalizedAgentInput {
+    id: Option<String>,
     name: String,
     summary: String,
     description: String,
+    trigger_condition: String,
+    manual_trigger_only: bool,
     system_prompt: String,
     capability_policy: AgentCapabilityPolicy,
     skill_ids: Vec<String>,
@@ -2016,6 +2201,8 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
                 name,
                 summary,
                 description,
+                trigger_condition,
+                manual_trigger_only,
                 system_prompt,
                 default_provider_id,
                 default_model,
@@ -2041,21 +2228,23 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
                 name: row.get(1)?,
                 summary: row.get(2)?,
                 description: row.get(3)?,
-                system_prompt: row.get(4)?,
+                trigger_condition: row.get(4)?,
+                manual_trigger_only: row.get::<_, i64>(5)? != 0,
+                system_prompt: row.get(6)?,
                 capability_policy: static_capability_policy(),
                 skill_ids: Vec::new(),
-                default_provider_id: row.get(5)?,
-                default_model: row.get(6)?,
-                is_builtin: row.get::<_, i64>(7)? != 0,
-                is_archived: row.get::<_, i64>(8)? != 0,
-                execution_mode: row.get(9)?,
-                collaboration_config: deserialize_collaboration_config(row.get(10)?),
-                heartbeat_config: deserialize_heartbeat_config(row.get(11)?),
-                accent_color: row.get(12)?,
-                scenario_llm_config: deserialize_scenario_llm_config(row.get(13)?),
+                default_provider_id: row.get(7)?,
+                default_model: row.get(8)?,
+                is_builtin: row.get::<_, i64>(9)? != 0,
+                is_archived: row.get::<_, i64>(10)? != 0,
+                execution_mode: row.get(11)?,
+                collaboration_config: deserialize_collaboration_config(row.get(12)?),
+                heartbeat_config: deserialize_heartbeat_config(row.get(13)?),
+                accent_color: row.get(14)?,
+                scenario_llm_config: deserialize_scenario_llm_config(row.get(15)?),
                 bot_configs: HashMap::new(),
-                created_at: row.get(14)?,
-                updated_at: row.get(15)?,
+                created_at: row.get(16)?,
+                updated_at: row.get(17)?,
             })
         })
         .map_err(|error| format!("读取同步用 agent 数据失败: {error}"))?;
@@ -2102,9 +2291,12 @@ mod tests {
         let created = create_agent_with_connection(
             &mut connection,
             AgentInput {
+                id: None,
                 name: "自定义助理".to_string(),
                 summary: "负责综合处理".to_string(),
                 description: "更完整的说明".to_string(),
+                trigger_condition: String::new(),
+                manual_trigger_only: false,
                 system_prompt: "先确认，再执行".to_string(),
                 capability_policy: None,
                 skill_ids: vec!["alpha".to_string(), "alpha".to_string(), "beta".to_string()],
@@ -2131,9 +2323,12 @@ mod tests {
             &mut connection,
             &created.id,
             AgentInput {
+                id: None,
                 name: "自定义助理 v2".to_string(),
                 summary: "负责复杂处理".to_string(),
                 description: "更新后的说明".to_string(),
+                trigger_condition: String::new(),
+                manual_trigger_only: false,
                 system_prompt: "".to_string(),
                 capability_policy: Some(AgentCapabilityPolicy {
                     strategy: "dynamic".to_string(),
@@ -2182,9 +2377,12 @@ mod tests {
         let created = create_agent_with_connection(
             &mut connection,
             AgentInput {
+                id: None,
                 name: "默认技能测试".to_string(),
                 summary: "负责综合处理".to_string(),
                 description: "更完整的说明".to_string(),
+                trigger_condition: String::new(),
+                manual_trigger_only: false,
                 system_prompt: "".to_string(),
                 capability_policy: Some(new_agent_default_capability_policy()),
                 skill_ids: vec![],
@@ -2211,9 +2409,12 @@ mod tests {
         let created = create_agent_with_connection(
             &mut connection,
             AgentInput {
+                id: None,
                 name: "项目推进助理".to_string(),
                 summary: "".to_string(),
                 description: "负责把复杂需求拆解成可执行步骤，并持续推进收尾。".to_string(),
+                trigger_condition: String::new(),
+                manual_trigger_only: false,
                 system_prompt: "".to_string(),
                 capability_policy: None,
                 skill_ids: vec![],
@@ -2240,6 +2441,71 @@ mod tests {
     }
 
     #[test]
+    fn create_and_update_agent_supports_editable_agent_id_and_trigger_fields() {
+        let mut connection = connection();
+
+        let created = create_agent_with_connection(
+            &mut connection,
+            AgentInput {
+                id: Some("review_agent".to_string()),
+                name: "审查智能体".to_string(),
+                summary: "".to_string(),
+                description: "负责审查用户提交的内容".to_string(),
+                trigger_condition: "用户请求审查时".to_string(),
+                manual_trigger_only: true,
+                system_prompt: "围绕 ${ARG} 审查".to_string(),
+                capability_policy: None,
+                skill_ids: vec![],
+                default_provider_id: "openai".to_string(),
+                default_model: "gpt-4.1".to_string(),
+                execution_mode: Some("single".to_string()),
+                collaboration_config: None,
+                accent_color: None,
+                bot_configs: HashMap::new(),
+                heartbeat_config: AgentHeartbeatConfig::default(),
+                scenario_llm_config: None,
+            },
+        )
+        .expect("create agent");
+
+        assert_eq!(created.id, "review_agent");
+        assert_eq!(created.trigger_condition, "用户请求审查时");
+        assert!(created.manual_trigger_only);
+
+        let updated = update_agent_with_connection(
+            &mut connection,
+            &created.id,
+            AgentInput {
+                id: Some("review_agent_v2".to_string()),
+                name: "审查智能体".to_string(),
+                summary: "".to_string(),
+                description: "负责审查用户提交的内容".to_string(),
+                trigger_condition: "用户请求复核时".to_string(),
+                manual_trigger_only: false,
+                system_prompt: "围绕 ${ARG} 复核".to_string(),
+                capability_policy: None,
+                skill_ids: vec!["pdf".to_string()],
+                default_provider_id: "openai".to_string(),
+                default_model: "gpt-4.1".to_string(),
+                execution_mode: Some("single".to_string()),
+                collaboration_config: None,
+                accent_color: None,
+                bot_configs: HashMap::new(),
+                heartbeat_config: AgentHeartbeatConfig::default(),
+                scenario_llm_config: None,
+            },
+        )
+        .expect("update id");
+
+        assert_eq!(updated.id, "review_agent_v2");
+        assert_eq!(updated.trigger_condition, "用户请求复核时");
+        assert!(!updated.manual_trigger_only);
+        assert!(get_active_agent_by_id(&connection, "review_agent")
+            .expect("old id lookup")
+            .is_none());
+    }
+
+    #[test]
     fn default_agent_falls_back_and_reassigns_after_archive() {
         let mut connection = connection();
 
@@ -2253,9 +2519,12 @@ mod tests {
         let custom = create_agent_with_connection(
             &mut connection,
             AgentInput {
+                id: None,
                 name: "项目助理".to_string(),
                 summary: "项目推进".to_string(),
                 description: "负责项目推进".to_string(),
+                trigger_condition: String::new(),
+                manual_trigger_only: false,
                 system_prompt: "".to_string(),
                 capability_policy: None,
                 skill_ids: vec![],
@@ -2297,6 +2566,8 @@ mod tests {
             name: "项目助理".to_string(),
             summary: "负责项目推进".to_string(),
             description: "擅长拆解任务和协调执行".to_string(),
+            trigger_condition: String::new(),
+            manual_trigger_only: false,
             system_prompt: "避免省略关键确认步骤".to_string(),
             capability_policy: AgentCapabilityPolicy {
                 strategy: "hybrid".to_string(),
@@ -2317,8 +2588,39 @@ mod tests {
         assert!(prompt.contains("项目助理"));
         assert!(prompt.contains("负责项目推进"));
         assert!(prompt.contains("能力策略"));
+        assert!(prompt.contains("必须使用 web_fetch 工具"));
         assert!(prompt.contains("偏好技能"));
         assert!(prompt.contains("避免省略关键确认步骤"));
+    }
+
+    #[test]
+    fn build_agent_system_prompt_expands_arg_placeholder() {
+        let prompt = build_agent_system_prompt_for_prompt(
+            &ConversationAgentConfig {
+                id: "agent".to_string(),
+                name: "审查智能体".to_string(),
+                summary: "".to_string(),
+                description: "负责审查".to_string(),
+                trigger_condition: "用户要求审查时".to_string(),
+                manual_trigger_only: true,
+                system_prompt: "请审查：${ARG}".to_string(),
+                capability_policy: AgentCapabilityPolicy::default(),
+                skill_ids: vec![],
+                default_provider_id: "openai".to_string(),
+                default_model: "gpt-4.1".to_string(),
+                execution_mode: "single".to_string(),
+                collaboration_config: None,
+                accent_color: None,
+                scenario_llm_config: None,
+            },
+            Some("合同条款"),
+        )
+        .expect("prompt");
+
+        assert!(prompt.contains("触发条件：用户要求审查时"));
+        assert!(prompt.contains("禁止模型自动调用"));
+        assert!(prompt.contains("请审查：合同条款"));
+        assert!(!prompt.contains("${ARG}"));
     }
 
     #[test]
@@ -2328,9 +2630,12 @@ mod tests {
         let created = create_agent_with_connection(
             &mut connection,
             AgentInput {
+                id: None,
                 name: "提醒助理".to_string(),
                 summary: "会定时提醒".to_string(),
                 description: "负责晨会提醒和日报抓取".to_string(),
+                trigger_condition: String::new(),
+                manual_trigger_only: false,
                 system_prompt: "".to_string(),
                 capability_policy: None,
                 skill_ids: vec![],

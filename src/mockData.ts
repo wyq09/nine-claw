@@ -7,6 +7,11 @@ import type {
   ProviderDefinition,
   ResourceItem,
 } from './types'
+import type {
+  ImageGenerationSystemConfig,
+  ImageProviderConfig,
+  ImageProviderDefinition,
+} from './types/imageGeneration'
 
 export const resourceSeed: ResourceItem[] = [
   {
@@ -139,6 +144,49 @@ export const providerDefinitions: ProviderDefinition[] = [
   },
 ]
 
+export const imageProviderDefinitions: ImageProviderDefinition[] = [
+  {
+    id: 'apimart_gpt_image_2',
+    name: 'APIMart GPT-Image-2',
+    defaultBaseUrl: 'https://api.apimart.ai/v1',
+    suggestedModel: 'gpt-image-2-official',
+    description: 'APIMart 官方 GPT-Image-2 异步生图通道，提交任务后通过 task_id 轮询结果。',
+    adapterType: 'apimart_gpt_image_2',
+  },
+  {
+    id: 'openai_image',
+    name: 'OpenAI Images',
+    defaultBaseUrl: 'https://api.openai.com/v1',
+    suggestedModel: 'gpt-image-1',
+    description: 'OpenAI 原生图片生成接口，优先用于直接接 OpenAI 的场景。',
+    adapterType: 'openai_images',
+  },
+  {
+    id: 'siliconflow_image',
+    name: 'SiliconFlow Images',
+    defaultBaseUrl: 'https://api.siliconflow.cn/v1',
+    suggestedModel: 'black-forest-labs/FLUX.1-schnell',
+    description: '适合挂 SiliconFlow 这类 OpenAI 兼容图片网关。',
+    adapterType: 'openai_compatible',
+  },
+  {
+    id: 'doubao_image',
+    name: 'Doubao Images',
+    defaultBaseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+    suggestedModel: 'doubao-seedream-3-0-t2i-250415',
+    description: '预留给火山 / 豆包图片模型接入，当前走兼容适配层。',
+    adapterType: 'openai_compatible',
+  },
+  {
+    id: 'custom_image',
+    name: 'Custom Image Gateway',
+    defaultBaseUrl: 'https://api.example.com/v1',
+    suggestedModel: 'your-image-model',
+    description: '自定义 OpenAI 兼容图片网关入口，后续新增供应商时优先落这里。',
+    adapterType: 'openai_compatible',
+  },
+]
+
 export function createInitialBotConfigs(): Record<string, BotConfig> {
   return {
     dingtalk: { enabled: true, imChannelPaused: false, clientId: '', clientSecret: '', status: '未连接' },
@@ -234,6 +282,43 @@ export function createInitialProviderConfigs(): Record<string, ProviderConfig> {
       status: '未配置',
     },
   }
+}
+
+export function emptyImageProviderConfig(adapterType: ImageProviderDefinition['adapterType']): ImageProviderConfig {
+  return {
+    adapterType,
+    baseUrl: '',
+    apiKey: '',
+    model: '',
+    note: '',
+    displayName: '',
+    status: '未配置',
+  }
+}
+
+export function createInitialImageProviderConfigs(): Record<string, ImageProviderConfig> {
+  return imageProviderDefinitions.reduce<Record<string, ImageProviderConfig>>((accumulator, definition) => {
+    accumulator[definition.id] = {
+      adapterType: definition.adapterType,
+      baseUrl: definition.defaultBaseUrl,
+      apiKey: '',
+      model: definition.suggestedModel,
+      note: '',
+      displayName: '',
+      status: '未配置',
+    }
+    return accumulator
+  }, {})
+}
+
+export const defaultImageGenerationSystemConfig: ImageGenerationSystemConfig = {
+  defaultProviderId: 'openai_image',
+  size: '1024x1024',
+  resolution: '1k',
+  background: 'auto',
+  outputFormat: 'png',
+  quality: 'auto',
+  count: 1,
 }
 
 export const defaultGeneralSettings: GeneralSettings = {

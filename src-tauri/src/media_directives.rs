@@ -188,11 +188,12 @@ pub(crate) fn parse_plain_media_path_reference(line: &str) -> Option<PlainMediaP
         .and_then(|value| value.to_str())
         .map(|extension| !extension.is_empty() && extension.len() <= 10)
         .unwrap_or(false);
-    let looks_absolute = path.starts_with('/')
-        || (path.len() >= 3
-            && path.as_bytes()[1] == b':'
-            && matches!(path.as_bytes()[2], b'/' | b'\\')
-            && path.as_bytes()[0].is_ascii_alphabetic());
+    let looks_absolute = has_reasonable_extension
+        && (path.starts_with('/')
+            || (path.len() >= 3
+                && path.as_bytes()[1] == b':'
+                && matches!(path.as_bytes()[2], b'/' | b'\\')
+                && path.as_bytes()[0].is_ascii_alphabetic()));
     let looks_relative_path = has_reasonable_extension
         && (path.starts_with("./")
             || path.starts_with("../")
@@ -300,5 +301,11 @@ mod tests {
     #[test]
     fn does_not_parse_plain_instruction_text_with_slash_as_path() {
         assert!(parse_plain_media_path_reference("压缩/裁剪这张").is_none());
+    }
+
+    #[test]
+    fn does_not_parse_slash_command_help_as_plain_media_path() {
+        assert!(parse_plain_media_path_reference("/new - 开启一个新的会话").is_none());
+        assert!(parse_plain_media_path_reference("/help - 显示可用指令").is_none());
     }
 }

@@ -1,7 +1,14 @@
 import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { llmLogExportGet, llmLogExportSet } from '../../lib/llmLogExportClient'
 import type { MouseEvent } from 'react'
-import { botDefinitions, createInitialBotConfigs, emptyProviderConfig, providerDefinitions, resourceSeed } from '../../mockData'
+import {
+  botDefinitions,
+  createInitialBotConfigs,
+  emptyProviderConfig,
+  imageProviderDefinitions,
+  providerDefinitions,
+  resourceSeed,
+} from '../../mockData'
 import { useComposerAttachments } from '../../hooks/useComposerAttachments'
 import { usePiAgent } from '../../hooks/usePiAgent'
 import { useToast } from '../../hooks/useToast'
@@ -28,6 +35,14 @@ import type {
   SystemSkillCatalog,
   ViewKey,
 } from '../../types'
+import type {
+  ImageGenerationSystemConfig,
+  ImageProviderConfig,
+} from '../../types/imageGeneration'
+import {
+  loadImageGenerationPreferences,
+  saveImageGenerationPreferences,
+} from '../../lib/imageGenerationClient'
 import {
   deleteAgent,
   botSendMedia,
@@ -64,9 +79,13 @@ import {
   APPEARANCE_SETTINGS_STORAGE_KEY,
   CUSTOM_PROVIDERS_META_KEY,
   GENERAL_SETTINGS_STORAGE_KEY,
+  IMAGE_GENERATION_SYSTEM_STORAGE_KEY,
+  IMAGE_PROVIDER_CONFIGS_STORAGE_KEY,
   LEGACY_APPEARANCE_SETTINGS_STORAGE_KEYS,
   LEGACY_CUSTOM_PROVIDERS_META_KEYS,
   LEGACY_GENERAL_SETTINGS_STORAGE_KEYS,
+  LEGACY_IMAGE_GENERATION_SYSTEM_STORAGE_KEYS,
+  LEGACY_IMAGE_PROVIDER_CONFIGS_STORAGE_KEYS,
   LEGACY_PROVIDER_CONFIGS_STORAGE_KEYS,
   PROVIDER_CONFIGS_STORAGE_KEY,
   buildBotConfigStatusPatch,
@@ -81,6 +100,8 @@ import {
   createEmptySystemSkillCatalog,
   createInitialAppearanceState,
   createInitialGeneralSettings,
+  createInitialImageGenerationSystemState,
+  createInitialImageProviderState,
   createInitialProviderState,
   getBotChannelRuntimeId,
   getProviderStatus,
@@ -92,6 +113,8 @@ import {
   normalizeAgentDraft,
   normalizeHeartbeatConfig,
   parseStoredCustomProviderMeta,
+  parseStoredImageGenerationSystemConfig,
+  parseStoredImageProviderConfigs,
   parseStoredProviderConfigs,
   persistStoredStorageValue,
   pickDefaultWorkspaceFileKey,
@@ -108,6 +131,8 @@ import {
   sanitizeAgentInputModelReference,
   sessionLlmDecode,
   sessionLlmEncode,
+  buildSlashCommandHelp,
+  parseSlashCommand,
   toBotSendMediaType,
   validateAgentDraft,
   validateSkillInstallLink,
@@ -208,6 +233,12 @@ export function NineClawApp() {
   const [selectedProviderId, setSelectedProviderId] = useState<ProviderId>('openai')
   const [selectedBotId, setSelectedBotId] = useState<BotChannelId>('dingtalk')
   const [providerConfigs, setProviderConfigs] = useState<Record<string, ProviderConfig>>(createInitialProviderState)
+  const [imageProviderConfigs, setImageProviderConfigs] = useState<Record<string, ImageProviderConfig>>(
+    createInitialImageProviderState,
+  )
+  const [imageGenerationSystem, setImageGenerationSystem] = useState<ImageGenerationSystemConfig>(
+    createInitialImageGenerationSystemState,
+  )
   const [customProviderMeta, setCustomProviderMeta] = useState<CustomProviderMeta[]>(() => loadCustomProviderMeta())
   const [qrDialogOpen, setQrDialogOpen] = useState(false)
   const [qrCodeUrl, setQrCodeUrl] = useState<string>('')
@@ -220,6 +251,11 @@ export function NineClawApp() {
   const [chatGateError, setChatGateError] = useState('')
   const providerCleanupInFlightRef = useRef<Set<string>>(new Set())
   const providerPreferencesHydratedRef = useRef(false)
+  const imageGenerationPreferencesHydratedRef = useRef(false)
+  const providerConfigsRef = useRef(providerConfigs)
+  const customProviderMetaRef = useRef(customProviderMeta)
+  const imageProviderConfigsRef = useRef(imageProviderConfigs)
+  const imageGenerationSystemRef = useRef(imageGenerationSystem)
 
   const deferredSkillSearch = useDeferredValue(skillSearch.trim().toLowerCase())
   const deferredResourceSearch = useDeferredValue(resourceSearch.trim().toLowerCase())
@@ -776,8 +812,8 @@ export function NineClawApp() {
 
         if (!hasBackendState) {
           void saveProviderPreferences({
-            providerConfigsPayload: JSON.stringify(providerConfigs),
-            customProviderMetaPayload: JSON.stringify(customProviderMeta),
+            providerConfigsPayload: JSON.stringify(providerConfigsRef.current),
+            customProviderMetaPayload: JSON.stringify(customProviderMetaRef.current),
           }).catch((error) => {
             console.warn('NineClaw: migrate provider preferences failed', error)
           })
@@ -817,6 +853,63 @@ export function NineClawApp() {
       LEGACY_CUSTOM_PROVIDERS_META_KEYS,
     )
   }, [customProviderMeta])
+
+  useEffect(() => {
+    providerConfigsRef.current = providerConfigs
+  }, [providerConfigs])
+
+  useEffect(() => {
+    customProviderMetaRef.current = customProviderMeta
+  }, [customProviderMeta])
+
+  useEffect(() => {
+    let cancelled = false
+
+    void loadImageGenerationPreferences()
+      .then((payload) => {
+        if (cancelled) {
+          return
+        }
+
+        const backendImageProviderConfigs = parseStoredImageProviderConfigs(payload.imageProviderConfigs)
+        const backendImageSystem = parseStoredImageGenerationSystemConfig(payload.imageGenerationSystem)
+
+        if (backendImageProviderConfigs) {
+          setImageProviderConfigs(backendImageProviderConfigs)
+        }
+        if (backendImageSystem) {
+          setImageGenerationSystem(backendImageSystem)
+        }
+
+        const hasBackendState = Boolean(payload.imageProviderConfigs || payload.imageGenerationSystem)
+        imageGenerationPreferencesHydratedRef.current = true
+
+        if (!hasBackendState) {
+          void saveImageGenerationPreferences({
+            imageProviderConfigsPayload: JSON.stringify(imageProviderConfigsRef.current),
+            imageGenerationSystemPayload: JSON.stringify(imageGenerationSystemRef.current),
+          }).catch((error) => {
+            console.warn('NineClaw: migrate image generation preferences failed', error)
+          })
+        }
+      })
+      .catch((error) => {
+        imageGenerationPreferencesHydratedRef.current = true
+        console.warn('NineClaw: load image generation preferences failed', error)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    imageProviderConfigsRef.current = imageProviderConfigs
+  }, [imageProviderConfigs])
+
+  useEffect(() => {
+    imageGenerationSystemRef.current = imageGenerationSystem
+  }, [imageGenerationSystem])
 
   // ── Bot status log (diagnostics) ──
   useEffect(() => {
@@ -929,7 +1022,6 @@ export function NineClawApp() {
       skillsError,
       skillsLoading,
       systemSkillCatalog,
-      systemSkillCatalog.skills.length,
       systemSkillInstallId,
       skillLibraryTab,
       skillSearch,
@@ -1006,9 +1098,12 @@ export function NineClawApp() {
     const omittedSkillIds = draft.skillIds.filter((skillId) => !availableSkillIds.has(skillId))
 
     const payload: AgentInput = normalizeAgentDraft({
+      id: draft.id,
       name: draft.name,
       summary: draft.summary,
       description: draft.description,
+      triggerCondition: draft.triggerCondition ?? '',
+      manualTriggerOnly: draft.manualTriggerOnly === true,
       systemPrompt: draft.systemPrompt,
       skillIds: normalizedSkillIds,
       defaultProviderId: fallbackProviderId,
@@ -1189,10 +1284,45 @@ export function NineClawApp() {
     handleSessionLlmChange(parsed.providerId, parsed.model)
   }
 
+  const executeSlashCommand = (composerText: string): boolean => {
+    const parsed = parseSlashCommand(composerText)
+    if (parsed.kind === 'none') {
+      return false
+    }
+
+    composerClearRef.current?.()
+    if (chatGateError) {
+      setChatGateError('')
+    }
+
+    if (parsed.kind === 'unknown') {
+      const knownCommands = buildSlashCommandHelp()
+      const message = `未知指令 /${parsed.name}。\n${knownCommands}`
+      setChatGateError(message)
+      toast.error(message, 9000)
+      return true
+    }
+
+    if (parsed.command.id === 'new') {
+      clearComposerAttachments()
+      resetSessionDraft()
+      handleViewChange('chat')
+      toast.success('已开启一个新的会话。')
+      return true
+    }
+
+    toast.success(buildSlashCommandHelp(), 12000)
+    return true
+  }
+
   const handleSubmit = async (
     composerText: string,
     extras?: { overrideAgentId?: string | null },
   ) => {
+    if (executeSlashCommand(composerText)) {
+      return
+    }
+
     if (composerAttachmentUploading) {
       setChatGateError('附件仍在导入中，请稍等片刻再发送。')
       return
@@ -1880,6 +2010,31 @@ export function NineClawApp() {
     })
   }
 
+  const saveImageGenerationSettings = useCallback(
+    async (
+      nextImageProviderConfigs: Record<string, ImageProviderConfig>,
+      nextImageGenerationSystem: ImageGenerationSystemConfig,
+    ) => {
+      setImageProviderConfigs(nextImageProviderConfigs)
+      setImageGenerationSystem(nextImageGenerationSystem)
+      persistStoredStorageValue(
+        IMAGE_PROVIDER_CONFIGS_STORAGE_KEY,
+        JSON.stringify(nextImageProviderConfigs),
+        LEGACY_IMAGE_PROVIDER_CONFIGS_STORAGE_KEYS,
+      )
+      persistStoredStorageValue(
+        IMAGE_GENERATION_SYSTEM_STORAGE_KEY,
+        JSON.stringify(nextImageGenerationSystem),
+        LEGACY_IMAGE_GENERATION_SYSTEM_STORAGE_KEYS,
+      )
+      await saveImageGenerationPreferences({
+        imageProviderConfigsPayload: JSON.stringify(nextImageProviderConfigs),
+        imageGenerationSystemPayload: JSON.stringify(nextImageGenerationSystem),
+      })
+    },
+    [],
+  )
+
   const addCustomProvider = (name: string, description: string, apiFormat: ProviderApiFormat) => {
     const id = `custom_${crypto.randomUUID().replace(/-/g, '')}`
     const defaultBaseUrl = apiFormat === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1'
@@ -2365,7 +2520,11 @@ export function NineClawApp() {
       activeProviderBadge={activeProviderBadge}
       mergedProviderDefinitions={mergedProviderDefinitions}
       generalSettings={generalSettings}
+      imageGenerationSystem={imageGenerationSystem}
+      imageProviderConfigs={imageProviderConfigs}
+      imageProviderDefinitions={imageProviderDefinitions}
       onAddCustomProvider={addCustomProvider}
+      onSaveImageGenerationSettings={saveImageGenerationSettings}
       onProviderConfigChange={updateProviderConfig}
       onCloseSettings={() => setSettingsOpen(false)}
       onRemoveCustomProvider={removeCustomProvider}

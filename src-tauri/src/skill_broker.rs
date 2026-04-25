@@ -219,6 +219,8 @@ mod tests {
             name: "Agent".to_string(),
             summary: "summary".to_string(),
             description: "desc".to_string(),
+            trigger_condition: String::new(),
+            manual_trigger_only: false,
             system_prompt: String::new(),
             skill_ids: vec!["pptx".to_string()],
             capability_policy: AgentCapabilityPolicy {

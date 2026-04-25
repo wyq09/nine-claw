@@ -19,9 +19,12 @@ pub(crate) fn build_supervisor_agent_input(
     collab.allowed_delegate_agent_ids = dedupe_string_ids(delegate_ids);
 
     AgentInput {
+        id: Some(record.id.clone()),
         name: record.name.clone(),
         summary: record.summary.clone(),
         description: record.description.clone(),
+        trigger_condition: record.trigger_condition.clone(),
+        manual_trigger_only: record.manual_trigger_only,
         system_prompt: record.system_prompt.clone(),
         capability_policy: Some(ensure_required_capability_skill(
             record.capability_policy.clone(),
@@ -65,6 +68,8 @@ mod tests {
             name: "Main Agent".to_string(),
             summary: "负责团队协调".to_string(),
             description: "负责拆解复杂任务并协调团队成员。".to_string(),
+            trigger_condition: String::new(),
+            manual_trigger_only: false,
             system_prompt: "先拆解再协调".to_string(),
             capability_policy: AgentCapabilityPolicy::default(),
             skill_ids: vec!["nineclaw-task-creator".to_string()],

@@ -311,9 +311,12 @@ fn filter_skills_for_import(skill_ids: Vec<String>) -> (Vec<String>, Vec<String>
 
 fn record_to_agent_input(record: AgentRecord, skill_ids: Vec<String>) -> AgentInput {
     AgentInput {
+        id: Some(record.id),
         name: record.name,
         summary: record.summary,
         description: record.description,
+        trigger_condition: record.trigger_condition,
+        manual_trigger_only: record.manual_trigger_only,
         system_prompt: record.system_prompt,
         capability_policy: Some(record.capability_policy),
         skill_ids,

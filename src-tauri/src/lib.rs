@@ -7,6 +7,7 @@ mod channels;
 mod chat_attachments;
 mod dev_trace;
 mod heartbeat;
+mod image_generation;
 mod llm_log_export;
 mod llm_trace;
 mod managed_runtime;
@@ -44,6 +45,10 @@ pub(crate) use app_constants::*;
 pub(crate) use history_app_state::{
     ensure_app_state_schema, open_history_db, record_token_usage_for_scheduler_pi_completion,
     storage_conn,
+};
+pub(crate) use image_generation::{
+    load_image_generation_preferences, resolve_default_image_generation_runtime,
+    save_image_generation_preferences,
 };
 pub(crate) use pi_usage::{
     accumulate_pi_token_usage, aggregate_usage_from_agent_messages, extract_usage_metadata_payload,
@@ -951,11 +956,14 @@ fn desktop_incomplete_reply_error(
 mod lib_tests {
     use super::{
         aggregate_token_usage_from_history_turns, aggregate_usage_from_agent_messages,
-        build_desktop_outbound_display_text, desktop_incomplete_reply_error,
-        desktop_media_reply_prompt, infer_media_mime_type, parse_context_stats_from_rpc_response,
-        prepend_multimodal_summary_context, record_multimodal_summary,
-        render_multimodal_summary_context, resolve_context_window_from_sources, summary_file_path,
-        usage_row_total_tokens, DesktopParsedMediaItem, ProviderRuntimeConfig,
+        build_desktop_anthropic_compat_extension_source, build_desktop_outbound_display_text,
+        build_provider_models_config_with_input, desktop_incomplete_reply_error,
+        desktop_media_reply_prompt, infer_media_mime_type, is_provider_image_block_rejection_error,
+        is_provider_reasoning_history_rejection_error, parse_context_stats_from_rpc_response,
+        prepend_multimodal_summary_context, quarantine_pi_session_file, record_multimodal_summary,
+        render_multimodal_summary_context, resolve_context_window_from_sources,
+        sanitize_pi_session_replay_state, summary_file_path, usage_row_total_tokens,
+        DesktopParsedMediaItem, ProviderRuntimeConfig,
     };
     use crate::channels::types::MediaType;
     use serde_json::json;
@@ -1076,6 +1084,148 @@ mod lib_tests {
         let reason = desktop_incomplete_reply_error(Some(&provider), true, true, false)
             .expect("missing provider reason");
         assert!(reason.contains("没有关联完整的 Provider 配置"));
+    }
+
+    #[test]
+    fn detects_provider_image_url_text_only_rejection() {
+        let error = "400 Failed to deserialize the JSON body into the target type: messages[39]: unknown variant `image_url`, expected `text` at line 1 column 1325060";
+        assert!(is_provider_image_block_rejection_error(error));
+        assert!(!is_provider_image_block_rejection_error(
+            "429 rate limit exceeded"
+        ));
+    }
+
+    #[test]
+    fn provider_models_config_can_fallback_to_text_only_input() {
+        let provider = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "custom-model".to_string(),
+        };
+
+        let default_config = build_provider_models_config_with_input(&provider, false, false)
+            .expect("default config");
+        let text_only_config = build_provider_models_config_with_input(&provider, true, false)
+            .expect("text-only config");
+
+        let default_input =
+            &default_config["providers"]["nineclaw-runtime-8b9035807842"]["models"][0]["input"];
+        let text_only_input =
+            &text_only_config["providers"]["nineclaw-runtime-8b9035807842"]["models"][0]["input"];
+        assert_eq!(default_input, &json!(["text", "image"]));
+        assert_eq!(text_only_input, &json!(["text"]));
+    }
+
+    #[test]
+    fn provider_models_config_can_disable_reasoning_effort_for_history_fallback() {
+        let provider = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "glm-4.6".to_string(),
+        };
+
+        let default_config = build_provider_models_config_with_input(&provider, false, false)
+            .expect("default config");
+        let fallback_config = build_provider_models_config_with_input(&provider, false, true)
+            .expect("fallback config");
+
+        assert_eq!(
+            default_config["providers"]["nineclaw-runtime-8b9035807842"]["compat"]
+                ["supportsReasoningEffort"],
+            json!(true)
+        );
+        assert_eq!(
+            fallback_config["providers"]["nineclaw-runtime-8b9035807842"]["compat"]
+                ["supportsReasoningEffort"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn detects_provider_reasoning_history_rejection() {
+        assert!(is_provider_reasoning_history_rejection_error(
+            "400 The reasoning_content in the thinking mode must be passed back to the API."
+        ));
+        assert!(!is_provider_reasoning_history_rejection_error(
+            "400 invalid api key"
+        ));
+    }
+
+    #[test]
+    fn sanitize_pi_session_replay_state_strips_reasoning_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "nineclaw-session-sanitize-test-{}.jsonl",
+            Uuid::new_v4()
+        ));
+        fs::write(
+            &path,
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hidden","thinkingSignature":"reasoning_content"},{"type":"text","text":"visible"}],"reasoning_content":"opaque","reasoning_details":[{"x":1}]}}"#,
+        )
+        .expect("write contaminated session");
+
+        let changed = sanitize_pi_session_replay_state(&path).expect("sanitize session");
+        let sanitized = fs::read_to_string(&path).expect("read sanitized");
+        let _ = fs::remove_file(&path);
+
+        assert!(changed);
+        assert!(sanitized.contains("visible"));
+        assert!(!sanitized.contains("reasoning_content"));
+        assert!(!sanitized.contains("thinkingSignature"));
+        assert!(!sanitized.contains(r#""type":"thinking""#));
+    }
+
+    #[test]
+    fn quarantine_pi_session_file_moves_contaminated_session_as_backup() {
+        let path = std::env::temp_dir().join(format!(
+            "nineclaw-session-quarantine-test-{}.jsonl",
+            Uuid::new_v4()
+        ));
+        fs::write(&path, "{}\n").expect("write session");
+
+        let changed = quarantine_pi_session_file(&path, "reasoning-history").expect("quarantine");
+        assert!(changed);
+        assert!(!path.exists());
+
+        let parent = path.parent().expect("temp parent");
+        let file_name = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .expect("file stem");
+        let backup = fs::read_dir(parent)
+            .expect("read temp")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|name| name.starts_with(file_name) && name.contains("quarantine"))
+                    .unwrap_or(false)
+            })
+            .expect("backup exists");
+        let _ = fs::remove_file(backup);
+    }
+
+    #[test]
+    fn anthropic_compat_extension_defends_against_url_only_image_blocks() {
+        let source = build_desktop_anthropic_compat_extension_source(
+            Path::new("/tmp/pi-ai/index.js"),
+            "provider",
+            "API_KEY",
+            "https://example.com",
+            "model",
+            true,
+        )
+        .expect("extension source");
+
+        assert!(source.contains("imageBlockPlaceholder"));
+        assert!(source.contains("image_url"));
+        assert!(source.contains("input: ['text']"));
+        assert!(source.contains("URL-only image block is not replayable"));
     }
 
     #[test]
@@ -1671,6 +1821,142 @@ fn summary_file_path(summary_key: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{PI_SUMMARY_FILE_PREFIX}{summary_key}.json"))
 }
 
+fn strip_provider_replay_state(value: &mut serde_json::Value) -> bool {
+    let mut changed = false;
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in [
+                "reasoning_content",
+                "reasoningContent",
+                "reasoning_details",
+                "reasoningDetails",
+                "reasoning",
+                "thinkingSignature",
+                "thoughtSignature",
+            ] {
+                if map.remove(key).is_some() {
+                    changed = true;
+                }
+            }
+
+            for child in map.values_mut() {
+                if strip_provider_replay_state(child) {
+                    changed = true;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let original_len = items.len();
+            items.retain(|item| {
+                let is_thinking = item
+                    .get("type")
+                    .and_then(|kind| kind.as_str())
+                    .map(|kind| {
+                        matches!(
+                            kind,
+                            "thinking"
+                                | "reasoning"
+                                | "reasoning_content"
+                                | "reasoningContent"
+                                | "redacted_thinking"
+                        )
+                    })
+                    .unwrap_or(false);
+                !is_thinking
+            });
+            if items.len() != original_len {
+                changed = true;
+            }
+            for child in items {
+                if strip_provider_replay_state(child) {
+                    changed = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
+pub(crate) fn sanitize_pi_session_replay_state(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let raw = fs::read_to_string(path)
+        .map_err(|error| format!("读取 pi session 以修复 reasoning 历史失败: {error}"))?;
+    let mut changed = false;
+    let mut sanitized_lines = Vec::new();
+
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(mut value) => {
+                if strip_provider_replay_state(&mut value) {
+                    changed = true;
+                }
+                sanitized_lines.push(
+                    serde_json::to_string(&value)
+                        .map_err(|error| format!("序列化修复后的 pi session 失败: {error}"))?,
+                );
+            }
+            Err(_) => sanitized_lines.push(line.to_string()),
+        }
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+
+    let backup_path = path.with_extension(format!(
+        "jsonl.reasoning-bak-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0)
+    ));
+    fs::write(&backup_path, raw).map_err(|error| {
+        format!(
+            "备份污染的 pi session 失败 {}: {error}",
+            backup_path.display()
+        )
+    })?;
+
+    let mut sanitized = sanitized_lines.join("\n");
+    sanitized.push('\n');
+    fs::write(path, sanitized)
+        .map_err(|error| format!("写回修复后的 pi session 失败 {}: {error}", path.display()))?;
+    Ok(true)
+}
+
+pub(crate) fn quarantine_pi_session_file(path: &Path, reason: &str) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let backup_path = path.with_extension(format!(
+        "jsonl.quarantine-{}-{}",
+        reason
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+            .collect::<String>()
+            .trim_matches('-'),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0)
+    ));
+    fs::rename(path, &backup_path).map_err(|error| {
+        format!(
+            "隔离污染的 pi session 失败 {} -> {}: {error}",
+            path.display(),
+            backup_path.display()
+        )
+    })?;
+    Ok(true)
+}
+
 fn normalize_summary_text(text: &str, max_chars: usize) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = compact.trim();
@@ -1737,6 +2023,15 @@ pub(crate) fn prepend_multimodal_summary_context(
         Ok(summary_context)
     } else {
         Ok(format!("{summary_context}\n\n{trimmed_prompt}"))
+    }
+}
+
+pub(crate) fn clear_multimodal_summary(summary_key: &str) -> Result<(), String> {
+    let path = summary_file_path(summary_key);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("删除多模态摘要失败 {}: {error}", path.display())),
     }
 }
 
@@ -1887,12 +2182,18 @@ fn build_desktop_anthropic_compat_extension_source(
     api_key_env: &str,
     base_url: &str,
     model: &str,
+    text_only_input: bool,
 ) -> Result<String, String> {
     let import_path = js_string_literal(&pi_ai_import_path.to_string_lossy())?;
     let provider_id = js_string_literal(provider_id)?;
     let api_key_env = js_string_literal(api_key_env)?;
     let base_url = js_string_literal(base_url)?;
     let model = js_string_literal(model)?;
+    let model_input = if text_only_input {
+        "['text']"
+    } else {
+        "['text', 'image']"
+    };
 
     Ok(format!(
         r#"import {{ createAssistantMessageEventStream, calculateCost, parseStreamingJson }} from {import_path};
@@ -1911,24 +2212,31 @@ function anthropicMessagesUrl(baseUrl) {{
 }}
 
 function convertContentBlocks(content) {{
-  const hasImages = content.some((block) => block.type === 'image');
+  const items = Array.isArray(content) ? content : [];
+  const hasImages = items.some((block) => block?.type === 'image' && block.data && block.mimeType);
   if (!hasImages) {{
-    return sanitizeSurrogates(content.map((block) => block.text).join('\n'));
+    return sanitizeSurrogates(items.map((block) => block?.text || imageBlockPlaceholder(block)).filter(Boolean).join('\n'));
   }}
 
-  const blocks = content.map((block) => {{
+  const blocks = items.flatMap((block) => {{
     if (block.type === 'text') {{
-      return {{ type: 'text', text: sanitizeSurrogates(block.text) }};
+      const text = sanitizeSurrogates(block.text);
+      return text.trim() ? [{{ type: 'text', text }}] : [];
     }}
 
-    return {{
-      type: 'image',
-      source: {{
-        type: 'base64',
-        media_type: block.mimeType,
-        data: block.data,
-      }},
-    }};
+    if (block.type === 'image' && block.data && block.mimeType) {{
+      return [{{
+        type: 'image',
+        source: {{
+          type: 'base64',
+          media_type: block.mimeType,
+          data: block.data,
+        }},
+      }}];
+    }}
+
+    const placeholder = imageBlockPlaceholder(block);
+    return placeholder ? [{{ type: 'text', text: sanitizeSurrogates(placeholder) }}] : [];
   }});
 
   if (!blocks.some((block) => block.type === 'text')) {{
@@ -1936,6 +2244,14 @@ function convertContentBlocks(content) {{
   }}
 
   return blocks;
+}}
+
+function imageBlockPlaceholder(block) {{
+  if (!block || typeof block !== 'object') return '';
+  if (block.type === 'image_url' || block.image_url) return '[image omitted: URL-only image block is not replayable in this runtime]';
+  if (block.type === 'input_image' || block.image_url) return '[image omitted: URL-only image block is not replayable in this runtime]';
+  if (block.type === 'image') return '[image omitted: image block was missing base64 data or mime type]';
+  return '';
 }}
 
 function convertMessages(messages) {{
@@ -1950,18 +2266,24 @@ function convertMessages(messages) {{
           params.push({{ role: 'user', content: sanitizeSurrogates(message.content) }});
         }}
       }} else {{
-        const blocks = message.content.map((item) =>
-          item.type === 'text'
-            ? {{ type: 'text', text: sanitizeSurrogates(item.text) }}
-            : {{
+        const blocks = (Array.isArray(message.content) ? message.content : []).flatMap((item) => {{
+          if (item.type === 'text') {{
+            const text = sanitizeSurrogates(item.text);
+            return text.trim() ? [{{ type: 'text', text }}] : [];
+          }}
+          if (item.type === 'image' && item.data && item.mimeType) {{
+            return [{{
                 type: 'image',
                 source: {{
                   type: 'base64',
                   media_type: item.mimeType,
                   data: item.data,
                 }},
-              }},
-        );
+              }}];
+          }}
+          const placeholder = imageBlockPlaceholder(item);
+          return placeholder ? [{{ type: 'text', text: sanitizeSurrogates(placeholder) }}] : [];
+        }});
         if (blocks.length > 0) {{
           params.push({{ role: 'user', content: blocks }});
         }}
@@ -2330,7 +2652,7 @@ export default function(pi) {{
       id: {model},
       name: {model},
       reasoning: false,
-      input: ['text', 'image'],
+      input: {model_input},
       cost: {{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }},
       contextWindow: 200000,
       maxTokens: 16384,
@@ -2344,6 +2666,7 @@ export default function(pi) {{
         api_key_env = api_key_env,
         base_url = base_url,
         model = model,
+        model_input = model_input,
     ))
 }
 
@@ -2351,6 +2674,7 @@ fn prepare_desktop_anthropic_compat_extension(
     runtime_dir: &Path,
     pi_executable: &Path,
     provider_config: &ProviderRuntimeConfig,
+    text_only_input: bool,
 ) -> Result<PiAnthropicCompatExtension, String> {
     let pi_ai_import_path = resolve_pi_ai_import_path(pi_executable).ok_or_else(|| {
         format!(
@@ -2371,6 +2695,7 @@ fn prepare_desktop_anthropic_compat_extension(
         &compat_api_key_env,
         &compat_base_url,
         provider_config.model.trim(),
+        text_only_input,
     )?;
     let extension_path = runtime_dir.join(format!("{}.mjs", compat_provider_id));
     fs::write(&extension_path, extension_source)
@@ -2396,6 +2721,8 @@ fn scrub_anthropic_process_env(command: &mut Command) {
 
 fn custom_provider_object(
     provider_config: &ProviderRuntimeConfig,
+    text_only_input: bool,
+    disable_reasoning_effort: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     let base_url = normalized_provider_runtime_base_url(
         &provider_config.base_url,
@@ -2408,6 +2735,11 @@ fn custom_provider_object(
         provider_config.provider_id.trim(),
     );
     let mut provider = serde_json::Map::new();
+    let model_input = if text_only_input {
+        json!(["text"])
+    } else {
+        json!(["text", "image"])
+    };
     provider.insert("baseUrl".to_string(), json!(base_url));
     provider.insert(
         "apiKey".to_string(),
@@ -2429,14 +2761,15 @@ fn custom_provider_object(
                   {
                     "id": model,
                     "api": "anthropic-messages",
-                    "input": ["text", "image"]
+                    "input": model_input
                   }
                 ]),
             );
         }
         _ => {
             provider.insert("api".to_string(), json!("openai-completions"));
-            let reasoning = openai_pi_compat_supports_reasoning_effort(model);
+            let reasoning =
+                !disable_reasoning_effort && openai_pi_compat_supports_reasoning_effort(model);
             provider.insert(
                 "compat".to_string(),
                 json!({
@@ -2450,7 +2783,7 @@ fn custom_provider_object(
                   {
                     "id": model,
                     "api": "openai-completions",
-                    "input": ["text", "image"]
+                    "input": model_input
                   }
                 ]),
             );
@@ -2459,8 +2792,10 @@ fn custom_provider_object(
     provider
 }
 
-fn build_provider_models_config(
+fn build_provider_models_config_with_input(
     provider_config: &ProviderRuntimeConfig,
+    text_only_input: bool,
+    disable_reasoning_effort: bool,
 ) -> Option<serde_json::Value> {
     let provider_id = provider_config.provider_id.trim();
     let base_url = normalized_provider_runtime_base_url(
@@ -2477,7 +2812,8 @@ fn build_provider_models_config(
     // Always materialize the selected provider into `models.json` so runtime
     // behavior matches the user's explicit UI configuration, even for built-in
     // providers on their default base URL.
-    let provider = custom_provider_object(provider_config);
+    let provider =
+        custom_provider_object(provider_config, text_only_input, disable_reasoning_effort);
     let mut providers = serde_json::Map::new();
     providers.insert(
         runtime_provider_id(provider_id),
@@ -2494,7 +2830,9 @@ fn prepare_pi_runtime_dir(provider_config: &ProviderRuntimeConfig) -> Result<Pat
     fs::write(&auth_path, "{}").map_err(|error| format!("写入 pi auth 配置失败: {error}"))?;
 
     let models_path = runtime_dir.join("models.json");
-    if let Some(models_config) = build_provider_models_config(provider_config) {
+    if let Some(models_config) =
+        build_provider_models_config_with_input(provider_config, false, false)
+    {
         let content = serde_json::to_vec_pretty(&models_config)
             .map_err(|error| format!("序列化 provider 配置失败: {error}"))?;
         fs::write(&models_path, content)
@@ -2527,6 +2865,30 @@ fn validate_desktop_provider_config(provider_config: &ProviderRuntimeConfig) -> 
     }
 
     Ok(())
+}
+
+fn is_provider_image_block_rejection_error(error: &str) -> bool {
+    let lower = error.trim().to_ascii_lowercase();
+    (lower.contains("image_url")
+        || lower.contains("input_image")
+        || lower.contains("unknown variant `image")
+        || lower.contains("unknown variant image"))
+        && (lower.contains("expected `text`")
+            || lower.contains("expected text")
+            || lower.contains("messages[")
+            || lower.contains("deserialize"))
+}
+
+fn is_provider_reasoning_history_rejection_error(error: &str) -> bool {
+    let lower = error.trim().to_ascii_lowercase();
+    (lower.contains("reasoning_content")
+        || lower.contains("reasoning content")
+        || lower.contains("thinking mode")
+        || lower.contains("reasoning mode"))
+        && (lower.contains("must be passed back")
+            || lower.contains("pass back")
+            || lower.contains("missing")
+            || lower.contains("required"))
 }
 
 fn emit_stream_event(
@@ -3076,12 +3438,16 @@ async fn stream_pi_prompt(
     );
 
     let mut attempt_prompt = trimmed_prompt.clone();
-    for attempt in 0..=1 {
+    let mut text_only_provider_input_retry = false;
+    let mut disable_reasoning_provider_retry = false;
+    for attempt in 0..=2 {
         let app = app.clone();
         let session_id_for_attempt = normalized_session_id.clone();
         let normalized_session_id = session_id_for_attempt.clone();
         let runtime_session_id = session_id_for_attempt.clone();
         let provider_config = provider_config.clone();
+        let text_only_provider_input = text_only_provider_input_retry;
+        let disable_reasoning_effort = disable_reasoning_provider_retry;
         let agent_config = agent_config.clone();
         let attachments = attachments.clone();
         let workspace_id_for_stream = workspace_id_for_stream.clone();
@@ -3152,6 +3518,7 @@ async fn stream_pi_prompt(
                 .map_err(|error| format!("写入 pi auth 配置失败: {error}"))?;
 
             if let Some(agent_config) = agent_config.as_ref() {
+                let image_runtime_config = resolve_default_image_generation_runtime(&app)?;
                 managed_runtime_prepared = Some(managed_runtime::prepare_managed_runtime(
                     &pi_location.executable,
                     &runtime_dir,
@@ -3159,13 +3526,20 @@ async fn stream_pi_prompt(
                     Some(trimmed_prompt.as_str()),
                     &normalized_session_id,
                     Some(provider_config),
+                    image_runtime_config.as_ref(),
                 )?);
             }
 
             let runtime_provider_config = provider_config.clone();
 
             let models_path = runtime_dir.join("models.json");
-            if let Some(models_config) = build_provider_models_config(&runtime_provider_config) {
+            if let Some(models_config) =
+                build_provider_models_config_with_input(
+                    &runtime_provider_config,
+                    text_only_provider_input,
+                    disable_reasoning_effort,
+                )
+            {
                 let content = serde_json::to_vec_pretty(&models_config)
                     .map_err(|error| format!("序列化 provider 配置失败: {error}"))?;
                 fs::write(&models_path, content)
@@ -3191,6 +3565,7 @@ async fn stream_pi_prompt(
                     &runtime_dir,
                     &pi_location.executable,
                     &runtime_provider_config,
+                    text_only_provider_input,
                 )?)
             } else {
                 None
@@ -4710,6 +5085,85 @@ async fn stream_pi_prompt(
                     error.clone(),
                     Some(serde_json::json!({ "attempt": attempt + 1 })),
                 );
+                if attempt == 0 && is_provider_image_block_rejection_error(&error) {
+                    managed_runtime::append_session_event_quiet(
+                        desktop_agent_home_for_runtime.as_deref(),
+                        &session_id_for_attempt,
+                        managed_runtime::SessionEventKind::RuntimeRetry,
+                        "provider rejected image blocks; retrying once with text-only message history",
+                        Some(serde_json::json!({ "attempt": attempt + 1, "error": error })),
+                    );
+                    text_only_provider_input_retry = true;
+                    continue;
+                }
+                if attempt < 2 && is_provider_reasoning_history_rejection_error(&error) {
+                    let session_path = session_file_path(Some(session_id_for_attempt.as_str()));
+                    match sanitize_pi_session_replay_state(&session_path) {
+                        Ok(true) => dev_trace(
+                            "desktop.stream",
+                            format!(
+                                "sanitized reasoning replay state before retry: session={} path={}",
+                                session_id_for_attempt,
+                                session_path.display()
+                            ),
+                        ),
+                        Ok(false) => {
+                            if session_path.exists() {
+                                match quarantine_pi_session_file(&session_path, "reasoning-history")
+                                {
+                                    Ok(true) => dev_trace(
+                                        "desktop.stream",
+                                        format!(
+                                            "quarantined pi session for fresh reasoning retry: session={} path={}",
+                                            session_id_for_attempt,
+                                            session_path.display()
+                                        ),
+                                    ),
+                                    Ok(false) => {}
+                                    Err(quarantine_error) => dev_trace(
+                                        "desktop.stream",
+                                        format!(
+                                            "failed to quarantine pi session for reasoning retry: session={} path={} error={}",
+                                            session_id_for_attempt,
+                                            session_path.display(),
+                                            quarantine_error
+                                        ),
+                                    ),
+                                }
+                                dev_trace(
+                                    "desktop.stream",
+                                    format!(
+                                        "reasoning replay retry requested but session needed no sanitize: session={} path={}",
+                                        session_id_for_attempt,
+                                        session_path.display()
+                                    ),
+                                );
+                            }
+                        }
+                        Err(sanitize_error) => dev_trace(
+                            "desktop.stream",
+                            format!(
+                                "failed to sanitize reasoning replay state: session={} path={} error={}",
+                                session_id_for_attempt,
+                                session_path.display(),
+                                sanitize_error
+                            ),
+                        ),
+                    }
+                    managed_runtime::append_session_event_quiet(
+                        desktop_agent_home_for_runtime.as_deref(),
+                        &session_id_for_attempt,
+                        managed_runtime::SessionEventKind::RuntimeRetry,
+                        "provider rejected replayed reasoning history; retrying once with reasoning effort disabled",
+                        Some(serde_json::json!({ "attempt": attempt + 1, "error": error })),
+                    );
+                    disable_reasoning_provider_retry = true;
+                    attempt_prompt = format!(
+                        "{}\n\n[system note] 上一次请求因为旧 PI session 中的 reasoning/thinking 历史无法被当前 Provider 回放而失败。NineClaw 已修复或隔离污染的 session 历史。请基于当前可见上下文和持久记忆继续处理用户请求；如果关键上下文缺失，只问一个最必要的问题。",
+                        prompt.trim()
+                    );
+                    continue;
+                }
                 if managed_runtime::should_auto_retry_runtime(
                     desktop_harness_for_retry.as_ref(),
                     attempt,
@@ -5334,6 +5788,8 @@ pub fn run() {
             list_token_usage_records,
             load_provider_preferences,
             save_provider_preferences,
+            load_image_generation_preferences,
+            save_image_generation_preferences,
             list_installed_skills,
             list_system_skill_catalog,
             install_system_skill,

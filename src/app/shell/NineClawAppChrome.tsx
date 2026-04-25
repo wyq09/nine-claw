@@ -16,6 +16,11 @@ import type {
   SettingsTab,
   ViewKey,
 } from '../../types'
+import type {
+  ImageGenerationSystemConfig,
+  ImageProviderConfig,
+  ImageProviderDefinition,
+} from '../../types/imageGeneration'
 import type { ResourcesViewProps, SkillsViewProps } from '../pages/LibraryAndTasks'
 import {
   SIDEBAR_FOOTER_SHORTCUTS_ENABLED,
@@ -108,7 +113,14 @@ export type NineClawAppChromeProps = {
   activeProviderBadge: string
   mergedProviderDefinitions: ProviderDefinition[]
   generalSettings: GeneralSettings
+  imageGenerationSystem: ImageGenerationSystemConfig
+  imageProviderConfigs: Record<string, ImageProviderConfig>
+  imageProviderDefinitions: ImageProviderDefinition[]
   onAddCustomProvider: (name: string, description: string, apiFormat: import('../../types').ProviderApiFormat) => void
+  onSaveImageGenerationSettings: (
+    imageProviderConfigs: Record<string, ImageProviderConfig>,
+    imageGenerationSystem: ImageGenerationSystemConfig,
+  ) => Promise<void>
   onProviderConfigChange: (providerId: ProviderId, updates: Partial<ProviderConfig>) => void
   onCloseSettings: () => void
   onRemoveCustomProvider: (providerId: ProviderId) => void
@@ -192,7 +204,11 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
     activeProviderBadge,
     mergedProviderDefinitions,
     generalSettings,
+    imageGenerationSystem,
+    imageProviderConfigs,
+    imageProviderDefinitions,
     onAddCustomProvider,
+    onSaveImageGenerationSettings,
     onProviderConfigChange,
     onCloseSettings,
     onRemoveCustomProvider,
@@ -632,7 +648,11 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
           allProviderDefinitions={mergedProviderDefinitions}
           appearanceSettings={appearanceSettings}
           generalSettings={generalSettings}
+          imageGenerationSystem={imageGenerationSystem}
+          imageProviderConfigs={imageProviderConfigs}
+          imageProviderDefinitions={imageProviderDefinitions}
           onAddCustomProvider={onAddCustomProvider}
+          onSaveImageGenerationSettings={onSaveImageGenerationSettings}
           onProviderConfigChange={onProviderConfigChange}
           onClose={onCloseSettings}
           onRemoveCustomProvider={onRemoveCustomProvider}

@@ -568,6 +568,8 @@ mod tests {
             name: "Supervisor".to_string(),
             summary: String::new(),
             description: String::new(),
+            trigger_condition: String::new(),
+            manual_trigger_only: false,
             system_prompt: String::new(),
             capability_policy: AgentCapabilityPolicy::default(),
             skill_ids: Vec::new(),
