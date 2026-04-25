@@ -235,6 +235,7 @@ mod tests {
             collaboration_config: None,
             accent_color: None,
             scenario_llm_config: None,
+            agent_loop_config: None,
         }
     }
 

@@ -32,7 +32,7 @@ impl Default for BatchFailStrategy {
 }
 
 /// Top-level configuration for an agent loop run.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLoopConfig {
     #[serde(default = "default_max_iterations")]

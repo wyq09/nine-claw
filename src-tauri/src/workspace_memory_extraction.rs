@@ -590,6 +590,7 @@ mod tests {
                 }),
                 task_push_notification_copy: None,
             }),
+            agent_loop_config: None,
             created_at: 0,
             updated_at: 0,
         };

@@ -37,6 +37,7 @@ pub(crate) fn build_supervisor_agent_input(
         collaboration_config: Some(collab),
         accent_color: record.accent_color.clone(),
         scenario_llm_config: record.scenario_llm_config.clone(),
+        agent_loop_config: record.agent_loop_config.clone(),
         bot_configs: record.bot_configs.clone(),
         heartbeat_config: record.heartbeat_config.clone(),
     }
@@ -90,6 +91,7 @@ mod tests {
                 memory_extraction: None,
                 task_push_notification_copy: None,
             }),
+            agent_loop_config: None,
             created_at: 1,
             updated_at: 1,
         }

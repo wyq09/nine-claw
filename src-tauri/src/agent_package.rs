@@ -328,6 +328,7 @@ fn record_to_agent_input(record: AgentRecord, skill_ids: Vec<String>) -> AgentIn
         bot_configs: record.bot_configs,
         heartbeat_config: record.heartbeat_config,
         scenario_llm_config: record.scenario_llm_config,
+        agent_loop_config: record.agent_loop_config,
     }
 }
 
