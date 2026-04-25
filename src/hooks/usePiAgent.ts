@@ -11,6 +11,9 @@ import {
   loadHistoryState,
   saveHistoryState,
   streamPiPrompt,
+  subscribeAgentLoopAborted,
+  subscribeAgentLoopCompleted,
+  subscribeAgentLoopStarted,
   subscribeBotMessage,
   subscribePiStream,
 } from '../lib/piClient'
@@ -22,6 +25,8 @@ import {
 } from '../lib/taskDeliveryNotification'
 import type {
   ActivityState,
+  AgentLoopIteration,
+  AgentLoopSegment,
   AgentTaskDeliveryRecord,
   ConversationAgentSnapshot,
   ConversationTurn,
@@ -620,6 +625,112 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       }
     }
   }, [])
+
+  // ── Agent Loop event subscriptions ──
+
+  /** Map loopId → { historyId, turnId } for tracking which turn owns each agent loop. */
+  const agentLoopTurnMapRef = useRef<Map<string, { historyId: string; turnId: string }>>(new Map())
+
+  useEffect(() => {
+    let isMounted = true
+    const unsubs: (() => void)[] = []
+
+    async function setup() {
+      unsubs.push(
+        await subscribeAgentLoopStarted((payload) => {
+          if (!isMounted) return
+
+          // Resolve the current active turn — agent loops run within the active stream session
+          const historyId = activeHistoryId
+          const turnId = currentTurnIdsRef.current.get(historyId) ?? ''
+          if (!historyId || !turnId) return
+
+          agentLoopTurnMapRef.current.set(payload.loopId, { historyId, turnId })
+
+          const segment: AgentLoopSegment = {
+            type: 'agent_loop',
+            loopId: payload.loopId,
+            status: 'running',
+            totalIterations: 0,
+            currentDepth: payload.depth,
+            iterations: [] as AgentLoopIteration[],
+            startedAt: Date.now(),
+          }
+
+          updateTurn(historyId, turnId, (turn) => ({
+            ...turn,
+            responseSegments: [...(turn.responseSegments ?? []), { type: 'agent_loop' as const, segment }],
+          }))
+        }),
+      )
+
+      unsubs.push(
+        await subscribeAgentLoopCompleted((payload) => {
+          if (!isMounted) return
+
+          const mapping = agentLoopTurnMapRef.current.get(payload.loopId)
+          if (!mapping) return
+          const { historyId, turnId } = mapping
+
+          updateTurn(historyId, turnId, (turn) => ({
+            ...turn,
+            responseSegments: (turn.responseSegments ?? []).map((seg) =>
+              seg.type === 'agent_loop' && seg.segment.loopId === payload.loopId
+                ? {
+                    ...seg,
+                    segment: {
+                      ...seg.segment,
+                      status: 'completed' as const,
+                      reason: payload.reason as AgentLoopSegment['reason'],
+                      totalIterations: payload.totalIterations,
+                      completedAt: Date.now(),
+                    },
+                  }
+                : seg,
+            ),
+          }))
+
+          agentLoopTurnMapRef.current.delete(payload.loopId)
+        }),
+      )
+
+      unsubs.push(
+        await subscribeAgentLoopAborted((payload) => {
+          if (!isMounted) return
+
+          const mapping = agentLoopTurnMapRef.current.get(payload.loopId)
+          if (!mapping) return
+          const { historyId, turnId } = mapping
+
+          updateTurn(historyId, turnId, (turn) => ({
+            ...turn,
+            responseSegments: (turn.responseSegments ?? []).map((seg) =>
+              seg.type === 'agent_loop' && seg.segment.loopId === payload.loopId
+                ? {
+                    ...seg,
+                    segment: {
+                      ...seg.segment,
+                      status: 'aborted' as const,
+                      totalIterations: payload.iterationsCompleted,
+                      completedAt: Date.now(),
+                    },
+                  }
+                : seg,
+            ),
+          }))
+
+          agentLoopTurnMapRef.current.delete(payload.loopId)
+        }),
+      )
+    }
+
+    void setup()
+
+    return () => {
+      isMounted = false
+      for (const un of unsubs) un()
+    }
+  }, [activeHistoryId])
 
   // ── Bot channel message history integration ──
 
