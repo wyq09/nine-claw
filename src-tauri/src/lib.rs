@@ -4646,6 +4646,32 @@ async fn stream_pi_prompt(
                     None,
                     None,
                 )?;
+
+                // Agent Loop: if agent has agent_loop_config, enter loop
+                if let Some(ref agent_cfg) = agent_config {
+                    if let Some(ref loop_config) = agent_cfg.agent_loop_config {
+                        if let Some(ref provider) = provider_config {
+                            let app_clone = app.clone();
+                            let agent_id = agent_cfg.id.clone();
+                            let sid = normalized_session_id.clone();
+                            let lc = loop_config.clone();
+                            let prov = provider.clone();
+                            let initial_text = emitted_assistant_text.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let _ = crate::agent_loop::run_agent_loop(
+                                    &app_clone,
+                                    &agent_id,
+                                    &sid,
+                                    &lc,
+                                    &prov,
+                                    &initial_text,
+                                    0,
+                                )
+                                .await;
+                            });
+                        }
+                    }
+                }
             }
 
             if let Some(agent_config) = agent_config.as_ref() {
@@ -4869,6 +4895,32 @@ async fn stream_pi_prompt(
                 None,
                 None,
             )?;
+
+            // Agent Loop: if agent has agent_loop_config, enter loop
+            if let Some(ref agent_cfg) = agent_config {
+                if let Some(ref loop_config) = agent_cfg.agent_loop_config {
+                    if let Some(ref provider) = provider_config {
+                        let app_clone = app.clone();
+                        let agent_id = agent_cfg.id.clone();
+                        let sid = normalized_session_id.clone();
+                        let lc = loop_config.clone();
+                        let prov = provider.clone();
+                        let initial_text = emitted_assistant_text.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = crate::agent_loop::run_agent_loop(
+                                &app_clone,
+                                &agent_id,
+                                &sid,
+                                &lc,
+                                &prov,
+                                &initial_text,
+                                0,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
         }
 
         if let Some(agent_config) = agent_config.as_ref() {
@@ -5719,6 +5771,30 @@ async fn bot_send_media(
     mgr.send_media(&channel_id, &user_id, &payload)
 }
 
+#[tauri::command]
+async fn agent_loop_respond_review(
+    loop_id: String,
+    approved: bool,
+    extend_to: Option<u32>,
+) -> Result<(), String> {
+    // TODO: Wire to ActiveLoops managed state in a follow-up
+    // For now, log and return Ok
+    log::info!(
+        "Agent Loop 审核响应: loop_id={}, approved={}, extend_to={:?}",
+        loop_id, approved, extend_to
+    );
+    Ok(())
+}
+
+#[tauri::command]
+async fn agent_loop_abort(
+    loop_id: String,
+) -> Result<(), String> {
+    // TODO: Wire to ActiveLoops managed state in a follow-up
+    log::info!("Agent Loop 取消请求: loop_id={}", loop_id);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -5878,7 +5954,9 @@ pub fn run() {
             ensure_runtime_dependencies,
             test_llm_provider_connection,
             generate_session_conversation_title,
-            get_session_context_stats
+            get_session_context_stats,
+            agent_loop_respond_review,
+            agent_loop_abort
         ])
         .run(app_context())
         .expect("error while running tauri application");
