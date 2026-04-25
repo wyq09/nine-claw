@@ -9,6 +9,8 @@ use crate::agent_loop_types::{
     AgentLoopExtendMarker, AgentLoopResult, ParsedLoopMarker,
 };
 
+use chrono::Local;
+
 // ---------------------------------------------------------------------------
 // Marker constants
 // ---------------------------------------------------------------------------
@@ -178,6 +180,142 @@ pub fn format_batch_result(result: &AgentLoopBatchResult) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Defense layer: heal_orphaned_tool_calls
+// ---------------------------------------------------------------------------
+
+/// Scan `history` for assistant messages whose `tool_calls` entries have no
+/// matching `tool` result (identified by `tool_call_id`). For every orphan,
+/// inject a synthetic tool-result message immediately after the assistant
+/// message so the conversation history remains well-formed for the LLM.
+pub fn heal_orphaned_tool_calls(history: &mut Vec<serde_json::Value>) {
+    // Collect the IDs of all tool results already present.
+    let mut answered_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in history.iter() {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
+                answered_ids.insert(id.to_string());
+            }
+        }
+    }
+
+    // Walk assistant messages and find orphaned tool_calls.
+    // We collect insertions as (index_after_assistant, synthetic_value) and
+    // apply them in reverse order so indices remain valid.
+    let mut insertions: Vec<(usize, serde_json::Value)> = Vec::new();
+
+    for (i, msg) in history.iter().enumerate() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        let tool_calls = match msg.get("tool_calls").and_then(|v| v.as_array()) {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => continue,
+        };
+
+        for tc in tool_calls {
+            let tc_id = match tc.get("id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+            if !answered_ids.contains(&tc_id) {
+                let synthetic = serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": "[NineClaw] 此工具调用因会话中断未完成，请根据已有信息继续。"
+                });
+                answered_ids.insert(tc_id);
+                insertions.push((i + 1, synthetic));
+            }
+        }
+    }
+
+    // Apply in reverse order to keep indices stable.
+    for (idx, val) in insertions.into_iter().rev() {
+        history.insert(idx, val);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Defense layer: inject_dynamic_context
+// ---------------------------------------------------------------------------
+
+/// Find the **last** message with `"role": "system"` in `history` and append
+/// a dynamic context block (current time + permission denials) to its
+/// `content`. Appending at the end protects the KV Cache prefix.
+pub fn inject_dynamic_context(
+    history: &mut Vec<serde_json::Value>,
+    permission_denials: &[String],
+) {
+    let now_str = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
+    let denials_text = if permission_denials.is_empty() {
+        "无".to_string()
+    } else {
+        permission_denials.join("，")
+    };
+
+    let context_block = format!(
+        "\n\n[动态上下文]\n当前时间：{}\n权限拒绝：{}",
+        now_str, denials_text
+    );
+
+    // Find the last system message.
+    let last_sys_idx = history
+        .iter()
+        .rposition(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("system"));
+
+    if let Some(idx) = last_sys_idx {
+        let content = history[idx]
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let new_content = format!("{}{}", content, context_block);
+        history[idx]["content"] = serde_json::Value::String(new_content);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Defense layer: compress_assistant_message
+// ---------------------------------------------------------------------------
+
+/// If an assistant message has a non-empty `tool_calls` array **and** its
+/// `content` is fewer than 50 characters of trimmed text, clear the content
+/// to save tokens. Substantive reasoning text is preserved.
+pub fn compress_assistant_message(msg: &mut serde_json::Value) {
+    let has_tool_calls = msg
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .map_or(false, |arr| !arr.is_empty());
+
+    if !has_tool_calls {
+        return;
+    }
+
+    let content_len = msg
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().len())
+        .unwrap_or(0);
+
+    if content_len < 50 {
+        msg["content"] = serde_json::Value::String(String::new());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Defense layer: prepare_loop_iteration
+// ---------------------------------------------------------------------------
+
+/// Prepare the conversation history for a new agent-loop iteration:
+/// heal orphaned tool calls first, then inject dynamic context.
+pub fn prepare_loop_iteration(
+    history: &mut Vec<serde_json::Value>,
+    permission_denials: &[String],
+) {
+    heal_orphaned_tool_calls(history);
+    inject_dynamic_context(history, permission_denials);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -310,5 +448,106 @@ mod tests {
         assert!(formatted.starts_with(MARKER_RESULT));
         assert!(formatted.contains("\"agentName\":\"Alpha\""));
         assert!(formatted.ends_with('\n'));
+    }
+
+    // -----------------------------------------------------------------------
+    // Defense layer tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_heal_orphaned_tool_calls_no_orphans() {
+        let mut history = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "let me check",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+                ]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "result data"
+            }),
+        ];
+        let original_len = history.len();
+        heal_orphaned_tool_calls(&mut history);
+        assert_eq!(history.len(), original_len, "no synthetic messages should be injected");
+    }
+
+    #[test]
+    fn test_heal_orphaned_tool_calls_with_orphan() {
+        let mut history = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "let me check",
+                "tool_calls": [
+                    {"id": "call_orphan", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+                ]
+            }),
+            serde_json::json!({"role": "user", "content": "any update?"}),
+        ];
+        heal_orphaned_tool_calls(&mut history);
+
+        // Should have injected a synthetic tool result.
+        assert_eq!(history.len(), 4);
+        let injected = &history[2];
+        assert_eq!(injected["role"], "tool");
+        assert_eq!(injected["tool_call_id"], "call_orphan");
+        assert!(injected["content"].as_str().unwrap().contains("[NineClaw]"));
+    }
+
+    #[test]
+    fn test_inject_dynamic_context() {
+        let mut history = vec![
+            serde_json::json!({"role": "system", "content": "You are helpful."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let denials = vec!["file_write".to_string(), "shell_exec".to_string()];
+        inject_dynamic_context(&mut history, &denials);
+
+        let sys_content = history[0]["content"].as_str().unwrap();
+        assert!(sys_content.contains("[动态上下文]"), "should contain context marker");
+        assert!(sys_content.contains("权限拒绝：file_write，shell_exec"), "should list denials");
+        assert!(sys_content.starts_with("You are helpful."), "original content preserved at start");
+    }
+
+    #[test]
+    fn test_compress_assistant_message_short_text_removed() {
+        let mut msg = serde_json::json!({
+            "role": "assistant",
+            "content": "让我看看",
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+            ]
+        });
+        compress_assistant_message(&mut msg);
+        assert_eq!(msg["content"].as_str().unwrap(), "", "short content should be cleared");
+    }
+
+    #[test]
+    fn test_compress_assistant_message_long_text_kept() {
+        let long_reasoning = "我需要先分析一下当前的情况，然后根据已有的信息来决定下一步的操作方案。这个任务涉及到多个步骤。";
+        let mut msg = serde_json::json!({
+            "role": "assistant",
+            "content": long_reasoning,
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+            ]
+        });
+        compress_assistant_message(&mut msg);
+        assert_eq!(msg["content"].as_str().unwrap(), long_reasoning, "long content should be kept");
+    }
+
+    #[test]
+    fn test_compress_assistant_message_no_tool_calls_kept() {
+        let mut msg = serde_json::json!({
+            "role": "assistant",
+            "content": "好的"
+        });
+        compress_assistant_message(&mut msg);
+        assert_eq!(msg["content"].as_str().unwrap(), "好的", "content without tool_calls should be kept");
     }
 }
