@@ -156,11 +156,75 @@ export type DelegationRunSegment = {
   toolCalls?: DelegationToolCallEntry[]
 }
 
+// ── Agent Loop 类型 ──────────────────────────────────────────
+
+export type BatchFailStrategy = 'FailFast' | 'WaitAll'
+
+export type AgentLoopConfig = {
+  maxIterations: number
+  iterationTimeoutMs: number
+  enableNested: boolean
+  maxDepth: number
+  allowExtend: boolean
+  maxExtendLimit: number
+  maxConcurrent: number
+  batchFailStrategy: BatchFailStrategy
+}
+
+export type AgentLoopIteration = {
+  iteration: number
+  markerType: 'call' | 'batch' | 'extend'
+  status: 'pending' | 'running' | 'reviewing' | 'completed'
+  delegate?: {
+    agentId: string
+    agentName: string
+    task: string
+    params?: Record<string, unknown>
+    output?: string
+    toolCallsCount?: number
+    durationMs?: number
+  }
+  batch?: {
+    delegates: Array<{
+      agentId: string
+      agentName: string
+      task: string
+      status: 'running' | 'completed' | 'error' | 'cancelled'
+      output?: string
+      durationMs?: number
+    }>
+  }
+}
+
+export type AgentLoopSegment = {
+  type: 'agent_loop'
+  loopId: string
+  status: 'running' | 'completed' | 'aborted' | 'error'
+  reason?: 'max_iterations' | 'natural' | 'abort' | 'error'
+  totalIterations: number
+  currentDepth: number
+  iterations: AgentLoopIteration[]
+  startedAt: number
+  completedAt?: number
+}
+
+export type AgentLoopReviewSegment = {
+  type: 'agent_loop_review'
+  loopId: string
+  reviewType: 'pause_for_review' | 'extend'
+  iteration: number
+  delegateInfo?: { agentName: string; task: string }
+  extendInfo?: { currentMax: number; requestedMax: number; reason: string }
+  status: 'pending' | 'approved' | 'rejected'
+}
+
 export type ResponseSegment =
   | { type: 'text'; text: string }
   | { type: 'tool'; toolCallId: string }
   | { type: 'delegate_plan'; planId: string; items: DelegatePlanItem[] }
   | { type: 'delegation_run'; run: DelegationRunSegment }
+  | { type: 'agent_loop'; segment: AgentLoopSegment }
+  | { type: 'agent_loop_review'; segment: AgentLoopReviewSegment }
 
 export type ChatAttachmentKind = 'image' | 'video' | 'audio' | 'file'
 
@@ -504,6 +568,7 @@ export type AgentRecord = {
   collaborationConfig?: AgentCollaborationConfig
   accentColor?: string
   scenarioLlmConfig?: AgentScenarioLlmConfig
+  agentLoopConfig?: AgentLoopConfig
   botConfigs: AgentBotBindings
   heartbeatConfig: AgentHeartbeatConfig
   createdAt: number
