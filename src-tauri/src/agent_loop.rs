@@ -1245,4 +1245,74 @@ mod tests {
         compress_assistant_message(&mut msg);
         assert_eq!(msg["content"].as_str().unwrap(), "好的", "content without tool_calls should be kept");
     }
+
+    // ── Integration: end-to-end marker cycle ────────────────────
+
+    #[test]
+    fn test_full_loop_cycle_text_without_markers() {
+        let text = "分析完成，以下是结论：...";
+        assert!(extract_first_loop_marker(text).is_none());
+    }
+
+    #[test]
+    fn test_full_loop_cycle_call_then_result_then_no_marker() {
+        // Round 1: CALL marker
+        let text1 = format!(
+            "让我委派分析\n{}{{\"agentId\":\"a1\",\"task\":\"analyze\",\"params\":{{}},\"expectStructuredOutput\":false,\"pauseForReview\":false}}\n",
+            MARKER_CALL
+        );
+        let marker1 = extract_first_loop_marker(&text1);
+        assert!(matches!(marker1, Some((ParsedLoopMarker::Call(_), _))));
+
+        // Simulate result injection
+        let result = AgentLoopResult {
+            agent_id: "a1".into(),
+            agent_name: "Analyzer".into(),
+            task: "analyze".into(),
+            status: "success".into(),
+            output: "found 3 issues".into(),
+            tool_calls_count: 2,
+            duration_ms: 5000,
+        };
+        let text_with_result = format!("{}\n{}", strip_loop_markers(&text1), format_single_result(&result));
+
+        // Verify result text contains RESULT marker
+        assert!(text_with_result.contains(MARKER_RESULT));
+
+        // Round 2: final reply has no markers → loop ends
+        let final_text = "综合分析结果，建议...";
+        assert!(extract_first_loop_marker(final_text).is_none());
+    }
+
+    #[test]
+    fn test_batch_then_extend_then_final() {
+        // BATCH marker
+        let batch_text = format!(
+            "{}{{\"calls\":[{{\"agentId\":\"a1\",\"task\":\"t1\",\"params\":{{}},\"expectStructuredOutput\":false,\"pauseForReview\":false}},{{\"agentId\":\"a2\",\"task\":\"t2\",\"params\":{{}},\"expectStructuredOutput\":false,\"pauseForReview\":false}}],\"pauseForReview\":false}}",
+            MARKER_BATCH
+        );
+        assert!(matches!(extract_first_loop_marker(&batch_text), Some((ParsedLoopMarker::Batch(_), _))));
+
+        // EXTEND marker
+        let extend_text = format!(
+            "{}{{\"currentIteration\":48,\"maxIterations\":50,\"reason\":\"need more\",\"requestedExtra\":20}}",
+            MARKER_EXTEND
+        );
+        assert!(matches!(extract_first_loop_marker(&extend_text), Some((ParsedLoopMarker::Extend(_), _))));
+
+        // FINAL marker
+        assert!(has_final_marker(&format!("done\n{}", MARKER_FINAL)));
+    }
+
+    #[test]
+    fn test_mixed_text_with_markers_and_final() {
+        let text = format!(
+            "以下是分析结果：\n{}{{\"agentId\":\"x\",\"task\":\"t\",\"params\":{{}},\"expectStructuredOutput\":false,\"pauseForReview\":false}}\n{}\n附加说明文字",
+            MARKER_CALL, MARKER_FINAL
+        );
+        // CALL should be found (FINAL is separate check)
+        let marker = extract_first_loop_marker(&text);
+        assert!(matches!(marker, Some((ParsedLoopMarker::Call(_), _))));
+        assert!(has_final_marker(&text));
+    }
 }
