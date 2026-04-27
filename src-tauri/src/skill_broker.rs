@@ -231,9 +231,11 @@ mod tests {
             },
             default_provider_id: "openai".to_string(),
             default_model: "gpt-5.4".to_string(),
+            allowed_tool_ids: crate::agents::default_allowed_tool_ids(),
             execution_mode: "single".to_string(),
             collaboration_config: None,
             accent_color: None,
+            avatar_uri: None,
             scenario_llm_config: None,
             agent_loop_config: None,
         }
@@ -264,6 +266,7 @@ mod tests {
             vec![
                 "pptx".to_string(),
                 "required".to_string(),
+                crate::agent_capabilities::ATOMIC_TOOLS_SKILL_ID.to_string(),
                 crate::agent_capabilities::TASK_CREATOR_SKILL_ID.to_string()
             ]
         );

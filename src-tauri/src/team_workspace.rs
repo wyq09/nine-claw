@@ -8,11 +8,22 @@ use crate::team_supervisor;
 use crate::workspace_fs;
 use chrono::Utc;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
+
+mod delegate_markers;
+mod supervisor_prompt;
+
+pub use delegate_markers::{
+    expand_delegate_markers_in_text, expand_delegate_plan_markers_in_text,
+};
+pub use supervisor_prompt::{
+    default_supervisor_orchestration_markdown, workspace_default_supervisor_orchestration_prompt,
+};
 
 pub fn resolve_workspace_artifacts_root(
     app: &AppHandle,
@@ -31,8 +42,12 @@ pub struct WorkspaceMemberView {
     pub agent_id: String,
     pub name: String,
     pub summary: String,
+    #[serde(default)]
+    pub description: String,
     pub role: String,
     pub skill_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_uri: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -90,65 +105,53 @@ pub fn list_team_member_views(
             agent_id: rec.id.clone(),
             name: rec.name,
             summary: rec.summary,
+            description: rec.description,
             role: m.role,
             skill_ids: rec.skill_ids,
+            avatar_uri: rec.avatar_uri,
         });
     }
     Ok(out)
 }
 
-/// 内置「主智能体角色」Markdown（`other_member_count` = 除主智能体外的成员数）。为 0 时不注入。
-pub fn default_supervisor_orchestration_markdown(other_member_count: usize) -> String {
-    if other_member_count == 0 {
-        return String::new();
-    }
-    let mut s = String::from("## 主智能体角色（MUST：硬性工作流）\n");
-    s.push_str(&format!(
-        "- 团队里还有 **{}** 名可委派成员。你是**项目经理 / 协调者**，**只负责**：澄清 → 拆解 → 指派 → 汇总。**严禁**亲自产出任何「可交付内容」（方案/代码/长文/设计稿/完整分析/表格报告/配色卡/文案正文/翻译等）。\n",
-        other_member_count
-    ));
-
-    s.push_str("\n### 执行顺序（必须按此流程）\n");
-    s.push_str("1. **评估**：先读成员名单与简介，判断本轮用户需求中的每一件子任务有无对口成员。只要名单里存在合理匹配的成员，就 **必须** 把该子任务委派给他，**即便你自认为也能做**。\n");
-    s.push_str("2. **单回合只做一件事**：\n");
-    s.push_str("   - 需要 **≥1 项委派** → 输出 **一次**「计划卡」`NINECLAW_DELEGATE_PLAN_JSON:...`（见协议 A），**随后立即结束本回合**。\n");
-    s.push_str(
-        "   - 全部子任务都没人可派（或用户只是闲聊/澄清）→ 你才可以直接回答，并保持**简短**。\n",
-    );
-    s.push_str("3. **禁止混用**：**绝不**允许「一边列出计划卡、一边自己把方案/代码/内容写出来」这种行为；也 **绝不**写「我直接代劳了」「任务已下发但我先把这段补上」之类语句。若你发现自己已经在写具体交付物，**立刻删除**，改为补进计划卡由对应成员执行。\n");
-    s.push_str("4. **等结果的下一轮**：委派结果（由 NineClaw 自动回注入到后续对话）返回后，你可在下一轮做**轻量汇总**——仅做：结构拼装、一致性检查、冲突调解、向用户复述要点与下一步选项。**不要替成员重写整份交付物**。若成员产出不够，再发一次补委派，而不是自己顶上。\n\n");
-
-    s.push_str("### 计划卡结构硬要求\n");
-    s.push_str("- 一次 `items` 要 **穷尽** 本轮所有可拆分的可委派子任务，`reason` 说明为何选该成员；不得故意漏写以便留给自己做。\n");
-    s.push_str("- `assignee` 必须是 ## 成员 中真实存在的 `agentId`（非 `name`，区分大小写）。\n");
-    s.push_str("- **该行单独占一行**，前后不要包进代码块/列表/引用。输出此行后，**本回合只允许再写 ≤ 2 句过渡语**（例如「已排好分工，等成员回来我再汇总」），不得继续写实质内容。\n");
-
-    s.push_str("\n### 反例（发现则立刻停并改为计划卡）\n");
-    s.push_str("- 列出一张「调度记录表」但自己同时产出了数据分析/配色/代码/文案。\n");
-    s.push_str(
-        "- 同一回合写了 `NINECLAW_DELEGATE_PLAN_JSON:...` 之后又把该子任务的答案自己写完。\n",
-    );
-    s.push_str("- 使用了「我直接代劳了 / 我先顶一下 / 我顺手做了」之类描述。\n");
-    s.push_str("- ❌ 用 `write` 工具往 `agents/<其他成员>/inbox/...` 写一份「任务说明 markdown」就当作委派——这只是文件操作，对方根本不会被触发。**唯一合法委派渠道**是协议 A/B 的 NINECLAW_ 文本标记。\n");
-    s.push_str("- ❌ 在结尾说「任务已写入 @某某 的 inbox / 请你去 @某某 的会话发消息让它读取 / 要不要现在去戳它一下」——你在团队会话里**不需要**用户当中转，标记落地就是委派，子会话由 NineClaw 后端自动起、结果自动回注。出现这类话术意味着你应当改用协议 B（`NINECLAW_DELEGATE_JSON:`）重发。\n\n");
-    s
+fn delegate_run_registry() -> &'static Mutex<HashMap<String, Arc<crate::channels::pi_bridge::PiRunHandle>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<crate::channels::pi_bridge::PiRunHandle>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 供前端「载入默认」：按当前成员数生成与运行时一致的默认文案。
-pub fn workspace_default_supervisor_orchestration_prompt(
-    app: &AppHandle,
-    workspace_id: &str,
-) -> Result<String, String> {
-    let conn = crate::storage_conn(app)?;
-    let Some(ws) = workspaces::get_workspace(&conn, workspace_id)? else {
-        return Err("工作空间不存在".to_string());
+fn register_delegate_run_handle(
+    run_id: &str,
+    handle: Arc<crate::channels::pi_bridge::PiRunHandle>,
+) {
+    if run_id.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut registry) = delegate_run_registry().lock() {
+        registry.insert(run_id.to_string(), handle);
+    }
+}
+
+fn unregister_delegate_run_handle(run_id: &str) {
+    if run_id.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut registry) = delegate_run_registry().lock() {
+        registry.remove(run_id);
+    }
+}
+
+pub fn abort_delegate_run(run_id: &str) -> Result<bool, String> {
+    let handle = delegate_run_registry()
+        .lock()
+        .map_err(|_| "锁定委派运行注册表失败".to_string())?
+        .get(run_id.trim())
+        .cloned();
+    let Some(handle) = handle else {
+        return Ok(false);
     };
-    let members = list_team_member_views(app, workspace_id)?;
-    let other = members
-        .iter()
-        .filter(|m| m.agent_id != ws.supervisor_agent_id)
-        .count();
-    Ok(default_supervisor_orchestration_markdown(other))
+    handle.abort()?;
+    Ok(true)
 }
 
 /// 仅当 `speaker` 为本团队主智能体时返回非空：协调提示词（库内自定义或内置默认）+ 协作 handoff，供与「智能体身份」合并为**同一条** `--append-system-prompt` 注入 Pi，确保模型按 agent 层指令采纳。
@@ -197,6 +200,32 @@ pub fn supervisor_agent_prompt_appendix_for_pi(
                 ));
             }
         }
+    }
+    let delegateable_members = members
+        .iter()
+        .filter(|m| m.agent_id != ws.supervisor_agent_id)
+        .map(|member| {
+            let role_hint = if member.role.trim().is_empty() {
+                String::new()
+            } else {
+                format!("角色: {}；", member.role.trim())
+            };
+            let summary = if member.summary.trim().is_empty() {
+                member.description.trim()
+            } else {
+                member.summary.trim()
+            };
+            format!(
+                "- `{}` / **{}**：{}{summary}",
+                member.agent_id, member.name, role_hint
+            )
+        })
+        .collect::<Vec<_>>();
+    if !delegateable_members.is_empty() {
+        parts.push(format!(
+            "## 当前可调用子智能体（每次委派只能从以下名单中选）\n{}\n\n当任务适合拆分时，优先引用上面的 agentId，并按成员简介选择最匹配的人。",
+            delegateable_members.join("\n")
+        ));
     }
     Ok(parts.join("\n\n"))
 }
@@ -689,9 +718,16 @@ pub fn run_delegate_with_provider_events(
         &prompt,
         2048,
         on_chunk,
-        |_| {},
+        |handle| {
+            if let Some(rid) = run_id_owned.as_deref() {
+                register_delegate_run_handle(rid, handle);
+            }
+        },
         on_event,
     );
+    if let Some(rid) = run_id_owned.as_deref() {
+        unregister_delegate_run_handle(rid);
+    }
 
     match outcome {
         Ok(PiProcessOutcome::Completed(r)) => {
@@ -743,97 +779,6 @@ pub fn run_delegate_with_provider_events(
             Err(e)
         }
     }
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DelegateMarker {
-    target_agent_id: String,
-    task: String,
-}
-
-/// 计划协议：单项任务。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DelegatePlanItem {
-    pub assignee: String,
-    pub task: String,
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub enabled: Option<bool>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct DelegatePlanPayload {
-    items: Vec<DelegatePlanItem>,
-}
-
-/// 将 `NINECLAW_DELEGATE_PLAN_JSON:{...}` 行转换为 HTML 注释形式的内联占位：
-/// `<!--NC_DELEGATE_PLAN:{"planId":"...","items":[...]}-->`。前端 `parseHistorySnapshot`
-/// 识别该占位后把这一段升级为 `responseSegment.kind='delegate_plan'`，**不**在 Rust 侧
-/// 执行任何委派。
-pub fn expand_delegate_plan_markers_in_text(source_text: &str) -> Result<String, String> {
-    let prefix = "NINECLAW_DELEGATE_PLAN_JSON:";
-    let mut out_lines: Vec<String> = Vec::new();
-    for line in source_text.lines() {
-        let trimmed = line.trim();
-        if let Some(json_part) = trimmed.strip_prefix(prefix) {
-            let parsed: DelegatePlanPayload = serde_json::from_str(json_part.trim())
-                .map_err(|e| format!("计划 JSON 无效: {e}"))?;
-            let plan_id = uuid::Uuid::new_v4().to_string();
-            let payload = serde_json::json!({
-                "planId": plan_id,
-                "items": parsed.items,
-            });
-            let payload_s =
-                serde_json::to_string(&payload).map_err(|e| format!("序列化计划失败: {e}"))?;
-            out_lines.push(format!("<!--NC_DELEGATE_PLAN:{}-->", payload_s));
-            continue;
-        }
-        out_lines.push(line.to_string());
-    }
-    Ok(out_lines.join("\n"))
-}
-
-/// 解析并执行 `NINECLAW_DELEGATE_JSON:{...}` 行，返回去掉标记后的正文 + 委派输出拼接。
-pub fn expand_delegate_markers_in_text(
-    app: &AppHandle,
-    workspace_id: &str,
-    source_text: &str,
-    provider: Option<&crate::ProviderRuntimeConfig>,
-) -> Result<String, String> {
-    let prefix = "NINECLAW_DELEGATE_JSON:";
-    let mut parts: Vec<String> = Vec::new();
-    for line in source_text.lines() {
-        let trimmed = line.trim();
-        if let Some(json_part) = trimmed.strip_prefix(prefix) {
-            let parsed: DelegateMarker = serde_json::from_str(json_part.trim())
-                .map_err(|e| format!("委派 JSON 无效: {e}"))?;
-            let target_label = match agents::get_agent_record(app, &parsed.target_agent_id) {
-                Ok(Some(r)) => format!("**{}** (`{}`)", r.name, r.id),
-                _ => format!("`{}`", parsed.target_agent_id),
-            };
-            let block = match provider {
-                None => "\n\n[委派未执行：缺少 Provider 配置]\n".to_string(),
-                Some(p) => match run_delegate_with_provider(
-                    app,
-                    workspace_id,
-                    &parsed.target_agent_id,
-                    &parsed.task,
-                    p,
-                ) {
-                    Ok(body) => {
-                        format!("\n\n---\n### 子智能体委派 · {}\n\n{}\n", target_label, body)
-                    }
-                    Err(e) => format!("\n\n[委派失败: {}]\n", e),
-                },
-            };
-            parts.push(block);
-            continue;
-        }
-        parts.push(line.to_string());
-    }
-    Ok(parts.join("\n"))
 }
 
 pub fn create_workspace_with_fs(

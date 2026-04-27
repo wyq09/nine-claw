@@ -573,6 +573,7 @@ mod tests {
             system_prompt: String::new(),
             capability_policy: AgentCapabilityPolicy::default(),
             skill_ids: Vec::new(),
+            allowed_tool_ids: crate::agents::default_allowed_tool_ids(),
             default_provider_id: "default-provider".to_string(),
             default_model: "default-model".to_string(),
             is_builtin: false,
@@ -580,6 +581,7 @@ mod tests {
             execution_mode: "desktop".to_string(),
             collaboration_config: None,
             accent_color: None,
+            avatar_uri: None,
             bot_configs: Default::default(),
             heartbeat_config: Default::default(),
             scenario_llm_config: Some(crate::agents::AgentScenarioLlmConfig {

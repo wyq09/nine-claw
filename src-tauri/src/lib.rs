@@ -61,7 +61,9 @@ pub(crate) use provider_runtime::{
     anthropic_messages_url, load_provider_preferences, normalize_anthropic_base_url,
     normalize_provider_api_format, normalize_provider_base_url,
     normalized_provider_runtime_base_url, openai_pi_compat_supports_reasoning_effort,
-    pi_runtime_dir, resolve_im_llm_runtime, save_provider_preferences, ProviderRuntimeConfig,
+    openai_pi_compat_requires_explicit_thinking_disable, pi_runtime_dir,
+    resolve_im_llm_runtime, save_provider_preferences, should_force_pi_thinking_off,
+    ProviderRuntimeConfig,
 };
 pub(crate) use proxy_settings::build_http_client;
 pub(crate) use session_llm_titles::refine_agent_task_metadata;
@@ -964,8 +966,8 @@ mod lib_tests {
         is_provider_reasoning_history_rejection_error, parse_context_stats_from_rpc_response,
         prepend_multimodal_summary_context, quarantine_pi_session_file, record_multimodal_summary,
         render_multimodal_summary_context, resolve_context_window_from_sources,
-        sanitize_pi_session_replay_state, summary_file_path, usage_row_total_tokens,
-        DesktopParsedMediaItem, ProviderRuntimeConfig,
+        sanitize_pi_session_replay_state, should_force_pi_thinking_off, summary_file_path,
+        usage_row_total_tokens, DesktopParsedMediaItem, ProviderRuntimeConfig,
     };
     use crate::channels::types::MediaType;
     use serde_json::json;
@@ -1145,6 +1147,25 @@ mod lib_tests {
                 ["supportsReasoningEffort"],
             json!(false)
         );
+    }
+
+    #[test]
+    fn provider_models_config_for_deepseek_v4_pro_sends_qwen_thinking_off_shape() {
+        let provider = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+        };
+
+        let config = build_provider_models_config_with_input(&provider, false, false)
+            .expect("deepseek config");
+        let provider_json = &config["providers"]["nineclaw-runtime-8b9035807842"];
+        assert_eq!(provider_json["compat"]["supportsReasoningEffort"], json!(false));
+        assert_eq!(provider_json["compat"]["thinkingFormat"], json!("qwen"));
+        assert_eq!(provider_json["models"][0]["reasoning"], json!(true));
+        assert!(should_force_pi_thinking_off(&provider, false));
     }
 
     #[test]
@@ -2736,6 +2757,11 @@ fn custom_provider_object(
         &provider_config.api_format,
         provider_config.provider_id.trim(),
     );
+    let requires_explicit_thinking_disable =
+        openai_pi_compat_requires_explicit_thinking_disable(model);
+    let model_reasoning = !disable_reasoning_effort
+        && (openai_pi_compat_supports_reasoning_effort(model)
+            || requires_explicit_thinking_disable);
     let mut provider = serde_json::Map::new();
     let model_input = if text_only_input {
         json!(["text"])
@@ -2770,14 +2796,18 @@ fn custom_provider_object(
         }
         _ => {
             provider.insert("api".to_string(), json!("openai-completions"));
-            let reasoning =
-                !disable_reasoning_effort && openai_pi_compat_supports_reasoning_effort(model);
+            let mut compat = serde_json::Map::new();
+            compat.insert("supportsDeveloperRole".to_string(), json!(false));
+            compat.insert(
+                "supportsReasoningEffort".to_string(),
+                json!(model_reasoning && !requires_explicit_thinking_disable),
+            );
+            if requires_explicit_thinking_disable {
+                compat.insert("thinkingFormat".to_string(), json!("qwen"));
+            }
             provider.insert(
                 "compat".to_string(),
-                json!({
-                  "supportsDeveloperRole": false,
-                  "supportsReasoningEffort": reasoning
-                }),
+                serde_json::Value::Object(compat),
             );
             provider.insert(
                 "models".to_string(),
@@ -2785,7 +2815,8 @@ fn custom_provider_object(
                   {
                     "id": model,
                     "api": "openai-completions",
-                    "input": model_input
+                    "input": model_input,
+                    "reasoning": model_reasoning
                   }
                 ]),
             );
@@ -3372,6 +3403,8 @@ async fn stream_pi_prompt(
         return Err("prompt 不能为空".to_string());
     }
 
+    managed_runtime::inject_credential_proxy_app_handle(app.clone());
+
     let normalized_session_id = session_id
         .as_deref()
         .map(str::trim)
@@ -3625,6 +3658,10 @@ async fn stream_pi_prompt(
                 command.args(["--model", runtime_provider_config.model.trim()]);
             }
 
+            if should_force_pi_thinking_off(&runtime_provider_config, disable_reasoning_effort) {
+                command.args(["--thinking", "off"]);
+            }
+
             if !runtime_provider_config.api_key.trim().is_empty() {
                 command.args(["--api-key", runtime_provider_config.api_key.trim()]);
             }
@@ -3644,6 +3681,8 @@ async fn stream_pi_prompt(
         let mut skill_paths: Vec<PathBuf> = Vec::new();
         let mut selected_skill_ids: Vec<String> = Vec::new();
         let mut desktop_agent_home: Option<PathBuf> = None;
+        let mut desktop_media_prompt = String::new();
+        let mut base_system_prompt_injected = false;
         if let Some(agent_config) = agent_config.as_ref() {
             if let Ok(workspace_root) = agent_workspace::resolve_workspace_root() {
                 let agent_home = workspace_root.join("agents").join(&agent_config.id);
@@ -3655,6 +3694,10 @@ async fn stream_pi_prompt(
                     .env("NINECLAW_WORKSPACE_ROOT", workspace_root.as_os_str())
                     .env("NINECLAW_AGENT_HOME", agent_home.as_os_str());
             }
+            desktop_media_prompt = desktop_media_reply_prompt(
+                desktop_agent_home.as_deref(),
+                team_artifacts_root_for_media.as_deref(),
+            );
 
             let base_agent_prompt = agents::build_agent_system_prompt_for_prompt(
                 agent_config,
@@ -3677,6 +3720,16 @@ async fn stream_pi_prompt(
                 }
                 None => base_agent_prompt,
             };
+            let merged_agent_prompt = match merged_agent_prompt {
+                Some(prompt) if !desktop_media_prompt.trim().is_empty() => Some(format!(
+                    "{prompt}\n\n# NineClaw 媒体输出\n\n{desktop_media_prompt}"
+                )),
+                Some(prompt) => Some(prompt),
+                None if !desktop_media_prompt.trim().is_empty() => Some(format!(
+                    "# NineClaw 媒体输出\n\n{desktop_media_prompt}"
+                )),
+                None => None,
+            };
             if let Some(system_prompt) = merged_agent_prompt {
                 system_prompt_chars += system_prompt.chars().count();
                 system_prompt_sections.push((
@@ -3684,6 +3737,7 @@ async fn stream_pi_prompt(
                     system_prompt.clone(),
                 ));
                 command.args(["--append-system-prompt", &system_prompt]);
+                base_system_prompt_injected = true;
             }
 
             let memory_isolation_prompt = "记忆隔离规则：当前智能体只能使用自己的私有工作区记忆。禁止读取、引用、总结或迁移其他智能体 `agents/<other-agent-id>/` 下的任何 markdown 记忆文件。";
@@ -3735,17 +3789,20 @@ async fn stream_pi_prompt(
                 command.args(["--skill", &skill_path]);
             }
         }
-
-        let desktop_media_prompt = desktop_media_reply_prompt(
-            desktop_agent_home.as_deref(),
-            team_artifacts_root_for_media.as_deref(),
-        );
-        system_prompt_chars += desktop_media_prompt.chars().count();
-        system_prompt_sections.push((
-            "desktop_media".to_string(),
-            desktop_media_prompt.clone(),
-        ));
-        command.args(["--append-system-prompt", &desktop_media_prompt]);
+        if desktop_media_prompt.is_empty() {
+            desktop_media_prompt = desktop_media_reply_prompt(
+                desktop_agent_home.as_deref(),
+                team_artifacts_root_for_media.as_deref(),
+            );
+        }
+        if !base_system_prompt_injected && !desktop_media_prompt.trim().is_empty() {
+            system_prompt_chars += desktop_media_prompt.chars().count();
+            system_prompt_sections.push((
+                "system_prompt".to_string(),
+                desktop_media_prompt.clone(),
+            ));
+            command.args(["--append-system-prompt", &desktop_media_prompt]);
+        }
 
         dev_trace(
             "desktop.stream",
@@ -5802,6 +5859,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             dev_trace("app", "NineClaw 启动");
+            managed_runtime::inject_credential_proxy_app_handle(app.handle().clone());
             resize_main_window_to_screen(&app.handle());
             if let Err(error) = proxy_settings::apply_saved_proxy_settings(&app.handle()) {
                 log::warn!("应用启动时载入代理设置失败: {error}");

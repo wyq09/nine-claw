@@ -13,7 +13,7 @@ use axum::{Json, Router};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -125,6 +125,10 @@ struct ProxySessionConfig {
     llm: Option<LlmProxyBinding>,
     image: Option<ImageGenerationRuntimeConfig>,
     external_apis: HashMap<String, ExternalApiCredential>,
+    session_id: Option<String>,
+    workspace_id: Option<String>,
+    caller_agent_id: Option<String>,
+    caller_agent_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -343,6 +347,52 @@ pub fn select_harness(
         file_path: selected_path,
         definition,
     })
+}
+
+fn restrict_harness_to_agent_tools(
+    harness: SelectedHarness,
+    runtime_dir: &Path,
+    allowed_tool_ids: &[String],
+) -> Result<SelectedHarness, String> {
+    let mut active_tools = crate::agents::runtime_tool_names_for_allowed_tool_ids(allowed_tool_ids);
+    if active_tools.is_empty() {
+        active_tools.push("__nineclaw_no_tools_allowed__".to_string());
+    }
+
+    let mut definition = harness.definition.clone();
+    definition.active_tools = active_tools;
+    let effective_path = runtime_dir.join(format!(
+        "harness-effective-{}.json",
+        sanitize_file_segment(&definition.name)
+    ));
+    let content = serde_json::to_vec_pretty(&definition)
+        .map_err(|error| format!("序列化有效 harness 失败: {error}"))?;
+    fs::write(&effective_path, content)
+        .map_err(|error| format!("写入有效 harness 失败 {}: {error}", effective_path.display()))?;
+
+    Ok(SelectedHarness {
+        file_path: effective_path,
+        definition,
+    })
+}
+
+fn sanitize_file_segment(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn contains_any(content: &str, needles: &[&str]) -> bool {
@@ -696,6 +746,7 @@ pub fn prepare_managed_runtime(
     ensure_agent_runtime_scaffold(&agent_home)?;
 
     let harness = select_harness(&agent_home, &agent_config.execution_mode, prompt)?;
+    let harness = restrict_harness_to_agent_tools(harness, runtime_dir, &agent_config.allowed_tool_ids)?;
     let credentials_path = agent_home.join(HARNESS_CREDENTIALS_FILE);
     let credentials: HarnessCredentialsConfig =
         read_json_file(&credentials_path).unwrap_or_default();
@@ -733,6 +784,10 @@ pub fn prepare_managed_runtime(
                 llm: llm_proxy.clone(),
                 image: image_runtime_config.cloned(),
                 external_apis,
+                session_id: Some(session_id.to_string()),
+                workspace_id: None,
+                caller_agent_id: Some(agent_config.id.clone()),
+                caller_agent_name: Some(agent_config.name.clone()),
             },
         );
     }
@@ -752,6 +807,12 @@ pub fn prepare_managed_runtime(
         proxy_base_url: Some(proxy_server.base_url.clone()),
         session_token: Some(proxy_session_token),
     })
+}
+
+static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+pub fn inject_credential_proxy_app_handle(app: tauri::AppHandle) {
+    let _ = APP_HANDLE.set(app);
 }
 
 fn credential_proxy_server() -> Result<&'static CredentialProxyServer, String> {
@@ -778,6 +839,7 @@ fn credential_proxy_server() -> Result<&'static CredentialProxyServer, String> {
         .route("/external/:token/dispatch", post(external_proxy_handler))
         .route("/image/:token/generate", post(image_proxy_handler))
         .route("/image/:token/task/:task_id", get(image_task_query_handler))
+        .route("/delegate/:token/dispatch", post(delegate_proxy_handler))
         .with_state(state.clone());
     tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::from_std(listener) {
@@ -1035,6 +1097,184 @@ async fn image_task_query_handler(
     Ok(Json(response))
 }
 
+// ---------------------------------------------------------------------------
+// delegate proxy handler — agent_delegate tool endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct DelegateRequest {
+    role: String,
+    task: String,
+    #[serde(default)]
+    context: String,
+}
+
+async fn delegate_proxy_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<DelegateRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Resolve AppHandle lazily — may not be available on very first call
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, "AppHandle 尚未注入，委派功能暂不可用".to_string())
+    })?;
+
+    // Look up session config to get provider info + caller context
+    let (llm_binding, session_id, workspace_id, caller_agent_id, caller_agent_name) = {
+        let guard = state.sessions.lock().map_err(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "session lock poisoned".to_string())
+        })?;
+        guard.get(&token).map(|s| {
+            (
+                s.llm.clone(),
+                s.session_id.clone(),
+                s.workspace_id.clone(),
+                s.caller_agent_id.clone(),
+                s.caller_agent_name.clone(),
+            )
+        }).unwrap_or((None, None, None, None, None))
+    };
+    let Some(llm) = llm_binding else {
+        return Err((StatusCode::UNAUTHORIZED, "unknown session or no LLM config".to_string()));
+    };
+
+    let allowed_delegate_ids: Option<HashSet<String>> = if let Some(workspace_id) = workspace_id.as_deref() {
+        crate::team_workspace::list_team_member_views(&app_handle, workspace_id)
+            .ok()
+            .map(|members| {
+                members
+                    .into_iter()
+                    .filter(|member| Some(member.agent_id.as_str()) != caller_agent_id.as_deref())
+                    .map(|member| member.agent_id)
+                    .collect::<HashSet<_>>()
+            })
+    } else if let Some(caller_id) = caller_agent_id.as_deref() {
+        crate::agents::get_agent_record(&app_handle, caller_id)
+            .ok()
+            .flatten()
+            .and_then(|record| record.collaboration_config)
+            .map(|config| {
+                config
+                    .allowed_delegate_agent_ids
+                    .into_iter()
+                    .filter(|agent_id| agent_id.trim() != caller_id)
+                    .collect::<HashSet<_>>()
+            })
+    } else {
+        None
+    };
+
+    // Find agent by role: first constrain to the current workspace / explicit allowlist,
+    // then try exact ID, exact name, and fuzzy name contains.
+    let agents = crate::agents::list_agents(&app_handle)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let candidate_agents: Vec<_> = agents
+        .iter()
+        .filter(|agent| {
+            if Some(agent.id.as_str()) == caller_agent_id.as_deref() {
+                return false;
+            }
+            allowed_delegate_ids
+                .as_ref()
+                .map(|ids| ids.contains(&agent.id))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    let requested_role = body.role.trim().to_lowercase();
+    let agent = candidate_agents
+        .iter()
+        .copied()
+        .find(|a| a.id == body.role.trim())
+        .or_else(|| {
+            candidate_agents
+                .iter()
+                .copied()
+                .find(|a| a.name.to_lowercase() == requested_role)
+        })
+        .or_else(|| {
+            candidate_agents
+                .iter()
+                .copied()
+                .find(|a| a.name.to_lowercase().contains(&requested_role))
+        });
+
+    let Some(agent) = agent else {
+        return Ok(Json(json!({
+            "ok": false,
+            "error": format!("未找到匹配 '{}' 的子智能体。当前可委派智能体：{}", body.role,
+                candidate_agents.iter().map(|a| format!("{}({})", a.name, a.id)).collect::<Vec<_>>().join(", "))
+        })));
+    };
+
+    // Rebuild provider config from the session's LLM binding
+    let provider_config = ProviderRuntimeConfig {
+        provider_id: llm.provider_id,
+        api_format: llm.api_format,
+        base_url: llm.base_url,
+        api_key: llm.api_key,
+        model: llm.model,
+    };
+
+    // Begin trace: record delegation in LLM trace panel
+    let trace_id = crate::llm_trace::begin(
+        &app_handle,
+        workspace_id.as_deref(),
+        "delegate",
+        caller_agent_id.as_deref().unwrap_or("unknown"),
+        caller_agent_name.as_deref().unwrap_or("Unknown"),
+        Some(&agent.id),
+        Some(&agent.name),
+        session_id.as_deref(),
+        Some(&provider_config.provider_id),
+        Some(&provider_config.model),
+        vec![],
+        &format!("[委派任务] {}\n\n{}", body.task, body.context),
+    );
+
+    // Execute delegation (blocking call with PiBridge)
+    let app = app_handle.clone();
+    let agent_id = agent.id.clone();
+    let task = body.task.clone();
+    let context = if body.context.is_empty() { None } else { Some(body.context.clone()) };
+    let trace_id_for_delegate = trace_id.clone();
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::agent_loop::delegate_to_agent_with_trace(
+            &app,
+            &agent_id,
+            &task,
+            context.as_deref(),
+            &provider_config,
+            Some(trace_id_for_delegate.as_str()),
+        )
+    }).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Finalize trace
+    let final_status = if result.status == "success" { "done" } else { "error" };
+    let trace_error = if result.status == "success" { None } else { Some(result.output.clone()) };
+    crate::llm_trace::finalize(
+        &app_handle,
+        &trace_id,
+        final_status,
+        trace_error,
+        Some(result.output.clone()),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    Ok(Json(json!({
+        "ok": result.status == "success",
+        "output": result.output,
+        "agentId": result.agent_id,
+        "agentName": result.agent_name,
+        "durationMs": result.duration_ms,
+        "error": if result.status == "success" { Value::Null } else { Value::String(result.output.clone()) }
+    })))
+}
+
 fn inject_external_auth(
     request: reqwest::RequestBuilder,
     credential: &ExternalApiCredential,
@@ -1127,6 +1367,48 @@ mod tests {
         )
         .expect("select harness");
         assert_eq!(harness.definition.name, "code");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restrict_harness_uses_agent_allowed_tools_as_active_tools() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create root");
+        ensure_agent_runtime_scaffold(&root).expect("scaffold");
+        let harness = select_harness(
+            &root,
+            "single",
+            Some("帮我修复这个 rust bug 并跑 cargo test"),
+        )
+        .expect("select harness");
+        assert_eq!(harness.definition.name, "code");
+
+        let restricted = restrict_harness_to_agent_tools(
+            harness,
+            &root,
+            &["read_file".to_string(), "grep".to_string(), "glob".to_string()],
+        )
+        .expect("restrict harness");
+        assert_eq!(
+            restricted.definition.active_tools,
+            vec!["read".to_string(), "grep".to_string(), "find".to_string()]
+        );
+        assert!(restricted.file_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restrict_harness_sets_sentinel_when_no_tools_allowed() {
+        let root = temp_root();
+        fs::create_dir_all(&root).expect("create root");
+        ensure_agent_runtime_scaffold(&root).expect("scaffold");
+        let harness = select_harness(&root, "single", Some("hello")).expect("select harness");
+
+        let restricted = restrict_harness_to_agent_tools(harness, &root, &[]).expect("restrict harness");
+        assert_eq!(
+            restricted.definition.active_tools,
+            vec!["__nineclaw_no_tools_allowed__".to_string()]
+        );
         let _ = fs::remove_dir_all(root);
     }
 

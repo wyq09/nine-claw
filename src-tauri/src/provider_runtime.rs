@@ -95,6 +95,23 @@ pub(crate) fn openai_pi_compat_supports_reasoning_effort(model: &str) -> bool {
         || m.contains("moonshot")
 }
 
+pub(crate) fn openai_pi_compat_requires_explicit_thinking_disable(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.contains("deepseek-v4")
+        || m.contains("deepseek_v4")
+        || m.contains("deepseek v4")
+        || m.contains("deepseek-v4-pro")
+        || m.contains("deepseek_v4_pro")
+}
+
+pub(crate) fn should_force_pi_thinking_off(
+    provider_config: &ProviderRuntimeConfig,
+    disable_reasoning_effort: bool,
+) -> bool {
+    disable_reasoning_effort
+        || openai_pi_compat_requires_explicit_thinking_disable(&provider_config.model)
+}
+
 /// 微信/飞书 IM 必须使用绑定智能体的默认模型；Base URL / API Key 从应用全局 Provider 配置读取。
 pub(crate) fn resolve_im_llm_runtime(
     app: &AppHandle,

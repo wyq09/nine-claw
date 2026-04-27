@@ -9,6 +9,8 @@ const MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE: &str = "nineclaw-image-task-query-t
 const MANAGED_RUNTIME_TOOL_RESULT_STORAGE_FILE: &str = "tool_result_storage.mjs";
 const MANAGED_RUNTIME_CURL_HTTP_FILE: &str = "curl_http.mjs";
 const MANAGED_RUNTIME_WEB_SEARCH_TRANSPORT_FILE: &str = "web_search_transport.mjs";
+const MANAGED_RUNTIME_IMAGE_DOWNLOADER_FILE: &str = "image_downloader.mjs";
+const MANAGED_RUNTIME_AGENT_DELEGATE_FILE: &str = "nineclaw-agent-delegate-tool.mjs";
 const WEB_SEARCH_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/web_search_tool.mjs");
 const WEB_FETCH_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/web_fetch_tool.mjs");
 const IMAGE_GENERATION_TOOL_SOURCE: &str =
@@ -20,6 +22,9 @@ const TOOL_RESULT_STORAGE_SOURCE: &str =
 const CURL_HTTP_SOURCE: &str = include_str!("../../src/runtime-tools/curl_http.mjs");
 const WEB_SEARCH_TRANSPORT_SOURCE: &str =
     include_str!("../../src/runtime-tools/web_search_transport.mjs");
+const IMAGE_DOWNLOADER_SOURCE: &str = include_str!("../../src/runtime-tools/image_downloader.mjs");
+const AGENT_DELEGATE_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/agent_delegate_tool.mjs");
 
 pub(crate) fn write_managed_runtime_extension_files(
     runtime_dir: &Path,
@@ -72,6 +77,14 @@ pub(crate) fn write_managed_runtime_extension_files(
         )
     })?;
 
+    let image_downloader_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_DOWNLOADER_FILE);
+    fs::write(&image_downloader_path, IMAGE_DOWNLOADER_SOURCE).map_err(|error| {
+        format!(
+            "写入 image_downloader 运行时模块失败 {}: {error}",
+            image_downloader_path.display()
+        )
+    })?;
+
     let image_generation_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_GENERATION_FILE);
     fs::write(&image_generation_path, IMAGE_GENERATION_TOOL_SOURCE).map_err(|error| {
         format!(
@@ -85,6 +98,14 @@ pub(crate) fn write_managed_runtime_extension_files(
         format!(
             "写入 image_task_query 运行时模块失败 {}: {error}",
             image_task_query_path.display()
+        )
+    })?;
+
+    let agent_delegate_path = runtime_dir.join(MANAGED_RUNTIME_AGENT_DELEGATE_FILE);
+    fs::write(&agent_delegate_path, AGENT_DELEGATE_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 agent_delegate 运行时模块失败 {}: {error}",
+            agent_delegate_path.display()
         )
     })?;
 
@@ -121,6 +142,7 @@ import {{ createWebSearchTool }} from "./{MANAGED_RUNTIME_WEB_SEARCH_FILE}";
 import {{ createWebFetchTool }} from "./{MANAGED_RUNTIME_WEB_FETCH_FILE}";
 import {{ createImageGenerationTool }} from "./{MANAGED_RUNTIME_IMAGE_GENERATION_FILE}";
 import {{ createImageTaskQueryTool }} from "./{MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE}";
+import {{ createAgentDelegateTool }} from "./{MANAGED_RUNTIME_AGENT_DELEGATE_FILE}";
 
 const execFile = promisify(execFileCallback);
 
@@ -146,11 +168,6 @@ function readHarness() {{
 function applyHarness(pi, harness) {{
   const active = Array.isArray(harness.activeTools) ? harness.activeTools.filter(Boolean) : [];
   const hasExplicitActiveTools = active.length > 0;
-  active.push("image_generate");
-  active.push("image_task_query");
-  if (harness.enableExternalApiProxy) {{
-    active.push("nineclaw_external_api");
-  }}
   if (hasExplicitActiveTools) {{
     const unique = [...new Set(active)];
     pi.setActiveTools(unique);
@@ -164,12 +181,39 @@ function proxyUrl() {{
   return `${{base}}/external/${{token}}/dispatch`;
 }}
 
+const TOOL_REPEAT_LIMIT = 3;
+const TOOL_LOOP_GUARD_REASON_PREFIX = "[NineClaw loop guard]";
+
+function stableToolInput(value) {{
+  if (Array.isArray(value)) {{
+    return value.map((item) => stableToolInput(item));
+  }}
+  if (value && typeof value === "object") {{
+    const out = {{}};
+    for (const key of Object.keys(value).sort()) {{
+      const item = value[key];
+      if (item !== undefined) {{
+        out[key] = stableToolInput(item);
+      }}
+    }}
+    return out;
+  }}
+  return value;
+}}
+
+function stableToolSignature(toolName, input) {{
+  return `${{String(toolName ?? "")}}\n${{JSON.stringify(stableToolInput(input ?? {{}}))}}`;
+}}
+
 export default function(pi) {{
   let externalToolRegistered = false;
   let webSearchToolRegistered = false;
   let webFetchToolRegistered = false;
   let imageGenerationToolRegistered = false;
   let imageTaskQueryToolRegistered = false;
+  let agentDelegateToolRegistered = false;
+  let lastToolSignature = "";
+  let repeatedToolSignatureCount = 0;
 
   function ensureWebSearchTool() {{
     if (webSearchToolRegistered) return;
@@ -246,6 +290,18 @@ export default function(pi) {{
     );
   }}
 
+  function ensureAgentDelegateTool() {{
+    if (agentDelegateToolRegistered) return;
+    agentDelegateToolRegistered = true;
+    pi.registerTool(
+      createAgentDelegateTool({{
+        Type,
+        fetchImpl: fetch,
+        processApi: process,
+      }})
+    );
+  }}
+
   function ensureExternalTool() {{
     if (externalToolRegistered) return;
     externalToolRegistered = true;
@@ -289,6 +345,7 @@ export default function(pi) {{
     ensureWebFetchTool();
     ensureImageGenerationTool();
     ensureImageTaskQueryTool();
+    ensureAgentDelegateTool();
     if (harness.enableExternalApiProxy) {{
       ensureExternalTool();
     }}
@@ -301,6 +358,7 @@ export default function(pi) {{
     ensureWebFetchTool();
     ensureImageGenerationTool();
     ensureImageTaskQueryTool();
+    ensureAgentDelegateTool();
     if (harness.enableExternalApiProxy) {{
       ensureExternalTool();
     }}
@@ -315,6 +373,20 @@ export default function(pi) {{
   }});
 
   pi.on("tool_call", async (event) => {{
+    const signature = stableToolSignature(event.toolName, event.input);
+    if (signature === lastToolSignature) {{
+      repeatedToolSignatureCount += 1;
+    }} else {{
+      lastToolSignature = signature;
+      repeatedToolSignatureCount = 1;
+    }}
+    if (repeatedToolSignatureCount >= TOOL_REPEAT_LIMIT) {{
+      return {{
+        block: true,
+        reason: `${{TOOL_LOOP_GUARD_REASON_PREFIX}} 检测到连续 ${{TOOL_REPEAT_LIMIT}} 次调用相同工具且参数一致，已拦截本次操作，防止进入死循环。工具：${{String(event.toolName ?? "unknown_tool")}}`
+      }};
+    }}
+
     if (event.toolName !== "bash") {{
       return undefined;
     }}
@@ -351,6 +423,7 @@ mod tests {
         let storage_helper_path = runtime_dir.join(MANAGED_RUNTIME_TOOL_RESULT_STORAGE_FILE);
         let curl_http_path = runtime_dir.join(MANAGED_RUNTIME_CURL_HTTP_FILE);
         let web_search_transport_path = runtime_dir.join(MANAGED_RUNTIME_WEB_SEARCH_TRANSPORT_FILE);
+        let image_downloader_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_DOWNLOADER_FILE);
         let image_task_query_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE);
         let image_generation_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_GENERATION_FILE);
         let extension_source = fs::read_to_string(&extension_path).expect("read extension");
@@ -362,6 +435,8 @@ mod tests {
         let curl_http_source = fs::read_to_string(&curl_http_path).expect("read curl http helper");
         let web_search_transport_source =
             fs::read_to_string(&web_search_transport_path).expect("read search transport helper");
+        let image_downloader_source =
+            fs::read_to_string(&image_downloader_path).expect("read image downloader helper");
         let image_generation_source =
             fs::read_to_string(&image_generation_path).expect("read image generation helper");
         let image_task_query_source =
@@ -377,6 +452,9 @@ mod tests {
         assert!(extension_source.contains("createWebFetchTool"));
         assert!(extension_source.contains("const hasExplicitActiveTools = active.length > 0"));
         assert!(extension_source.contains("if (hasExplicitActiveTools)"));
+        assert!(extension_source.contains("const TOOL_REPEAT_LIMIT = 3"));
+        assert!(extension_source.contains("stableToolSignature(event.toolName, event.input)"));
+        assert!(extension_source.contains("[NineClaw loop guard]"));
         assert!(helper_source.contains("name: \"web_search\""));
         assert!(fetch_helper_source.contains("name: \"web_fetch\""));
         assert!(image_generation_source.contains("name: \"image_generate\""));
@@ -385,6 +463,10 @@ mod tests {
         assert!(fetch_helper_source.contains("tool_result_storage.mjs"));
         assert!(fetch_helper_source.contains("curl_http.mjs"));
         assert!(helper_source.contains("web_search_transport.mjs"));
+        assert!(helper_source.contains("image_downloader.mjs"));
+        assert!(fetch_helper_source.contains("image_downloader.mjs"));
+        assert!(image_downloader_source.contains("fetchUrlWithCurl"));
+        assert!(image_downloader_source.contains("downloadImagesToWorkdir"));
         assert!(storage_helper_source.contains("Result exceeded"));
         assert!(storage_helper_source.contains("Use the file reading tool"));
         assert!(curl_http_source.contains("execFileImpl(\"curl\""));
@@ -397,6 +479,7 @@ mod tests {
         let _ = fs::remove_file(storage_helper_path);
         let _ = fs::remove_file(curl_http_path);
         let _ = fs::remove_file(web_search_transport_path);
+        let _ = fs::remove_file(image_downloader_path);
         let _ = fs::remove_file(image_generation_path);
         let _ = fs::remove_file(image_task_query_path);
         let _ = fs::remove_dir_all(runtime_dir);

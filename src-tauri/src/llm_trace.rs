@@ -321,6 +321,41 @@ fn emit_event(app: &AppHandle, phase: &str, entry: &TraceEntry) {
     let _ = app.emit("workspace.llm_trace", payload);
 }
 
+fn emit_text_delta_event(app: &AppHandle, entry: &TraceEntry, kind: &str, text: &str) {
+    let payload = serde_json::json!({
+        "phase": "updated",
+        "entry": {
+            "id": &entry.id,
+            "workspaceId": &entry.workspace_id,
+            "kind": &entry.kind,
+            "traceType": &entry.trace_type,
+            "callerKind": &entry.caller_kind,
+            "targetKind": &entry.target_kind,
+            "callerAgentId": &entry.caller_agent_id,
+            "callerAgentName": &entry.caller_agent_name,
+            "targetAgentId": &entry.target_agent_id,
+            "targetAgentName": &entry.target_agent_name,
+            "sessionId": &entry.session_id,
+            "parentTraceId": &entry.parent_trace_id,
+            "provider": &entry.provider,
+            "model": &entry.model,
+            "responseId": &entry.response_id,
+            "status": &entry.status,
+            "error": &entry.error,
+            "startedAt": entry.started_at,
+            "finishedAt": entry.finished_at,
+            "durationMs": entry.duration_ms,
+            "usage": &entry.usage,
+            "toolCalls": &entry.tool_calls,
+        },
+        "delta": {
+            "kind": kind,
+            "text": text,
+        },
+    });
+    let _ = app.emit("workspace.llm_trace", payload);
+}
+
 /// 开始一条追踪。返回 `trace_id`，用于后续补充工具调用与结束时落盘。
 pub fn begin(
     app: &AppHandle,
@@ -483,7 +518,7 @@ pub fn append_response(app: &AppHandle, trace_id: &str, delta: &str) {
         entry.sync_structured_blocks();
         entry.clone()
     };
-    emit_event(app, "updated", &snapshot);
+    emit_text_delta_event(app, &snapshot, "response", delta);
 }
 
 /// 追加思考过程文本片段（thinking_delta）。
@@ -504,7 +539,7 @@ pub fn append_thinking(app: &AppHandle, trace_id: &str, delta: &str) {
         entry.sync_structured_blocks();
         entry.clone()
     };
-    emit_event(app, "updated", &snapshot);
+    emit_text_delta_event(app, &snapshot, "thinking", delta);
 }
 
 /// 结束一条追踪，落盘 + emit 事件。

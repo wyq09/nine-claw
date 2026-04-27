@@ -516,11 +516,17 @@ pub(crate) fn workspace_delegate(
 /// 会自然结束。后续阶段可替换为真正 `AbortHandle`。
 #[tauri::command]
 pub(crate) async fn workspace_abort_delegate(app: AppHandle, run_id: String) -> Result<(), String> {
+    let abort_message = match team_workspace::abort_delegate_run(run_id.trim()) {
+        Ok(true) => None,
+        Ok(false) => Some("未找到仍在运行的子智能体，已回退为前端中止状态。".to_string()),
+        Err(error) => Some(format!("尝试中止子智能体失败：{error}")),
+    };
     let _ = app.emit(
         "workspace.delegate.done",
         serde_json::json!({
             "runId": run_id,
             "status": "aborted",
+            "error": abort_message,
         }),
     );
     Ok(())

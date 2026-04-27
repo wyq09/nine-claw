@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub const TASK_CREATOR_SKILL_ID: &str = "nineclaw-task-creator";
+pub const ATOMIC_TOOLS_SKILL_ID: &str = "nineclaw-atomic-tools";
 pub const TEAM_SUPERVISOR_ORCHESTRATOR_SKILL_ID: &str = "team-supervisor-orchestrator";
 pub const DEFAULT_MAX_DYNAMIC_SKILLS: usize = 4;
 const MIN_DYNAMIC_SKILLS: usize = 1;
@@ -99,7 +100,10 @@ pub fn dedupe_skill_ids(skill_ids: Vec<String>) -> Vec<String> {
 }
 
 pub fn required_system_skill_ids_for_mode(execution_mode: &str) -> Vec<String> {
-    let mut skill_ids = vec![TASK_CREATOR_SKILL_ID.to_string()];
+    let mut skill_ids = vec![
+        ATOMIC_TOOLS_SKILL_ID.to_string(),
+        TASK_CREATOR_SKILL_ID.to_string(),
+    ];
     if execution_mode.trim() == "supervisor" {
         skill_ids.push(TEAM_SUPERVISOR_ORCHESTRATOR_SKILL_ID.to_string());
     }
@@ -172,12 +176,17 @@ mod tests {
 
         assert_eq!(
             effective_required_skill_ids(&policy, "single"),
-            vec!["alpha".to_string(), TASK_CREATOR_SKILL_ID.to_string()]
+            vec![
+                "alpha".to_string(),
+                ATOMIC_TOOLS_SKILL_ID.to_string(),
+                TASK_CREATOR_SKILL_ID.to_string(),
+            ]
         );
         assert_eq!(
             effective_required_skill_ids(&policy, "supervisor"),
             vec![
                 "alpha".to_string(),
+                ATOMIC_TOOLS_SKILL_ID.to_string(),
                 TASK_CREATOR_SKILL_ID.to_string(),
                 TEAM_SUPERVISOR_ORCHESTRATOR_SKILL_ID.to_string(),
             ]

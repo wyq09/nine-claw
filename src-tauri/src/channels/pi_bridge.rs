@@ -256,6 +256,24 @@ mod tests {
     }
 
     #[test]
+    fn bot_provider_models_config_handles_deepseek_v4_pro_thinking_toggle() {
+        let config = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+        };
+
+        let models = PiBridge::build_provider_models_config_from_config(&config, false, false)
+            .expect("config");
+        let provider = &models["providers"]["nineclaw-runtime-8b9035807842"];
+        assert_eq!(provider["compat"]["supportsReasoningEffort"], json!(false));
+        assert_eq!(provider["compat"]["thinkingFormat"], json!("qwen"));
+        assert_eq!(provider["models"][0]["reasoning"], json!(true));
+    }
+
+    #[test]
     fn bot_slash_command_parser_recognizes_new_help_and_unknown() {
         assert_eq!(
             PiBridge::parse_bot_slash_command("/new"),
@@ -705,18 +723,27 @@ impl PiBridge {
             }
             _ => {
                 provider.insert("api".to_string(), json!("openai-completions"));
+                let requires_explicit_thinking_disable =
+                    crate::openai_pi_compat_requires_explicit_thinking_disable(model);
                 let reasoning = !disable_reasoning_effort
-                    && crate::openai_pi_compat_supports_reasoning_effort(model);
+                    && (crate::openai_pi_compat_supports_reasoning_effort(model)
+                        || requires_explicit_thinking_disable);
+                let mut compat = serde_json::Map::new();
+                compat.insert("supportsDeveloperRole".to_string(), json!(false));
+                compat.insert(
+                    "supportsReasoningEffort".to_string(),
+                    json!(reasoning && !requires_explicit_thinking_disable),
+                );
+                if requires_explicit_thinking_disable {
+                    compat.insert("thinkingFormat".to_string(), json!("qwen"));
+                }
                 provider.insert(
                     "compat".to_string(),
-                    json!({
-                        "supportsDeveloperRole": false,
-                        "supportsReasoningEffort": reasoning
-                    }),
+                    serde_json::Value::Object(compat),
                 );
                 provider.insert(
                     "models".to_string(),
-                    json!([{ "id": model, "api": "openai-completions", "input": model_input }]),
+                    json!([{ "id": model, "api": "openai-completions", "input": model_input, "reasoning": reasoning }]),
                 );
             }
         }
@@ -1195,6 +1222,9 @@ impl PiBridge {
             if !config.model.is_empty() {
                 cmd.args(["--model", &config.model]);
             }
+            if crate::should_force_pi_thinking_off(config, disable_reasoning_history) {
+                cmd.args(["--thinking", "off"]);
+            }
             if !config.api_key.is_empty() {
                 cmd.args(["--api-key", &config.api_key]);
             }
@@ -1223,6 +1253,7 @@ impl PiBridge {
         let mut system_prompt_chars = 0usize;
         let mut system_prompt_sections: Vec<(String, String)> = Vec::new();
         if let Some(agent_config) = self.agent_config.as_ref() {
+            let media_prompt = "当前回复目标是 IM 用户。NineClaw 已具备把本地图片、文件、视频发送给用户的能力，微信等通道会在你输出媒体指令后自动上传并下发。用户要图片或文件时，不要回答“当前通道不支持”“不能稳定发送”“只能读取展示”之类的限制性描述；如果文件已经存在或刚生成，请直接单独输出一行 `::nc-media{type=\"image|file|video\" path=\"/absolute/path/to/file\"}`。该指令行不要附加解释文字；普通文本说明单独写在其他行。若你在正文里单独列出本地绝对路径，NineClaw 也会把它视为待发送媒体，但优先使用 `::nc-media`。";
             if let Ok(workspace_root) = crate::agent_workspace::resolve_workspace_root() {
                 let agent_home = workspace_root.join("agents").join(&agent_config.id);
                 cmd.current_dir(&agent_home)
@@ -1235,17 +1266,15 @@ impl PiBridge {
             if let Some(system_prompt) = agents::build_agent_system_prompt_for_prompt(
                 agent_config,
                 Some(prepared_input.message.as_str()),
-            ) {
+            )
+            .map(|prompt| format!("{prompt}\n\n# NineClaw 媒体输出\n\n{media_prompt}"))
+            .or_else(|| Some(format!("# NineClaw 媒体输出\n\n{media_prompt}")))
+            {
                 system_prompt_chars += system_prompt.chars().count();
                 system_prompt_sections
                     .push(("agent_system_prompt".to_string(), system_prompt.clone()));
                 cmd.args(["--append-system-prompt", &system_prompt]);
             }
-
-            let media_prompt = "当前回复目标是 IM 用户。NineClaw 已具备把本地图片、文件、视频发送给用户的能力，微信等通道会在你输出媒体指令后自动上传并下发。用户要图片或文件时，不要回答“当前通道不支持”“不能稳定发送”“只能读取展示”之类的限制性描述；如果文件已经存在或刚生成，请直接单独输出一行 `::nc-media{type=\"image|file|video\" path=\"/absolute/path/to/file\"}`。该指令行不要附加解释文字；普通文本说明单独写在其他行。若你在正文里单独列出本地绝对路径，NineClaw 也会把它视为待发送媒体，但优先使用 `::nc-media`。";
-            system_prompt_chars += media_prompt.chars().count();
-            system_prompt_sections.push(("im_media".to_string(), media_prompt.to_string()));
-            cmd.args(["--append-system-prompt", media_prompt]);
             let memory_isolation_prompt = "记忆隔离规则：当前智能体只能使用自己的私有工作区记忆。禁止读取、引用、总结或迁移其他智能体 `agents/<other-agent-id>/` 下的任何 markdown 记忆文件。";
             system_prompt_chars += memory_isolation_prompt.chars().count();
             system_prompt_sections.push((

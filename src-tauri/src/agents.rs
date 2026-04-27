@@ -10,6 +10,21 @@ use tauri::AppHandle;
 use uuid::Uuid;
 
 const DEFAULT_AGENT_STATE_KEY: &str = "default_agent_id";
+const DEFAULT_ALLOWED_TOOL_IDS: &[&str] = &[
+    "bash",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "grep",
+    "list_dir",
+    "glob",
+    "web_search",
+    "web_fetch",
+    "image_generate",
+    "image_task_query",
+    "agent_spawn",
+    "external_api",
+];
 
 /// 用户在「系统指令」中填写的内容会进入 `agent_system_prompt`；不应对其做过短截断，仅保留与模型侧类似的硬上限防误粘贴。
 const MAX_USER_SYSTEM_INSTRUCTION_CHARS: usize = 32_000;
@@ -62,6 +77,8 @@ pub struct AgentRecord {
     pub capability_policy: AgentCapabilityPolicy,
     #[serde(default)]
     pub skill_ids: Vec<String>,
+    #[serde(default = "default_allowed_tool_ids")]
+    pub allowed_tool_ids: Vec<String>,
     pub default_provider_id: String,
     pub default_model: String,
     pub is_builtin: bool,
@@ -69,6 +86,8 @@ pub struct AgentRecord {
     pub execution_mode: String,
     pub collaboration_config: Option<AgentCollaborationConfig>,
     pub accent_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_uri: Option<String>,
     #[serde(default)]
     pub bot_configs: HashMap<String, AgentBotConfig>,
     #[serde(default)]
@@ -99,6 +118,8 @@ pub struct AgentInput {
     pub capability_policy: Option<AgentCapabilityPolicy>,
     #[serde(default)]
     pub skill_ids: Vec<String>,
+    #[serde(default = "default_allowed_tool_ids")]
+    pub allowed_tool_ids: Vec<String>,
     pub default_provider_id: String,
     pub default_model: String,
     #[serde(default)]
@@ -107,6 +128,8 @@ pub struct AgentInput {
     pub collaboration_config: Option<AgentCollaborationConfig>,
     #[serde(default)]
     pub accent_color: Option<String>,
+    #[serde(default)]
+    pub avatar_uri: Option<String>,
     #[serde(default)]
     pub bot_configs: HashMap<String, AgentBotConfig>,
     #[serde(default)]
@@ -234,6 +257,8 @@ pub struct ConversationAgentConfig {
     pub capability_policy: AgentCapabilityPolicy,
     #[serde(default)]
     pub skill_ids: Vec<String>,
+    #[serde(default = "default_allowed_tool_ids")]
+    pub allowed_tool_ids: Vec<String>,
     #[serde(default)]
     pub default_provider_id: String,
     #[serde(default)]
@@ -244,6 +269,8 @@ pub struct ConversationAgentConfig {
     pub collaboration_config: Option<AgentCollaborationConfig>,
     #[serde(default)]
     pub accent_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenario_llm_config: Option<AgentScenarioLlmConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,6 +287,70 @@ struct BuiltinAgentSeed {
     default_provider_id: &'static str,
     default_model: &'static str,
     accent_color: &'static str,
+}
+
+pub fn default_allowed_tool_ids() -> Vec<String> {
+    DEFAULT_ALLOWED_TOOL_IDS
+        .iter()
+        .map(|item| item.to_string())
+        .collect()
+}
+
+pub fn normalize_allowed_tool_ids(tool_ids: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for tool_id in tool_ids {
+        let Some(canonical) = canonical_allowed_tool_id(&tool_id) else {
+            continue;
+        };
+        if seen.insert(canonical.clone()) {
+            normalized.push(canonical);
+        }
+    }
+    normalized
+}
+
+pub fn runtime_tool_names_for_allowed_tool_ids(tool_ids: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut tools = Vec::new();
+    for tool_id in tool_ids {
+        let runtime_name = match tool_id.trim() {
+            "read_file" => "read",
+            "write_file" => "write",
+            "edit_file" => "edit",
+            "list_dir" => "ls",
+            "glob" => "find",
+            "agent_spawn" => "agent_delegate",
+            "external_api" => "nineclaw_external_api",
+            value => value,
+        };
+        let runtime_name = runtime_name.trim();
+        if !runtime_name.is_empty() && seen.insert(runtime_name.to_string()) {
+            tools.push(runtime_name.to_string());
+        }
+    }
+    tools
+}
+
+fn canonical_allowed_tool_id(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let canonical = match trimmed {
+        "read" => "read_file",
+        "write" => "write_file",
+        "edit" => "edit_file",
+        "ls" => "list_dir",
+        "find" => "glob",
+        "agent_delegate" => "agent_spawn",
+        "nineclaw_external_api" => "external_api",
+        other => other,
+    };
+    if !DEFAULT_ALLOWED_TOOL_IDS.contains(&canonical) {
+        return None;
+    }
+    Some(canonical.to_string())
 }
 
 pub(crate) fn ensure_agents_ready_conn(connection: &Connection) -> Result<(), String> {
@@ -343,11 +434,13 @@ pub fn get_conversation_agent_config(
         system_prompt: record.system_prompt,
         capability_policy: record.capability_policy,
         skill_ids: record.skill_ids,
+        allowed_tool_ids: record.allowed_tool_ids,
         default_provider_id: record.default_provider_id,
         default_model: record.default_model,
         execution_mode: record.execution_mode,
         collaboration_config: record.collaboration_config,
         accent_color: record.accent_color,
+        avatar_uri: record.avatar_uri,
         scenario_llm_config: record.scenario_llm_config.clone(),
         agent_loop_config: record.agent_loop_config.clone(),
     }))
@@ -474,7 +567,14 @@ pub fn build_agent_system_prompt_for_prompt(
         } else {
             String::new()
         };
-        sections.push(format!("偏好技能：{}{}", listed, suffix));
+            sections.push(format!("偏好技能：{}{}", listed, suffix));
+    }
+
+    if !agent.allowed_tool_ids.is_empty() {
+        sections.push(format!(
+            "允许工具：{}。严禁调用未列入允许工具的工具。",
+            agent.allowed_tool_ids.join("、")
+        ));
     }
 
     let system_prompt = agent.system_prompt.trim();
@@ -491,7 +591,9 @@ pub fn build_agent_system_prompt_for_prompt(
         } else {
             expanded_prompt
         };
-        sections.push(format!("附加执行约束：\n{body}"));
+        sections.push(format!(
+            "最高优先级执行要求（MUST）：以下是用户为当前智能体配置的专属系统提示词。除非违反平台安全或系统级限制，否则必须严格遵守；若与下面的通用能力说明冲突，以本段为准。\n{body}"
+        ));
     }
 
     if agent_workspace::runtime_sync_enabled() {
@@ -528,7 +630,9 @@ fn ensure_agents_schema(connection: &Connection) -> Result<(), String> {
                 collaboration_config_json TEXT,
                 heartbeat_config_json TEXT,
                 capability_policy_json TEXT,
+                allowed_tool_ids_json TEXT,
                 accent_color TEXT,
+                avatar_uri TEXT,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -561,8 +665,10 @@ fn ensure_agents_schema(connection: &Connection) -> Result<(), String> {
     add_agents_column_if_missing(connection, "scenario_llm_config_json", "TEXT")?;
     add_agents_column_if_missing(connection, "agent_loop_config_json", "TEXT")?;
     add_agents_column_if_missing(connection, "capability_policy_json", "TEXT")?;
+    add_agents_column_if_missing(connection, "allowed_tool_ids_json", "TEXT")?;
     add_agents_column_if_missing(connection, "trigger_condition", "TEXT NOT NULL DEFAULT ''")?;
     add_agents_column_if_missing(connection, "manual_trigger_only", "INTEGER NOT NULL DEFAULT 0")?;
+    add_agents_column_if_missing(connection, "avatar_uri", "TEXT")?;
     crate::heartbeat::ensure_heartbeat_schema(connection)?;
 
     Ok(())
@@ -614,8 +720,8 @@ fn seed_builtin_agents(connection: &Connection) -> Result<(), String> {
                 "INSERT OR IGNORE INTO agents (
                 id, name, summary, description, trigger_condition, manual_trigger_only, system_prompt, default_provider_id,
                 default_model, is_builtin, is_archived, execution_mode,
-                collaboration_config_json, heartbeat_config_json, capability_policy_json, accent_color, scenario_llm_config_json, agent_loop_config_json, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, '', 0, ?5, ?6, ?7, 1, 0, 'single', NULL, NULL, ?8, ?9, NULL, NULL, ?10, ?10)",
+                collaboration_config_json, heartbeat_config_json, capability_policy_json, allowed_tool_ids_json, accent_color, scenario_llm_config_json, agent_loop_config_json, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, '', 0, ?5, ?6, ?7, 1, 0, 'single', NULL, NULL, ?8, ?9, ?10, NULL, NULL, ?11, ?11)",
                 params![
                     seed.id,
                     seed.name,
@@ -625,6 +731,7 @@ fn seed_builtin_agents(connection: &Connection) -> Result<(), String> {
                     seed.default_provider_id,
                     seed.default_model,
                     capability_policy_json,
+                    serialize_allowed_tool_ids(&default_allowed_tool_ids())?,
                     seed.accent_color,
                     1_735_689_600_000_i64,
                 ],
@@ -736,7 +843,9 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
                 execution_mode,
                 collaboration_config_json,
                 heartbeat_config_json,
+                allowed_tool_ids_json,
                 accent_color,
+                avatar_uri,
                 scenario_llm_config_json,
                 agent_loop_config_json,
                 created_at,
@@ -770,12 +879,14 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
                 execution_mode: row.get(11)?,
                 collaboration_config: deserialize_collaboration_config(row.get(12)?),
                 heartbeat_config: deserialize_heartbeat_config(row.get(13)?),
-                accent_color: row.get(14)?,
-                scenario_llm_config: deserialize_scenario_llm_config(row.get(15)?),
-                agent_loop_config: deserialize_agent_loop_config(row.get(16)?),
+                allowed_tool_ids: deserialize_allowed_tool_ids(row.get(14)?),
+                accent_color: row.get(15)?,
+                avatar_uri: row.get(16)?,
+                scenario_llm_config: deserialize_scenario_llm_config(row.get(17)?),
+                agent_loop_config: deserialize_agent_loop_config(row.get(18)?),
                 bot_configs: HashMap::new(),
-                created_at: row.get(17)?,
-                updated_at: row.get(18)?,
+                created_at: row.get(19)?,
+                updated_at: row.get(20)?,
             })
         })
         .map_err(|error| format!("解析智能体列表失败: {error}"))?;
@@ -857,7 +968,9 @@ fn get_active_agent_by_id(
                 execution_mode,
                 collaboration_config_json,
                 heartbeat_config_json,
+                allowed_tool_ids_json,
                 accent_color,
+                avatar_uri,
                 scenario_llm_config_json,
                 agent_loop_config_json,
                 created_at,
@@ -886,12 +999,14 @@ fn get_active_agent_by_id(
                 execution_mode: row.get(11)?,
                 collaboration_config: deserialize_collaboration_config(row.get(12)?),
                 heartbeat_config: deserialize_heartbeat_config(row.get(13)?),
-                accent_color: row.get(14)?,
-                scenario_llm_config: deserialize_scenario_llm_config(row.get(15)?),
-                agent_loop_config: deserialize_agent_loop_config(row.get(16)?),
+                allowed_tool_ids: deserialize_allowed_tool_ids(row.get(14)?),
+                accent_color: row.get(15)?,
+                avatar_uri: row.get(16)?,
+                scenario_llm_config: deserialize_scenario_llm_config(row.get(17)?),
+                agent_loop_config: deserialize_agent_loop_config(row.get(18)?),
                 bot_configs: HashMap::new(),
-                created_at: row.get(17)?,
-                updated_at: row.get(18)?,
+                created_at: row.get(19)?,
+                updated_at: row.get(20)?,
             })
         })
         .optional()
@@ -1014,6 +1129,7 @@ fn create_agent_with_connection(
     let scenario_json = serialize_scenario_llm_config(&normalized.scenario_llm_config)?;
     let agent_loop_json = serialize_agent_loop_config(&normalized.agent_loop_config)?;
     let capability_policy_json = serialize_capability_policy(&normalized.capability_policy)?;
+    let allowed_tool_ids_json = serialize_allowed_tool_ids(&normalized.allowed_tool_ids)?;
 
     let transaction = connection
         .transaction()
@@ -1024,8 +1140,8 @@ fn create_agent_with_connection(
             "INSERT INTO agents (
                 id, name, summary, description, trigger_condition, manual_trigger_only, system_prompt, default_provider_id,
                 default_model, is_builtin, is_archived, execution_mode,
-                collaboration_config_json, heartbeat_config_json, capability_policy_json, accent_color, scenario_llm_config_json, agent_loop_config_json, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
+                collaboration_config_json, heartbeat_config_json, capability_policy_json, allowed_tool_ids_json, accent_color, avatar_uri, scenario_llm_config_json, agent_loop_config_json, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19)",
             params![
                 agent_id.as_str(),
                 normalized.name.as_str(),
@@ -1040,7 +1156,9 @@ fn create_agent_with_connection(
                 collaboration_json,
                 heartbeat_json,
                 capability_policy_json,
+                allowed_tool_ids_json,
                 normalized.accent_color.as_deref(),
+                normalized.avatar_uri.as_deref(),
                 scenario_json,
                 agent_loop_json,
                 now,
@@ -1100,6 +1218,7 @@ fn update_agent_with_connection(
     let scenario_json = serialize_scenario_llm_config(&normalized.scenario_llm_config)?;
     let agent_loop_json = serialize_agent_loop_config(&normalized.agent_loop_config)?;
     let capability_policy_json = serialize_capability_policy(&normalized.capability_policy)?;
+    let allowed_tool_ids_json = serialize_allowed_tool_ids(&normalized.allowed_tool_ids)?;
 
     let transaction = connection
         .transaction()
@@ -1127,10 +1246,12 @@ fn update_agent_with_connection(
                 collaboration_config_json = ?12,
                 heartbeat_config_json = ?13,
                 capability_policy_json = ?14,
-                accent_color = ?15,
-                scenario_llm_config_json = ?16,
-                agent_loop_config_json = ?17,
-                updated_at = ?18
+                allowed_tool_ids_json = ?15,
+                accent_color = ?16,
+                avatar_uri = ?17,
+                scenario_llm_config_json = ?18,
+                agent_loop_config_json = ?19,
+                updated_at = ?20
             WHERE id = ?1 AND is_archived = 0",
             params![
                 agent_id,
@@ -1147,7 +1268,9 @@ fn update_agent_with_connection(
                 collaboration_json,
                 heartbeat_json,
                 capability_policy_json,
+                allowed_tool_ids_json,
                 normalized.accent_color,
+                normalized.avatar_uri,
                 scenario_json,
                 agent_loop_json,
                 now,
@@ -1605,6 +1728,7 @@ fn normalize_agent_input(payload: AgentInput) -> Result<NormalizedAgentInput, St
             static_capability_policy(),
         ),
         skill_ids: dedupe_skill_ids(payload.skill_ids),
+        allowed_tool_ids: normalize_allowed_tool_ids(payload.allowed_tool_ids),
         default_provider_id,
         default_model,
         execution_mode: normalize_execution_mode(payload.execution_mode.as_deref()),
@@ -1615,6 +1739,10 @@ fn normalize_agent_input(payload: AgentInput) -> Result<NormalizedAgentInput, St
             .accent_color
             .map(|color| color.trim().to_string())
             .filter(|color| !color.is_empty()),
+        avatar_uri: payload
+            .avatar_uri
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
         bot_configs: normalize_bot_configs(payload.bot_configs)?,
         heartbeat_config: normalize_heartbeat_config(payload.heartbeat_config)?,
         scenario_llm_config: normalize_scenario_llm_config(payload.scenario_llm_config),
@@ -1768,6 +1896,19 @@ fn serialize_capability_policy(config: &AgentCapabilityPolicy) -> Result<Option<
     serde_json::to_string(&normalized)
         .map(Some)
         .map_err(|error| format!("序列化能力策略失败: {error}"))
+}
+
+fn serialize_allowed_tool_ids(tool_ids: &[String]) -> Result<Option<String>, String> {
+    let normalized = normalize_allowed_tool_ids(tool_ids.to_vec());
+    serde_json::to_string(&normalized)
+        .map(Some)
+        .map_err(|error| format!("序列化允许工具失败: {error}"))
+}
+
+fn deserialize_allowed_tool_ids(raw: Option<String>) -> Vec<String> {
+    raw.and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+        .map(normalize_allowed_tool_ids)
+        .unwrap_or_else(default_allowed_tool_ids)
 }
 
 fn deserialize_capability_policy(
@@ -2159,11 +2300,13 @@ struct NormalizedAgentInput {
     system_prompt: String,
     capability_policy: AgentCapabilityPolicy,
     skill_ids: Vec<String>,
+    allowed_tool_ids: Vec<String>,
     default_provider_id: String,
     default_model: String,
     execution_mode: String,
     collaboration_config: Option<AgentCollaborationConfig>,
     accent_color: Option<String>,
+    avatar_uri: Option<String>,
     bot_configs: HashMap<String, AgentBotConfig>,
     heartbeat_config: AgentHeartbeatConfig,
     scenario_llm_config: Option<AgentScenarioLlmConfig>,
@@ -2252,7 +2395,9 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
                 execution_mode,
                 collaboration_config_json,
                 heartbeat_config_json,
+                allowed_tool_ids_json,
                 accent_color,
+                avatar_uri,
                 scenario_llm_config_json,
                 agent_loop_config_json,
                 created_at,
@@ -2282,12 +2427,14 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
                 execution_mode: row.get(11)?,
                 collaboration_config: deserialize_collaboration_config(row.get(12)?),
                 heartbeat_config: deserialize_heartbeat_config(row.get(13)?),
-                accent_color: row.get(14)?,
-                scenario_llm_config: deserialize_scenario_llm_config(row.get(15)?),
-                agent_loop_config: deserialize_agent_loop_config(row.get(16)?),
+                allowed_tool_ids: deserialize_allowed_tool_ids(row.get(14)?),
+                accent_color: row.get(15)?,
+                avatar_uri: row.get(16)?,
+                scenario_llm_config: deserialize_scenario_llm_config(row.get(17)?),
+                agent_loop_config: deserialize_agent_loop_config(row.get(18)?),
                 bot_configs: HashMap::new(),
-                created_at: row.get(17)?,
-                updated_at: row.get(18)?,
+                created_at: row.get(19)?,
+                updated_at: row.get(20)?,
             })
         })
         .map_err(|error| format!("读取同步用 agent 数据失败: {error}"))?;
@@ -2343,11 +2490,13 @@ mod tests {
                 system_prompt: "先确认，再执行".to_string(),
                 capability_policy: None,
                 skill_ids: vec!["alpha".to_string(), "alpha".to_string(), "beta".to_string()],
+                allowed_tool_ids: default_allowed_tool_ids(),
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),
                 execution_mode: Some("single".to_string()),
                 collaboration_config: None,
                 accent_color: Some("#112233".to_string()),
+                avatar_uri: None,
                 bot_configs: HashMap::new(),
                 heartbeat_config: AgentHeartbeatConfig::default(),
                 scenario_llm_config: None,
@@ -2362,6 +2511,7 @@ mod tests {
         );
         assert_eq!(created.capability_policy.strategy, "static");
         assert_eq!(created.name, "自定义助理");
+        assert_eq!(created.allowed_tool_ids, default_allowed_tool_ids());
 
         let updated = update_agent_with_connection(
             &mut connection,
@@ -2381,6 +2531,7 @@ mod tests {
                     max_dynamic_skills: 3,
                 }),
                 skill_ids: vec!["gamma".to_string()],
+                allowed_tool_ids: vec!["read_file".to_string(), "web_fetch".to_string()],
                 default_provider_id: "anthropic".to_string(),
                 default_model: "claude-sonnet-4-0".to_string(),
                 execution_mode: Some("supervisor".to_string()),
@@ -2390,6 +2541,7 @@ mod tests {
                     shared_context_policy: "summary".to_string(),
                 }),
                 accent_color: None,
+                avatar_uri: None,
                 bot_configs: HashMap::new(),
                 heartbeat_config: AgentHeartbeatConfig::default(),
                 scenario_llm_config: None,
@@ -2413,6 +2565,10 @@ mod tests {
                 .map(|item| item.shared_context_policy.as_str()),
             Some("summary")
         );
+        assert_eq!(
+            updated.allowed_tool_ids,
+            vec!["read_file".to_string(), "web_fetch".to_string()]
+        );
     }
 
     #[test]
@@ -2431,11 +2587,13 @@ mod tests {
                 system_prompt: "".to_string(),
                 capability_policy: Some(new_agent_default_capability_policy()),
                 skill_ids: vec![],
+                allowed_tool_ids: default_allowed_tool_ids(),
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),
                 execution_mode: Some("single".to_string()),
                 collaboration_config: None,
                 accent_color: None,
+                avatar_uri: None,
                 bot_configs: HashMap::new(),
                 heartbeat_config: AgentHeartbeatConfig::default(),
                 scenario_llm_config: None,
@@ -2446,6 +2604,37 @@ mod tests {
 
         assert!(created.skill_ids.is_empty());
         assert_eq!(created.capability_policy.strategy, "hybrid");
+    }
+
+    #[test]
+    fn allowed_tool_ids_normalize_aliases_and_map_to_runtime_names() {
+        let normalized = normalize_allowed_tool_ids(vec![
+            " read ".to_string(),
+            "find".to_string(),
+            "agent_delegate".to_string(),
+            "nineclaw_external_api".to_string(),
+            "read_file".to_string(),
+            "unknown".to_string(),
+        ]);
+
+        assert_eq!(
+            normalized,
+            vec![
+                "read_file".to_string(),
+                "glob".to_string(),
+                "agent_spawn".to_string(),
+                "external_api".to_string(),
+            ]
+        );
+        assert_eq!(
+            runtime_tool_names_for_allowed_tool_ids(&normalized),
+            vec![
+                "read".to_string(),
+                "find".to_string(),
+                "agent_delegate".to_string(),
+                "nineclaw_external_api".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2464,11 +2653,13 @@ mod tests {
                 system_prompt: "".to_string(),
                 capability_policy: None,
                 skill_ids: vec![],
+                allowed_tool_ids: default_allowed_tool_ids(),
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),
                 execution_mode: Some("single".to_string()),
                 collaboration_config: None,
                 accent_color: None,
+                avatar_uri: None,
                 bot_configs: HashMap::new(),
                 heartbeat_config: AgentHeartbeatConfig::default(),
                 scenario_llm_config: None,
@@ -2503,11 +2694,13 @@ mod tests {
                 system_prompt: "围绕 ${ARG} 审查".to_string(),
                 capability_policy: None,
                 skill_ids: vec![],
+                allowed_tool_ids: default_allowed_tool_ids(),
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),
                 execution_mode: Some("single".to_string()),
                 collaboration_config: None,
                 accent_color: None,
+                avatar_uri: None,
                 bot_configs: HashMap::new(),
                 heartbeat_config: AgentHeartbeatConfig::default(),
                 scenario_llm_config: None,
@@ -2533,11 +2726,13 @@ mod tests {
                 system_prompt: "围绕 ${ARG} 复核".to_string(),
                 capability_policy: None,
                 skill_ids: vec!["pdf".to_string()],
+                allowed_tool_ids: vec!["read".to_string(), "find".to_string()],
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),
                 execution_mode: Some("single".to_string()),
                 collaboration_config: None,
                 accent_color: None,
+                avatar_uri: None,
                 bot_configs: HashMap::new(),
                 heartbeat_config: AgentHeartbeatConfig::default(),
                 scenario_llm_config: None,
@@ -2548,6 +2743,10 @@ mod tests {
 
         assert_eq!(updated.id, "review_agent_v2");
         assert_eq!(updated.trigger_condition, "用户请求复核时");
+        assert_eq!(
+            updated.allowed_tool_ids,
+            vec!["read_file".to_string(), "glob".to_string()]
+        );
         assert!(!updated.manual_trigger_only);
         assert!(get_active_agent_by_id(&connection, "review_agent")
             .expect("old id lookup")
@@ -2577,11 +2776,13 @@ mod tests {
                 system_prompt: "".to_string(),
                 capability_policy: None,
                 skill_ids: vec![],
+                allowed_tool_ids: default_allowed_tool_ids(),
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),
                 execution_mode: Some("single".to_string()),
                 collaboration_config: None,
                 accent_color: None,
+                avatar_uri: None,
                 bot_configs: HashMap::new(),
                 heartbeat_config: AgentHeartbeatConfig::default(),
                 scenario_llm_config: None,
@@ -2626,11 +2827,13 @@ mod tests {
                 max_dynamic_skills: 4,
             },
             skill_ids: vec!["alpha".to_string(), "beta".to_string()],
+            allowed_tool_ids: vec!["read_file".to_string(), "web_fetch".to_string()],
             default_provider_id: "openai".to_string(),
             default_model: "gpt-4.1".to_string(),
             execution_mode: "single".to_string(),
             collaboration_config: None,
             accent_color: None,
+            avatar_uri: None,
             scenario_llm_config: None,
             agent_loop_config: None,
         })
@@ -2640,7 +2843,9 @@ mod tests {
         assert!(prompt.contains("负责项目推进"));
         assert!(prompt.contains("能力策略"));
         assert!(prompt.contains("必须使用 web_fetch 工具"));
+        assert!(prompt.contains("允许工具：read_file、web_fetch"));
         assert!(prompt.contains("偏好技能"));
+        assert!(prompt.contains("最高优先级执行要求（MUST）"));
         assert!(prompt.contains("避免省略关键确认步骤"));
     }
 
@@ -2657,11 +2862,13 @@ mod tests {
                 system_prompt: "请审查：${ARG}".to_string(),
                 capability_policy: AgentCapabilityPolicy::default(),
                 skill_ids: vec![],
+                allowed_tool_ids: default_allowed_tool_ids(),
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),
                 execution_mode: "single".to_string(),
                 collaboration_config: None,
                 accent_color: None,
+                avatar_uri: None,
                 scenario_llm_config: None,
                 agent_loop_config: None,
             },
@@ -2691,11 +2898,13 @@ mod tests {
                 system_prompt: "".to_string(),
                 capability_policy: None,
                 skill_ids: vec![],
+                allowed_tool_ids: default_allowed_tool_ids(),
                 default_provider_id: "openai".to_string(),
                 default_model: "gpt-4.1".to_string(),
                 execution_mode: Some("single".to_string()),
                 collaboration_config: None,
                 accent_color: None,
+                avatar_uri: None,
                 bot_configs: HashMap::new(),
                 heartbeat_config: AgentHeartbeatConfig {
                     timezone: "Asia/Shanghai".to_string(),

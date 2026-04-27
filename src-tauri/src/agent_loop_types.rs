@@ -37,8 +37,12 @@ impl Default for BatchFailStrategy {
 pub struct AgentLoopConfig {
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+    /// 单轮委派超时（毫秒），超时则强制中断该轮并继续。
     #[serde(default = "default_iteration_timeout_ms")]
     pub iteration_timeout_ms: u64,
+    /// 整体超时（毫秒），超时则强制结束循环。0 表示不限制。
+    #[serde(default = "default_total_timeout_ms")]
+    pub total_timeout_ms: u64,
     #[serde(default = "default_true")]
     pub enable_nested: bool,
     #[serde(default = "default_max_depth")]
@@ -59,6 +63,9 @@ fn default_max_iterations() -> u32 {
 fn default_iteration_timeout_ms() -> u64 {
     120_000
 }
+fn default_total_timeout_ms() -> u64 {
+    600_000
+}
 fn default_true() -> bool {
     true
 }
@@ -77,6 +84,7 @@ impl Default for AgentLoopConfig {
         Self {
             max_iterations: default_max_iterations(),
             iteration_timeout_ms: default_iteration_timeout_ms(),
+            total_timeout_ms: default_total_timeout_ms(),
             enable_nested: default_true(),
             max_depth: default_max_depth(),
             allow_extend: default_true(),
