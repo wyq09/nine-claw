@@ -102,6 +102,10 @@ export async function llmTraceClear(options: {
 export type LlmTraceEvent = {
   phase: 'started' | 'updated' | 'finalized'
   entry: LlmTraceEntry
+  delta?: {
+    kind: 'response' | 'thinking' | string
+    text: string
+  } | null
 }
 
 export async function onLlmTraceEvent(

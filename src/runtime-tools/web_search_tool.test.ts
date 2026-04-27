@@ -194,14 +194,71 @@ describe('web_search tool execute', () => {
 
     const text = result.content[0].text
     expect(text).toContain('Result exceeded 1000 characters and was written to')
-    const filePath = result.details.storage.filePath as string
+    expect(result.details.storage?.filePath).toBeTruthy()
+    const filePath = result.details.storage?.filePath
+    if (!filePath) {
+      throw new Error('expected stored web search payload path')
+    }
     expect(filePath).toBeTruthy()
     expect(await stat(filePath)).toBeTruthy()
     const stored = await readFile(filePath, 'utf8')
     expect(stored).toContain('[DuckDuckGo]')
     expect(stored).toContain('Example result')
     expect(stored).toContain('[Bing INT]')
-    expect(result.details.storage.inline).toBe(false)
+    expect(result.details.storage?.inline).toBe(false)
+  })
+
+  it('downloads images discovered on search result pages', async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), 'web-search-images-'))
+    const deps = createDeps({
+      fetchImpl: vi.fn(async (url: string) => {
+        if (url === 'https://example.com/thumb.webp') {
+          return {
+            ok: true,
+            status: 200,
+            url,
+            headers: { get: (name: string) => (name.toLowerCase() === 'content-type' ? 'image/webp' : null) },
+            arrayBuffer: async () => new Uint8Array([5, 6, 7]).buffer,
+          }
+        }
+        return {
+          ok: true,
+          status: 200,
+          text: async () => `
+            <div class="result">
+              <a class="result__a" href="https://example.com/story">Example story</a>
+              <div class="result__snippet">Useful story.</div>
+              <img src="https://example.com/thumb.webp" />
+            </div>
+          `,
+        }
+      }),
+    })
+
+    const tool = createWebSearchTool(deps as never)
+    const result = await tool.execute(
+      'tool-call-images',
+      {
+        query: 'image story',
+        engines: ['duckduckgo'],
+        maxImages: 1,
+      },
+      undefined,
+      undefined,
+      { cwd },
+    )
+
+    expect(result.content[0].text).toContain('Downloaded images:')
+    expect(result.details.engines[0].images).toEqual(['https://example.com/thumb.webp'])
+    expect(result.details.engines[0].downloadedImages[0]).toMatchObject({
+      url: 'https://example.com/thumb.webp',
+      ok: true,
+      contentType: 'image/webp',
+      bytes: 3,
+    })
+    const imagePath = result.details.engines[0].downloadedImages[0].filePath as string
+    expect(imagePath.startsWith(path.join(cwd, '.nineclaw-tool-results', 'images'))).toBe(true)
+    expect(await readFile(imagePath)).toEqual(Buffer.from([5, 6, 7]))
   })
 
   it('reports google anti-bot interstitials explicitly when using curl transport', async () => {

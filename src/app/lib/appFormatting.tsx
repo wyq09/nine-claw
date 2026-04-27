@@ -17,6 +17,7 @@ import type {
   AgentScenarioLlmConfig,
   AgentScenarioLlmSlot,
   AgentTaskListItem,
+  AgentToolId,
   AgentWorkspaceBundle,
   AgentWorkspaceFile,
   BotChannelId,
@@ -29,6 +30,56 @@ import type {
   SystemSkillCatalog,
   TokenUsage,
 } from '../../types'
+
+export const AGENT_TOOL_OPTIONS: { id: AgentToolId; label: string; description: string }[] = [
+  { id: 'bash', label: 'bash', description: '执行命令行命令' },
+  { id: 'read_file', label: 'read_file', description: '读取文件内容' },
+  { id: 'write_file', label: 'write_file', description: '写入或创建文件' },
+  { id: 'edit_file', label: 'edit_file', description: '按差异编辑文件' },
+  { id: 'grep', label: 'grep', description: '按文本模式搜索文件内容' },
+  { id: 'list_dir', label: 'list_dir', description: '列出目录内容' },
+  { id: 'glob', label: 'glob', description: '按路径模式查找文件' },
+  { id: 'web_search', label: 'web_search', description: '联网搜索信息' },
+  { id: 'web_fetch', label: 'web_fetch', description: '抓取网页内容' },
+  { id: 'image_generate', label: 'image_generate', description: '生成图片' },
+  { id: 'image_task_query', label: 'image_task_query', description: '查询图片任务' },
+  { id: 'agent_spawn', label: 'agent_spawn', description: '委派子智能体' },
+  { id: 'external_api', label: 'external_api', description: '调用外部 API 扩展' },
+]
+
+const AGENT_TOOL_ID_SET = new Set<AgentToolId>(AGENT_TOOL_OPTIONS.map((tool) => tool.id))
+
+const AGENT_TOOL_ALIASES: Record<string, AgentToolId> = {
+  read: 'read_file',
+  write: 'write_file',
+  edit: 'edit_file',
+  ls: 'list_dir',
+  find: 'glob',
+  agent_delegate: 'agent_spawn',
+  nineclaw_external_api: 'external_api',
+}
+
+export function createDefaultAgentAllowedToolIds(): AgentToolId[] {
+  return AGENT_TOOL_OPTIONS.map((tool) => tool.id)
+}
+
+export function normalizeAgentAllowedToolIds(value?: readonly unknown[] | null): AgentToolId[] {
+  if (!Array.isArray(value)) {
+    return createDefaultAgentAllowedToolIds()
+  }
+  const ids: AgentToolId[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') {
+      continue
+    }
+    const raw = item.trim()
+    const id = (AGENT_TOOL_ALIASES[raw] ?? raw) as AgentToolId
+    if (AGENT_TOOL_ID_SET.has(id) && !ids.includes(id)) {
+      ids.push(id)
+    }
+  }
+  return ids
+}
 
 const ABSOLUTE_TIME_FORMATTER = new Intl.DateTimeFormat('zh-CN', {
   year: 'numeric',
@@ -321,11 +372,13 @@ export function buildConversationAgentSnapshot(agent: AgentRecord): Conversation
     name: agent.name,
     summary: agent.summary,
     description: agent.description,
+    ...(agent.avatarUri ? { avatarUri: agent.avatarUri } : {}),
     triggerCondition: agent.triggerCondition,
     manualTriggerOnly: agent.manualTriggerOnly,
     systemPrompt: agent.systemPrompt,
     capabilityPolicy: normalizeAgentCapabilityPolicy(agent.capabilityPolicy, createStaticAgentCapabilityPolicy()),
     skillIds: [...agent.skillIds],
+    allowedToolIds: normalizeAgentAllowedToolIds(agent.allowedToolIds),
     defaultProviderId: agent.defaultProviderId,
     defaultModel: agent.defaultModel,
     executionMode: agent.executionMode,
@@ -403,11 +456,13 @@ export function createEmptyAgentDraft(
     name: '',
     summary: '',
     description: '',
+    avatarUri: '',
     triggerCondition: '',
     manualTriggerOnly: false,
     systemPrompt: '',
     capabilityPolicy: createStaticAgentCapabilityPolicy(),
     skillIds: [],
+    allowedToolIds: createDefaultAgentAllowedToolIds(),
     defaultProviderId: providerId,
     defaultModel: model,
     executionMode: 'single',
@@ -446,11 +501,13 @@ export function createAgentDraftFromRecord(agent: AgentRecord): AgentInput {
     name: agent.name,
     summary: agent.summary,
     description: agent.description,
+    ...(agent.avatarUri ? { avatarUri: agent.avatarUri } : {}),
     triggerCondition: agent.triggerCondition,
     manualTriggerOnly: agent.manualTriggerOnly,
     systemPrompt: agent.systemPrompt,
     capabilityPolicy: normalizeAgentCapabilityPolicy(agent.capabilityPolicy, createStaticAgentCapabilityPolicy()),
     skillIds: [...agent.skillIds],
+    allowedToolIds: normalizeAgentAllowedToolIds(agent.allowedToolIds),
     defaultProviderId: agent.defaultProviderId,
     defaultModel: agent.defaultModel,
     executionMode: agent.executionMode,
@@ -459,6 +516,7 @@ export function createAgentDraftFromRecord(agent: AgentRecord): AgentInput {
     ...(agent.collaborationConfig ? { collaborationConfig: agent.collaborationConfig } : {}),
     ...(agent.accentColor ? { accentColor: agent.accentColor } : {}),
     ...(agent.scenarioLlmConfig ? { scenarioLlmConfig: agent.scenarioLlmConfig } : {}),
+    ...(agent.agentLoopConfig ? { agentLoopConfig: agent.agentLoopConfig } : {}),
   }
 }
 
@@ -488,12 +546,14 @@ export function normalizeAgentDraft(input: AgentInput): AgentInput {
   const explicitSummary = input.summary.trim()
   const description = input.description.trim() || explicitSummary
   const summary = explicitSummary || buildAutoAgentSummary(description, name)
+  const avatarUri = input.avatarUri?.trim() ?? ''
   return {
     ...input,
     id,
     name,
     summary,
     description,
+    avatarUri,
     triggerCondition: input.triggerCondition.trim(),
     manualTriggerOnly: input.manualTriggerOnly === true,
     systemPrompt: input.systemPrompt.trim(),
@@ -501,6 +561,7 @@ export function normalizeAgentDraft(input: AgentInput): AgentInput {
     defaultProviderId: input.defaultProviderId.trim(),
     defaultModel: input.defaultModel.trim(),
     skillIds: Array.from(new Set(input.skillIds.map((item) => item.trim()).filter(Boolean))),
+    allowedToolIds: normalizeAgentAllowedToolIds(input.allowedToolIds),
     botConfigs: createAgentBotConfigState(input.botConfigs),
     heartbeatConfig: normalizeHeartbeatConfig(input.heartbeatConfig),
     scenarioLlmConfig: normalizeAgentScenarioLlmConfigInDraft(input.scenarioLlmConfig),
@@ -673,6 +734,7 @@ export function parseAgentBuilderDraft(content: string): AgentBuilderDraft | nul
     const id = typeof parsed.id === 'string' ? parsed.id.trim() : ''
     const summary = typeof parsed.summary === 'string' ? parsed.summary.trim() : ''
     const description = typeof parsed.description === 'string' ? parsed.description.trim() : ''
+    const avatarUri = typeof parsed.avatarUri === 'string' ? parsed.avatarUri.trim() : ''
     const triggerCondition =
       typeof parsed.triggerCondition === 'string' ? parsed.triggerCondition.trim() : ''
     const manualTriggerOnly = parsed.manualTriggerOnly === true
@@ -689,6 +751,7 @@ export function parseAgentBuilderDraft(content: string): AgentBuilderDraft | nul
     const skillIds = Array.isArray(parsed.skillIds)
       ? Array.from(new Set(parsed.skillIds.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean)))
       : []
+    const allowedToolIds = normalizeAgentAllowedToolIds(parsed.allowedToolIds)
     const capabilityPolicy = normalizeAgentCapabilityPolicy(
       parsed.capabilityPolicy,
       createDefaultAgentCapabilityPolicy(),
@@ -703,11 +766,13 @@ export function parseAgentBuilderDraft(content: string): AgentBuilderDraft | nul
       name,
       summary: normalizedSummary,
       description: normalizedDescription,
+      ...(avatarUri ? { avatarUri } : {}),
       triggerCondition,
       manualTriggerOnly,
       systemPrompt,
       capabilityPolicy,
       skillIds,
+      allowedToolIds,
       defaultProviderId,
       defaultModel,
       executionMode,

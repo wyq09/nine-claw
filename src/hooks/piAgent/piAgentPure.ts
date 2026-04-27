@@ -1,5 +1,6 @@
 import type { BotMessageEvent } from '../../lib/piClient'
 import { createStaticAgentCapabilityPolicy, normalizeAgentCapabilityPolicy } from '../../app/lib/agentCapabilities'
+import { normalizeAgentAllowedToolIds } from '../../app/lib/appFormatting'
 import type {
   ActivityEntry,
   ActivityState,
@@ -235,12 +236,18 @@ export function parseConversationAgentSnapshot(value: unknown): ConversationAgen
     name: candidate.name,
     summary: candidate.summary,
     description: candidate.description,
+    ...(typeof candidate.avatarUri === 'string' && candidate.avatarUri.trim()
+      ? { avatarUri: candidate.avatarUri.trim() }
+      : {}),
     systemPrompt: typeof candidate.systemPrompt === 'string' ? candidate.systemPrompt : '',
     capabilityPolicy: normalizeAgentCapabilityPolicy(
       candidate.capabilityPolicy as Partial<AgentCapabilityPolicy> | undefined,
       createStaticAgentCapabilityPolicy(),
     ),
     skillIds: parseStringArray(candidate.skillIds),
+    allowedToolIds: normalizeAgentAllowedToolIds(
+      Array.isArray(candidate.allowedToolIds) ? parseStringArray(candidate.allowedToolIds) : undefined,
+    ),
     defaultProviderId: typeof candidate.defaultProviderId === 'string' ? candidate.defaultProviderId : '',
     defaultModel: typeof candidate.defaultModel === 'string' ? candidate.defaultModel : '',
     executionMode: isAgentExecutionMode(candidate.executionMode) ? candidate.executionMode : 'single',

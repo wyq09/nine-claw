@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { LlmTraceEntry } from '../../../../lib/llmTraceClient'
 import {
+  applyLlmTraceEvent,
   getTraceKindLabel,
   getTraceMessageBlocks,
   getTraceResponseBlocks,
@@ -48,5 +49,49 @@ describe('llmTraceModel', () => {
     expect(
       matchesTraceScope(makeEntry({ workspaceId: 'ws-1', sessionId: 'session-1' }), { sessionId: 'session-1' }),
     ).toBe(false)
+  })
+
+  it('applies response delta events without replacing the entry with partial payloads', () => {
+    const current = makeEntry({
+      status: 'running',
+      responseText: 'hello',
+      responseBlocks: [{ id: 'output-0', kind: 'output', label: 'assistant_reply', content: 'hello' }],
+    })
+    const [patched] = applyLlmTraceEvent([current], {
+      phase: 'updated',
+      entry: makeEntry({
+        id: current.id,
+        status: 'running',
+        responseText: undefined,
+        responseBlocks: undefined,
+      }),
+      delta: { kind: 'response', text: ' world' },
+    })
+
+    expect(patched.responseText).toBe('hello world')
+    expect(patched.responseBlocks?.[0]?.content).toBe('hello world')
+    expect(patched.userMessage).toBe('user')
+  })
+
+  it('applies thinking delta events to thinking fields only', () => {
+    const current = makeEntry({
+      status: 'running',
+      thinkingText: 'plan',
+      responseText: 'answer',
+      responseBlocks: [
+        { id: 'thinking-0', kind: 'thinking', label: 'thinking', content: 'plan' },
+        { id: 'output-0', kind: 'output', label: 'assistant_reply', content: 'answer' },
+      ],
+    })
+    const [patched] = applyLlmTraceEvent([current], {
+      phase: 'updated',
+      entry: makeEntry({ id: current.id, status: 'running' }),
+      delta: { kind: 'thinking', text: ' next' },
+    })
+
+    expect(patched.thinkingText).toBe('plan next')
+    expect(patched.responseText).toBe('answer')
+    expect(patched.responseBlocks?.[0]?.content).toBe('plan next')
+    expect(patched.responseBlocks?.[1]?.content).toBe('answer')
   })
 })

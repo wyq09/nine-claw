@@ -1,5 +1,6 @@
 import { createTempArtifactTracker, finalizeLargeTextResult } from "./tool_result_storage.mjs";
 import { detectSearchInterstitial, fetchSearchResponse } from "./web_search_transport.mjs";
+import { downloadImagesToWorkdir, extractImageUrlsFromHtml } from "./image_downloader.mjs";
 
 const DEFAULT_LIMIT = 5;
 const DEFAULT_MAX_RESULT_SIZE_CHARS = 12_000;
@@ -160,6 +161,18 @@ export function createWebSearchParameters(Type) {
           "Maximum characters returned directly to the model. Larger outputs are written to a temp file.",
       }),
     ),
+    downloadImages: Type.Optional(
+      Type.Boolean({
+        description: "Whether to download images discovered on search result pages. Default is true.",
+      }),
+    ),
+    maxImages: Type.Optional(
+      Type.Integer({
+        minimum: 0,
+        maximum: 20,
+        description: "Maximum images to download per search engine response. Default is 4.",
+      }),
+    ),
   });
 }
 
@@ -197,6 +210,8 @@ export function normalizeWebSearchInput(input) {
       200000,
       DEFAULT_MAX_RESULT_SIZE_CHARS,
     ),
+    downloadImages: input?.downloadImages !== false,
+    maxImages: clampNumber(input?.maxImages, 0, 20, 4),
   };
 }
 
@@ -627,7 +642,7 @@ function decodePossibleUrl(value) {
   }
 }
 
-async function fetchEngineResults(engine, normalizedInput, deps, signal, tempArtifactTracker) {
+async function fetchEngineResults(engine, normalizedInput, deps, signal, tempArtifactTracker, ctx) {
   const response = await fetchSearchResponse(
     buildEngineUrl(engine, normalizedInput),
     normalizedInput.language,
@@ -637,6 +652,17 @@ async function fetchEngineResults(engine, normalizedInput, deps, signal, tempArt
   );
   const results = response.ok ? extractSearchResults(engine, response.html, normalizedInput.limit) : [];
   const interstitialError = response.ok ? detectSearchInterstitial(engine, response.html, results) : undefined;
+  const imageUrls = response.ok ? extractImageUrlsFromHtml(response.html, response.finalUrl, 50) : [];
+  const downloadedImages =
+    response.ok && normalizedInput.downloadImages && imageUrls.length > 0
+      ? await downloadImagesToWorkdir(
+          imageUrls,
+          ctx,
+          { limit: normalizedInput.maxImages, userAgent: undefined },
+          deps,
+          tempArtifactTracker,
+        )
+      : [];
 
   return {
     engine: {
@@ -651,6 +677,8 @@ async function fetchEngineResults(engine, normalizedInput, deps, signal, tempArt
     transport: response.transport,
     resultCount: results.length,
     results,
+    images: imageUrls,
+    downloadedImages,
     error: response.ok ? interstitialError : `HTTP ${response.status}`,
   };
 }
@@ -676,6 +704,14 @@ export function renderWebSearchText(normalizedInput, engineResponses) {
       lines.push(`   ${result.url}`);
       if (result.snippet) {
         lines.push(`   ${result.snippet}`);
+      }
+    }
+    const savedImages = (engineResponse.downloadedImages ?? []).filter((item) => item.ok);
+    if (savedImages.length > 0) {
+      lines.push("Downloaded images:");
+      for (const image of savedImages) {
+        lines.push(`   ${image.filePath}`);
+        lines.push(`   Source: ${image.url}`);
       }
     }
   }
@@ -714,7 +750,7 @@ export function createWebSearchTool(deps) {
       const engineResponses = await Promise.all(
         engines.map(async (engine) => {
           try {
-            return await fetchEngineResults(engine, normalizedInput, deps, signal, tempArtifactTracker);
+            return await fetchEngineResults(engine, normalizedInput, deps, signal, tempArtifactTracker, ctx);
           } catch (error) {
             return {
               engine: { key: engine.key, name: engine.name, region: engine.region },
@@ -725,6 +761,8 @@ export function createWebSearchTool(deps) {
               transport: typeof deps.execFileImpl === "function" ? "curl" : "fetch",
               resultCount: 0,
               results: [],
+              images: [],
+              downloadedImages: [],
               error: error instanceof Error ? error.message : String(error),
             };
           }

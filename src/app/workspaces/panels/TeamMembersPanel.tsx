@@ -1,4 +1,5 @@
 import { useMemo } from 'react'
+import { AgentAvatar } from '../../../components/AgentAvatar'
 import type { AgentRecord, WorkspaceMemberView } from '../../../types'
 
 export type TeamMembersPanelProps = {
@@ -36,6 +37,13 @@ export function TeamMembersPanel({
             className={`workspace-member-item${m.role === 'supervisor' ? ' supervisor' : ''}`}
           >
             <div className="workspace-member-identity">
+              <AgentAvatar
+                name={m.name}
+                avatarUri={m.avatarUri}
+                accentColor={agents.find((agent) => agent.id === m.agentId)?.accentColor ?? null}
+                className="workspace-member-avatar"
+                size={16}
+              />
               <span className="workspace-member-name">{m.name}</span>
               <span className={`workspace-member-role${m.role === 'supervisor' ? ' supervisor' : ''}`}>
                 {m.role === 'supervisor' ? '主智能体' : '成员'}

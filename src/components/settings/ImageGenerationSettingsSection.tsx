@@ -11,6 +11,7 @@ import type {
 const IMAGE_PROVIDER_ICON_LABEL: Record<ImageProviderAdapterType, string> = {
   openai_images: '◎',
   openai_compatible: '◇',
+  apimart_gpt_image_2: '✦',
 }
 
 type ImageGenerationSettingsSectionProps = {

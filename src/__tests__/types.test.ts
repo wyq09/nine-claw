@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import type { ProviderConfig } from '../../../types'
+import type { ProviderConfig } from '../types'
 
 describe('ProviderConfig type — maxContextTokens field', () => {
   it('accepts optional maxContextTokens field', () => {

@@ -63,6 +63,7 @@ export function TurnResponseBody({
     name: string
     role?: 'supervisor' | 'member'
     accentColor?: string | null
+    avatarUri?: string | null
     avatarEmoji?: string | null
   } | null
 }) {
@@ -112,6 +113,11 @@ export function TurnResponseBody({
       }
 
       if (!showExecutionRail) {
+        return
+      }
+
+      if (segment.type !== 'tool') {
+        flushGroupedToolCalls()
         return
       }
 
@@ -540,6 +546,9 @@ export function hasRenderableTurnContent(
       }
       if (segment.type === 'delegate_plan' || segment.type === 'delegation_run') {
         return true
+      }
+      if (segment.type !== 'tool') {
+        return false
       }
       return showExecutionRail && turn.toolCalls.some((toolCall) => toolCall.toolCallId === segment.toolCallId)
     })

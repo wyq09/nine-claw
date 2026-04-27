@@ -1,14 +1,24 @@
+import { open } from '@tauri-apps/plugin-dialog'
+import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { AppIcon } from '../../components/AppIcon'
+import { AgentAvatar } from '../../components/AgentAvatar'
 import type {
   AgentInput,
   AgentLoopConfig,
   AgentRecord,
+  AgentScenarioLlmConfig,
+  AgentToolId,
   InstalledSkillItem,
 } from '../../types'
 import {
+  AGENT_TOOL_OPTIONS,
   formatInstalledSkillScopeLabel,
   formatInstalledSkillSource,
   getAgentColor,
+  normalizeAgentScenarioLlmConfigInDraft,
+  sessionLlmDecode,
+  sessionLlmEncode,
   SkillDescriptionDisclosure,
 } from '../lib'
 
@@ -20,7 +30,7 @@ const DEFAULT_AGENT_LOOP_CONFIG: AgentLoopConfig = {
   allowExtend: true,
   maxExtendLimit: 200,
   maxConcurrent: 5,
-  batchFailStrategy: 'WaitAll',
+  batchFailStrategy: 'waitAll',
 }
 
 export type AgentSkillPickerDialogProps = {
@@ -51,8 +61,8 @@ export function AgentSkillPickerDialog({
         aria-labelledby="agent-skill-picker-title"
         onClick={(event) => event.stopPropagation()}
       >
-        <h3 id="agent-skill-picker-title">添加允许工具</h3>
-        <p>从本地已安装技能里搜索并选择。选中的工具会成为这个智能体可使用的工具集合。</p>
+        <h3 id="agent-skill-picker-title">添加允许技能</h3>
+        <p>从本地已安装技能里搜索并选择。选中的技能会成为这个智能体可加载的技能集合。</p>
 
         <label className="input-field skill-install-field">
           <span>搜索技能</span>
@@ -158,6 +168,7 @@ export function AgentEditorDialog({
   allSkills,
   defaultAgentId,
   mode,
+  modelOptions,
   onClose,
   onCloseDeleteAgentDialog,
   onConfirmDeleteAgent,
@@ -173,6 +184,39 @@ export function AgentEditorDialog({
   selectedAgent,
   managedAgentId,
 }: AgentEditorDialogProps) {
+  const [promptEditorOpen, setPromptEditorOpen] = useState(false)
+  const [avatarMenu, setAvatarMenu] = useState<null | { x: number; y: number; panel: 'main' | 'url' }>(null)
+  const [avatarUrlDraft, setAvatarUrlDraft] = useState('')
+  const avatarMenuButtonRef = useRef<HTMLButtonElement | null>(null)
+  const avatarUrlInputRef = useRef<HTMLInputElement | null>(null)
+
+  useEffect(() => {
+    if (!avatarMenu || avatarMenu.panel !== 'url') {
+      return
+    }
+    const id = requestAnimationFrame(() => avatarUrlInputRef.current?.focus())
+    return () => cancelAnimationFrame(id)
+  }, [avatarMenu])
+
+  useEffect(() => {
+    if (!avatarMenu) {
+      return
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        setAvatarMenu(null)
+      }
+    }
+    const onScroll = () => setAvatarMenu(null)
+    document.addEventListener('keydown', onKey, true)
+    window.addEventListener('scroll', onScroll, true)
+    return () => {
+      document.removeEventListener('keydown', onKey, true)
+      window.removeEventListener('scroll', onScroll, true)
+    }
+  }, [avatarMenu])
+
   const missingSkillIds = (agentDraft?.skillIds ?? []).filter((skillId) => !allSkills.some((skill) => skill.id === skillId))
   const mountedSkills = allSkills.filter((skill) => agentDraft?.skillIds.includes(skill.id) ?? false)
   const editorAccent = getAgentColor(
@@ -182,6 +226,96 @@ export function AgentEditorDialog({
 
   if (!agentDraft) {
     return null
+  }
+
+  const toggleAllowedTool = (toolId: AgentToolId) => {
+    const active = agentDraft.allowedToolIds.includes(toolId)
+    onDraftChange({
+      allowedToolIds: active
+        ? agentDraft.allowedToolIds.filter((item) => item !== toolId)
+        : [...agentDraft.allowedToolIds, toolId],
+    })
+  }
+
+  const scenarioSlotEncoded = (slot: { providerId: string; model: string } | undefined) => {
+    const p = slot?.providerId?.trim() ?? ''
+    const m = slot?.model?.trim() ?? ''
+    if (!p || !m) {
+      return sessionLlmEncode('', '')
+    }
+    return sessionLlmEncode(p, m)
+  }
+
+  const setScenarioSlot = (
+    key: 'titleGeneration' | 'memoryExtraction' | 'taskPushNotificationCopy',
+    encodedValue: string,
+  ) => {
+    const decoded = encodedValue ? sessionLlmDecode(encodedValue) : null
+    const nextSlot =
+      decoded && decoded.providerId.trim() && decoded.model.trim()
+        ? { providerId: decoded.providerId.trim(), model: decoded.model.trim() }
+        : undefined
+    const merged: AgentScenarioLlmConfig = {
+      ...(agentDraft.scenarioLlmConfig ?? {}),
+      [key]: nextSlot,
+    }
+    onDraftChange({
+      scenarioLlmConfig: normalizeAgentScenarioLlmConfigInDraft(merged),
+    })
+  }
+
+  const handlePickAvatar = async (): Promise<boolean> => {
+    const picked = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: '头像图片', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg'] }],
+    })
+    const filePath = Array.isArray(picked) ? picked[0] : picked
+    if (typeof filePath === 'string' && filePath.trim()) {
+      onDraftChange({ avatarUri: filePath })
+      return true
+    }
+    return false
+  }
+
+  const onAvatarButtonClick = () => {
+    if (avatarMenu) {
+      setAvatarMenu(null)
+      return
+    }
+    const el = avatarMenuButtonRef.current
+    if (!el) {
+      return
+    }
+    setAvatarUrlDraft(agentDraft.avatarUri?.trim() ?? '')
+    const r = el.getBoundingClientRect()
+    setAvatarMenu({ x: r.left, y: r.bottom + 6, panel: 'main' })
+  }
+
+  const pickAvatarFromMenu = async () => {
+    const ok = await handlePickAvatar()
+    if (ok) {
+      setAvatarMenu(null)
+    }
+  }
+
+  const openUrlPanel = () => {
+    setAvatarUrlDraft(agentDraft.avatarUri?.trim() ?? '')
+    setAvatarMenu((m) => (m ? { ...m, panel: 'url' } : m))
+  }
+
+  const backToMainPanel = () => {
+    setAvatarMenu((m) => (m ? { ...m, panel: 'main' } : m))
+  }
+
+  const applyAvatarUrlFromMenu = () => {
+    onDraftChange({ avatarUri: avatarUrlDraft.trim() })
+    setAvatarMenu(null)
+  }
+
+  const clearAvatarFromMenu = () => {
+    onDraftChange({ avatarUri: '' })
+    setAvatarMenu(null)
   }
 
   return (
@@ -196,13 +330,30 @@ export function AgentEditorDialog({
           <div className="agent-detail-hero agent-editor-hero-stage" style={{ borderColor: editorAccent + '1f' }}>
             <div className="agent-editor-hero-head">
               <div className="agent-detail-hero-main">
-                <span className="agent-badge large" style={{ backgroundColor: editorAccent }}>
-                  <AppIcon name="bot" size={24} />
-                </span>
+                <div className="agent-editor-hero-avatar">
+                  <button
+                    type="button"
+                    ref={avatarMenuButtonRef}
+                    className="agent-editor-hero-avatar-pick"
+                    onClick={onAvatarButtonClick}
+                    title="设置头像"
+                    aria-label="设置头像"
+                    aria-haspopup="menu"
+                    aria-expanded={Boolean(avatarMenu)}
+                  >
+                    <AgentAvatar
+                      name={selectedAgent?.name ?? agentDraft.name ?? '智能体'}
+                      avatarUri={agentDraft.avatarUri}
+                      accentColor={editorAccent}
+                      className="agent-badge large"
+                      size={24}
+                      fallbackToIcon={!agentDraft.avatarUri}
+                    />
+                  </button>
+                </div>
                 <div className="agent-detail-copy">
                   <span className="agent-page-kicker">Agent Studio</span>
                   <h2 id="agent-editor-title">{mode === 'create' ? '新建智能体' : selectedAgent?.name ?? '编辑智能体'}</h2>
-                  <p>配置智能体的标识、展示信息、自动触发规则、可用工具和提示词内容。</p>
                 </div>
               </div>
               <div className="agent-editor-hero-toolbar">
@@ -226,7 +377,8 @@ export function AgentEditorDialog({
             </div>
             <div className="agent-hero-pills">
               <span className="agent-hero-pill">{mode === 'create' ? '未保存' : '用户智能体'}</span>
-              <span className="agent-hero-pill">{agentDraft.skillIds.length} 个允许工具</span>
+              <span className="agent-hero-pill">{agentDraft.allowedToolIds.length} 个工具</span>
+              <span className="agent-hero-pill">{agentDraft.skillIds.length} 个技能</span>
               {displayAgentId ? <span className="agent-hero-pill">ID: {displayAgentId}</span> : null}
               {selectedAgent?.id === defaultAgentId ? <span className="agent-hero-pill accent">当前默认</span> : null}
             </div>
@@ -307,6 +459,98 @@ export function AgentEditorDialog({
                   <small>开启后仅允许用户手动触发这个智能体。</small>
                 </span>
               </label>
+            </div>
+
+            <div className="agent-section">
+              <div className="agent-section-header">
+                <div>
+                  <strong>模型配置</strong>
+                  <p>此智能体使用的 LLM 模型。留空则使用会话级默认模型。</p>
+                </div>
+              </div>
+
+              <div className="agent-form-grid">
+                <label className="input-field">
+                  <span>模型</span>
+                  <select
+                    value={sessionLlmEncode(agentDraft.defaultProviderId, agentDraft.defaultModel)}
+                    onChange={(event) => {
+                      const decoded = sessionLlmDecode(event.target.value)
+                      if (decoded) {
+                        onDraftChange({ defaultProviderId: decoded.providerId, defaultModel: decoded.model })
+                      }
+                    }}
+                  >
+                    {modelOptions.length === 0 ? (
+                      <option value="">暂无可用模型，请先在设置中配置</option>
+                    ) : (
+                      <>
+                        <option value={sessionLlmEncode('', '')}>使用会话默认</option>
+                        {modelOptions.map((opt) => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
+                      </>
+                    )}
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <div className="agent-section">
+              <div className="agent-section-header">
+                <div>
+                  <strong>场景模型</strong>
+                  <p>
+                    与上方默认模型解耦的辅助调用：不选则统一使用本智能体默认模型。工作区「共享记忆」提取以<strong>主智能体</strong>的「记忆提取」为准。
+                  </p>
+                </div>
+              </div>
+
+              <div className="agent-form-grid">
+                <label className="input-field">
+                  <span>会话标题生成</span>
+                  <select
+                    value={scenarioSlotEncoded(agentDraft.scenarioLlmConfig?.titleGeneration)}
+                    onChange={(event) => setScenarioSlot('titleGeneration', event.target.value)}
+                  >
+                    <option value={sessionLlmEncode('', '')}>使用智能体默认</option>
+                    {modelOptions.map((opt) => (
+                      <option key={`title-${opt.value}`} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="input-field">
+                  <span>团队记忆提取</span>
+                  <select
+                    value={scenarioSlotEncoded(agentDraft.scenarioLlmConfig?.memoryExtraction)}
+                    onChange={(event) => setScenarioSlot('memoryExtraction', event.target.value)}
+                  >
+                    <option value={sessionLlmEncode('', '')}>使用智能体默认</option>
+                    {modelOptions.map((opt) => (
+                      <option key={`mem-${opt.value}`} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="input-field agent-field-full">
+                  <span>任务通知标题与简介</span>
+                  <select
+                    value={scenarioSlotEncoded(agentDraft.scenarioLlmConfig?.taskPushNotificationCopy)}
+                    onChange={(event) => setScenarioSlot('taskPushNotificationCopy', event.target.value)}
+                  >
+                    <option value={sessionLlmEncode('', '')}>使用智能体默认</option>
+                    {modelOptions.map((opt) => (
+                      <option key={`push-${opt.value}`} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                  <small>定时任务在任务中心 / 系统推送中展示的标题与一句话简介生成。</small>
+                </label>
+              </div>
             </div>
 
             <div className="agent-section">
@@ -400,13 +644,13 @@ export function AgentEditorDialog({
                           onDraftChange({
                             agentLoopConfig: {
                               ...agentDraft.agentLoopConfig!,
-                              batchFailStrategy: event.target.value as 'FailFast' | 'WaitAll',
+                              batchFailStrategy: event.target.value as 'failFast' | 'waitAll',
                             },
                           })
                         }
                       >
-                        <option value="WaitAll">等待全部完成</option>
-                        <option value="FailFast">任一失败即停止</option>
+                        <option value="waitAll">等待全部完成</option>
+                        <option value="failFast">任一失败即停止</option>
                       </select>
                     </label>
                   </div>
@@ -502,7 +746,41 @@ export function AgentEditorDialog({
               <div className="agent-section-header">
                 <div>
                   <strong>允许使用的工具</strong>
-                  <p>从已安装技能中选择此智能体可使用的工具；未安装但已记录的工具可在下方移除。</p>
+                  <p>限制此智能体运行时可调用的底层原子工具；未勾选的工具不会注入给模型。</p>
+                </div>
+              </div>
+
+              <div className="agent-tool-permission-grid" role="group" aria-label="允许使用的工具">
+                {AGENT_TOOL_OPTIONS.map((tool) => {
+                  const active = agentDraft.allowedToolIds.includes(tool.id)
+                  return (
+                    <button
+                      key={tool.id}
+                      type="button"
+                      className={`agent-tool-permission ${active ? 'active' : ''}`}
+                      onClick={() => toggleAllowedTool(tool.id)}
+                      title={tool.description}
+                      aria-pressed={active}
+                    >
+                      {tool.label}
+                    </button>
+                  )
+                })}
+              </div>
+
+              {agentDraft.allowedToolIds.length === 0 ? (
+                <div className="agent-empty-block warning">
+                  <strong>当前没有允许的工具</strong>
+                  <span>保存后此智能体只能生成文本，不能读取文件、执行命令、联网或委派。</span>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="agent-section">
+              <div className="agent-section-header">
+                <div>
+                  <strong>允许使用的技能</strong>
+                  <p>从已安装技能中选择此智能体可加载的技能；未安装但已记录的技能可在下方移除。</p>
                 </div>
 
                 <button
@@ -512,7 +790,7 @@ export function AgentEditorDialog({
                   disabled={allSkills.length === 0}
                 >
                   <AppIcon name="plus" size={16} />
-                  <span>添加工具</span>
+                  <span>添加技能</span>
                 </button>
               </div>
 
@@ -557,11 +835,11 @@ export function AgentEditorDialog({
                 </div>
               ) : (
                 <div className="agent-empty-block">
-                  <strong>{allSkills.length > 0 ? '还没有允许工具' : '暂无已安装工具'}</strong>
+                  <strong>{allSkills.length > 0 ? '还没有允许技能' : '暂无已安装技能'}</strong>
                   <span>
                     {allSkills.length > 0
-                      ? '点击右上角“添加工具”，从已安装技能里搜索并添加。'
-                      : '先去技能库安装技能，再回到这里配置允许使用的工具。'}
+                      ? '点击右上角“添加技能”，从已安装技能里搜索并添加。'
+                      : '先去技能库安装技能，再回到这里配置允许使用的技能。'}
                   </span>
                 </div>
               )}
@@ -573,6 +851,15 @@ export function AgentEditorDialog({
                   <strong>提示词内容</strong>
                   <p>可使用 {'${ARG}'} 占位符引用本次手动触发或自动调用时的用户输入。</p>
                 </div>
+                <button
+                  type="button"
+                  className="outline-button"
+                  onClick={() => setPromptEditorOpen(true)}
+                  title="放大编辑提示词"
+                >
+                  <AppIcon name="eye" size={16} />
+                  <span>放大编辑</span>
+                </button>
               </div>
 
               <label className="input-field agent-field-full">
@@ -643,6 +930,125 @@ export function AgentEditorDialog({
           </div>
         ) : null}
       </div>
+      {promptEditorOpen
+        ? createPortal(
+            <div className="confirm-dialog-overlay agent-prompt-editor-overlay" role="presentation" onClick={() => setPromptEditorOpen(false)}>
+              <div
+                className="confirm-dialog agent-prompt-editor-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="agent-prompt-editor-title"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="agent-prompt-editor-head">
+                  <div>
+                    <strong id="agent-prompt-editor-title">大提示词编辑器</strong>
+                    <p>这里编辑的内容会直接保存到当前智能体的系统提示词字段。</p>
+                  </div>
+                  <button
+                    type="button"
+                    className="icon-button subtle"
+                    onClick={() => setPromptEditorOpen(false)}
+                    aria-label="关闭提示词放大编辑器"
+                  >
+                    <AppIcon name="close" size={18} />
+                  </button>
+                </div>
+                <label className="input-field agent-field-full agent-prompt-editor-field">
+                  <span>提示词内容</span>
+                  <textarea
+                    className="agent-prompt-editor-textarea"
+                    autoFocus
+                    value={agentDraft.systemPrompt}
+                    onChange={(event) => onDraftChange({ systemPrompt: event.target.value })}
+                    rows={20}
+                    placeholder="例如：你是合同审查智能体。请围绕 ${ARG} 输出风险点、修改建议和需要用户补充的信息。"
+                  />
+                </label>
+                <div className="confirm-dialog-actions">
+                  <button type="button" className="outline-button" onClick={() => setPromptEditorOpen(false)}>
+                    完成
+                  </button>
+                </div>
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
+
+      {avatarMenu
+        ? createPortal(
+            <>
+              <div
+                role="presentation"
+                className="agent-editor-avatar-menu-backdrop"
+                onClick={() => setAvatarMenu(null)}
+              />
+              <div
+                className="agent-editor-avatar-menu"
+                style={{ left: avatarMenu.x, top: avatarMenu.y }}
+                role="menu"
+                onMouseDown={(event) => event.stopPropagation()}
+              >
+                {avatarMenu.panel === 'main' ? (
+                  <>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="agent-editor-avatar-menu-item"
+                      onClick={() => void pickAvatarFromMenu()}
+                    >
+                      <AppIcon name="upload" size={16} />
+                      <span>选择本地图片</span>
+                    </button>
+                    <button type="button" role="menuitem" className="agent-editor-avatar-menu-item" onClick={openUrlPanel}>
+                      <AppIcon name="network" size={16} />
+                      <span>输入或粘贴地址</span>
+                    </button>
+                    <div className="agent-editor-avatar-menu-sep" role="separator" />
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="agent-editor-avatar-menu-item danger"
+                      disabled={!agentDraft.avatarUri?.trim()}
+                      onClick={clearAvatarFromMenu}
+                    >
+                      <AppIcon name="trash" size={16} />
+                      <span>清空头像</span>
+                    </button>
+                  </>
+                ) : (
+                  <div className="agent-editor-avatar-menu-url" role="none">
+                    <label className="agent-editor-avatar-menu-url-label">
+                      <span>路径或 URL</span>
+                      <input
+                        ref={avatarUrlInputRef}
+                        value={avatarUrlDraft}
+                        onChange={(event) => setAvatarUrlDraft(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault()
+                            applyAvatarUrlFromMenu()
+                          }
+                        }}
+                        placeholder="本地路径、https://、file://、asset:"
+                      />
+                    </label>
+                    <div className="agent-editor-avatar-menu-url-row">
+                      <button type="button" className="outline-button" onClick={backToMainPanel}>
+                        返回
+                      </button>
+                      <button type="button" className="primary-button" onClick={applyAvatarUrlFromMenu}>
+                        应用
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </>,
+            document.body,
+          )
+        : null}
     </div>
   )
 }

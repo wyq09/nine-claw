@@ -19,10 +19,12 @@ import {
 } from '../lib/piClient'
 import type { BotMessageEvent } from '../lib/piClient'
 import { generateSessionConversationTitle } from '../lib/sessionTitleClient'
+import { isToolLoopGuardBlockResult } from '../lib/toolLoopGuard'
 import {
   listenTaskDeliveryNotificationActions,
   showTaskDeliveryDesktopNotification,
 } from '../lib/taskDeliveryNotification'
+import { useToast } from './useToast'
 import type {
   ActivityState,
   AgentLoopIteration,
@@ -72,6 +74,7 @@ function yieldToNextPaint(): Promise<void> {
 }
 
 export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | null>) {
+  const toast = useToast()
   const [error, setError] = useState('')
   const [runningHistoryIds, setRunningHistoryIds] = useState<string[]>([])
   /** 已调用 `streamPiPrompt`（主对话流已挂起） */
@@ -91,6 +94,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
   const openTaskSessionRef = useRef<(sessionId: string) => void>(() => {})
   const notifyNewTaskDeliveryRef = useRef<(delivery: AgentTaskDeliveryRecord) => void>(() => {})
   const notifiedTaskDeliveryIdsRef = useRef<Set<string>>(new Set())
+  const notifiedToolLoopGuardIdsRef = useRef<Set<string>>(new Set())
   /** 防止同一会话重复并发「标题 LLM」请求 */
   const sessionTitleLlmInflightRef = useRef<Set<string>>(new Set())
   const latestHistoryRef = useRef<HistoryItem[]>([])
@@ -522,6 +526,14 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       if (!toolCallId) {
         return
       }
+      const rawResultText = payload.resultText ?? payload.result_text
+      const resultText = rawResultText ?? ''
+      const isError = payload.isError ?? payload.is_error
+
+      if (isError && isToolLoopGuardBlockResult(resultText) && !notifiedToolLoopGuardIdsRef.current.has(toolCallId)) {
+        notifiedToolLoopGuardIdsRef.current.add(toolCallId)
+        toast.error('检测到连续 3 次相同工具调用，已拦截以防止死循环。')
+      }
 
       updateTurn(currentHistoryId, currentTurnId, (turn) => ({
         ...turn,
@@ -530,8 +542,8 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
             ? {
                 ...toolCall,
                 argsText: payload.argsText ?? payload.args_text ?? toolCall.argsText,
-                resultText: payload.resultText ?? payload.result_text ?? toolCall.resultText,
-                state: payload.isError ?? payload.is_error ? 'error' : 'done',
+                resultText: rawResultText ?? toolCall.resultText,
+                state: isError ? 'error' : 'done',
                 completedAt: toolCall.completedAt ?? Date.now(),
               }
             : toolCall,

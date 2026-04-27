@@ -4,6 +4,7 @@ type LazyDetailsProps = Omit<DetailsHTMLAttributes<HTMLDetailsElement>, 'childre
   summary: ReactNode
   summaryClassName?: string
   children: ReactNode | ((open: boolean) => ReactNode)
+  defaultOpen?: boolean
 }
 
 export function LazyDetails({

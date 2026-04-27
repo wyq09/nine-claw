@@ -122,6 +122,7 @@ export type ChatViewProps = {
     name: string
     role?: 'supervisor' | 'member'
     accentColor?: string | null
+    avatarUri?: string | null
     avatarEmoji?: string | null
   } | null
   /**
@@ -716,4 +717,3 @@ export function ChatView({
     </div>
   )
 }
-

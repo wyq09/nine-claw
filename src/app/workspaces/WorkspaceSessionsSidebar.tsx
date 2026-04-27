@@ -1,6 +1,7 @@
 import { useMemo, useState, type MouseEvent } from 'react'
 import type { HistoryItem } from '../../types'
 import { AppIcon } from '../../components/AppIcon'
+import { AgentAvatar } from '../../components/AgentAvatar'
 
 export type WorkspaceSessionsSidebarProps = {
   workspaceId: string
@@ -167,29 +168,45 @@ export function WorkspaceSessionsSidebar({
           <section key={group.key} className="workspace-sessions-group">
             <header className="workspace-sessions-group-head">{group.label}</header>
             <ul>
-              {group.items.map((item) => {
-                const isActive = item.id === activeHistoryId
-                const lastPrompt = item.turns[item.turns.length - 1]?.prompt ?? ''
-                return (
-                  <li key={item.id}>
+	              {group.items.map((item) => {
+	                const isActive = item.id === activeHistoryId
+	                const lastPrompt = item.turns[item.turns.length - 1]?.prompt ?? ''
+                  const agent = item.agent
+	                return (
+	                  <li key={item.id}>
                     <button
                       type="button"
                       className={`workspace-sessions-item${isActive ? ' active' : ''}`}
                       onClick={() => onSelectSession(item.id)}
-                    >
-                      <div className="workspace-sessions-item-title">
-                        {item.title || '未命名会话'}
-                      </div>
-                      {lastPrompt ? (
-                        <div className="workspace-sessions-item-sub">
-                          {lastPrompt.length > 48 ? `${lastPrompt.slice(0, 48)}…` : lastPrompt}
+	                    >
+                        <div className="workspace-sessions-item-main">
+                          <AgentAvatar
+                            name={agent?.name || item.title || '会话'}
+                            avatarUri={agent?.avatarUri}
+                            accentColor={agent?.accentColor}
+                            className="workspace-sessions-item-avatar"
+                            size={16}
+                            fallbackToIcon={!agent}
+                          />
+                          <div className="workspace-sessions-item-copy">
+	                          <div className="workspace-sessions-item-title">
+	                            {item.title || '未命名会话'}
+	                          </div>
+                              {agent?.name ? (
+                                <div className="workspace-sessions-item-agent">{agent.name}</div>
+                              ) : null}
+	                          {lastPrompt ? (
+	                            <div className="workspace-sessions-item-sub">
+	                              {lastPrompt.length > 48 ? `${lastPrompt.slice(0, 48)}…` : lastPrompt}
+	                            </div>
+	                          ) : null}
+                          </div>
                         </div>
-                      ) : null}
-                      <div className="workspace-sessions-item-meta">
-                        <span>{new Date(item.updatedAt || item.createdAt).toLocaleString()}</span>
-                        <span>·</span>
-                        <span>{item.turns.length} 轮</span>
-                      </div>
+	                      <div className="workspace-sessions-item-meta">
+	                        <span>{new Date(item.updatedAt || item.createdAt).toLocaleString()}</span>
+	                        <span>·</span>
+	                        <span>{item.turns.length} 轮</span>
+	                      </div>
                       {onDeleteSession ? (
                         <span
                           className="workspace-sessions-item-delete"

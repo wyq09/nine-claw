@@ -6063,6 +6063,36 @@ select.task-edit-control {
   line-height: 1.6;
 }
 
+.agent-tool-permission-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.agent-tool-permission {
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid var(--chrome-border);
+  border-radius: 8px;
+  background: var(--surface-base);
+  color: var(--chrome-muted);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.agent-tool-permission:hover {
+  border-color: rgba(var(--accent-rgb), 0.45);
+  color: var(--chrome-text);
+}
+
+.agent-tool-permission.active {
+  border-color: var(--blue);
+  background: rgba(var(--accent-rgb), 0.1);
+  color: var(--blue);
+}
+
 .agent-helper-copy {
   display: grid;
   gap: 6px;
@@ -11902,5 +11932,4 @@ select.task-edit-control {
   outline: none;
   border-color: var(--accent-blue, #7ab7ff);
   box-shadow: 0 0 0 2px rgba(122, 183, 255, 0.2);
-}
 }

@@ -158,7 +158,7 @@ export type DelegationRunSegment = {
 
 // ── Agent Loop 类型 ──────────────────────────────────────────
 
-export type BatchFailStrategy = 'FailFast' | 'WaitAll'
+export type BatchFailStrategy = 'failFast' | 'waitAll'
 
 export type AgentLoopConfig = {
   maxIterations: number
@@ -248,6 +248,21 @@ export type AgentExecutionMode = 'single' | 'supervisor' | 'worker'
 
 export type AgentSkillStrategy = 'static' | 'hybrid' | 'dynamic'
 
+export type AgentToolId =
+  | 'bash'
+  | 'read_file'
+  | 'write_file'
+  | 'edit_file'
+  | 'grep'
+  | 'list_dir'
+  | 'glob'
+  | 'web_search'
+  | 'web_fetch'
+  | 'image_generate'
+  | 'image_task_query'
+  | 'agent_spawn'
+  | 'external_api'
+
 export type AgentCapabilityPolicy = {
   strategy: AgentSkillStrategy
   requiredSkillIds: string[]
@@ -315,11 +330,13 @@ export type ConversationAgentSnapshot = {
   name: string
   summary: string
   description: string
+  avatarUri?: string
   triggerCondition?: string
   manualTriggerOnly?: boolean
   systemPrompt: string
   capabilityPolicy: AgentCapabilityPolicy
   skillIds: string[]
+  allowedToolIds: AgentToolId[]
   defaultProviderId: ProviderId
   defaultModel: string
   executionMode: AgentExecutionMode
@@ -452,8 +469,10 @@ export type WorkspaceMemberView = {
   agentId: string
   name: string
   summary: string
+  description: string
   role: string
   skillIds: string[]
+  avatarUri?: string
 }
 
 export type WorkspaceResourceRecord = {
@@ -555,11 +574,13 @@ export type AgentRecord = {
   name: string
   summary: string
   description: string
+  avatarUri?: string
   triggerCondition: string
   manualTriggerOnly: boolean
   systemPrompt: string
   capabilityPolicy: AgentCapabilityPolicy
   skillIds: string[]
+  allowedToolIds: AgentToolId[]
   defaultProviderId: ProviderId
   defaultModel: string
   isBuiltin: boolean
@@ -580,11 +601,13 @@ export type AgentInput = {
   name: string
   summary: string
   description: string
+  avatarUri?: string
   triggerCondition: string
   manualTriggerOnly: boolean
   systemPrompt: string
   capabilityPolicy?: AgentCapabilityPolicy
   skillIds: string[]
+  allowedToolIds: AgentToolId[]
   defaultProviderId: ProviderId
   defaultModel: string
   executionMode: AgentExecutionMode
@@ -606,11 +629,13 @@ export type AgentBuilderDraft = {
   name: string
   summary: string
   description: string
+  avatarUri?: string
   triggerCondition?: string
   manualTriggerOnly?: boolean
   systemPrompt: string
   capabilityPolicy?: AgentCapabilityPolicy
   skillIds: string[]
+  allowedToolIds?: AgentToolId[]
   defaultProviderId: ProviderId
   defaultModel: string
   executionMode: AgentExecutionMode

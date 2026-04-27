@@ -10,6 +10,7 @@ import {
 } from '../../../lib/llmTraceClient'
 import { AppIcon } from '../../../components/AppIcon'
 import {
+  applyLlmTraceEvent,
   getTraceKindLabel,
   getTraceMessageBlocks,
   getTraceResponseBlocks,
@@ -403,19 +404,30 @@ export function LlmTracePanel({
   }, [hasWorkspaceScope, open, refresh, sessionId, workspaceId])
 
   useEffect(() => {
+    if (!open || (!workspaceId && !sessionId)) {
+      return
+    }
+    const intervalId = window.setInterval(() => {
+      void refresh()
+    }, 2500)
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void refresh()
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+    return () => {
+      window.clearInterval(intervalId)
+      document.removeEventListener('visibilitychange', handleVisibility)
+    }
+  }, [open, refresh, sessionId, workspaceId])
+
+  useEffect(() => {
     if (!open || (!workspaceId && !sessionId)) return
     let unsubscribe: (() => void) | null = null
     void onLlmTraceEvent((payload: LlmTraceEvent) => {
       if (!matchesTraceScope(payload.entry, { workspaceId, sessionId })) return
-      setEntries((prev) => {
-        const idx = prev.findIndex((e) => e.id === payload.entry.id)
-        if (idx >= 0) {
-          const next = prev.slice()
-          next[idx] = payload.entry
-          return next
-        }
-        return [payload.entry, ...prev]
-      })
+      setEntries((prev) => applyLlmTraceEvent(prev, payload))
     }).then((un) => {
       unsubscribe = un
     })
@@ -423,14 +435,6 @@ export function LlmTracePanel({
       unsubscribe?.()
     }
   }, [open, sessionId, workspaceId])
-
-  useEffect(() => {
-    if (!open || (!workspaceId && !sessionId)) return
-    const id = window.setInterval(() => {
-      void refresh()
-    }, 1000)
-    return () => clearInterval(id)
-  }, [open, workspaceId, sessionId, refresh])
 
   const toggle = useCallback(async () => {
     if (!workspaceId) return

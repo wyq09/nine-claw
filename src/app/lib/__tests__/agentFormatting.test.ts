@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+  createDefaultAgentAllowedToolIds,
   createEmptyAgentDraft,
+  normalizeAgentAllowedToolIds,
   normalizeAgentDraft,
   validateAgentDraft,
 } from '../appFormatting'
@@ -13,6 +15,7 @@ describe('agent draft formatting', () => {
       id: ' reviewer_agent ',
       name: '  Review Agent  ',
       description: '  Reviews ${ARG}  ',
+      avatarUri: '  /tmp/reviewer.png  ',
       triggerCondition: '  用户需要代码审查时  ',
       manualTriggerOnly: true,
       systemPrompt: '  Focus on ${ARG}.  ',
@@ -27,11 +30,23 @@ describe('agent draft formatting', () => {
 
     expect(normalized.id).toBe('reviewer_agent')
     expect(normalized.name).toBe('Review Agent')
+    expect(normalized.avatarUri).toBe('/tmp/reviewer.png')
     expect(normalized.triggerCondition).toBe('用户需要代码审查时')
     expect(normalized.manualTriggerOnly).toBe(true)
     expect(normalized.systemPrompt).toBe('Focus on ${ARG}.')
     expect(normalized.skillIds).toEqual(['pdf', 'pptx'])
+    expect(normalized.allowedToolIds).toEqual(createDefaultAgentAllowedToolIds())
     expect(normalized.capabilityPolicy?.strategy).toBe('static')
+  })
+
+  it('normalizes agent tool permissions and runtime aliases', () => {
+    expect(normalizeAgentAllowedToolIds(['read', 'find', 'agent_delegate', 'unknown', 'read_file'])).toEqual([
+      'read_file',
+      'glob',
+      'agent_spawn',
+    ])
+    expect(normalizeAgentAllowedToolIds([])).toEqual([])
+    expect(normalizeAgentAllowedToolIds(undefined)).toEqual(createDefaultAgentAllowedToolIds())
   })
 
   it('rejects invalid editable Agent_ID values', () => {

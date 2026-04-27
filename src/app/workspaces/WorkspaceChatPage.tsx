@@ -7,6 +7,7 @@ import type {
 } from '../../types'
 import { ChatView, type ChatViewProps } from '../chat/ChatWorkspace'
 import { AppIcon } from '../../components/AppIcon'
+import { AgentAvatar } from '../../components/AgentAvatar'
 import { workspaceList } from '../../lib/piClient'
 import { WorkspaceSessionsSidebar } from './WorkspaceSessionsSidebar'
 import { TeamDrawer, type TeamDrawerTab } from './TeamDrawer'
@@ -118,6 +119,7 @@ export function WorkspaceChatPage({
         name: member?.name ?? agent?.name ?? agentId,
         role,
         accentColor: agent?.accentColor ?? null,
+        avatarUri: member?.avatarUri ?? agent?.avatarUri ?? null,
         avatarEmoji: null,
       }
     },
@@ -218,6 +220,13 @@ export function WorkspaceChatPage({
           onClick={() => insertMention(m)}
         >
           <span className="workspace-mention-index">{idx + 1}</span>
+          <AgentAvatar
+            name={m.name}
+            avatarUri={m.avatarUri}
+            accentColor={agentById.get(m.agentId)?.accentColor ?? null}
+            className="workspace-mention-avatar"
+            size={14}
+          />
           <span className="workspace-mention-name">{m.name}</span>
           <span className={`workspace-mention-role${m.role === 'supervisor' ? ' supervisor' : ''}`}>
             {m.role === 'supervisor' ? '主' : '成员'}
@@ -238,6 +247,13 @@ export function WorkspaceChatPage({
           onClick={() => insertMention(m)}
           title={m.summary || m.name}
         >
+          <AgentAvatar
+            name={m.name}
+            avatarUri={m.avatarUri}
+            accentColor={agentById.get(m.agentId)?.accentColor ?? null}
+            className="workspace-mention-chip-avatar"
+            size={12}
+          />
           @{m.name}
         </button>
       ))}

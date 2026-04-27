@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { AppIcon } from '../../components/AppIcon'
+import { AgentAvatar } from '../../components/AgentAvatar'
 import type {
   AgentInput,
   AgentRecord,
@@ -354,9 +355,14 @@ export function AgentsView({
                     }}
                   >
                     <span className="agent-row-tone" style={{ backgroundColor: getAgentColor(agent) }} />
-                    <span className="agent-badge" style={{ backgroundColor: getAgentColor(agent) }}>
-                      <AppIcon name="bot" size={18} />
-                    </span>
+                    <AgentAvatar
+                      name={agent.name}
+                      avatarUri={agent.avatarUri}
+                      accentColor={getAgentColor(agent)}
+                      className="agent-badge"
+                      size={18}
+                      fallbackToIcon={!agent.avatarUri}
+                    />
                     <span className="agent-copy">
                       <strong>
                         {agent.name}

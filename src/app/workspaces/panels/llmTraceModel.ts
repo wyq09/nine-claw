@@ -1,5 +1,6 @@
 import type {
   LlmTraceEntry,
+  LlmTraceEvent,
   LlmTraceMessageBlock,
   LlmTraceResponseBlock,
 } from '../../../lib/llmTraceClient'
@@ -92,4 +93,49 @@ export function getTraceResponseBlocks(entry: LlmTraceEntry): LlmTraceResponseBl
       content: entry.responseText ?? '',
     },
   ]
+}
+
+function appendResponseBlockDelta(
+  blocks: LlmTraceResponseBlock[] | undefined,
+  kind: 'response' | 'thinking' | string,
+  text: string,
+): LlmTraceResponseBlock[] | undefined {
+  if (!blocks || blocks.length === 0) return blocks
+  const blockKind = kind === 'thinking' ? 'thinking' : 'output'
+  let patched = false
+  const next = blocks.map((block) => {
+    if (block.kind !== blockKind) return block
+    patched = true
+    return { ...block, content: `${block.content ?? ''}${text}` }
+  })
+  return patched ? next : blocks
+}
+
+export function applyLlmTraceEvent(entries: LlmTraceEntry[], event: LlmTraceEvent): LlmTraceEntry[] {
+  const deltaText = event.delta?.text ?? ''
+  const deltaKind = event.delta?.kind ?? ''
+  const idx = entries.findIndex((entry) => entry.id === event.entry.id)
+
+  if (idx < 0) {
+    return [event.entry, ...entries]
+  }
+
+  const current = entries[idx]
+  const next = entries.slice()
+  if (!deltaText) {
+    next[idx] = event.entry
+    return next
+  }
+
+  next[idx] = {
+    ...current,
+    ...event.entry,
+    responseText:
+      deltaKind === 'response' ? `${current.responseText ?? ''}${deltaText}` : current.responseText,
+    thinkingText:
+      deltaKind === 'thinking' ? `${current.thinkingText ?? ''}${deltaText}` : current.thinkingText,
+    messageBlocks: current.messageBlocks ?? event.entry.messageBlocks,
+    responseBlocks: appendResponseBlockDelta(current.responseBlocks, deltaKind, deltaText),
+  }
+  return next
 }

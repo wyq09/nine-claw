@@ -268,17 +268,9 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
       if (!matchesTraceScope(payload.entry, { workspaceId: llmTraceWorkspaceId, sessionId: traceSessionId })) {
         return
       }
-      void llmTraceList({ workspaceId: llmTraceWorkspaceId, sessionId: traceSessionId, days: 3, limit: 200 })
-        .then((list) => {
-          if (mounted) {
-            setStandaloneTraceCount(list.length)
-          }
-        })
-        .catch(() => {
-          if (mounted) {
-            setStandaloneTraceCount(0)
-          }
-        })
+      if (payload.phase === 'started' && mounted) {
+        setStandaloneTraceCount((count) => count + 1)
+      }
     }).then((unlisten) => {
       unsubscribe = unlisten
     })

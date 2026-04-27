@@ -95,6 +95,7 @@ import {
   buildSessionLlmSelectOptions,
   buildSkillInstallPrompt,
   createAgentBotConfigState,
+  createDefaultAgentAllowedToolIds,
   createAgentDraftFromRecord,
   createEmptyAgentDraft,
   createEmptySystemSkillCatalog,
@@ -112,6 +113,7 @@ import {
   loadCustomProviderMeta,
   normalizeAgentDraft,
   normalizeHeartbeatConfig,
+  orderAgentsWithDefaultFirst,
   parseStoredCustomProviderMeta,
   parseStoredImageGenerationSystemConfig,
   parseStoredImageProviderConfigs,
@@ -295,6 +297,14 @@ export function NineClawApp() {
     [agents, defaultAgentId],
   )
   const editableAgents = useMemo(() => agents.filter((item) => !item.isBuiltin), [agents])
+  const editableAgentsOrdered = useMemo(
+    () => orderAgentsWithDefaultFirst(editableAgents, defaultAgentId),
+    [editableAgents, defaultAgentId],
+  )
+  const agentsDisplayOrder = useMemo(
+    () => orderAgentsWithDefaultFirst(agents, defaultAgentId),
+    [agents, defaultAgentId],
+  )
   const selectedManagedAgent = useMemo(
     () => editableAgents.find((item) => item.id === managedAgentId) ?? null,
     [editableAgents, managedAgentId],
@@ -367,10 +377,13 @@ export function NineClawApp() {
       })),
     [systemSkillCatalog.skills, systemSkillCatalog.updatedAt],
   )
-  const visibleAgents = editableAgents.filter((agent) => {
-    if (!deferredAgentSearch) return true
-    return `${agent.name} ${agent.summary} ${agent.description}`.toLowerCase().includes(deferredAgentSearch)
-  })
+  const visibleAgents = useMemo(() => {
+    const filtered = editableAgents.filter((agent) => {
+      if (!deferredAgentSearch) return true
+      return `${agent.name} ${agent.summary} ${agent.description}`.toLowerCase().includes(deferredAgentSearch)
+    })
+    return orderAgentsWithDefaultFirst(filtered, defaultAgentId)
+  }, [editableAgents, deferredAgentSearch, defaultAgentId])
   const visibleAgentSkillOptions = useMemo(() => {
     const searchNeedle = agentSkillSearch.trim().toLowerCase()
     const activeSkillIds = new Set(agentEditorDraft?.skillIds ?? [])
@@ -1102,10 +1115,12 @@ export function NineClawApp() {
       name: draft.name,
       summary: draft.summary,
       description: draft.description,
+      avatarUri: draft.avatarUri,
       triggerCondition: draft.triggerCondition ?? '',
       manualTriggerOnly: draft.manualTriggerOnly === true,
       systemPrompt: draft.systemPrompt,
       skillIds: normalizedSkillIds,
+      allowedToolIds: draft.allowedToolIds ?? createDefaultAgentAllowedToolIds(),
       defaultProviderId: fallbackProviderId,
       defaultModel: fallbackModel,
       executionMode: draft.executionMode,
@@ -2374,7 +2389,7 @@ export function NineClawApp() {
                 : null
           }
           installedSkills={installedSkills}
-          editableAgents={editableAgents}
+          editableAgents={editableAgentsOrdered}
           onOpenAgentEditor={handleOpenAgentEditor}
           agentEditorDraft={agentEditorDraft}
           agentBotBindingDialogOpen={agentBotBindingDialogOpen}
@@ -2454,7 +2469,7 @@ export function NineClawApp() {
           onSelectSession={handleWorkspaceSelectSession}
           onDeleteSession={handleRequestDeleteHistoryItem}
           history={history}
-          agents={agents}
+          agents={agentsDisplayOrder}
           onDispatchDelegatePlan={handleDispatchDelegatePlan}
         />
       }
@@ -2497,7 +2512,7 @@ export function NineClawApp() {
       historyDeleteBusy={historyDeleteBusy}
       onConfirmDeleteHistoryItem={handleConfirmDeleteHistoryItem}
       newSessionDialogOpen={newSessionDialogOpen}
-      agents={agents}
+      agents={agentsDisplayOrder}
       agentsLoading={agentsLoading}
       sessionLlmSelectOptionsWithFallback={sessionLlmSelectOptionsWithFallback}
       newSessionAgentId={newSessionAgentId}

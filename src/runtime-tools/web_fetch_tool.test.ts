@@ -49,6 +49,8 @@ describe('web_fetch helpers', () => {
     expect(normalized).toEqual({
       url: 'https://mp.weixin.qq.com/s/abc',
       ua: 'custom-agent',
+      downloadImages: true,
+      maxImages: 6,
     })
     expect(isWeChatArticleUrl(normalized.url)).toBe(true)
   })
@@ -166,12 +168,70 @@ describe('web_fetch tool execute', () => {
     )
 
     expect(result.content[0].text).toContain('Result exceeded 12000 characters and was written to')
-    const filePath = result.details.storage.filePath as string
+    expect(result.details.storage?.filePath).toBeTruthy()
+    const filePath = result.details.storage?.filePath
+    if (!filePath) {
+      throw new Error('expected stored web fetch payload path')
+    }
     expect(await stat(filePath)).toBeTruthy()
     const stored = await readFile(filePath, 'utf8')
     expect(stored).toContain('"url": "https://example.com/raw"')
     expect(stored).toContain('"effectiveUa": "custom-agent/1.0"')
     expect(stored).toContain('"kind": "html"')
+  })
+
+  it('downloads parsed page images into the workdir result folder', async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), 'web-fetch-images-'))
+    const deps = createDeps({
+      execFileImpl: vi.fn(async (_command: string, args: string[]) => {
+        const url = args[args.length - 1]
+        const headerPath = args[args.indexOf('-D') + 1]
+        const bodyPath = args[args.indexOf('-o') + 1]
+        if (url === 'https://example.com/hero.png') {
+          await writeFile(headerPath, 'HTTP/2 200\ncontent-type: image/png\n')
+          await writeFile(bodyPath, Buffer.from([1, 2, 3, 4]))
+          return {
+            stdout: '__NC_CURL_META__200\timage/png\thttps://example.com/hero.png',
+            stderr: '',
+          }
+        }
+        await writeFile(headerPath, 'HTTP/2 200\ncontent-type: text/html; charset=utf-8\n')
+        await writeFile(
+          bodyPath,
+          Buffer.from('<html><body><article><img src="/hero.png" /><p>Story</p></article></body></html>'),
+        )
+        return {
+          stdout: '__NC_CURL_META__200\ttext/html; charset=utf-8\thttps://example.com/post',
+          stderr: '',
+        }
+      }),
+    })
+
+    const tool = createWebFetchTool(deps as never)
+    const result = await tool.execute(
+      'tool-call-images',
+      {
+        url: 'https://example.com/post',
+        maxImages: 1,
+      },
+      undefined,
+      undefined,
+      { cwd },
+    )
+
+    const payload = JSON.parse(result.content[0].text)
+    expect(payload.images).toEqual(['https://example.com/hero.png'])
+    expect(payload.downloadedImages[0]).toMatchObject({
+      url: 'https://example.com/hero.png',
+      ok: true,
+      contentType: 'image/png',
+      bytes: 4,
+    })
+    const imagePath = payload.downloadedImages[0].filePath as string
+    expect(imagePath.startsWith(path.join(cwd, '.nineclaw-tool-results', 'images'))).toBe(true)
+    expect(await readFile(imagePath)).toEqual(Buffer.from([1, 2, 3, 4]))
+    const downloadedImage = result.details.downloadedImages?.[0] as { filePath?: string } | undefined
+    expect(downloadedImage?.filePath).toBe(imagePath)
   })
 
   it('returns a stable error payload for invalid URLs', async () => {

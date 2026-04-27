@@ -1,4 +1,5 @@
 export * from './appConstants'
+export * from './agentOrdering'
 export * from './agentCapabilities'
 export * from './appStorage'
 export * from './appFormatting'

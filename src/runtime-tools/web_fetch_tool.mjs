@@ -1,4 +1,5 @@
 import { fetchUrlWithCurl } from "./curl_http.mjs";
+import { downloadImagesToWorkdir } from "./image_downloader.mjs";
 import { createTempArtifactTracker, finalizeLargeTextResult } from "./tool_result_storage.mjs";
 
 const DEFAULT_MAX_RESULT_SIZE_CHARS = 12_000;
@@ -24,6 +25,18 @@ export function createWebFetchParameters(Type) {
           "Optional User-Agent override. Leave empty to use the default browser UA or the built-in WeChat UA for mp.weixin.qq.com articles.",
       }),
     ),
+    downloadImages: Type.Optional(
+      Type.Boolean({
+        description: "Whether to download parsed page images into .nineclaw-tool-results/images. Default is true.",
+      }),
+    ),
+    maxImages: Type.Optional(
+      Type.Integer({
+        minimum: 0,
+        maximum: 20,
+        description: "Maximum number of parsed page images to download. Default is 6.",
+      }),
+    ),
   });
 }
 
@@ -31,11 +44,20 @@ export function normalizeWebFetchInput(input) {
   return {
     url: normalizeOptionalString(input?.url) ?? "",
     ua: normalizeOptionalString(input?.ua) ?? null,
+    downloadImages: input?.downloadImages !== false,
+    maxImages: clampNumber(input?.maxImages, 0, 20, 6),
   };
 }
 
 function normalizeOptionalString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function clampNumber(value, min, max, fallback) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.trunc(value)));
 }
 
 function parseHttpUrl(value) {
@@ -312,6 +334,7 @@ export function buildStructuredFetchResponse(normalizedInput, fetchResult, deps)
     contentText,
     json: parsedJson,
     images,
+    downloadedImages: [],
     links,
     isVideo,
     rawBytes: fetchResult.bodyBuffer.length,
@@ -364,6 +387,7 @@ export function createWebFetchTool(deps) {
           contentText: null,
           json: null,
           images: [],
+          downloadedImages: [],
           links: [],
           isVideo: null,
           rawBytes: 0,
@@ -386,6 +410,18 @@ export function createWebFetchTool(deps) {
           tempArtifactTracker,
         );
         responsePayload = buildStructuredFetchResponse(normalizedInput, fetchResult, deps);
+        if (normalizedInput.downloadImages && responsePayload.images.length > 0) {
+          responsePayload.downloadedImages = await downloadImagesToWorkdir(
+            responsePayload.images,
+            ctx,
+            {
+              limit: normalizedInput.maxImages,
+              userAgent: responsePayload.effectiveUa,
+            },
+            deps,
+            tempArtifactTracker,
+          );
+        }
       } catch (error) {
         responsePayload = {
           url: normalizedInput.url,
@@ -405,6 +441,7 @@ export function createWebFetchTool(deps) {
           contentText: null,
           json: null,
           images: [],
+          downloadedImages: [],
           links: [],
           isVideo: null,
           rawBytes: 0,
@@ -436,6 +473,7 @@ export function createWebFetchTool(deps) {
           status: responsePayload.status,
           title: responsePayload.title,
           contentLength: responsePayload.contentText?.length ?? 0,
+          downloadedImages: responsePayload.downloadedImages,
           storage: finalized.storage,
         },
       };

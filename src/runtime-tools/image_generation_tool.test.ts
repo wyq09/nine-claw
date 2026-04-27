@@ -94,7 +94,12 @@ describe('image_generate tool execute', () => {
       type: 'image',
       mimeType: 'image/png',
     })
-    const savedPath = result.details.savedPaths[0]
+    expect(result.details.savedPaths?.length).toBeGreaterThan(0)
+    const savedPath = result.details.savedPaths?.[0]
+    expect(savedPath).toBeTruthy()
+    if (!savedPath) {
+      throw new Error('expected saved image path')
+    }
     expect(savedPath.startsWith(path.join(cwd, '.nineclaw-generated-images'))).toBe(true)
     expect(await readFile(savedPath, 'utf8')).toBe('fake-image')
   })

@@ -11,7 +11,7 @@ import {
   useState,
   type RefObject,
 } from 'react'
-import { AppIcon } from '../../components/AppIcon'
+import { AgentAvatar } from '../../components/AgentAvatar'
 import { PromptBubbleContent } from '../../components/PromptBubbleContent'
 import { turnHasInlineAttachments, turnHasInlineFileAttachment } from '../../lib/inlineMedia'
 import type { AgentBuilderDraft, ConversationAgentSnapshot, ConversationTurn } from '../../types'
@@ -68,6 +68,7 @@ export type VirtualizedChatTurnsProps = {
     name: string
     role?: 'supervisor' | 'member'
     accentColor?: string | null
+    avatarUri?: string | null
     avatarEmoji?: string | null
   } | null
   agentBuilderActionBusyId: string
@@ -129,6 +130,7 @@ const ChatTurnRow = memo(function ChatTurnRow({
     name: string
     role?: 'supervisor' | 'member'
     accentColor?: string | null
+    avatarUri?: string | null
     avatarEmoji?: string | null
   } | null
   agentBuilderActionBusyId: string
@@ -200,6 +202,7 @@ const ChatTurnRow = memo(function ChatTurnRow({
                     name: turn.speakerAgentId,
                     role: undefined,
                     accentColor: null,
+                    avatarUri: null,
                     avatarEmoji: null,
                   }
                 )
@@ -209,6 +212,7 @@ const ChatTurnRow = memo(function ChatTurnRow({
                   name: selectedAgent.name,
                   role: undefined,
                   accentColor: selectedAgent.accentColor,
+                  avatarUri: selectedAgent.avatarUri,
                   avatarEmoji: null,
                 }
               }
@@ -216,28 +220,18 @@ const ChatTurnRow = memo(function ChatTurnRow({
             })()
             const avatarAccent =
               speakerInfo?.accentColor || selectedAgent?.accentColor || null
-            const avatarStyle = avatarAccent
-              ? {
-                  borderColor: `${avatarAccent}55`,
-                  background: `${avatarAccent}22`,
-                  color: avatarAccent,
-                }
-              : undefined
             const showSpeakerRow = Boolean(resolveSpeaker && speakerInfo)
-            const avatarLetter =
-              speakerInfo?.name?.trim()?.charAt(0)?.toUpperCase() ?? ''
             return (
         <div className="chat-response">
           <div className="assistant-message-shell">
-            <div className="assistant-avatar" style={avatarStyle} aria-hidden>
-              {speakerInfo?.avatarEmoji ? (
-                <span className="assistant-avatar-emoji">{speakerInfo.avatarEmoji}</span>
-              ) : showSpeakerRow && avatarLetter ? (
-                <span className="assistant-avatar-initial">{avatarLetter}</span>
-              ) : (
-                <AppIcon name="bot" size={20} />
-              )}
-            </div>
+            <AgentAvatar
+              name={speakerInfo?.name ?? selectedAgent?.name ?? '智能体'}
+              avatarUri={speakerInfo?.avatarUri ?? selectedAgent?.avatarUri}
+              accentColor={avatarAccent}
+              className="assistant-avatar"
+              fallbackToIcon={!showSpeakerRow && !speakerInfo?.avatarUri}
+              size={20}
+            />
             <div className="assistant-message-stack">
               {showSpeakerRow ? (
                 <div

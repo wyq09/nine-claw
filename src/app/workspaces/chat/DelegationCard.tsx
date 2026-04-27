@@ -5,6 +5,7 @@ import type {
   DelegationTurnEntry,
 } from '../../../types'
 import { AppIcon } from '../../../components/AppIcon'
+import { AgentAvatar } from '../../../components/AgentAvatar'
 import {
   subscribeWorkspaceDelegateChunk,
   subscribeWorkspaceDelegateTerminal,
@@ -22,6 +23,7 @@ export type DelegationCardProps = {
     name: string
     role?: 'supervisor' | 'member'
     accentColor?: string | null
+    avatarUri?: string | null
     avatarEmoji?: string | null
   } | null
 }
@@ -182,15 +184,7 @@ export function DelegationCard({ workspaceId, run, onReassign, resolveSpeaker }:
     [resolveSpeaker, run.assignee],
   )
   const displayName = assigneeInfo?.name ?? run.assignee
-  const avatarInitial = displayName.trim().charAt(0).toUpperCase() || '?'
   const accent = assigneeInfo?.accentColor ?? null
-  const avatarStyle = accent
-    ? {
-        borderColor: `${accent}55`,
-        background: `${accent}18`,
-        color: accent,
-      }
-    : undefined
   const [outputExpanded, setOutputExpanded] = useState(false)
   const [augmentOpen, setAugmentOpen] = useState(false)
   const [augmentText, setAugmentText] = useState('')
@@ -228,18 +222,19 @@ export function DelegationCard({ workspaceId, run, onReassign, resolveSpeaker }:
 
   const canStop = live.status === 'running' || live.status === 'pending'
   const hasLiveTrace = live.toolCalls.length > 0 || live.turns.length > 0
+  const actionCount = live.toolCalls.length + live.turns.length
 
   return (
     <div className={`delegation-card ${meta.className}`} data-run-id={run.runId}>
       <header className="delegation-card-header">
         <div className="delegation-card-identity">
-          <div className="delegation-card-avatar" style={avatarStyle} aria-hidden>
-            {assigneeInfo?.avatarEmoji ? (
-              <span className="delegation-card-avatar-emoji">{assigneeInfo.avatarEmoji}</span>
-            ) : (
-              <span className="delegation-card-avatar-initial">{avatarInitial}</span>
-            )}
-          </div>
+          <AgentAvatar
+            name={displayName}
+            avatarUri={assigneeInfo?.avatarUri}
+            accentColor={accent}
+            className="delegation-card-avatar"
+            size={18}
+          />
           <div className="delegation-card-identity-text">
             <div className="delegation-card-name-row">
               <span className="delegation-card-assignee-name">{displayName}</span>
@@ -256,6 +251,16 @@ export function DelegationCard({ workspaceId, run, onReassign, resolveSpeaker }:
           </div>
         </div>
         <div className="delegation-card-actions">
+          {output ? (
+            <button
+              type="button"
+              className="delegation-card-result-link"
+              onClick={() => setOutputExpanded((v) => !v)}
+              title={outputExpanded ? '收起结果' : '查看结果'}
+            >
+              结果 <span aria-hidden>›</span>
+            </button>
+          ) : null}
           <button
             type="button"
             className="delegation-card-icon-btn"
@@ -265,6 +270,16 @@ export function DelegationCard({ workspaceId, run, onReassign, resolveSpeaker }:
             aria-label="停止"
           >
             <AppIcon name="stop" size={16} />
+          </button>
+          <button
+            type="button"
+            className="delegation-card-icon-btn delegation-card-chevron-btn"
+            onClick={() => setLiveExpanded((v) => !v)}
+            title={liveExpanded ? '收起运行细节' : '展开运行细节'}
+            aria-label={liveExpanded ? '收起运行细节' : '展开运行细节'}
+            aria-expanded={liveExpanded}
+          >
+            <AppIcon name="chevron-down" size={16} />
           </button>
           <button
             type="button"
@@ -394,6 +409,21 @@ export function DelegationCard({ workspaceId, run, onReassign, resolveSpeaker }:
       ) : null}
 
       {live.error ? <div className="delegation-card-error">{live.error}</div> : null}
+
+      {live.status === 'running' || live.status === 'pending' ? (
+        <div className="delegation-card-processing" role="status" aria-live="polite">
+          <AgentAvatar
+            name={displayName}
+            avatarUri={assigneeInfo?.avatarUri}
+            accentColor={accent}
+            className="delegation-card-processing-avatar"
+            size={16}
+          />
+          <strong>{displayName}</strong>
+          <span>{live.status === 'pending' ? '排队中' : '正在处理'}</span>
+          {actionCount > 0 ? <span className="delegation-card-processing-meta">{actionCount} 个动作</span> : null}
+        </div>
+      ) : null}
     </div>
   )
 }
