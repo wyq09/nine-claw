@@ -28,6 +28,7 @@ import type {
 } from '../types/imageGeneration'
 import type { ResourcesViewProps, SkillsViewProps } from '../app/pages/LibraryAndTasks'
 import { AppIcon, type IconName } from './AppIcon'
+import { NumericDraftField } from './NumericDraftField'
 import { ImageGenerationSettingsSection } from './settings/ImageGenerationSettingsSection'
 import { UsageStatsPanel } from './UsageStatsPanel'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -425,34 +426,38 @@ export function SettingsModal({
       ? '常规'
       : tab === 'appearance'
         ? '外观与行为'
-        : tab === 'providers'
-          ? '模型提供方'
-          : tab === 'usage'
-            ? '用量统计'
-            : tab === 'skills'
-              ? '探索技能'
-              : tab === 'resources'
-                ? '资源库'
-                : tab === 'logs'
-                  ? '日志'
-                  : '快捷键'
+        : tab === 'parameters'
+          ? '参数'
+          : tab === 'providers'
+            ? '模型提供方'
+            : tab === 'usage'
+              ? '用量统计'
+              : tab === 'skills'
+                ? '探索技能'
+                : tab === 'resources'
+                  ? '资源库'
+                  : tab === 'logs'
+                    ? '日志'
+                    : '快捷键'
 
   const currentTabDescription =
     tab === 'general'
       ? '维护应用默认行为、语言偏好和对外接入配置。'
       : tab === 'appearance'
         ? '控制侧栏密度、执行轨迹和页面动态效果。'
-        : tab === 'providers'
-          ? '统一管理大模型接口、默认模型与连通性校验。'
-          : tab === 'usage'
-            ? '按模型、智能体与日期查看本地累计用量。'
-            : tab === 'skills'
-              ? '浏览已安装技能与系统技能库，通过链接安装或刷新目录。'
-              : tab === 'resources'
-                ? '模板、规范与可复用资产，统一检索与编排入口。'
-                : tab === 'logs'
-                  ? '将已完成的 LLM 调用链（与调试面板同源）额外写入你选择的目录，便于外部工具分析。'
-                  : '配置发送方式与常用桌面快捷操作。'
+        : tab === 'parameters'
+          ? '统一管理 Agent 工具调用轮数上限、流式连接重试次数与大模型外层重试。'
+          : tab === 'providers'
+            ? '统一管理大模型接口、默认模型与连通性校验。'
+            : tab === 'usage'
+              ? '按模型、智能体与日期查看本地累计用量。'
+              : tab === 'skills'
+                ? '浏览已安装技能与系统技能库，通过链接安装或刷新目录。'
+                : tab === 'resources'
+                  ? '模板、规范与可复用资产，统一检索与编排入口。'
+                  : tab === 'logs'
+                    ? '将已完成的 LLM 调用链（与调试面板同源）额外写入你选择的目录，便于外部工具分析。'
+                    : '配置发送方式与常用桌面快捷操作。'
   const selectedProviderFormatDefaults = getProviderFormatDefaults(selectedProviderConfig.apiFormat)
 
   return (
@@ -474,6 +479,7 @@ export function SettingsModal({
             <div className="settings-tab-list">
               <SettingsTabButton active={tab === 'general'} icon="settings" label="通用" onClick={() => onSelectTab('general')} />
               <SettingsTabButton active={tab === 'appearance'} icon="sparkles" label="个性化" onClick={() => onSelectTab('appearance')} />
+              <SettingsTabButton active={tab === 'parameters'} icon="wrench" label="参数" onClick={() => onSelectTab('parameters')} />
               <SettingsTabButton active={tab === 'providers'} icon="provider" label="大模型 Provider" onClick={() => onSelectTab('providers')} />
               <SettingsTabButton active={tab === 'usage'} icon="zap" label="用量统计" onClick={() => onSelectTab('usage')} />
               <SettingsTabButton active={tab === 'skills'} icon="puzzle" label="探索技能" onClick={() => onSelectTab('skills')} />
@@ -663,18 +669,16 @@ export function SettingsModal({
                           <p>默认 1052；勿与系统其他服务冲突。</p>
                         </div>
                         <label className="input-field settings-peer-field">
-                          <input
-                            type="number"
+                          <NumericDraftField
+                            aria-label="监听端口"
+                            value={peerGatewayDraft.port}
                             min={1}
                             max={65535}
-                            value={peerGatewayDraft.port}
+                            fallbackOnBlur={1052}
                             disabled={peerGatewayInfo.envOverrideActive}
-                            onChange={(event) => {
-                              const next = Number.parseInt(event.target.value, 10)
+                            onCommit={(next) => {
                               setPeerGatewayDraft((previous) =>
-                                previous
-                                  ? { ...previous, port: Number.isFinite(next) ? next : previous.port }
-                                  : previous,
+                                previous ? { ...previous, port: next } : previous,
                               )
                               setPeerGatewaySaveNotice('')
                             }}
@@ -819,6 +823,89 @@ export function SettingsModal({
                     }))
                   }
                 />
+              </div>
+            ) : null}
+
+            {tab === 'parameters' ? (
+              <div className="settings-section-stack">
+                <div className="settings-peer-gateway-block">
+                  <div className="settings-peer-gateway-title">
+                    <strong>Agent 循环</strong>
+                    <span>
+                      控制 Agent 单次对话中工具调用的循环行为。接近上限时系统会弹窗提醒。
+                    </span>
+                  </div>
+                  <div className="settings-row stacked">
+                    <div>
+                      <strong>最大迭代次数</strong>
+                      <p>单次对话中 Agent 执行工具调用的最大轮数。</p>
+                    </div>
+                    <label className="input-field settings-peer-field" style={{ maxWidth: 200 }}>
+                      <NumericDraftField
+                        aria-label="最大迭代次数"
+                        value={generalSettings.runtimeParameters.maxAgentToolRoundsPerDialogue}
+                        min={1}
+                        max={500}
+                        fallbackOnBlur={80}
+                        onCommit={(next) =>
+                          setGeneralSettings((previous) => ({
+                            ...previous,
+                            runtimeParameters: { ...previous.runtimeParameters, maxAgentToolRoundsPerDialogue: next },
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+                  <div className="settings-row stacked">
+                    <div>
+                      <strong>流式传输中断重试</strong>
+                      <p>Agent 循环中流式响应断开或长时间无输出时的最大等待/重连重试次数。</p>
+                    </div>
+                    <label className="input-field settings-peer-field" style={{ maxWidth: 200 }}>
+                      <NumericDraftField
+                        aria-label="流式中断重试"
+                        value={generalSettings.runtimeParameters.streamDisconnectMaxRetries}
+                        min={0}
+                        max={20}
+                        fallbackOnBlur={3}
+                        onCommit={(next) =>
+                          setGeneralSettings((previous) => ({
+                            ...previous,
+                            runtimeParameters: { ...previous.runtimeParameters, streamDisconnectMaxRetries: next },
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+                </div>
+
+                <div className="settings-peer-gateway-block">
+                  <div className="settings-peer-gateway-title">
+                    <strong>LLM 请求</strong>
+                    <span>控制大模型 API 请求的重试策略（网络错误、限流等）。</span>
+                  </div>
+                  <div className="settings-row stacked">
+                    <div>
+                      <strong>最大重试次数</strong>
+                      <p>遇到网络错误或 429 限流时的指数退避重试上限（含首次请求）。</p>
+                    </div>
+                    <label className="input-field settings-peer-field" style={{ maxWidth: 200 }}>
+                      <NumericDraftField
+                        aria-label="LLM 外层最大重试次数"
+                        value={generalSettings.runtimeParameters.llmOuterMaxAttempts}
+                        min={1}
+                        max={24}
+                        fallbackOnBlur={8}
+                        onCommit={(next) =>
+                          setGeneralSettings((previous) => ({
+                            ...previous,
+                            runtimeParameters: { ...previous.runtimeParameters, llmOuterMaxAttempts: next },
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+                </div>
               </div>
             ) : null}
 
@@ -1080,17 +1167,28 @@ export function SettingsModal({
                           <label className="input-field">
                             <span>最大上下文窗口 (tokens)</span>
                             <input
-                              type="number"
-                              min={1}
-                              value={selectedProviderConfig.maxContextTokens ?? ''}
+                              type="text"
+                              inputMode="numeric"
+                              autoComplete="off"
+                              value={
+                                selectedProviderConfig.maxContextTokens === undefined ||
+                                selectedProviderConfig.maxContextTokens === null
+                                  ? ''
+                                  : String(selectedProviderConfig.maxContextTokens)
+                              }
                               onChange={(event) => {
                                 const raw = event.target.value.trim()
-                                const parsed = raw ? parseInt(raw, 10) : undefined
+                                if (raw === '') {
+                                  onProviderConfigChange(selectedProviderId, { maxContextTokens: undefined })
+                                  return
+                                }
+                                const parsed = parseInt(raw, 10)
                                 onProviderConfigChange(selectedProviderId, {
-                                  maxContextTokens: parsed && parsed > 0 ? parsed : undefined,
+                                  maxContextTokens: Number.isFinite(parsed) && parsed > 0 ? parsed : undefined,
                                 })
                               }}
                               placeholder="如 128000，留空表示自动检测"
+                              aria-label="最大上下文窗口 (tokens)"
                             />
                           </label>
 
@@ -1401,38 +1499,38 @@ export function SettingsModal({
                   {imageSaveError ? <p className="settings-note error">{imageSaveError}</p> : null}
                   {imageSaveNotice ? <p className="settings-note">{imageSaveNotice}</p> : null}
                 </div>
-              ) : (
-                <div />
-              )}
-              <button type="button" className="outline-button settings-footer-button" onClick={onClose}>
-                关闭
-              </button>
-              {tab === 'providers' && providerSettingsMode === 'image' ? (
-                <button
-                  type="button"
-                  className="primary-dark-button settings-footer-button"
-                  disabled={imageSaveBusy}
-                  onClick={async () => {
-                    setImageSaveBusy(true)
-                    setImageSaveError('')
-                    setImageSaveNotice('')
-                    try {
-                      await onSaveImageGenerationSettings(draftImageProviderConfigs, draftImageGenerationSystem)
-                      setImageSaveNotice('图片大模型配置已保存，重启后会自动恢复。')
-                    } catch (error) {
-                      setImageSaveError(error instanceof Error ? error.message : String(error))
-                    } finally {
-                      setImageSaveBusy(false)
-                    }
-                  }}
-                >
-                  {imageSaveBusy ? '保存中…' : '保存图片配置'}
+              ) : null}
+              <div className="settings-footer-actions">
+                <button type="button" className="outline-button settings-footer-button" onClick={onClose}>
+                  关闭
                 </button>
-              ) : (
-                <button type="button" className="primary-dark-button settings-footer-button" onClick={onClose}>
-                  完成
-                </button>
-              )}
+                {tab === 'providers' && providerSettingsMode === 'image' ? (
+                  <button
+                    type="button"
+                    className="primary-dark-button settings-footer-button"
+                    disabled={imageSaveBusy}
+                    onClick={async () => {
+                      setImageSaveBusy(true)
+                      setImageSaveError('')
+                      setImageSaveNotice('')
+                      try {
+                        await onSaveImageGenerationSettings(draftImageProviderConfigs, draftImageGenerationSystem)
+                        setImageSaveNotice('图片大模型配置已保存，重启后会自动恢复。')
+                      } catch (error) {
+                        setImageSaveError(error instanceof Error ? error.message : String(error))
+                      } finally {
+                        setImageSaveBusy(false)
+                      }
+                    }}
+                  >
+                    {imageSaveBusy ? '保存中…' : '保存图片配置'}
+                  </button>
+                ) : (
+                  <button type="button" className="primary-dark-button settings-footer-button" onClick={onClose}>
+                    完成
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>

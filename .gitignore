@@ -38,3 +38,4 @@ src-tauri/.listenhub/
 
 # Cached official Node.js binaries
 .cache/
+.env

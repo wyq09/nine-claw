@@ -6,6 +6,7 @@ import type {
   ProviderConfig,
   ProviderDefinition,
   ResourceItem,
+  RuntimeParameters,
 } from './types'
 import type {
   ImageGenerationSystemConfig,
@@ -321,6 +322,12 @@ export const defaultImageGenerationSystemConfig: ImageGenerationSystemConfig = {
   count: 1,
 }
 
+export const defaultRuntimeParameters: RuntimeParameters = {
+  maxAgentToolRoundsPerDialogue: 80,
+  streamDisconnectMaxRetries: 3,
+  llmOuterMaxAttempts: 8,
+}
+
 export const defaultGeneralSettings: GeneralSettings = {
   language: '中文',
   launchOnStartup: true,
@@ -328,6 +335,7 @@ export const defaultGeneralSettings: GeneralSettings = {
   customProxyUrl: '',
   submitShortcut: 'mod_enter',
   llmCallLogDir: '',
+  runtimeParameters: defaultRuntimeParameters,
 }
 
 export const defaultAppearanceSettings: AppearanceSettings = {

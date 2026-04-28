@@ -108,10 +108,56 @@ pub struct AgentTaskDeliveryRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTaskDeliveryTarget {
+    /// 旧库行可能仅有 sessionId / resultInNewSession，无 kind；与桌面会话投递语义一致。
+    #[serde(default = "default_agent_task_delivery_kind")]
     pub kind: String,
     pub session_id: String,
     #[serde(default)]
     pub result_in_new_session: bool,
+}
+
+fn default_agent_task_delivery_kind() -> String {
+    DELIVERY_KIND_DESKTOP.to_string()
+}
+
+/// 兼容旧数据：`sessionId` 缺失或为 snake_case / 调度器 `targetUserId`；`kind` 可为调度器 `channelId`。
+fn parse_agent_task_delivery_json(
+    raw: &str,
+    fallback_source_session_id: &str,
+) -> Result<AgentTaskDeliveryTarget, String> {
+    use serde_json::Value;
+
+    let mut value: Value =
+        serde_json::from_str(raw).map_err(|e| format!("解析 delivery_json 失败: {e}"))?;
+
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "delivery_json 必须是 JSON 对象".to_string())?;
+
+    if !obj.contains_key("sessionId") {
+        let sid = obj
+            .remove("session_id")
+            .or_else(|| obj.remove("targetUserId"))
+            .or_else(|| obj.remove("target_user_id"));
+        let sid = sid.or_else(|| {
+            if fallback_source_session_id.is_empty() {
+                None
+            } else {
+                Some(Value::String(fallback_source_session_id.to_string()))
+            }
+        });
+        if let Some(v) = sid {
+            obj.insert("sessionId".to_string(), v);
+        }
+    }
+
+    if !obj.contains_key("kind") {
+        if let Some(k) = obj.remove("channelId").or_else(|| obj.remove("channel_id")) {
+            obj.insert("kind".to_string(), k);
+        }
+    }
+
+    serde_json::from_value(value).map_err(|e| format!("delivery_json 与投递格式不匹配: {e}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,20 +522,26 @@ pub fn list_tasks(
                         )
                     }
                 };
+            let source_session_id: String = row.get(3)?;
             let delivery_json: String = row.get(14)?;
-            let delivery = serde_json::from_str::<AgentTaskDeliveryTarget>(&delivery_json)
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        14,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
-                    )
-                })?;
+            let delivery =
+                parse_agent_task_delivery_json(&delivery_json, &source_session_id).map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            14,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                error,
+                            )),
+                        )
+                    },
+                )?;
             Ok(AgentTaskListItem {
                 id: row.get(0)?,
                 agent_id: row.get(1)?,
                 agent_name: row.get(2)?,
-                source_session_id: row.get(3)?,
+                source_session_id,
                 title: row.get(4)?,
                 intent_summary: row.get(5)?,
                 task_type: row.get(6)?,
@@ -635,8 +687,9 @@ pub fn update_task(
             |row| row.get(0),
         )
         .map_err(|error| format!("读取任务投递配置失败: {error}"))?;
-    let mut delivery: AgentTaskDeliveryTarget = serde_json::from_str(&existing_delivery_json)
-        .map_err(|error| format!("解析任务投递配置失败: {error}"))?;
+    let mut delivery: AgentTaskDeliveryTarget =
+        parse_agent_task_delivery_json(&existing_delivery_json, &existing.source_session_id)
+            .map_err(|error| format!("解析任务投递配置失败: {error}"))?;
     let want_new_session = input
         .result_in_new_session
         .unwrap_or(delivery.result_in_new_session);
@@ -786,10 +839,11 @@ pub fn list_active_tasks_for_scheduler(
         .map_err(|error| format!("读取 agent tasks 失败: {error}"))?;
     let rows = statement
         .query_map(params![STATUS_ACTIVE], |row| {
+            let source_session_id: String = row.get(2)?;
             let task = AgentTaskRecord {
                 id: row.get(0)?,
                 agent_id: row.get(1)?,
-                source_session_id: row.get(2)?,
+                source_session_id,
                 creator_user_id: row.get(3)?,
                 title: row.get(4)?,
                 intent_summary: row.get(5)?,
@@ -803,14 +857,19 @@ pub fn list_active_tasks_for_scheduler(
                 updated_at: row.get(14)?,
             };
             let delivery_json: String = row.get(11)?;
-            let delivery = serde_json::from_str::<AgentTaskDeliveryTarget>(&delivery_json)
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        11,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
-                    )
-                })?;
+            let delivery =
+                parse_agent_task_delivery_json(&delivery_json, &task.source_session_id).map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            11,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                error,
+                            )),
+                        )
+                    },
+                )?;
             Ok(SchedulerTaskDefinition { task, delivery })
         })
         .map_err(|error| format!("解析 agent tasks 失败: {error}"))?;

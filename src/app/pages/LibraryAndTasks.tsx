@@ -1,6 +1,7 @@
 import type { Dispatch, SetStateAction } from 'react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AppIcon } from '../../components/AppIcon'
+import { NumericDraftField } from '../../components/NumericDraftField'
 import { useToast } from '../../hooks/useToast'
 import type { AgentRecord, AgentTaskListItem, AgentTaskUpdateInput, InstalledSkillItem, ResourceItem, SkillLibraryTab, SystemSkillCatalog } from '../../types'
 import {
@@ -455,25 +456,22 @@ export function TaskCenterEditPage({
               </select>
             </label>
             {editDraft.scheduleType === 'interval' ? (
-              <label className="task-edit-field">
-                <span className="task-edit-label">间隔（分钟）</span>
-                <input
-                  className="task-edit-control"
-                  type="number"
-                  min={1}
-                  value={editDraft.intervalMinutes ?? 10}
-                  onChange={(event) =>
-                    setEditDraft((current) =>
-                      current
-                        ? {
-                            ...current,
-                            intervalMinutes: Number.parseInt(event.target.value || '0', 10) || 0,
-                          }
-                        : current,
-                    )
-                  }
-                />
-              </label>
+                <label className="task-edit-field">
+                  <span className="task-edit-label">间隔（分钟）</span>
+                  <NumericDraftField
+                    className="task-edit-control"
+                    aria-label="任务间隔（分钟）"
+                    value={editDraft.intervalMinutes != null && editDraft.intervalMinutes >= 1 ? editDraft.intervalMinutes : 10}
+                    min={1}
+                    max={86400}
+                    fallbackOnBlur={10}
+                    onCommit={(next) =>
+                      setEditDraft((current) =>
+                        current ? { ...current, intervalMinutes: next } : current,
+                      )
+                    }
+                  />
+                </label>
             ) : editDraft.scheduleType === 'once_at' ? (
               <>
                 <label className="task-edit-field">

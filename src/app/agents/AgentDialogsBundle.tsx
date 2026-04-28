@@ -2,6 +2,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { AppIcon } from '../../components/AppIcon'
+import { NumericDraftField } from '../../components/NumericDraftField'
 import { AgentAvatar } from '../../components/AgentAvatar'
 import type {
   AgentInput,
@@ -21,9 +22,10 @@ import {
   sessionLlmEncode,
   SkillDescriptionDisclosure,
 } from '../lib'
+import { defaultRuntimeParameters } from '../../mockData'
 
 const DEFAULT_AGENT_LOOP_CONFIG: AgentLoopConfig = {
-  maxIterations: 50,
+  maxIterations: 80,
   iterationTimeoutMs: 120000,
   enableNested: true,
   maxDepth: 3,
@@ -582,35 +584,26 @@ export function AgentEditorDialog({
               {agentDraft.agentLoopConfig && (
                 <>
                   <div className="agent-form-grid">
-                    <label className="input-field">
-                      <span>最大迭代次数</span>
-                      <input
-                        type="number"
-                        min={1}
-                        max={200}
-                        value={agentDraft.agentLoopConfig.maxIterations}
-                        onChange={(event) =>
-                          onDraftChange({
-                            agentLoopConfig: {
-                              ...agentDraft.agentLoopConfig!,
-                              maxIterations: Math.max(1, Math.min(200, Number(event.target.value) || 50)),
-                            },
-                          })
-                        }
-                      />
-                    </label>
+                    <div className="agent-workspace-hint agent-field-full" style={{ gridColumn: '1 / -1' }}>
+                      <span>
+                        单次对话内工具调用最大轮数由{' '}
+                        <strong>设置 → 参数 → Agent 循环</strong> 中的「最大迭代次数」统一配置（默认{' '}
+                        {defaultRuntimeParameters.maxAgentToolRoundsPerDialogue} 轮）。
+                      </span>
+                    </div>
                     <label className="input-field">
                       <span>单次超时（秒）</span>
-                      <input
-                        type="number"
+                      <NumericDraftField
+                        aria-label="单次超时（秒）"
+                        value={Math.round(agentDraft.agentLoopConfig.iterationTimeoutMs / 1000)}
                         min={10}
                         max={600}
-                        value={Math.round(agentDraft.agentLoopConfig.iterationTimeoutMs / 1000)}
-                        onChange={(event) =>
+                        fallbackOnBlur={120}
+                        onCommit={(sec) =>
                           onDraftChange({
                             agentLoopConfig: {
                               ...agentDraft.agentLoopConfig!,
-                              iterationTimeoutMs: Math.max(10, Math.min(600, Number(event.target.value) || 120)) * 1000,
+                              iterationTimeoutMs: sec * 1000,
                             },
                           })
                         }
@@ -621,16 +614,17 @@ export function AgentEditorDialog({
                   <div className="agent-form-grid">
                     <label className="input-field">
                       <span>最大并发数</span>
-                      <input
-                        type="number"
+                      <NumericDraftField
+                        aria-label="最大并发数"
+                        value={agentDraft.agentLoopConfig.maxConcurrent}
                         min={1}
                         max={20}
-                        value={agentDraft.agentLoopConfig.maxConcurrent}
-                        onChange={(event) =>
+                        fallbackOnBlur={5}
+                        onCommit={(next) =>
                           onDraftChange({
                             agentLoopConfig: {
                               ...agentDraft.agentLoopConfig!,
-                              maxConcurrent: Math.max(1, Math.min(20, Number(event.target.value) || 5)),
+                              maxConcurrent: next,
                             },
                           })
                         }
@@ -678,16 +672,17 @@ export function AgentEditorDialog({
                     <div className="agent-form-grid">
                       <label className="input-field">
                         <span>嵌套最大深度</span>
-                        <input
-                          type="number"
+                        <NumericDraftField
+                          aria-label="嵌套最大深度"
+                          value={agentDraft.agentLoopConfig.maxDepth}
                           min={1}
                           max={10}
-                          value={agentDraft.agentLoopConfig.maxDepth}
-                          onChange={(event) =>
+                          fallbackOnBlur={3}
+                          onCommit={(next) =>
                             onDraftChange({
                               agentLoopConfig: {
                                 ...agentDraft.agentLoopConfig!,
-                                maxDepth: Math.max(1, Math.min(10, Number(event.target.value) || 3)),
+                                maxDepth: next,
                               },
                             })
                           }
@@ -720,16 +715,17 @@ export function AgentEditorDialog({
                     <div className="agent-form-grid">
                       <label className="input-field">
                         <span>扩容上限</span>
-                        <input
-                          type="number"
+                        <NumericDraftField
+                          aria-label="扩容上限"
+                          value={agentDraft.agentLoopConfig.maxExtendLimit}
                           min={50}
                           max={1000}
-                          value={agentDraft.agentLoopConfig.maxExtendLimit}
-                          onChange={(event) =>
+                          fallbackOnBlur={200}
+                          onCommit={(next) =>
                             onDraftChange({
                               agentLoopConfig: {
                                 ...agentDraft.agentLoopConfig!,
-                                maxExtendLimit: Math.max(50, Math.min(1000, Number(event.target.value) || 200)),
+                                maxExtendLimit: next,
                               },
                             })
                           }

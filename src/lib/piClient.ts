@@ -21,6 +21,7 @@ import type {
   PersistedChatAttachment,
   PiStreamPayload,
   ProviderRuntimeConfig,
+  RuntimeParameters,
   RuntimeDependencyStatus,
   ScheduledJobRecord,
   ScheduledJobRunRecord,
@@ -47,6 +48,8 @@ export async function streamPiPrompt(
     attachments?: PersistedChatAttachment[]
     workspaceId?: string | null
     overrideAgentId?: string | null
+    /** 与设置 → 参数一致；不传则服务端使用上次缓存或默认值 */
+    runtimeParameters?: RuntimeParameters | null
   },
 ): Promise<void> {
   await invoke('stream_pi_prompt', {
@@ -57,7 +60,13 @@ export async function streamPiPrompt(
     attachments: options?.attachments ?? [],
     workspaceId: options?.workspaceId ?? null,
     overrideAgentId: options?.overrideAgentId ?? null,
+    runtimeParameters: options?.runtimeParameters ?? null,
   })
+}
+
+/** 写入全局运行时参数缓存（与其它入口共享 `merge_from_payload` 逻辑）。 */
+export async function syncRuntimeParameters(payload: RuntimeParameters): Promise<RuntimeParameters> {
+  return invoke<RuntimeParameters>('sync_runtime_parameters', { payload })
 }
 
 export async function listAgentTaskDeliveries(

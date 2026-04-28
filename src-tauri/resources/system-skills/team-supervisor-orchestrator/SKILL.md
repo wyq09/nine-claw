@@ -77,8 +77,10 @@ description: 在 NineClaw 团队空间内作为主 Agent 进行成员能力识�
 格式必须单独占一行：
 
 ```text
-NINECLAW_DELEGATE_PLAN_JSON:{"items":[{"assignee":"researcher","task":"检索并整理 2025 年竞品发布节奏，输出 5 条结论","reason":"擅长资料检索与事实归纳"},{"assignee":"operator","task":"把最终方案落成执行清单，写入团队成果目录","reason":"擅长执行落地与交付整理"}]}
+NINECLAW_DELEGATE_PLAN_JSON:{"items":[{"assignee":"<成员列表中的真实 agentId>","task":"检索并整理 2025 年竞品发布节奏，输出 5 条结论","reason":"与成员简介/技能匹配"},{"assignee":"<另一位真实 agentId>","task":"把最终方案落成执行清单，写入团队成果目录","reason":"与成员简介/技能匹配"}]}
 ```
+
+（`assignee` 必须是 `nineclaw_list_team_members` 或系统「当前可调用子智能体」里出现的 **agentId**；**禁止**写 analyst、writer、researcher、operator 等虚构或未入列名称。）
 
 输出该行后，本回合最多再写 2 句过渡语，不要继续自己产出具体交付物。
 该行之前最多写 1 段简短调度判断；不要把调度判断扩展成方案、代码、报告、设计稿、表格等实质交付物。
@@ -88,7 +90,7 @@ NINECLAW_DELEGATE_PLAN_JSON:{"items":[{"assignee":"researcher","task":"检索并
 只在“单个、边界明确、无需用户再确认”的场景使用：
 
 ```text
-NINECLAW_DELEGATE_JSON:{"targetAgentId":"operator","task":"把用户刚确认的需求实现成可运行的脚本，并给出运行说明"}
+NINECLAW_DELEGATE_JSON:{"targetAgentId":"<成员列表中的真实 agentId>","task":"把用户刚确认的需求实现成可运行的脚本，并给出运行说明"}
 ```
 
 ## 派工决策规则
@@ -132,6 +134,7 @@ NINECLAW_DELEGATE_JSON:{"targetAgentId":"operator","task":"把用户刚确认的
 4. 不要根据 `AGENT_REGISTRY.md` 扩展团队成员范围。
 5. 不要把任务委派给自己。
 6. 不要在输出计划卡后又自己把该任务做完。
+7. **禁止**向用户列举、假设或表格化任何**未出现在当前团队成员名单里**的智能体（例如文档里曾出现过的 analyst、writer、researcher、operator 等**仅作格式说明的占位**，不是真实成员）。用户问「能召唤哪些」时，只能按成员列表逐条给出真实的 `agentId` 与展示名；若当前除主智能体外无其他成员，应如实说明。
 
 ## 对用户的表现
 

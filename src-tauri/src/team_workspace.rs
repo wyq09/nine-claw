@@ -111,6 +111,37 @@ pub fn list_team_member_views(
             avatar_uri: rec.avatar_uri,
         });
     }
+
+    // 展示顺序：主智能体置顶，其余按名称升序（与加入时间解耦，便于扫视）
+    let sup_id: Option<String> = workspaces::get_workspace(&conn, workspace_id)
+        .ok()
+        .flatten()
+        .map(|ws| ws.supervisor_agent_id.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(ref sid) = sup_id {
+        out.sort_by(|a, b| {
+            let a_s = a.agent_id.as_str() == sid.as_str();
+            let b_s = b.agent_id.as_str() == sid.as_str();
+            match (a_s, b_s) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a
+                    .name
+                    .to_lowercase()
+                    .cmp(&b.name.to_lowercase())
+                    .then_with(|| a.agent_id.cmp(&b.agent_id)),
+            }
+        });
+    } else {
+        out.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.agent_id.cmp(&b.agent_id))
+        });
+    }
+
     Ok(out)
 }
 

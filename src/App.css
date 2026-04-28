@@ -8493,15 +8493,22 @@ select.task-edit-control {
 .settings-footer {
   border-top: 1px solid var(--chrome-border);
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  gap: 8px;
+  gap: 12px;
   background: var(--settings-footer-bg);
 }
 
 .settings-footer-copy {
   flex: 1 1 auto;
   min-width: 0;
+}
+
+.settings-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  margin-left: auto;
 }
 
 .settings-footer-copy .settings-note {

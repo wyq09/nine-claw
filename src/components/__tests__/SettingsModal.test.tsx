@@ -53,6 +53,11 @@ const generalSettings: GeneralSettings = {
   customProxyUrl: '',
   submitShortcut: 'enter',
   llmCallLogDir: '',
+  runtimeParameters: {
+    maxAgentToolRoundsPerDialogue: 80,
+    streamDisconnectMaxRetries: 3,
+    llmOuterMaxAttempts: 8,
+  },
 }
 
 const appearanceSettings: AppearanceSettings = {
@@ -251,5 +256,61 @@ describe('SettingsModal provider tabs', () => {
         size: '1536x1024',
       }),
     )
+  })
+
+  it('renders parameters tab with agent loop and LLM retry fields', () => {
+    render(
+      <SettingsModal
+        activeProviderBadge="系统默认：OpenAI"
+        allProviderDefinitions={[llmProviderDefinition]}
+        appearanceSettings={appearanceSettings}
+        generalSettings={generalSettings}
+        imageGenerationSystem={imageGenerationSystem}
+        imageProviderConfigs={{ openai_image: imageProviderConfig }}
+        imageProviderDefinitions={[imageProviderDefinition]}
+        onAddCustomProvider={vi.fn()}
+        onSaveImageGenerationSettings={vi.fn().mockResolvedValue(undefined)}
+        onProviderConfigChange={vi.fn()}
+        onClose={vi.fn()}
+        onRemoveCustomProvider={vi.fn()}
+        onSelectProvider={vi.fn()}
+        onSelectTab={vi.fn()}
+        providerConfigs={{ openai: llmProviderConfig }}
+        selectedProviderConfig={llmProviderConfig}
+        selectedProviderDefinition={llmProviderDefinition}
+        selectedProviderId="openai"
+        setAppearanceSettings={vi.fn()}
+        setGeneralSettings={vi.fn()}
+        tab="parameters"
+        skillsLibrary={{
+          installedSkillCount: 0,
+          installedSkills: [],
+          onChangeTab: vi.fn(),
+          onInstallByLink: vi.fn(),
+          onInstallSystemSkill: vi.fn(),
+          onRefresh: vi.fn(),
+          sessionBusy: false,
+          setSearch: vi.fn(),
+          skillsError: '',
+          skillsLoading: false,
+          systemSkillCount: 0,
+          systemSkillCatalog: { available: false, skills: [], message: '' },
+          systemSkillInstallId: '',
+          tab: 'installed',
+          skillSearch: '',
+          visibleSystemSkills: [],
+        }}
+        resourcesLibrary={{
+          onSearch: vi.fn(),
+          resourceSearch: '',
+          visibleResources: [],
+        }}
+      />,
+    )
+
+    expect(screen.getByRole('heading', { level: 2, name: '参数' })).toBeInTheDocument()
+    expect(screen.getByLabelText('最大迭代次数')).toHaveDisplayValue('80')
+    expect(screen.getByLabelText('流式中断重试')).toHaveDisplayValue('3')
+    expect(screen.getByLabelText('LLM 外层最大重试次数')).toHaveDisplayValue('8')
   })
 })

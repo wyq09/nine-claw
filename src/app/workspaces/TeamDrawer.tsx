@@ -10,6 +10,7 @@ import {
   workspaceAddMember,
   workspaceDeleteMemory,
   workspaceDeleteResource,
+  workspaceList,
   workspaceListMembers,
   workspaceListMemories,
   workspaceListResources,
@@ -74,7 +75,7 @@ export function TeamDrawer({
   const [memories, setMemories] = useState<WorkspaceMemoryRecord[]>([])
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
-  const [newMemberId, setNewMemberId] = useState('')
+  const [peerWorkspaces, setPeerWorkspaces] = useState<{ id: string; name: string }[]>([])
   const [newMemoTitle, setNewMemoTitle] = useState('')
   const [newMemoContent, setNewMemoContent] = useState('')
 
@@ -107,11 +108,53 @@ export function TeamDrawer({
     void refresh()
   }, [refresh])
 
-  const onAddMember = async () => {
-    if (!newMemberId) return
+  useEffect(() => {
+    if (!open || activeTab !== 'members') {
+      return
+    }
+    let cancelled = false
+    workspaceList(false)
+      .then((list) => {
+        if (cancelled) return
+        setPeerWorkspaces(
+          list
+            .filter((w) => w.id !== workspace.id && !w.archived)
+            .map((w) => ({ id: w.id, name: w.name })),
+        )
+      })
+      .catch(() => {
+        if (!cancelled) setPeerWorkspaces([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, activeTab, workspace.id])
+
+  const onAddMembersBatch = async (agentIds: string[]) => {
+    setError('')
     try {
-      await workspaceAddMember(workspace.id, newMemberId, 'member')
-      setNewMemberId('')
+      for (const id of agentIds) {
+        await workspaceAddMember(workspace.id, id, 'member')
+      }
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  const onImportMembersFromWorkspace = async (sourceWorkspaceId: string) => {
+    setError('')
+    try {
+      const srcMembers = await workspaceListMembers(sourceWorkspaceId)
+      const current = new Set(members.map((m) => m.agentId))
+      const toAdd = srcMembers.map((m) => m.agentId).filter((id) => !current.has(id))
+      if (toAdd.length === 0) {
+        setError('该工作区没有可新增的成员（均已在本团队）。')
+        return
+      }
+      for (const id of toAdd) {
+        await workspaceAddMember(workspace.id, id, 'member')
+      }
       await refresh()
     } catch (e) {
       setError(String(e))
@@ -219,9 +262,13 @@ export function TeamDrawer({
           <TeamMembersPanel
             members={members}
             agents={agents}
-            newMemberId={newMemberId}
-            onNewMemberIdChange={setNewMemberId}
-            onAddMember={() => void onAddMember()}
+            peerWorkspaces={peerWorkspaces}
+            onAddMembersBatch={async (ids) => {
+              await onAddMembersBatch(ids)
+            }}
+            onImportMembersFromWorkspace={async (sid) => {
+              await onImportMembersFromWorkspace(sid)
+            }}
             onRemoveMember={(id) => void onRemoveMember(id)}
           />
         ) : null}

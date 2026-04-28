@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { AppIcon } from '../AppIcon'
+import { NumericDraftField } from '../NumericDraftField'
 import type {
   ImageGenerationSystemConfig,
   ImageProviderAdapterType,
@@ -433,15 +434,16 @@ export function ImageGenerationSettingsSection({
               </div>
               <label className="input-field">
                 <span>张数</span>
-                <input
-                  type="number"
+                <NumericDraftField
+                  aria-label="单次生成张数"
+                  value={imageGenerationSystem.count}
                   min={1}
                   max={4}
-                  value={imageGenerationSystem.count}
-                  onChange={(event) =>
+                  fallbackOnBlur={1}
+                  onCommit={(next) =>
                     onImageGenerationSystemChange((previous) => ({
                       ...previous,
-                      count: Math.max(1, Math.min(4, parseInt(event.target.value || '1', 10) || 1)),
+                      count: next,
                     }))
                   }
                 />

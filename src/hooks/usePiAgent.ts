@@ -38,6 +38,7 @@ import type {
   PersistedChatAttachment,
   ProviderId,
   ProviderRuntimeConfig,
+  RuntimeParameters,
   ToolCallEntry,
 } from '../types'
 import {
@@ -935,6 +936,20 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
   }, [])
 
   useEffect(() => {
+    let unlisten: (() => void) | undefined
+    void listen<{ kind?: string; message?: string }>('nineclaw-runtime-notification', (event) => {
+      const message = typeof event.payload.message === 'string' ? event.payload.message.trim() : ''
+      if (!message) {
+        return
+      }
+      toast.success(message, 9000)
+    }).then((fn) => {
+      unlisten = fn
+    })
+    return () => unlisten?.()
+  }, [toast])
+
+  useEffect(() => {
     let cancelled = false
 
     const pollTaskDeliveries = async () => {
@@ -1011,6 +1026,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       attachments?: PersistedChatAttachment[]
       workspaceId?: string | null
       overrideAgentId?: string | null
+      runtimeParameters?: RuntimeParameters | null
     },
     options?: { forceNewSession?: boolean },
   ) => {
@@ -1113,6 +1129,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
           attachments: context?.attachments ?? [],
           workspaceId: context?.workspaceId ?? null,
           overrideAgentId: context?.overrideAgentId ?? null,
+          runtimeParameters: context?.runtimeParameters ?? null,
         })
         desktopStreamFlyRef.current.set(nextHistoryId, streamFly)
         await streamFly
@@ -1163,6 +1180,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       attachments?: PersistedChatAttachment[]
       workspaceId?: string | null
       overrideAgentId?: string | null
+      runtimeParameters?: RuntimeParameters | null
     },
   ) => submitPromptInternal(rawPrompt, context)
 
@@ -1175,6 +1193,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       attachments?: PersistedChatAttachment[]
       workspaceId?: string | null
       overrideAgentId?: string | null
+      runtimeParameters?: RuntimeParameters | null
     },
   ) => submitPromptInternal(rawPrompt, context, { forceNewSession: true })
 

@@ -497,9 +497,17 @@ export type WorkspaceMemoryRecord = {
   updatedAt: number
 }
 
+/** 全局 runtime 参数（「设置 → 参数」）与 `stream_pi_prompt` / 委派 Agent Loop 共享 */
+export type RuntimeParameters = {
+  maxAgentToolRoundsPerDialogue: number
+  streamDisconnectMaxRetries: number
+  llmOuterMaxAttempts: number
+}
+
 export type SettingsTab =
   | 'general'
   | 'appearance'
+  | 'parameters'
   | 'providers'
   | 'usage'
   | 'shortcuts'
@@ -788,6 +796,8 @@ export type GeneralSettings = {
   submitShortcut: SubmitShortcut
   /** 额外导出 LLM 调用链 jsonl 的目录，空则仅写入工作区/.debug */
   llmCallLogDir: string
+  /** Agent 循环 / 流式 / LLM 外层重试等全局运行时参数 */
+  runtimeParameters: RuntimeParameters
 }
 
 export type ThemeMode = 'dark' | 'light' | 'claude'

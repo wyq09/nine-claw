@@ -3,7 +3,7 @@ export function createAgentDelegateParameters(Type) {
     role: Type.String({
       minLength: 1,
       description:
-        "The name or ID of the sub-agent to delegate to. Examples: 'analyst', 'researcher', 'writer', or the exact agent ID.",
+        "Exact sub-agent identifier: use the real agent id, or the exact display name, of a delegate that your session allowlist already lists (system prompt / team members / collaboration allowlist). Do not invent job titles or generic roles (no 'analyst', 'writer', 'researcher', etc. unless that is literally a configured agent's name).",
     }),
     task: Type.String({
       minLength: 1,
@@ -84,14 +84,13 @@ export function createAgentDelegateTool(deps) {
     name: "agent_delegate",
     label: "Agent Delegate",
     description:
-      "Delegate a task to a specialized sub-agent. Use this when you need a different perspective, " +
-      "specialized capability (analysis, research, writing, coding), or when the task benefits from " +
-      "being handled by an agent with a dedicated system prompt and tool set. " +
-      "The sub-agent will execute the task independently and return its result.",
+      "Delegate a task to another agent that is already allowed for this session (team member or explicit allowlist). " +
+      "The `role` field must match a real agent id or exact name from that allowlist — never invent generic role names. " +
+      "The sub-agent runs with its own system prompt and tools and returns a result.",
     promptSnippet:
-      "Delegate tasks to specialized sub-agents by specifying their role and a clear task description.",
+      "Delegate by passing the real allowed sub-agent id or name plus a self-contained task.",
     promptGuidelines: [
-      "Use agent_delegate when a sub-task requires specialized expertise or a different tool set.",
+      "Only reference sub-agents that appear in the current allowlist; if unsure, list members from context or tools first.",
       "Provide clear, self-contained task descriptions — the sub-agent won't see your conversation history.",
       "Include all necessary context in the task or context field so the sub-agent can work independently.",
       "You can delegate to the same sub-agent multiple times if needed.",

@@ -19,6 +19,7 @@ mod peer_gateway;
 mod pi_runtime;
 mod pi_timeouts;
 mod prompt_attachments;
+mod runtime_parameters;
 mod proxy_settings;
 mod scheduler;
 mod skills;
@@ -3396,7 +3397,10 @@ async fn stream_pi_prompt(
     agent_config: Option<ConversationAgentConfig>,
     attachments: Option<Vec<prompt_attachments::PromptAttachmentInput>>,
     workspace_id: Option<String>,
+    runtime_parameters: Option<runtime_parameters::RuntimeParametersPayload>,
 ) -> Result<(), String> {
+    let merged_runtime_parameters =
+        crate::runtime_parameters::merge_from_payload(runtime_parameters);
     let trimmed_prompt = prompt.trim().to_string();
     let attachments = attachments.unwrap_or_default();
     if trimmed_prompt.is_empty() && attachments.is_empty() {
@@ -3475,8 +3479,16 @@ async fn stream_pi_prompt(
     let mut attempt_prompt = trimmed_prompt.clone();
     let mut text_only_provider_input_retry = false;
     let mut disable_reasoning_provider_retry = false;
-    for attempt in 0..=2 {
+    let llm_attempt_cap = merged_runtime_parameters
+        .llm_outer_max_attempt_rounds
+        .max(1)
+        .min(24) as usize;
+    for attempt in 0..llm_attempt_cap {
         let app = app.clone();
+        let tool_iteration_cap = merged_runtime_parameters.max_agent_tool_rounds_per_dialogue;
+        let stall_retry_cap = merged_runtime_parameters.stream_disconnect_max_retries;
+        let delegate_iteration_cap =
+            merged_runtime_parameters.max_agent_tool_rounds_per_dialogue.max(1).min(500);
         let session_id_for_attempt = normalized_session_id.clone();
         let normalized_session_id = session_id_for_attempt.clone();
         let runtime_session_id = session_id_for_attempt.clone();
@@ -4003,6 +4015,10 @@ async fn stream_pi_prompt(
         let pi_total_runtime_timeout = pi_timeouts::pi_total_runtime_timeout();
         let pi_first_output_timeout = pi_timeouts::pi_first_output_timeout();
         let pi_idle_output_timeout = pi_timeouts::pi_idle_output_timeout();
+        let mut completed_pi_turns = 0u32;
+        let mut stream_stall_retries = 0u32;
+        let mut iteration_limit_warned = false;
+        let mut iteration_abort_sent = false;
 
         loop {
             if started_at.elapsed() >= pi_total_runtime_timeout {
@@ -4053,6 +4069,7 @@ async fn stream_pi_prompt(
             let timeout = base_timeout.min(remaining_total);
             let line = match stdout_rx.recv_timeout(timeout) {
                 Ok(Ok(current_line)) => {
+                    stream_stall_retries = 0;
                     if !logged_ttft {
                         logged_ttft = true;
                         dev_trace(
@@ -4098,10 +4115,34 @@ async fn stream_pi_prompt(
                     let timeout_error = if timeout == remaining_total {
                         format!("pi 总运行超时（>{} 秒）", pi_total_runtime_timeout.as_secs())
                     } else if saw_any_output {
-                        format!("等待 pi 后续输出超时（>{} 秒）", pi_idle_output_timeout.as_secs())
+                        format!(
+                            "等待 pi 后续输出超时（>{} 秒）",
+                            pi_idle_output_timeout.as_secs()
+                        )
                     } else {
-                        format!("等待 pi 首包输出超时（>{} 秒）", pi_first_output_timeout.as_secs())
+                        format!(
+                            "等待 pi 首包输出超时（>{} 秒）",
+                            pi_first_output_timeout.as_secs()
+                        )
                     };
+                    let stalled_waiting_for_more = timeout != remaining_total && saw_any_output;
+                    if stalled_waiting_for_more && stream_stall_retries < stall_retry_cap {
+                        stream_stall_retries += 1;
+                        let backoff_ms =
+                            (250u64 * (1u64 << stream_stall_retries.min(6))).min(7000).max(100);
+                        thread::sleep(Duration::from_millis(backoff_ms));
+                        dev_trace(
+                            "desktop.stream",
+                            format!(
+                                "pi stdout stall retry {}/{} backoff_ms={} session={}",
+                                stream_stall_retries,
+                                stall_retry_cap,
+                                backoff_ms,
+                                normalized_session_id
+                            ),
+                        );
+                        continue;
+                    }
                     dev_trace(
                         "desktop.stream",
                         format!("pi 超时: session={} error={}", normalized_session_id, timeout_error),
@@ -4177,6 +4218,48 @@ async fn stream_pi_prompt(
                 .get("type")
                 .and_then(|item| item.as_str())
                 .unwrap_or_default();
+
+            if line_type == "turn_end" {
+                completed_pi_turns += 1;
+                let cap = tool_iteration_cap.max(1).min(500);
+                let warn_at = cap.saturating_sub(10).max(1);
+                if !iteration_limit_warned && completed_pi_turns >= warn_at && completed_pi_turns < cap {
+                    iteration_limit_warned = true;
+                    let _ = app.emit(
+                        "nineclaw-runtime-notification",
+                        serde_json::json!({
+                            "kind": "agent_loop_approaching_limit",
+                            "sessionId": &normalized_session_id,
+                            "current": completed_pi_turns,
+                            "max": cap,
+                            "message": format!(
+                                "工具调用轮数已接近上限（约 {}/{} 轮），请在设置 → 参数中调整。",
+                                completed_pi_turns,
+                                cap
+                            ),
+                        }),
+                    );
+                }
+                if completed_pi_turns >= cap && !iteration_abort_sent {
+                    iteration_abort_sent = true;
+                    abort_requested.store(true, Ordering::SeqCst);
+                    dev_trace(
+                        "desktop.stream",
+                        format!(
+                            "agent tool iteration limit: session={} completed_pi_turns={} cap={}",
+                            normalized_session_id, completed_pi_turns, cap,
+                        ),
+                    );
+                    if let Err(error) =
+                        crate::runtime_parameters::write_abort_json_stdin(&stdin, &normalized_session_id)
+                    {
+                        dev_trace(
+                            "desktop.stream",
+                            format!("iteration-limit abort write failed: {error}"),
+                        );
+                    }
+                }
+            }
 
             if line_type == "response" {
                 let command = value
@@ -4711,7 +4794,8 @@ async fn stream_pi_prompt(
                             let app_clone = app.clone();
                             let agent_id = agent_cfg.id.clone();
                             let sid = normalized_session_id.clone();
-                            let lc = loop_config.clone();
+                            let mut lc = loop_config.clone();
+                            lc.max_iterations = delegate_iteration_cap;
                             let prov = provider.clone();
                             let initial_text = emitted_assistant_text.clone();
                             tauri::async_runtime::spawn(async move {
@@ -4960,7 +5044,8 @@ async fn stream_pi_prompt(
                         let app_clone = app.clone();
                         let agent_id = agent_cfg.id.clone();
                         let sid = normalized_session_id.clone();
-                        let lc = loop_config.clone();
+                        let mut lc = loop_config.clone();
+                        lc.max_iterations = delegate_iteration_cap;
                         let prov = provider.clone();
                         let initial_text = emitted_assistant_text.clone();
                         tauri::async_runtime::spawn(async move {
@@ -5304,6 +5389,13 @@ static CHANNEL_MANAGER: OnceLock<Mutex<ChannelManager>> = OnceLock::new();
 
 pub(crate) fn channel_manager() -> &'static Mutex<ChannelManager> {
     CHANNEL_MANAGER.get_or_init(|| Mutex::new(ChannelManager::new()))
+}
+
+#[tauri::command]
+async fn sync_runtime_parameters(
+    payload: runtime_parameters::RuntimeParametersPayload,
+) -> Result<runtime_parameters::RuntimeParametersPayload, String> {
+    Ok(runtime_parameters::merge_from_payload(Some(payload)))
 }
 
 #[tauri::command]
@@ -6010,6 +6102,7 @@ pub fn run() {
             bot_send_message,
             bot_send_media,
             ensure_runtime_dependencies,
+            sync_runtime_parameters,
             test_llm_provider_connection,
             generate_session_conversation_title,
             get_session_context_stats,

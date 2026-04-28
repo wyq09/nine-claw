@@ -71,6 +71,7 @@ import {
   workspaceListMembers,
   workspaceRunDelegateTask,
   writeAgentWorkspaceFile,
+  syncRuntimeParameters,
 } from '../../lib/piClient'
 import type { QrCodeEvent, BotStatusEvent } from '../../lib/piClient'
 import { buildPromptWithAttachments } from '../../lib/composerAttachments'
@@ -775,6 +776,14 @@ export function NineClawApp() {
   }, [generalSettings.llmCallLogDir])
 
   useEffect(() => {
+    void syncRuntimeParameters(generalSettings.runtimeParameters).catch(() => {})
+  }, [
+    generalSettings.runtimeParameters.maxAgentToolRoundsPerDialogue,
+    generalSettings.runtimeParameters.streamDisconnectMaxRetries,
+    generalSettings.runtimeParameters.llmOuterMaxAttempts,
+  ])
+
+  useEffect(() => {
     persistStoredStorageValue(
       APPEARANCE_SETTINGS_STORAGE_KEY,
       JSON.stringify(appearanceSettings),
@@ -1423,6 +1432,7 @@ export function NineClawApp() {
       attachments: composerAttachments,
       workspaceId: effectiveWorkspaceId,
       overrideAgentId,
+      runtimeParameters: generalSettings.runtimeParameters,
     })
   }
 
@@ -1443,6 +1453,7 @@ export function NineClawApp() {
       await submitPromptInNewSession(buildSkillInstallPrompt(trimmedLink), {
         providerConfig: effectiveChatRuntime,
         sessionLlm: sessionLlmDisplay,
+        runtimeParameters: generalSettings.runtimeParameters,
       })
       setSkillInstallLink('')
     } finally {
