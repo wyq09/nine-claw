@@ -1,8 +1,9 @@
-use crate::agent_capabilities::AgentCapabilityPolicy;
 use crate::agents::{self, AgentRecord};
 use crate::channels::pi_bridge::{PiBridge, PiProcessOutcome};
 use crate::dev_trace::dev_trace;
 use crate::llm_trace;
+use crate::managed_runtime::get_embedding_registry;
+use crate::memory_gate::{canonical_memory_route, MemoryGate};
 use crate::pi_runtime;
 use crate::prompts;
 use crate::provider_runtime::{normalized_provider_runtime_base_url, resolve_im_llm_runtime};
@@ -32,6 +33,7 @@ struct WorkspaceConversationTurn {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExtractedWorkspaceMemory {
+    route: String,
     title: String,
     content: String,
     tags: Vec<String>,
@@ -72,19 +74,21 @@ fn normalize_memory_fingerprint(value: &str) -> String {
     normalize_whitespace(value).to_lowercase()
 }
 
-fn canonical_tag(tag: &str) -> Option<String> {
-    match tag.trim().to_ascii_lowercase().as_str() {
-        "decision" | "决策" => Some("decision".to_string()),
-        "constraint" | "constraints" | "约束" | "限制" => Some("constraint".to_string()),
-        "fact" | "facts" | "事实" => Some("fact".to_string()),
-        "preference" | "preferences" | "偏好" => Some("preference".to_string()),
-        "resource" | "resources" | "资料" | "资源" => Some("resource".to_string()),
-        "plan" | "plans" | "计划" => Some("plan".to_string()),
-        "risk" | "risks" | "风险" => Some("risk".to_string()),
-        "workflow" | "workflows" | "流程" | "工作流" => Some("workflow".to_string()),
-        "people" | "person" | "成员" | "人员" => Some("people".to_string()),
-        _ => None,
-    }
+fn route_to_default_tag(route: &str) -> Option<String> {
+    canonical_memory_route(route).filter(|route| {
+        matches!(
+            route.as_str(),
+            "decision"
+                | "constraint"
+                | "fact"
+                | "preference"
+                | "resource"
+                | "plan"
+                | "risk"
+                | "workflow"
+                | "people"
+        )
+    })
 }
 
 fn resolve_memory_extraction_model(record: &AgentRecord) -> (String, String) {
@@ -229,20 +233,41 @@ fn parse_memories_from_value(value: &serde_json::Value) -> Vec<ExtractedWorkspac
         else {
             continue;
         };
+        let route = item
+            .get("route")
+            .and_then(|field| field.as_str())
+            .and_then(route_to_default_tag)
+            .unwrap_or_else(|| "fact".to_string());
         let mut tags = item
             .get("tags")
             .and_then(|field| field.as_array())
             .map(|tags| {
                 tags.iter()
                     .filter_map(|tag| tag.as_str())
-                    .filter_map(canonical_tag)
+                    .filter_map(route_to_default_tag)
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        tags.dedup();
         if tags.is_empty() {
-            tags.push("fact".to_string());
+            tags = item
+                .get("routes")
+                .and_then(|field| field.as_array())
+                .map(|routes| {
+                    routes
+                        .iter()
+                        .filter_map(|route| route.as_str())
+                        .filter_map(route_to_default_tag)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
         }
+        if tags.is_empty() {
+            tags.push(route.clone());
+        }
+        if !tags.iter().any(|tag| tag == &route) {
+            tags.insert(0, route.clone());
+        }
+        tags.dedup();
         if tags.len() > 4 {
             tags.truncate(4);
         }
@@ -256,6 +281,7 @@ fn parse_memories_from_value(value: &serde_json::Value) -> Vec<ExtractedWorkspac
             continue;
         }
         out.push(ExtractedWorkspaceMemory {
+            route,
             title,
             content,
             tags,
@@ -265,6 +291,12 @@ fn parse_memories_from_value(value: &serde_json::Value) -> Vec<ExtractedWorkspac
         }
     }
     out
+}
+
+fn memory_gate_should_write(value: &serde_json::Value) -> bool {
+    MemoryGate::from_json_value(value)
+        .map(|gate| gate.inferred_should_write())
+        .unwrap_or(true)
 }
 
 fn parse_workspace_memory_llm_output(raw: &str) -> Vec<ExtractedWorkspaceMemory> {
@@ -287,6 +319,9 @@ fn parse_workspace_memory_llm_output(raw: &str) -> Vec<ExtractedWorkspaceMemory>
 
     for candidate in candidates {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate) {
+            if !memory_gate_should_write(&value) {
+                return Vec::new();
+            }
             let parsed = parse_memories_from_value(&value);
             if !parsed.is_empty() || candidate.contains("\"memories\"") {
                 return parsed;
@@ -399,7 +434,8 @@ fn run_workspace_memory_extraction(
                 Some(&runtime.model),
                 vec![llm_trace::TraceSystemPromptSection {
                     label: "workspace_memory_extraction".to_string(),
-                    content: "提取团队共享记忆候选条目，并返回结构化 JSON。".to_string(),
+                    content: "先做共享记忆 gate，再输出路由后的候选条目，并返回结构化 JSON。"
+                        .to_string(),
                 }],
                 &prompt,
             ),
@@ -467,10 +503,55 @@ fn run_workspace_memory_extraction(
 
     let mut inserted = 0usize;
     for memory in memories {
+        // --- Vector dedup: check if semantically similar memory already exists ---
+        let candidate_text = format!("{}\n{}", memory.title, memory.content);
+        let mut vector_dedup_skip = false;
+        if let Some(registry) = get_embedding_registry() {
+            let rt = tokio::runtime::Handle::current();
+            if let Ok(similar_result) = rt.block_on(async {
+                let provider = {
+                    let guard = registry.read().await;
+                    guard.default_provider()
+                };
+                let Some(provider) = provider else {
+                    return Ok::<Option<String>, String>(None);
+                };
+                let embeddings = provider.embed(vec![candidate_text.clone()]).await?;
+                let query_vec = embeddings.into_iter().next();
+                let Some(query_vec) = query_vec else {
+                    return Ok(None);
+                };
+                let conn2 = crate::storage_conn(app)?;
+                let hit = crate::memory_vector::vector_search::find_similar(
+                    &conn2,
+                    &request.workspace_id,
+                    &query_vec,
+                    0.95,
+                )?;
+                Ok(hit)
+            }) {
+                if similar_result.is_some() {
+                    dev_trace(
+                        "workspace.memory",
+                        format!(
+                            "vector dedup skipped: workspace={} title={}",
+                            request.workspace_id, memory.title
+                        ),
+                    );
+                    vector_dedup_skip = true;
+                }
+            }
+            // If embedding / search fails, fall through to text dedup only
+        }
+
+        if vector_dedup_skip {
+            continue;
+        }
+
         if memory_exists(&memory, &recent_memories) {
             continue;
         }
-        team_workspace::write_team_memory_entry(
+        let record = team_workspace::write_team_memory_entry(
             app,
             &request.workspace_id,
             memory.title,
@@ -479,6 +560,44 @@ fn run_workspace_memory_extraction(
             memory.tags,
         )?;
         inserted += 1;
+
+        // --- Auto-index: generate embedding vector for the new memory ---
+        if let Some(registry) = get_embedding_registry() {
+            let index_text = format!("{}\n{}", record.title, record.content);
+            let memory_id = record.id.clone();
+            let workspace_id = request.workspace_id.clone();
+            let rt = tokio::runtime::Handle::current();
+            let _ = rt.block_on(async {
+                let provider = {
+                    let guard = registry.read().await;
+                    guard.default_provider()
+                };
+                let Some(provider) = provider else {
+                    return Ok::<(), String>(());
+                };
+                let embeddings = provider.embed(vec![index_text]).await?;
+                let embedding = embeddings
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "embedding result empty".to_string())?;
+                let conn2 = crate::storage_conn(app)?;
+                let vector_id = format!("vec_{}", Uuid::new_v4().simple());
+                crate::memory_vector::upsert_vector(
+                    &conn2,
+                    &vector_id,
+                    &memory_id,
+                    &workspace_id,
+                    &embedding,
+                    provider.id(),
+                )?;
+                Ok(())
+            })
+            .map_err(|e| {
+                log::warn!("记忆向量自动索引失败 (best-effort): {e}");
+                // Swallow the error — memory is already written successfully.
+                e
+            });
+        }
     }
     Ok(inserted)
 }
@@ -547,6 +666,7 @@ pub(crate) fn spawn_workspace_memory_extraction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_capabilities::AgentCapabilityPolicy;
 
     fn memory_row(title: &str, content: &str) -> WorkspaceMemoryRecord {
         WorkspaceMemoryRecord {
@@ -613,9 +733,10 @@ mod tests {
 
     #[test]
     fn parse_workspace_memory_llm_output_accepts_json_wrapper() {
-        let raw = "下面是结果：{\"memories\":[{\"title\":\"部署约束\",\"content\":\"产物统一写入团队 artifacts 目录。\",\"tags\":[\"constraint\",\"resource\"]}]}";
+        let raw = "下面是结果：{\"gate\":{\"should_write\":true,\"constraint\":true},\"memories\":[{\"route\":\"constraint\",\"title\":\"部署约束\",\"content\":\"产物统一写入团队 artifacts 目录。\",\"tags\":[\"constraint\",\"resource\"]}]}";
         let parsed = parse_workspace_memory_llm_output(raw);
         assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].route, "constraint");
         assert_eq!(parsed[0].title, "部署约束");
         assert_eq!(
             parsed[0].tags,
@@ -626,8 +747,8 @@ mod tests {
     #[test]
     fn parse_workspace_memory_llm_output_normalizes_tags_and_deduplicates() {
         let raw = r#"{"memories":[
-          {"title":"团队偏好","content":"默认输出中文。","tags":["偏好","fact"]},
-          {"title":"团队偏好","content":"默认输出中文。","tags":["preference"]}
+          {"route":"preference","title":"团队偏好","content":"默认输出中文。","tags":["偏好","fact"]},
+          {"route":"preference","title":"团队偏好","content":"默认输出中文。","tags":["preference"]}
         ]}"#;
         let parsed = parse_workspace_memory_llm_output(raw);
         assert_eq!(parsed.len(), 1);
@@ -638,8 +759,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_workspace_memory_llm_output_returns_empty_when_gate_blocks_write() {
+        let raw = r#"{"gate":{"should_write":false},"memories":[{"route":"fact","title":"闲聊","content":"只是寒暄。","tags":["fact"]}]}"#;
+        let parsed = parse_workspace_memory_llm_output(raw);
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_workspace_memory_llm_output_uses_route_when_tags_missing() {
+        let raw = r#"{"gate":{"should_write":true,"workflow":true},"memories":[{"route":"workflow","title":"协作流程","content":"先 gate 再写共享记忆。"}]}"#;
+        let parsed = parse_workspace_memory_llm_output(raw);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].route, "workflow");
+        assert_eq!(parsed[0].tags, vec!["workflow".to_string()]);
+    }
+
+    #[test]
+    fn parse_workspace_memory_llm_output_infers_write_from_gate_route() {
+        let raw = r#"{"gate":{"workflow":true},"memories":[{"route":"workflow","title":"协作流程","content":"只要 route 命中就允许写入。"}]}"#;
+        let parsed = parse_workspace_memory_llm_output(raw);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].route, "workflow");
+    }
+
+    #[test]
     fn memory_exists_matches_same_title_and_content() {
         let candidate = ExtractedWorkspaceMemory {
+            route: "constraint".to_string(),
             title: "团队约束".to_string(),
             content: "所有成果写入 artifacts 目录。".to_string(),
             tags: vec!["constraint".to_string()],

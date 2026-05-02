@@ -142,6 +142,11 @@ struct CredentialProxyServer {
     state: CredentialProxyState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DelegateRoleHint {
+    role: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExternalDispatchRequest {
@@ -198,6 +203,208 @@ fn stable_session_token(agent_id: &str, session_id: &str) -> String {
     hasher.update([0]);
     hasher.update(session_id.trim().as_bytes());
     format!("nc_{}", format!("{:x}", hasher.finalize()))
+}
+
+fn normalize_delegate_lookup_key(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+fn kebab_case_delegate_lookup_key(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut last_was_sep = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep && !out.is_empty() {
+            out.push('-');
+            last_was_sep = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn build_delegate_lookup_keys(
+    agent: &crate::agents::AgentRecord,
+    role_hint: Option<&DelegateRoleHint>,
+) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for raw in [
+        agent.id.trim(),
+        agent.name.trim(),
+        role_hint.map(|hint| hint.role.trim()).unwrap_or_default(),
+    ] {
+        if raw.is_empty() {
+            continue;
+        }
+        let normalized = normalize_delegate_lookup_key(raw);
+        if !normalized.is_empty() {
+            keys.insert(normalized);
+        }
+        let kebab = kebab_case_delegate_lookup_key(raw);
+        if !kebab.is_empty() {
+            keys.insert(kebab.clone());
+            keys.insert(format!("agent-{kebab}"));
+        }
+    }
+    keys
+}
+
+fn tokenize_delegate_lookup_text(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| {
+            !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+                && !('\u{4e00}' <= ch && ch <= '\u{9fff}')
+        })
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_lowercase())
+        .collect()
+}
+
+fn build_delegate_search_haystack(
+    agent: &crate::agents::AgentRecord,
+    role_hint: Option<&DelegateRoleHint>,
+) -> String {
+    [
+        agent.id.trim(),
+        agent.name.trim(),
+        role_hint.map(|hint| hint.role.trim()).unwrap_or_default(),
+        agent.summary.trim(),
+        agent.description.trim(),
+    ]
+    .into_iter()
+    .filter(|value| !value.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n")
+    .to_lowercase()
+}
+
+fn score_delegate_agent_match(
+    agent: &crate::agents::AgentRecord,
+    role_hint: Option<&DelegateRoleHint>,
+    requested_role: &str,
+    task: &str,
+) -> usize {
+    let haystack = build_delegate_search_haystack(agent, role_hint);
+    if haystack.is_empty() {
+        return 0;
+    }
+
+    let mut score = 0usize;
+    for needle in [requested_role, task] {
+        let normalized = needle.trim().to_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        if haystack.contains(&normalized) {
+            score += normalized.chars().count().max(1) * 10;
+        }
+        for token in tokenize_delegate_lookup_text(needle) {
+            if token.chars().count() <= 1 {
+                continue;
+            }
+            if haystack.contains(&token) {
+                score += token.chars().count();
+            }
+        }
+    }
+    score
+}
+
+fn resolve_delegate_agent<'a>(
+    candidate_agents: &'a [&crate::agents::AgentRecord],
+    role_hints: &HashMap<String, DelegateRoleHint>,
+    requested_role: &str,
+    task: &str,
+) -> Option<&'a crate::agents::AgentRecord> {
+    let requested_role = requested_role.trim();
+    if requested_role.is_empty() {
+        return None;
+    }
+    let normalized = normalize_delegate_lookup_key(requested_role);
+    let kebab = kebab_case_delegate_lookup_key(requested_role);
+    let mut requested_keys = HashSet::new();
+    requested_keys.insert(normalized.clone());
+    if !kebab.is_empty() {
+        requested_keys.insert(kebab.clone());
+        requested_keys.insert(format!("agent-{kebab}"));
+    }
+
+    candidate_agents
+        .iter()
+        .copied()
+        .find(|agent| agent.id == requested_role)
+        .or_else(|| {
+            candidate_agents.iter().copied().find(|agent| {
+                let role_hint = role_hints.get(&agent.id);
+                build_delegate_lookup_keys(agent, role_hint)
+                    .iter()
+                    .any(|key| requested_keys.contains(key))
+            })
+        })
+        .or_else(|| {
+            candidate_agents.iter().copied().find(|agent| {
+                let role_hint = role_hints.get(&agent.id);
+                let haystacks = [
+                    normalize_delegate_lookup_key(&agent.name),
+                    role_hint
+                        .map(|hint| normalize_delegate_lookup_key(&hint.role))
+                        .unwrap_or_default(),
+                ];
+                haystacks
+                    .iter()
+                    .filter(|value| !value.is_empty())
+                    .any(|value| value.contains(&normalized))
+            })
+        })
+        .or_else(|| {
+            candidate_agents
+                .iter()
+                .copied()
+                .filter_map(|agent| {
+                    let role_hint = role_hints.get(&agent.id);
+                    let score = score_delegate_agent_match(agent, role_hint, requested_role, task);
+                    (score > 0).then_some((score, agent))
+                })
+                .max_by(|(left_score, left_agent), (right_score, right_agent)| {
+                    left_score
+                        .cmp(right_score)
+                        .then_with(|| right_agent.updated_at.cmp(&left_agent.updated_at))
+                })
+                .map(|(_, agent)| agent)
+        })
+}
+
+fn format_delegate_candidates(
+    candidate_agents: &[&crate::agents::AgentRecord],
+    role_hints: &HashMap<String, DelegateRoleHint>,
+) -> String {
+    if candidate_agents.is_empty() {
+        return "无".to_string();
+    }
+    candidate_agents
+        .iter()
+        .map(|agent| {
+            let mut label = format!("{}({})", agent.name, agent.id);
+            if let Some(role_hint) = role_hints.get(&agent.id) {
+                let role = role_hint.role.trim();
+                if !role.is_empty() {
+                    label.push_str(&format!(" role={role}"));
+                }
+            }
+            label
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn delegate_scope_label(workspace_id: Option<&str>) -> &'static str {
+    if workspace_id.is_some() {
+        "当前团队成员"
+    } else {
+        "当前直接聊天可调用的智能体"
+    }
 }
 
 pub fn ensure_agent_runtime_scaffold(agent_home: &Path) -> Result<(), String> {
@@ -367,8 +574,12 @@ fn restrict_harness_to_agent_tools(
     ));
     let content = serde_json::to_vec_pretty(&definition)
         .map_err(|error| format!("序列化有效 harness 失败: {error}"))?;
-    fs::write(&effective_path, content)
-        .map_err(|error| format!("写入有效 harness 失败 {}: {error}", effective_path.display()))?;
+    fs::write(&effective_path, content).map_err(|error| {
+        format!(
+            "写入有效 harness 失败 {}: {error}",
+            effective_path.display()
+        )
+    })?;
 
     Ok(SelectedHarness {
         file_path: effective_path,
@@ -708,6 +919,34 @@ fn resolve_typebox_import_path(pi_executable: &Path) -> Option<PathBuf> {
                 ancestor
                     .join("pi-package")
                     .join("node_modules")
+                    .join("typebox")
+                    .join("build")
+                    .join("index.mjs"),
+                ancestor
+                    .join("pi-package")
+                    .join("node_modules")
+                    .join("typebox")
+                    .join("build")
+                    .join("type")
+                    .join("index.mjs"),
+                ancestor
+                    .join("pi-package")
+                    .join("node_modules")
+                    .join("@sinclair")
+                    .join("typebox")
+                    .join("build")
+                    .join("index.mjs"),
+                ancestor
+                    .join("pi-package")
+                    .join("node_modules")
+                    .join("@sinclair")
+                    .join("typebox")
+                    .join("build")
+                    .join("type")
+                    .join("index.mjs"),
+                ancestor
+                    .join("pi-package")
+                    .join("node_modules")
                     .join("@sinclair")
                     .join("typebox")
                     .join("build")
@@ -746,7 +985,8 @@ pub fn prepare_managed_runtime(
     ensure_agent_runtime_scaffold(&agent_home)?;
 
     let harness = select_harness(&agent_home, &agent_config.execution_mode, prompt)?;
-    let harness = restrict_harness_to_agent_tools(harness, runtime_dir, &agent_config.allowed_tool_ids)?;
+    let harness =
+        restrict_harness_to_agent_tools(harness, runtime_dir, &agent_config.allowed_tool_ids)?;
     let credentials_path = agent_home.join(HARNESS_CREDENTIALS_FILE);
     let credentials: HarnessCredentialsConfig =
         read_json_file(&credentials_path).unwrap_or_default();
@@ -815,6 +1055,10 @@ pub fn inject_credential_proxy_app_handle(app: tauri::AppHandle) {
     let _ = APP_HANDLE.set(app);
 }
 
+pub fn injected_app_handle() -> Option<tauri::AppHandle> {
+    APP_HANDLE.get().cloned()
+}
+
 fn credential_proxy_server() -> Result<&'static CredentialProxyServer, String> {
     static SERVER: OnceLock<CredentialProxyServer> = OnceLock::new();
     if let Some(server) = SERVER.get() {
@@ -840,6 +1084,11 @@ fn credential_proxy_server() -> Result<&'static CredentialProxyServer, String> {
         .route("/image/:token/generate", post(image_proxy_handler))
         .route("/image/:token/task/:task_id", get(image_task_query_handler))
         .route("/delegate/:token/dispatch", post(delegate_proxy_handler))
+        .route("/ask-user/:token/dispatch", post(ask_user_proxy_handler))
+        .route("/memory/:token/update", post(memory_update_handler))
+        .route("/memory/:token/search", post(memory_search_handler))
+        .route("/memory/:token/read", post(memory_read_handler))
+        .route("/memory/:token/delete", post(memory_delete_handler))
         .with_state(state.clone());
     tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::from_std(listener) {
@@ -1109,6 +1358,23 @@ struct DelegateRequest {
     context: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AskUserRequest {
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    questions: Value,
+    #[serde(default)]
+    submit_label: Option<String>,
+    #[serde(default)]
+    cancel_label: Option<String>,
+    #[serde(default)]
+    allow_skip: bool,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
 async fn delegate_proxy_handler(
     State(state): State<CredentialProxyState>,
     AxumPath(token): AxumPath<String>,
@@ -1116,52 +1382,66 @@ async fn delegate_proxy_handler(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     // Resolve AppHandle lazily — may not be available on very first call
     let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
-        (StatusCode::SERVICE_UNAVAILABLE, "AppHandle 尚未注入，委派功能暂不可用".to_string())
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入，委派功能暂不可用".to_string(),
+        )
     })?;
 
     // Look up session config to get provider info + caller context
     let (llm_binding, session_id, workspace_id, caller_agent_id, caller_agent_name) = {
         let guard = state.sessions.lock().map_err(|_| {
-            (StatusCode::INTERNAL_SERVER_ERROR, "session lock poisoned".to_string())
-        })?;
-        guard.get(&token).map(|s| {
             (
-                s.llm.clone(),
-                s.session_id.clone(),
-                s.workspace_id.clone(),
-                s.caller_agent_id.clone(),
-                s.caller_agent_name.clone(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session lock poisoned".to_string(),
             )
-        }).unwrap_or((None, None, None, None, None))
+        })?;
+        guard
+            .get(&token)
+            .map(|s| {
+                (
+                    s.llm.clone(),
+                    s.session_id.clone(),
+                    s.workspace_id.clone(),
+                    s.caller_agent_id.clone(),
+                    s.caller_agent_name.clone(),
+                )
+            })
+            .unwrap_or((None, None, None, None, None))
     };
     let Some(llm) = llm_binding else {
-        return Err((StatusCode::UNAUTHORIZED, "unknown session or no LLM config".to_string()));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "unknown session or no LLM config".to_string(),
+        ));
     };
 
-    let allowed_delegate_ids: Option<HashSet<String>> = if let Some(workspace_id) = workspace_id.as_deref() {
+    let (allowed_delegate_ids, delegate_role_hints): (
+        Option<HashSet<String>>,
+        HashMap<String, DelegateRoleHint>,
+    ) = if let Some(workspace_id) = workspace_id.as_deref() {
         crate::team_workspace::list_team_member_views(&app_handle, workspace_id)
             .ok()
             .map(|members| {
-                members
-                    .into_iter()
-                    .filter(|member| Some(member.agent_id.as_str()) != caller_agent_id.as_deref())
-                    .map(|member| member.agent_id)
-                    .collect::<HashSet<_>>()
+                let mut ids = HashSet::new();
+                let mut role_hints = HashMap::new();
+                for member in members {
+                    if Some(member.agent_id.as_str()) == caller_agent_id.as_deref() {
+                        continue;
+                    }
+                    if !member.role.trim().is_empty() {
+                        role_hints.insert(
+                            member.agent_id.clone(),
+                            DelegateRoleHint { role: member.role },
+                        );
+                    }
+                    ids.insert(member.agent_id);
+                }
+                (Some(ids), role_hints)
             })
-    } else if let Some(caller_id) = caller_agent_id.as_deref() {
-        crate::agents::get_agent_record(&app_handle, caller_id)
-            .ok()
-            .flatten()
-            .and_then(|record| record.collaboration_config)
-            .map(|config| {
-                config
-                    .allowed_delegate_agent_ids
-                    .into_iter()
-                    .filter(|agent_id| agent_id.trim() != caller_id)
-                    .collect::<HashSet<_>>()
-            })
+            .unwrap_or((None, HashMap::new()))
     } else {
-        None
+        (None, HashMap::new())
     };
 
     // Find agent by role: first constrain to the current workspace / explicit allowlist,
@@ -1181,29 +1461,25 @@ async fn delegate_proxy_handler(
         })
         .collect();
 
-    let requested_role = body.role.trim().to_lowercase();
-    let agent = candidate_agents
-        .iter()
-        .copied()
-        .find(|a| a.id == body.role.trim())
-        .or_else(|| {
-            candidate_agents
-                .iter()
-                .copied()
-                .find(|a| a.name.to_lowercase() == requested_role)
-        })
-        .or_else(|| {
-            candidate_agents
-                .iter()
-                .copied()
-                .find(|a| a.name.to_lowercase().contains(&requested_role))
-        });
+    let agent = resolve_delegate_agent(
+        &candidate_agents,
+        &delegate_role_hints,
+        &body.role,
+        &body.task,
+    );
 
     let Some(agent) = agent else {
+        let available = format_delegate_candidates(&candidate_agents, &delegate_role_hints);
+        let scope_label = delegate_scope_label(workspace_id.as_deref());
         return Ok(Json(json!({
             "ok": false,
-            "error": format!("未找到匹配 '{}' 的子智能体。当前可委派智能体：{}", body.role,
-                candidate_agents.iter().map(|a| format!("{}({})", a.name, a.id)).collect::<Vec<_>>().join(", "))
+            "error": format!(
+                "未找到匹配 '{}' 的子智能体。请使用{}中的真实 agentId、显示名{}。当前可委派智能体：{}",
+                body.role,
+                scope_label,
+                if workspace_id.is_some() { "或团队 role" } else { "" },
+                available,
+            )
         })));
     };
 
@@ -1236,7 +1512,11 @@ async fn delegate_proxy_handler(
     let app = app_handle.clone();
     let agent_id = agent.id.clone();
     let task = body.task.clone();
-    let context = if body.context.is_empty() { None } else { Some(body.context.clone()) };
+    let context = if body.context.is_empty() {
+        None
+    } else {
+        Some(body.context.clone())
+    };
     let trace_id_for_delegate = trace_id.clone();
 
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -1248,11 +1528,21 @@ async fn delegate_proxy_handler(
             &provider_config,
             Some(trace_id_for_delegate.as_str()),
         )
-    }).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Finalize trace
-    let final_status = if result.status == "success" { "done" } else { "error" };
-    let trace_error = if result.status == "success" { None } else { Some(result.output.clone()) };
+    let final_status = if result.status == "success" {
+        "done"
+    } else {
+        "error"
+    };
+    let trace_error = if result.status == "success" {
+        None
+    } else {
+        Some(result.output.clone())
+    };
     crate::llm_trace::finalize(
         &app_handle,
         &trace_id,
@@ -1272,6 +1562,430 @@ async fn delegate_proxy_handler(
         "agentName": result.agent_name,
         "durationMs": result.duration_ms,
         "error": if result.status == "success" { Value::Null } else { Value::String(result.output.clone()) }
+    })))
+}
+
+async fn ask_user_proxy_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<AskUserRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入，ask_user 暂不可用".to_string(),
+        )
+    })?;
+
+    let session_id = {
+        let guard = state.sessions.lock().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session lock poisoned".to_string(),
+            )
+        })?;
+        guard
+            .get(&token)
+            .and_then(|config| config.session_id.clone())
+            .ok_or_else(|| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "unknown session or missing session id".to_string(),
+                )
+            })?
+    };
+
+    let widget = crate::widget_runtime::build_ask_user_widget(
+        body.title,
+        body.description,
+        body.submit_label,
+        body.cancel_label,
+        body.allow_skip,
+        body.questions,
+    )
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
+    let timeout_ms = body.timeout_ms.unwrap_or(10 * 60 * 1000).clamp(1_000, 60 * 60 * 1000);
+    let result = crate::widget_runtime::create_pending_widget_request(
+        &app_handle,
+        &session_id,
+        widget,
+        timeout_ms,
+    )
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// memory proxy handlers — memory tool endpoints
+// ---------------------------------------------------------------------------
+
+/// Resolve workspace_id for memory operations: prefer body value, fall back to session config.
+fn resolve_memory_workspace(
+    state: &CredentialProxyState,
+    token: &str,
+    body_workspace_id: Option<&str>,
+) -> Result<String, (StatusCode, String)> {
+    if let Some(ws) = body_workspace_id {
+        if !ws.trim().is_empty() {
+            return Ok(ws.to_string());
+        }
+    }
+    let guard = state.sessions.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session lock poisoned".to_string(),
+        )
+    })?;
+    guard
+        .get(token)
+        .and_then(|cfg| cfg.workspace_id.clone())
+        .filter(|ws| !ws.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "workspace_id is required for memory operations".to_string(),
+            )
+        })
+}
+
+/// Global embedding registry for memory tool handlers. Initialized at startup.
+static EMBEDDING_REGISTRY: OnceLock<Arc<tokio::sync::RwLock<crate::embedding::ProviderRegistry>>> =
+    OnceLock::new();
+
+pub fn inject_embedding_registry(registry: Arc<tokio::sync::RwLock<crate::embedding::ProviderRegistry>>) {
+    let _ = EMBEDDING_REGISTRY.set(registry);
+}
+
+/// Returns a reference-counted handle to the global embedding registry, if initialized.
+pub fn get_embedding_registry() -> Option<Arc<tokio::sync::RwLock<crate::embedding::ProviderRegistry>>> {
+    EMBEDDING_REGISTRY.get().cloned()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct MemoryUpdateRequest {
+    title: String,
+    content: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    memory_id: Option<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+async fn memory_update_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<MemoryUpdateRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入".to_string(),
+        )
+    })?;
+
+    // Resolve workspace_id from session if not provided in body
+    let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
+
+    if workspace_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "workspace_id is required for memory operations".to_string(),
+        ));
+    }
+
+    let conn = crate::storage_conn(&app_handle)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let tags_json = serde_json::to_string(&body.tags)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("序列化 tags 失败: {e}")))?;
+
+    let memory_id = body.memory_id.unwrap_or_else(|| {
+        format!("mem_{}", Uuid::new_v4().simple())
+    });
+
+    let record = if let Ok(existing) = crate::storage::workspaces::update_workspace_memory(
+        &conn,
+        &memory_id,
+        Some(&body.title),
+        Some(&body.content),
+        Some(&tags_json),
+    ) {
+        existing
+    } else {
+        crate::storage::workspaces::insert_workspace_memory(
+            &conn,
+            &memory_id,
+            &workspace_id,
+            &body.title,
+            &body.content,
+            None::<&str>,
+            &tags_json,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+    };
+
+    // Generate embedding asynchronously
+    if let Some(registry) = EMBEDDING_REGISTRY.get() {
+        let registry = registry.clone();
+        let memory_id_clone = memory_id.clone();
+        let workspace_id_clone = workspace_id.clone();
+        let text_to_embed = format!("{} {}", body.title, body.content);
+        tauri::async_runtime::spawn(async move {
+            let provider = {
+                let guard = registry.read().await;
+                guard.default_provider()
+            };
+            if let Some(provider) = provider {
+                match provider.embed(vec![text_to_embed]).await {
+                    Ok(embeddings) => {
+                        if let Some(embedding) = embeddings.into_iter().next() {
+                            let conn = crate::storage_conn(&APP_HANDLE.get().unwrap());
+                            if let Ok(conn) = conn {
+                                let vector_id = format!("vec_{}", Uuid::new_v4().simple());
+                                if let Err(e) = crate::memory_vector::upsert_vector(
+                                    &conn,
+                                    &vector_id,
+                                    &memory_id_clone,
+                                    &workspace_id_clone,
+                                    &embedding,
+                                    provider.id(),
+                                ) {
+                                    log::warn!("生成记忆向量索引失败: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("生成记忆嵌入失败: {e}");
+                    }
+                }
+            }
+        });
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "memoryId": record.id,
+        "title": record.title,
+        "tags": body.tags,
+        "updatedAt": record.updated_at,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct MemorySearchRequest {
+    query: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+    #[serde(default)]
+    threshold: Option<f32>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+fn default_search_limit() -> usize {
+    10
+}
+
+async fn memory_search_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<MemorySearchRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入".to_string(),
+        )
+    })?;
+
+    let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
+
+    if workspace_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "workspace_id is required for memory operations".to_string(),
+        ));
+    }
+
+    // Generate query embedding
+    let registry = EMBEDDING_REGISTRY.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "嵌入服务尚未初始化".to_string(),
+        )
+    })?;
+
+    let provider = {
+        let guard = registry.read().await;
+        guard.default_provider().ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "无可用的嵌入提供者".to_string(),
+            )
+        })?
+    };
+
+    let embeddings = provider
+        .embed(vec![body.query.clone()])
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("生成查询嵌入失败: {e}")))?;
+
+    let query_embedding = embeddings
+        .into_iter()
+        .next()
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "嵌入结果为空".to_string()))?;
+
+    let threshold = body.threshold.unwrap_or(0.3);
+    let tag_filter = if body.tags.is_empty() {
+        None
+    } else {
+        Some(body.tags.clone())
+    };
+
+    let conn = crate::storage_conn(&app_handle)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let hits = crate::memory_vector::search_vectors(
+        &conn,
+        &workspace_id,
+        &query_embedding,
+        body.limit,
+        threshold,
+        tag_filter.as_deref(),
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Fetch full memory records for each hit
+    let mut results = Vec::new();
+    for hit in &hits {
+        if let Ok(Some(record)) = crate::storage::workspaces::get_workspace_memory(&conn, &hit.memory_id) {
+            results.push(json!({
+                "memoryId": record.id,
+                "title": record.title,
+                "content": record.content,
+                "tags": serde_json::from_str::<Vec<String>>(&record.tags_json).unwrap_or_default(),
+                "score": hit.score,
+                "updatedAt": record.updated_at,
+            }));
+        }
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "results": results,
+        "total": results.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct MemoryReadRequest {
+    memory_id: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+async fn memory_read_handler(
+    State(_state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<MemoryReadRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入".to_string(),
+        )
+    })?;
+
+    let _workspace_id = body.workspace_id.clone().unwrap_or_else(|| {
+        let proxy_server = credential_proxy_server().map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        }).ok();
+        proxy_server
+            .and_then(|server| {
+                let guard = server.state.sessions.lock().ok()?;
+                guard.get(&token).and_then(|cfg| cfg.workspace_id.clone())
+            })
+            .unwrap_or_default()
+    });
+
+    let conn = crate::storage_conn(&app_handle)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let record = crate::storage::workspaces::get_workspace_memory(&conn, &body.memory_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let Some(record) = record else {
+        return Ok(Json(json!({
+            "ok": false,
+            "error": format!("记忆 {} 不存在", body.memory_id),
+        })));
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "memoryId": record.id,
+        "workspaceId": record.workspace_id,
+        "title": record.title,
+        "content": record.content,
+        "tags": serde_json::from_str::<Vec<String>>(&record.tags_json).unwrap_or_default(),
+        "authorAgentId": record.author_agent_id,
+        "createdAt": record.created_at,
+        "updatedAt": record.updated_at,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct MemoryDeleteRequest {
+    memory_id: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+async fn memory_delete_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<MemoryDeleteRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入".to_string(),
+        )
+    })?;
+
+    let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
+
+    if workspace_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "workspace_id is required for memory operations".to_string(),
+        ));
+    }
+
+    let conn = crate::storage_conn(&app_handle)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Also delete associated vector
+    let _ = crate::memory_vector::delete_vector_by_memory_id(&conn, &body.memory_id);
+
+    crate::storage::workspaces::delete_workspace_memory(&conn, &workspace_id, &body.memory_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "memoryId": body.memory_id,
     })))
 }
 
@@ -1334,6 +2048,37 @@ fn response_with_status(status: StatusCode, message: &str) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_capabilities::static_capability_policy;
+    use crate::agents::{AgentHeartbeatConfig, AgentRecord};
+
+    fn test_agent(id: &str, name: &str) -> AgentRecord {
+        AgentRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            summary: String::new(),
+            description: String::new(),
+            trigger_condition: String::new(),
+            manual_trigger_only: false,
+            system_prompt: String::new(),
+            capability_policy: static_capability_policy(),
+            skill_ids: Vec::new(),
+            allowed_tool_ids: Vec::new(),
+            default_provider_id: String::new(),
+            default_model: String::new(),
+            is_builtin: false,
+            is_archived: false,
+            execution_mode: "single".to_string(),
+            collaboration_config: None,
+            accent_color: None,
+            avatar_uri: None,
+            bot_configs: HashMap::new(),
+            heartbeat_config: AgentHeartbeatConfig::default(),
+            scenario_llm_config: None,
+            agent_loop_config: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
 
     fn temp_root() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1386,7 +2131,11 @@ mod tests {
         let restricted = restrict_harness_to_agent_tools(
             harness,
             &root,
-            &["read_file".to_string(), "grep".to_string(), "glob".to_string()],
+            &[
+                "read_file".to_string(),
+                "grep".to_string(),
+                "glob".to_string(),
+            ],
         )
         .expect("restrict harness");
         assert_eq!(
@@ -1404,7 +2153,8 @@ mod tests {
         ensure_agent_runtime_scaffold(&root).expect("scaffold");
         let harness = select_harness(&root, "single", Some("hello")).expect("select harness");
 
-        let restricted = restrict_harness_to_agent_tools(harness, &root, &[]).expect("restrict harness");
+        let restricted =
+            restrict_harness_to_agent_tools(harness, &root, &[]).expect("restrict harness");
         assert_eq!(
             restricted.definition.active_tools,
             vec!["__nineclaw_no_tools_allowed__".to_string()]
@@ -1457,5 +2207,119 @@ mod tests {
         let url = build_external_api_url("https://api.example.com", "/search", &query);
         assert!(url.starts_with("https://api.example.com/search?"));
         assert!(url.contains("q=rust%20lang"));
+    }
+
+    #[test]
+    fn resolve_delegate_agent_matches_workspace_role_and_slug() {
+        let color = test_agent("agent_1", "ColorMaster");
+        let psych = test_agent("agent_2", "PsychMarketer");
+        let candidates = vec![&color, &psych];
+        let role_hints = HashMap::from([(
+            color.id.clone(),
+            DelegateRoleHint {
+                role: "colorist".to_string(),
+            },
+        )]);
+
+        let matched = resolve_delegate_agent(&candidates, &role_hints, "agent-colorist", "")
+            .expect("match role slug");
+        assert_eq!(matched.id, color.id);
+
+        let matched = resolve_delegate_agent(&candidates, &role_hints, "ColorMaster", "")
+            .expect("match name");
+        assert_eq!(matched.id, color.id);
+    }
+
+    #[test]
+    fn format_delegate_candidates_includes_role_hint() {
+        let color = test_agent("agent_1", "ColorMaster");
+        let psych = test_agent("agent_2", "PsychMarketer");
+        let candidates = vec![&color, &psych];
+        let role_hints = HashMap::from([(
+            psych.id.clone(),
+            DelegateRoleHint {
+                role: "marketer".to_string(),
+            },
+        )]);
+
+        let formatted = format_delegate_candidates(&candidates, &role_hints);
+        assert!(formatted.contains("ColorMaster(agent_1)"));
+        assert!(formatted.contains("PsychMarketer(agent_2) role=marketer"));
+    }
+
+    #[test]
+    fn resolve_delegate_agent_can_match_by_description_and_task() {
+        let mut color = test_agent("agent_1", "ColorMaster");
+        color.description =
+            "专注于品牌配色策略、Design Token 体系与 CSS/Tailwind 落地。".to_string();
+        let mut psych = test_agent("agent_2", "PsychMarketer");
+        psych.description = "专注于消费心理、转化文案和增长策略。".to_string();
+        let candidates = vec![&color, &psych];
+
+        let matched = resolve_delegate_agent(
+            &candidates,
+            &HashMap::new(),
+            "帮我找一个适合做配色方案的智能体",
+            "需要输出网站品牌配色、design token 和 tailwind 变量",
+        )
+        .expect("match by description");
+        assert_eq!(matched.id, color.id);
+    }
+
+    #[test]
+    fn direct_chat_delegate_scope_is_global_agents() {
+        assert_eq!(delegate_scope_label(None), "当前直接聊天可调用的智能体");
+        assert_eq!(delegate_scope_label(Some("workspace-1")), "当前团队成员");
+    }
+
+    #[test]
+    fn resolve_typebox_import_path_supports_unscoped_typebox_layout() {
+        let root = temp_root();
+        let pi_dir = root.join("runtime");
+        let pi_path = pi_dir.join("pi");
+        let candidate = root
+            .join("pi-package")
+            .join("node_modules")
+            .join("typebox")
+            .join("build")
+            .join("index.mjs");
+
+        fs::create_dir_all(candidate.parent().expect("candidate parent"))
+            .expect("create candidate");
+        fs::create_dir_all(&pi_dir).expect("create pi dir");
+        fs::write(&pi_path, "#!/bin/sh\n").expect("write pi");
+        fs::write(&candidate, "export {};\n").expect("write candidate");
+
+        let resolved = resolve_typebox_import_path(&pi_path).expect("resolve path");
+        let expected = fs::canonicalize(&candidate).expect("canonical candidate");
+        assert_eq!(resolved, expected);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_typebox_import_path_supports_scoped_typebox_layout() {
+        let root = temp_root();
+        let pi_dir = root.join("runtime");
+        let pi_path = pi_dir.join("pi");
+        let candidate = root
+            .join("pi-package")
+            .join("node_modules")
+            .join("@sinclair")
+            .join("typebox")
+            .join("build")
+            .join("index.mjs");
+
+        fs::create_dir_all(candidate.parent().expect("candidate parent"))
+            .expect("create candidate");
+        fs::create_dir_all(&pi_dir).expect("create pi dir");
+        fs::write(&pi_path, "#!/bin/sh\n").expect("write pi");
+        fs::write(&candidate, "export {};\n").expect("write candidate");
+
+        let resolved = resolve_typebox_import_path(&pi_path).expect("resolve path");
+        let expected = fs::canonicalize(&candidate).expect("canonical candidate");
+        assert_eq!(resolved, expected);
+
+        let _ = fs::remove_dir_all(root);
     }
 }
