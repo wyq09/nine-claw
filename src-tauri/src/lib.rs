@@ -5,22 +5,26 @@ mod agent_task_schedule;
 mod agent_tasks;
 mod agent_workspace;
 mod agents;
+mod app_log;
 mod channels;
 mod chat_attachments;
 mod dev_trace;
+mod embedding;
 mod heartbeat;
 mod image_generation;
 mod llm_log_export;
 mod llm_trace;
+mod macos_native_dictation_panel;
 mod managed_runtime;
 mod managed_runtime_extension;
 mod media_directives;
+mod memory_gate;
 mod peer_gateway;
 mod pi_runtime;
 mod pi_timeouts;
 mod prompt_attachments;
-mod runtime_parameters;
 mod proxy_settings;
+mod runtime_parameters;
 mod scheduler;
 mod skills;
 mod storage;
@@ -28,8 +32,10 @@ mod team_supervisor;
 mod team_workspace;
 mod workspace_fs;
 mod workspace_memory_extraction;
+mod widget_runtime;
 
 mod agent_package;
+mod agent_presets;
 mod app_constants;
 mod commands_agents_skills;
 mod commands_chat_workspace;
@@ -40,6 +46,7 @@ mod pi_usage;
 mod prompts;
 mod provider_runtime;
 mod provider_stream_noise;
+mod runtime_agent_config;
 mod session_llm_titles;
 mod skill_broker;
 mod time_util;
@@ -61,19 +68,20 @@ pub(crate) use pi_usage::{
 pub(crate) use provider_runtime::{
     anthropic_messages_url, load_provider_preferences, normalize_anthropic_base_url,
     normalize_provider_api_format, normalize_provider_base_url,
-    normalized_provider_runtime_base_url, openai_pi_compat_supports_reasoning_effort,
-    openai_pi_compat_requires_explicit_thinking_disable, pi_runtime_dir,
-    resolve_im_llm_runtime, save_provider_preferences, should_force_pi_thinking_off,
-    ProviderRuntimeConfig,
+    normalized_provider_runtime_base_url, openai_pi_compat_requires_explicit_thinking_disable,
+    openai_pi_compat_supports_reasoning_effort, pi_runtime_dir, resolve_im_llm_runtime,
+    save_provider_preferences, should_force_pi_thinking_off, ProviderRuntimeConfig,
 };
 pub(crate) use proxy_settings::build_http_client;
 pub(crate) use session_llm_titles::refine_agent_task_metadata;
 pub(crate) use time_util::chrono_like_timestamp;
 
+use app_log::{app_log_export_all, app_log_list, app_log_open_dir, app_log_read};
 use commands_agents_skills::*;
 use commands_chat_workspace::*;
 use commands_llm_log_export::*;
 use commands_llm_trace::*;
+use widget_runtime::{widget_cancel_response, widget_submit_response};
 use history_app_state::{
     clear_history_state, list_token_usage_records, load_history_state, save_history_state,
 };
@@ -139,7 +147,7 @@ fn pi_reuse_desktop_enabled() -> bool {
         .unwrap_or(true)
 }
 
-fn open_path_in_default_app(path: &Path) -> Result<(), String> {
+pub(crate) fn open_path_in_default_app(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut cmd = Command::new("open");
@@ -962,15 +970,18 @@ mod lib_tests {
     use super::{
         aggregate_token_usage_from_history_turns, aggregate_usage_from_agent_messages,
         build_desktop_anthropic_compat_extension_source, build_desktop_outbound_display_text,
-        build_provider_models_config_with_input, desktop_incomplete_reply_error,
-        desktop_media_reply_prompt, infer_media_mime_type, is_provider_image_block_rejection_error,
-        is_provider_reasoning_history_rejection_error, parse_context_stats_from_rpc_response,
-        prepend_multimodal_summary_context, quarantine_pi_session_file, record_multimodal_summary,
-        render_multimodal_summary_context, resolve_context_window_from_sources,
-        sanitize_pi_session_replay_state, should_force_pi_thinking_off, summary_file_path,
-        usage_row_total_tokens, DesktopParsedMediaItem, ProviderRuntimeConfig,
+        build_provider_models_config_with_input, build_turn_prompt_with_multimodal_summary,
+        desktop_incomplete_reply_error, desktop_media_reply_prompt, infer_media_mime_type,
+        is_provider_image_block_rejection_error, is_provider_reasoning_history_rejection_error,
+        parse_context_stats_from_rpc_response, prepend_multimodal_summary_context,
+        quarantine_pi_session_file, record_multimodal_summary, render_multimodal_summary_context,
+        resolve_context_window_from_sources, resolve_pi_ai_import_path,
+        sanitize_pi_session_replay_state, should_force_pi_thinking_off,
+        should_retry_text_only_after_image_rejection, summary_file_path, usage_row_total_tokens,
+        DesktopParsedMediaItem, ProviderRuntimeConfig,
     };
     use crate::channels::types::MediaType;
+    use crate::prompt_attachments;
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1023,6 +1034,53 @@ mod lib_tests {
             .expect("prepend summary context");
         assert!(prompt.contains("原始图片/视频已从主会话上下文移除"));
         assert!(prompt.contains("继续看第三张图"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn visual_turn_skips_previous_multimodal_summary_context() {
+        let key = format!("test-visual-summary-{}", Uuid::new_v4());
+        let path = summary_file_path(&key);
+        let _ = fs::remove_file(&path);
+
+        record_multimodal_summary(&key, "第一张图是什么", "这是上一张图的摘要")
+            .expect("record summary");
+
+        let prompt = build_turn_prompt_with_multimodal_summary(
+            "识别这张新图片",
+            &key,
+            &[prompt_attachments::PromptAttachmentInput {
+                file_name: "fresh.png".to_string(),
+                file_path: "/tmp/fresh.png".to_string(),
+                mime_type: "image/png".to_string(),
+                kind: "image".to_string(),
+                transcript: None,
+            }],
+        )
+        .expect("build prompt");
+
+        assert_eq!(prompt, "识别这张新图片");
+        assert!(!prompt.contains("上一张图的摘要"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn text_only_turn_keeps_previous_multimodal_summary_context() {
+        let key = format!("test-text-summary-{}", Uuid::new_v4());
+        let path = summary_file_path(&key);
+        let _ = fs::remove_file(&path);
+
+        record_multimodal_summary(&key, "第一张图是什么", "这是上一张图的摘要")
+            .expect("record summary");
+
+        let prompt = build_turn_prompt_with_multimodal_summary("继续分析刚才那张图", &key, &[])
+            .expect("build prompt");
+
+        assert!(prompt.contains("原始图片/视频已从主会话上下文移除"));
+        assert!(prompt.contains("这是上一张图的摘要"));
+        assert!(prompt.contains("继续分析刚才那张图"));
 
         let _ = fs::remove_file(&path);
     }
@@ -1101,6 +1159,25 @@ mod lib_tests {
     }
 
     #[test]
+    fn current_visual_turn_does_not_retry_with_text_only_history() {
+        assert!(!should_retry_text_only_after_image_rejection(
+            0,
+            true,
+            "messages[39]: unknown variant `image_url`, expected `text`"
+        ));
+        assert!(should_retry_text_only_after_image_rejection(
+            0,
+            false,
+            "messages[39]: unknown variant `image_url`, expected `text`"
+        ));
+        assert!(!should_retry_text_only_after_image_rejection(
+            1,
+            false,
+            "messages[39]: unknown variant `image_url`, expected `text`"
+        ));
+    }
+
+    #[test]
     fn provider_models_config_can_fallback_to_text_only_input() {
         let provider = ProviderRuntimeConfig {
             provider_id: "custom".to_string(),
@@ -1163,7 +1240,10 @@ mod lib_tests {
         let config = build_provider_models_config_with_input(&provider, false, false)
             .expect("deepseek config");
         let provider_json = &config["providers"]["nineclaw-runtime-8b9035807842"];
-        assert_eq!(provider_json["compat"]["supportsReasoningEffort"], json!(false));
+        assert_eq!(
+            provider_json["compat"]["supportsReasoningEffort"],
+            json!(false)
+        );
         assert_eq!(provider_json["compat"]["thinkingFormat"], json!("qwen"));
         assert_eq!(provider_json["models"][0]["reasoning"], json!(true));
         assert!(should_force_pi_thinking_off(&provider, false));
@@ -1250,6 +1330,94 @@ mod lib_tests {
         assert!(source.contains("image_url"));
         assert!(source.contains("input: ['text']"));
         assert!(source.contains("URL-only image block is not replayable"));
+    }
+
+    #[test]
+    fn anthropic_compat_extension_uses_serialized_import_path_and_multimodal_input() {
+        let source = build_desktop_anthropic_compat_extension_source(
+            Path::new("/tmp/pi runtime/pi-ai/index.js"),
+            "provider-id",
+            "API_KEY",
+            "https://example.com/base/",
+            "model-name",
+            false,
+        )
+        .expect("extension source");
+
+        assert!(source.contains("\"/tmp/pi runtime/pi-ai/index.js\""));
+        assert!(source.contains("input: ['text', 'image']"));
+        assert!(source.contains("provider-id"));
+        assert!(source.contains("https://example.com/base/"));
+        assert!(source.contains("model-name"));
+    }
+
+    #[test]
+    fn resolve_pi_ai_import_path_prefers_pi_package_node_modules() {
+        let root = std::env::temp_dir().join(format!("nineclaw-pi-ai-path-{}", Uuid::new_v4()));
+        let pi_dir = root.join("runtime");
+        let pi_path = pi_dir.join("pi");
+        let candidate = root
+            .join("pi-package")
+            .join("node_modules")
+            .join("@mariozechner")
+            .join("pi-ai")
+            .join("dist")
+            .join("index.js");
+
+        fs::create_dir_all(candidate.parent().expect("candidate parent"))
+            .expect("create candidate");
+        fs::create_dir_all(&pi_dir).expect("create pi dir");
+        fs::write(&pi_path, "#!/bin/sh\n").expect("write pi");
+        fs::write(&candidate, "export {};\n").expect("write candidate");
+
+        let resolved = resolve_pi_ai_import_path(&pi_path).expect("resolve path");
+        let expected = fs::canonicalize(&candidate).expect("canonical candidate");
+        assert_eq!(resolved, expected);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_pi_ai_import_path_falls_back_to_nested_pi_dependency() {
+        let root = std::env::temp_dir().join(format!("nineclaw-pi-ai-nested-{}", Uuid::new_v4()));
+        let pi_dir = root.join("runtime");
+        let pi_path = pi_dir.join("pi");
+        let candidate = root
+            .join("node_modules")
+            .join("@mariozechner")
+            .join("pi-coding-agent")
+            .join("node_modules")
+            .join("@mariozechner")
+            .join("pi-ai")
+            .join("dist")
+            .join("index.js");
+
+        fs::create_dir_all(candidate.parent().expect("candidate parent"))
+            .expect("create candidate");
+        fs::create_dir_all(&pi_dir).expect("create pi dir");
+        fs::write(&pi_path, "#!/bin/sh\n").expect("write pi");
+        fs::write(&candidate, "export {};\n").expect("write candidate");
+
+        let resolved = resolve_pi_ai_import_path(&pi_path).expect("resolve path");
+        let expected = fs::canonicalize(&candidate).expect("canonical candidate");
+        assert_eq!(resolved, expected);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_pi_ai_import_path_returns_none_when_no_candidate_exists() {
+        let root = std::env::temp_dir().join(format!("nineclaw-pi-ai-missing-{}", Uuid::new_v4()));
+        let pi_dir = root.join("runtime");
+        let pi_path = pi_dir.join("pi");
+
+        fs::create_dir_all(&pi_dir).expect("create pi dir");
+        fs::write(&pi_path, "#!/bin/sh\n").expect("write pi");
+
+        let resolved = resolve_pi_ai_import_path(&pi_path);
+        assert!(resolved.is_none());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2050,6 +2218,18 @@ pub(crate) fn prepend_multimodal_summary_context(
     }
 }
 
+pub(crate) fn build_turn_prompt_with_multimodal_summary(
+    prompt: &str,
+    summary_key: &str,
+    attachments: &[prompt_attachments::PromptAttachmentInput],
+) -> Result<String, String> {
+    if prompt_attachments::attachments_include_visual_context(attachments) {
+        return Ok(prompt.to_string());
+    }
+
+    prepend_multimodal_summary_context(prompt, summary_key)
+}
+
 pub(crate) fn clear_multimodal_summary(summary_key: &str) -> Result<(), String> {
     let path = summary_file_path(summary_key);
     match fs::remove_file(&path) {
@@ -2806,10 +2986,7 @@ fn custom_provider_object(
             if requires_explicit_thinking_disable {
                 compat.insert("thinkingFormat".to_string(), json!("qwen"));
             }
-            provider.insert(
-                "compat".to_string(),
-                serde_json::Value::Object(compat),
-            );
+            provider.insert("compat".to_string(), serde_json::Value::Object(compat));
             provider.insert(
                 "models".to_string(),
                 json!([
@@ -2923,6 +3100,16 @@ fn is_provider_reasoning_history_rejection_error(error: &str) -> bool {
             || lower.contains("pass back")
             || lower.contains("missing")
             || lower.contains("required"))
+}
+
+fn should_retry_text_only_after_image_rejection(
+    attempt: usize,
+    current_turn_has_visual_context: bool,
+    error: &str,
+) -> bool {
+    attempt == 0
+        && !current_turn_has_visual_context
+        && is_provider_image_block_rejection_error(error)
 }
 
 fn emit_stream_event(
@@ -3408,6 +3595,7 @@ async fn stream_pi_prompt(
     }
 
     managed_runtime::inject_credential_proxy_app_handle(app.clone());
+    let agent_config = runtime_agent_config::refresh_runtime_agent_config(&app, agent_config)?;
 
     let normalized_session_id = session_id
         .as_deref()
@@ -3476,6 +3664,8 @@ async fn stream_pi_prompt(
         None,
     );
 
+    let current_turn_has_visual_context =
+        prompt_attachments::attachments_include_visual_context(&attachments);
     let mut attempt_prompt = trimmed_prompt.clone();
     let mut text_only_provider_input_retry = false;
     let mut disable_reasoning_provider_retry = false;
@@ -3487,8 +3677,10 @@ async fn stream_pi_prompt(
         let app = app.clone();
         let tool_iteration_cap = merged_runtime_parameters.max_agent_tool_rounds_per_dialogue;
         let stall_retry_cap = merged_runtime_parameters.stream_disconnect_max_retries;
-        let delegate_iteration_cap =
-            merged_runtime_parameters.max_agent_tool_rounds_per_dialogue.max(1).min(500);
+        let delegate_iteration_cap = merged_runtime_parameters
+            .max_agent_tool_rounds_per_dialogue
+            .max(1)
+            .min(500);
         let session_id_for_attempt = normalized_session_id.clone();
         let normalized_session_id = session_id_for_attempt.clone();
         let runtime_session_id = session_id_for_attempt.clone();
@@ -3502,7 +3694,11 @@ async fn stream_pi_prompt(
         let summary_key = summary_key.clone();
         let trimmed_prompt = attempt_prompt.clone();
         let prepared_input = prompt_attachments::prepare_prompt_input(
-            &prepend_multimodal_summary_context(&trimmed_prompt, &summary_key)?,
+            &build_turn_prompt_with_multimodal_summary(
+                &trimmed_prompt,
+                &summary_key,
+                &attachments,
+            )?,
             &attachments,
         )?;
 
@@ -4893,6 +5089,10 @@ async fn stream_pi_prompt(
             return Ok(());
         }
 
+        if !should_pool_after_turn {
+            close_pi_stdin(&stdin);
+        }
+
         let aborting_now = abort_requested.load(Ordering::SeqCst) || saw_model_abort_event;
         let exit_wait_reason = if abort_requested.load(Ordering::SeqCst) {
             close_pi_stdin(&stdin);
@@ -5281,7 +5481,11 @@ async fn stream_pi_prompt(
                     error.clone(),
                     Some(serde_json::json!({ "attempt": attempt + 1 })),
                 );
-                if attempt == 0 && is_provider_image_block_rejection_error(&error) {
+                if should_retry_text_only_after_image_rejection(
+                    attempt,
+                    current_turn_has_visual_context,
+                    &error,
+                ) {
                     managed_runtime::append_session_event_quiet(
                         desktop_agent_home_for_runtime.as_deref(),
                         &session_id_for_attempt,
@@ -5291,6 +5495,23 @@ async fn stream_pi_prompt(
                     );
                     text_only_provider_input_retry = true;
                     continue;
+                }
+                if current_turn_has_visual_context
+                    && attempt == 0
+                    && is_provider_image_block_rejection_error(&error)
+                {
+                    let clarified = format!(
+                        "当前模型或 Provider 拒绝了图片输入，这次回答并没有真正看到你上传的图片。\n原始错误：{}",
+                        error
+                    );
+                    managed_runtime::append_session_event_quiet(
+                        desktop_agent_home_for_runtime.as_deref(),
+                        &session_id_for_attempt,
+                        managed_runtime::SessionEventKind::RuntimeError,
+                        clarified.clone(),
+                        Some(serde_json::json!({ "attempt": attempt + 1, "error": error })),
+                    );
+                    return Err(clarified);
                 }
                 if attempt < 2 && is_provider_reasoning_history_rejection_error(&error) {
                     let session_path = session_file_path(Some(session_id_for_attempt.as_str()));
@@ -5930,18 +6151,23 @@ async fn agent_loop_respond_review(
     // For now, log and return Ok
     log::info!(
         "Agent Loop 审核响应: loop_id={}, approved={}, extend_to={:?}",
-        loop_id, approved, extend_to
+        loop_id,
+        approved,
+        extend_to
     );
     Ok(())
 }
 
 #[tauri::command]
-async fn agent_loop_abort(
-    loop_id: String,
-) -> Result<(), String> {
+async fn agent_loop_abort(loop_id: String) -> Result<(), String> {
     // TODO: Wire to ActiveLoops managed state in a follow-up
     log::info!("Agent Loop 取消请求: loop_id={}", loop_id);
     Ok(())
+}
+
+#[tauri::command]
+fn macos_open_native_dictation_panel(app: tauri::AppHandle) -> Result<(), String> {
+    macos_native_dictation_panel::open(&app)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -5950,6 +6176,51 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            let log_dir = match app.path().app_data_dir() {
+                Ok(root) => root.join("logs"),
+                Err(error) => {
+                    eprintln!("解析应用数据目录失败，跳过文件日志: {error}");
+                    PathBuf::new()
+                }
+            };
+            if !log_dir.as_os_str().is_empty() {
+                if let Err(error) = std::fs::create_dir_all(&log_dir) {
+                    eprintln!("创建日志目录失败: {error}");
+                } else {
+                    let date_logger = fern::DateBased::new(&log_dir, "nineclaw-%Y-%m-%d.log");
+                    let file_dispatch = fern::Dispatch::new().chain(date_logger);
+                    let mut log_builder = tauri_plugin_log::Builder::new()
+                        .clear_targets()
+                        .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                        .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
+                        .max_file_size(u128::MAX)
+                        .level(log::LevelFilter::Info)
+                        .target(tauri_plugin_log::Target::new(
+                            tauri_plugin_log::TargetKind::Dispatch(file_dispatch),
+                        ))
+                        .format(|out, message, record| {
+                            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+                            let lvl = format!("{:<5}", record.level());
+                            out.finish(format_args!(
+                                "[{}] [{}] [{}] {}",
+                                ts,
+                                lvl,
+                                record.target(),
+                                message
+                            ))
+                        });
+                    #[cfg(debug_assertions)]
+                    {
+                        log_builder = log_builder.target(tauri_plugin_log::Target::new(
+                            tauri_plugin_log::TargetKind::Stdout,
+                        ));
+                    }
+                    if let Err(error) = app.handle().plugin(log_builder.build()) {
+                        eprintln!("初始化文件日志失败: {error}");
+                    }
+                }
+            }
+
             dev_trace("app", "NineClaw 启动");
             managed_runtime::inject_credential_proxy_app_handle(app.handle().clone());
             resize_main_window_to_screen(&app.handle());
@@ -5992,13 +6263,6 @@ pub fn run() {
                 scheduler::start_embedded_scheduler(app_handle);
             });
 
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -6035,6 +6299,8 @@ pub fn run() {
             archive_agent,
             delete_agent,
             set_default_agent,
+            list_default_agent_presets,
+            reset_agent_to_default_preset,
             read_agent_workspace_bundle,
             read_agent_workspace_file,
             write_agent_workspace_file,
@@ -6055,6 +6321,8 @@ pub fn run() {
             update_agent_task,
             run_agent_task_now,
             stream_pi_prompt,
+            widget_submit_response,
+            widget_cancel_response,
             workspace_list,
             workspace_create,
             workspace_update,
@@ -6066,6 +6334,11 @@ pub fn run() {
             llm_log_export_get,
             llm_log_export_set,
             llm_log_export_preview,
+            app_log_list,
+            app_log_read,
+            app_log_open_dir,
+            app_log_export_all,
+            macos_open_native_dictation_panel,
             workspace_resolve_artifacts_root,
             workspace_list_artifacts_entries,
             workspace_read_artifact_text,
