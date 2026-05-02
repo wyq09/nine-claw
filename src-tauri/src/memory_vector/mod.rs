@@ -288,4 +288,311 @@ mod tests {
         let unindexed = find_memories_without_vectors(&conn, "no-such-ws", 10).unwrap();
         assert!(unindexed.is_empty());
     }
+
+    // ── Integration tests ──────────────────────────────────────────────
+
+    /// Helper: insert a workspace row.
+    fn ensure_workspace(conn: &Connection, ws_id: &str) {
+        let now = now_ms();
+        conn.execute(
+            "INSERT OR IGNORE INTO workspaces (id, name, description, supervisor_agent_id, created_at, updated_at, archived)
+             VALUES (?1, ?2, '', '', ?3, ?3, 0)",
+            params![ws_id, ws_id, now],
+        ).unwrap();
+    }
+
+    /// Helper: insert a workspace_memories row.
+    fn insert_test_memory(conn: &Connection, id: &str, ws: &str, title: &str, content: &str) {
+        let now = now_ms();
+        conn.execute(
+            "INSERT OR IGNORE INTO workspace_memories (id, workspace_id, title, content, tags_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, '[]', ?5, ?6)",
+            params![id, ws, title, content, now, now],
+        ).unwrap();
+    }
+
+    /// Helper: insert a vector for the given memory.
+    fn insert_test_vector(conn: &Connection, memory_id: &str, workspace_id: &str, embedding: &[f32]) {
+        let id = uuid::Uuid::new_v4().to_string();
+        upsert_vector(conn, &id, memory_id, workspace_id, embedding, "test-model").unwrap();
+    }
+
+    // ── 1. Full CRUD lifecycle ─────────────────────────────────────────
+
+    #[test]
+    fn test_full_crud_lifecycle() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-crud";
+        let mem_id = "mem-crud-1";
+        ensure_workspace(&conn, ws);
+        insert_test_memory(&conn, mem_id, ws, "Lifecycle", "Content");
+
+        // Create
+        let emb = vec![0.5, 0.5, 0.5];
+        insert_test_vector(&conn, mem_id, ws, &emb);
+        let rec = get_vector_by_memory_id(&conn, mem_id).unwrap().unwrap();
+        assert_eq!(rec.memory_id, mem_id);
+        assert_eq!(rec.dimension, 3);
+
+        // Update (upsert with same memory_id)
+        let emb2 = vec![0.9, 0.1, 0.0];
+        insert_test_vector(&conn, mem_id, ws, &emb2);
+        let rec2 = get_vector_by_memory_id(&conn, mem_id).unwrap().unwrap();
+        assert!((rec2.embedding[0] - 0.9).abs() < 1e-5);
+
+        // Delete
+        let deleted = delete_vector_by_memory_id(&conn, mem_id).unwrap();
+        assert!(deleted);
+        assert!(get_vector_by_memory_id(&conn, mem_id).unwrap().is_none());
+    }
+
+    // ── 2. Cosine search returns most similar ──────────────────────────
+
+    #[test]
+    fn test_cosine_search_returns_similar() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-search-sim";
+        ensure_workspace(&conn, ws);
+
+        // Three memories with different embeddings
+        let mems = vec![
+            ("m1".to_string(), vec![1.0f32, 0.0, 0.0]),
+            ("m2".to_string(), vec![0.0f32, 1.0, 0.0]),
+            ("m3".to_string(), vec![0.0f32, 0.0, 1.0]),
+        ];
+        for (mid, emb) in &mems {
+            insert_test_memory(&conn, mid, ws, mid, "content");
+            insert_test_vector(&conn, mid, ws, emb);
+        }
+
+        // Query near m1
+        let query = vec![0.99, 0.01, 0.0f32];
+        let hits = search_vectors(&conn, ws, &query, 10, 0.0, None).unwrap();
+        assert!(!hits.is_empty(), "should have results");
+        assert_eq!(hits[0].memory_id, "m1", "m1 should be top result");
+    }
+
+    // ── 3. Search respects threshold ───────────────────────────────────
+
+    #[test]
+    fn test_search_respects_threshold() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-thresh";
+        ensure_workspace(&conn, ws);
+
+        insert_test_memory(&conn, "m-orth", ws, "orth", "content");
+        insert_test_vector(&conn, "m-orth", ws, &[1.0, 0.0f32]);
+
+        // Query orthogonal [0,1] vs stored [1,0] -> similarity = 0
+        let hits = search_vectors(&conn, ws, &[0.0, 1.0f32], 10, 0.5, None).unwrap();
+        assert!(hits.is_empty(), "orthogonal vectors should not meet threshold 0.5");
+    }
+
+    // ── 4. Search is workspace-scoped ─────────────────────────────────
+
+    #[test]
+    fn test_search_workspace_scoped() {
+        let conn = open_in_memory().unwrap();
+        let ws1 = "ws-scope-1";
+        let ws2 = "ws-scope-2";
+        ensure_workspace(&conn, ws1);
+        ensure_workspace(&conn, ws2);
+
+        insert_test_memory(&conn, "mem-a", ws1, "A", "content");
+        insert_test_vector(&conn, "mem-a", ws1, &[1.0, 0.0f32]);
+
+        insert_test_memory(&conn, "mem-b", ws2, "B", "content");
+        insert_test_vector(&conn, "mem-b", ws2, &[1.0, 0.0f32]);
+
+        // Search ws1 — should only get mem-a
+        let hits = search_vectors(&conn, ws1, &[1.0, 0.0f32], 10, 0.0, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].memory_id, "mem-a");
+    }
+
+    // ── 5. Search empty workspace ──────────────────────────────────────
+
+    #[test]
+    fn test_search_empty_workspace() {
+        let conn = open_in_memory().unwrap();
+        let hits = search_vectors(&conn, "ws-nonexistent", &[1.0, 0.0f32], 10, 0.0, None).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    // ── 6. Find missing vectors (partial index) ────────────────────────
+
+    #[test]
+    fn test_find_missing_vectors_partial_index() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-missing";
+        ensure_workspace(&conn, ws);
+
+        // 3 memories, only 1 indexed
+        for mid in ["m1", "m2", "m3"] {
+            insert_test_memory(&conn, mid, ws, mid, "content");
+        }
+        insert_test_vector(&conn, "m1", ws, &[0.1, 0.2f32]);
+
+        let unindexed = find_memories_without_vectors(&conn, ws, 10).unwrap();
+        assert_eq!(unindexed.len(), 2);
+        let ids: Vec<&str> = unindexed.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert!(ids.contains(&"m2"));
+        assert!(ids.contains(&"m3"));
+    }
+
+    // ── 7. Different dimensions in same workspace ──────────────────────
+
+    #[test]
+    fn test_different_dimensions_in_same_workspace() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-dims";
+        ensure_workspace(&conn, ws);
+
+        let emb_512: Vec<f32> = (0..512).map(|i| (i as f32) * 0.001).collect();
+        let emb_256: Vec<f32> = (0..256).map(|i| (i as f32) * 0.001).collect();
+
+        insert_test_memory(&conn, "mem-512", ws, "512d", "content");
+        insert_test_vector(&conn, "mem-512", ws, &emb_512);
+
+        insert_test_memory(&conn, "mem-256", ws, "256d", "content");
+        insert_test_vector(&conn, "mem-256", ws, &emb_256);
+
+        // Search with 512-dim query — only 512-dim results (256-dim vectors will have similarity 0 due to dimension mismatch in cosine)
+        let mut query_512 = emb_512.clone();
+        query_512[0] = 10.0; // boost to make similarity clear
+        let hits = search_vectors(&conn, ws, &query_512, 10, 0.5, None).unwrap();
+        // The 512-dim vector should have high similarity, the 256-dim one should not
+        // (cosine_similarity returns 0.0 for different-length vectors)
+        assert!(hits.iter().any(|h| h.memory_id == "mem-512"), "should find 512-dim memory");
+        assert!(!hits.iter().any(|h| h.memory_id == "mem-256"), "should not find 256-dim memory with 512-dim query");
+    }
+
+    // ── 8. Embedding blob roundtrip with realistic 512 floats ──────────
+
+    #[test]
+    fn test_embedding_blob_roundtrip_realistic() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-roundtrip";
+        let mem_id = "mem-roundtrip";
+        ensure_workspace(&conn, ws);
+        insert_test_memory(&conn, mem_id, ws, "Roundtrip", "content");
+
+        let mut emb: Vec<f32> = (0..512).map(|i| {
+            let x = (i as f32) * 0.001 - 0.256;
+            (x * 1000.0).round() / 1000.0 // keep precision manageable
+        }).collect();
+        emb[0] = 0.123;
+        emb[511] = -0.987;
+
+        insert_test_vector(&conn, mem_id, ws, &emb);
+
+        let rec = get_vector_by_memory_id(&conn, mem_id).unwrap().unwrap();
+        assert_eq!(rec.embedding.len(), 512);
+        for (i, (a, b)) in emb.iter().zip(rec.embedding.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-5, "mismatch at index {i}: expected {a}, got {b}");
+        }
+    }
+
+    // ── 9. Multiple vectors ranked by similarity ───────────────────────
+
+    #[test]
+    fn test_multiple_vectors_ranked_by_similarity() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-ranked";
+        ensure_workspace(&conn, ws);
+
+        // 5 orthogonal-ish memories
+        let embs: Vec<(&str, Vec<f32>)> = vec![
+            ("m1", vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+            ("m2", vec![0.0, 1.0, 0.0, 0.0, 0.0]),
+            ("m3", vec![0.0, 0.0, 1.0, 0.0, 0.0]),
+            ("m4", vec![0.0, 0.0, 0.0, 1.0, 0.0]),
+            ("m5", vec![0.0, 0.0, 0.0, 0.0, 1.0]),
+        ];
+        for (mid, emb) in &embs {
+            insert_test_memory(&conn, mid, ws, mid, "content");
+            insert_test_vector(&conn, mid, ws, emb);
+        }
+
+        // Query near m2
+        let query = vec![0.01, 0.99, 0.01, 0.0, 0.0f32];
+        let hits = search_vectors(&conn, ws, &query, 10, 0.0, None).unwrap();
+        assert_eq!(hits[0].memory_id, "m2", "m2 should be top result");
+        // Verify scores are descending
+        for window in hits.windows(2) {
+            assert!(window[0].score >= window[1].score, "results should be sorted by score descending");
+        }
+    }
+
+    // ── 10. Update memory preserves vector ─────────────────────────────
+
+    #[test]
+    fn test_update_memory_preserves_vector() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-preserve";
+        let mem_id = "mem-preserve";
+        ensure_workspace(&conn, ws);
+        insert_test_memory(&conn, mem_id, ws, "Original title", "Original content");
+        let emb = vec![0.42, 0.58f32];
+        insert_test_vector(&conn, mem_id, ws, &emb);
+
+        // Update memory title (direct SQL, simulating workspace memory update)
+        let now = now_ms();
+        conn.execute(
+            "UPDATE workspace_memories SET title = 'Updated title', updated_at = ?1 WHERE id = ?2",
+            params![now, mem_id],
+        ).unwrap();
+
+        // Vector should still be there
+        let rec = get_vector_by_memory_id(&conn, mem_id).unwrap().unwrap();
+        assert!((rec.embedding[0] - 0.42).abs() < 1e-5);
+        assert!((rec.embedding[1] - 0.58).abs() < 1e-5);
+    }
+
+    // ── 11 & 12. find_similar above/below threshold ────────────────────
+
+    #[test]
+    fn test_find_similar_above_threshold() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-fsa";
+        ensure_workspace(&conn, ws);
+        insert_test_memory(&conn, "m-fsa", ws, "similar", "content");
+        insert_test_vector(&conn, "m-fsa", ws, &[1.0, 0.0f32]);
+
+        // Query very close to [1,0]
+        let result = vector_search::find_similar(&conn, ws, &[0.99, 0.01f32], 0.9).unwrap();
+        assert!(result.is_some(), "should find similar above threshold");
+        assert_eq!(result.unwrap(), "m-fsa");
+    }
+
+    #[test]
+    fn test_find_similar_below_threshold() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-fsb";
+        ensure_workspace(&conn, ws);
+        insert_test_memory(&conn, "m-fsb", ws, "not similar", "content");
+        insert_test_vector(&conn, "m-fsb", ws, &[1.0, 0.0f32]);
+
+        // Query orthogonal
+        let result = vector_search::find_similar(&conn, ws, &[0.0, 1.0f32], 0.9).unwrap();
+        assert!(result.is_none(), "should not find similar below threshold");
+    }
+
+    // ── 13. find_memories_without_vectors all indexed ──────────────────
+
+    #[test]
+    fn test_find_memories_without_vectors_all_indexed_with_data() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-allidx";
+        ensure_workspace(&conn, ws);
+
+        // Insert 3 memories and index all 3
+        for mid in ["ma1", "ma2", "ma3"] {
+            insert_test_memory(&conn, mid, ws, mid, "content");
+            insert_test_vector(&conn, mid, ws, &[0.1, 0.2f32]);
+        }
+
+        let unindexed = find_memories_without_vectors(&conn, ws, 10).unwrap();
+        assert!(unindexed.is_empty(), "all memories are indexed, should return empty");
+    }
 }
