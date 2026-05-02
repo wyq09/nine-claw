@@ -5,6 +5,7 @@ use super::{
     sanitize_workspace_file_name, sanitize_workspace_segment, trim_to_char_limit,
     truncate_for_memory, AgentWorkspaceFile, MemoryCategoryDefinition,
 };
+use rusqlite::Connection;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -145,6 +146,11 @@ pub(super) fn build_memory_wiki_snapshot(
         ],
     ) {
         sections.push("涉及人物身份或关系时，优先查 `RELATIONSHIP_MAP.md`。".to_string());
+    }
+
+    // Append vector semantic hints (optional — graceful no-op on any failure)
+    if let Some(hints) = append_vector_semantic_hints(agent_home, &prompt) {
+        sections.push(hints);
     }
 
     Ok(Some(sections.join("\n")))
@@ -471,4 +477,139 @@ fn contains_any(content: &str, needles: &[&str]) -> bool {
 
 fn contains_all(content: &str, needles: &[&str]) -> bool {
     needles.iter().all(|needle| content.contains(needle))
+}
+
+/// Extract agent_id from the agent_home path (`…/agents/<agent_id>`).
+fn agent_id_from_home(agent_home: &Path) -> Option<String> {
+    agent_home
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Look up workspace_id(s) that the given agent belongs to.
+fn find_workspace_ids_for_agent(conn: &Connection, agent_id: &str) -> Vec<String> {
+    let mut stmt = match conn.prepare(
+        "SELECT DISTINCT workspace_id FROM workspace_members WHERE agent_id = ?1",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("vector_memory_hints: prepare workspace lookup failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut rows = match stmt.query(rusqlite::params![agent_id]) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("vector_memory_hints: query workspace lookup failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut ids = Vec::new();
+    while let Ok(Some(row)) = rows.next() {
+        if let Ok(id) = row.get::<_, String>(0) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// Generate semantic search hints using vector similarity.
+///
+/// Returns `None` if anything fails (no registry, no provider, no hits, etc.).
+fn vector_memory_hints(
+    conn: &Connection,
+    workspace_id: &str,
+    prompt: &str,
+) -> Option<String> {
+    let registry = crate::managed_runtime::get_embedding_registry()?;
+
+    let embeddings = tokio::task::block_in_place(|| {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let guard = registry.read().await;
+            if let Some(provider) = guard.default_provider() {
+                provider.embed(vec![prompt.to_string()]).await
+            } else {
+                Err("no default embedding provider".to_string())
+            }
+        })
+    })
+    .ok()?;
+
+    let query_vec = &embeddings.get(0)?;
+    let hits = match crate::memory_vector::search_vectors(
+        conn, workspace_id, query_vec, 3, 0.6, None,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("vector_memory_hints: search_vectors failed: {e}");
+            return None;
+        }
+    };
+
+    if hits.is_empty() {
+        return None;
+    }
+
+    let mut hints = String::from("[语义相关记忆]");
+    for hit in hits {
+        match crate::storage::workspaces::get_workspace_memory(conn, &hit.memory_id) {
+            Ok(Some(mem)) => {
+                let preview: String = mem.content.chars().take(80).collect();
+                let _ = writeln!(
+                    hints,
+                    "- {} (相似度: {:.0}%): {}",
+                    mem.title,
+                    hit.score * 100.0,
+                    preview
+                );
+            }
+            Ok(None) => {
+                log::warn!(
+                    "vector_memory_hints: memory_id {} not found, skipping",
+                    hit.memory_id
+                );
+            }
+            Err(e) => {
+                log::warn!("vector_memory_hints: get memory failed for {}: {e}", hit.memory_id);
+            }
+        }
+    }
+    Some(hints)
+}
+
+/// Append vector semantic hints for the given agent_home and prompt.
+/// Completely optional — returns `None` on any failure, existing keyword matching still works.
+fn append_vector_semantic_hints(agent_home: &Path, prompt: &str) -> Option<String> {
+    if prompt.is_empty() {
+        return None;
+    }
+
+    let agent_id = agent_id_from_home(agent_home)?;
+
+    // Obtain a DB connection via the global APP_HANDLE
+    let app_handle = crate::managed_runtime::injected_app_handle()?;
+    let conn = match crate::storage_conn(&app_handle) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("vector_memory_hints: storage_conn failed: {e}");
+            return None;
+        }
+    };
+
+    // Find workspace(s) this agent belongs to
+    let workspace_ids = find_workspace_ids_for_agent(&conn, &agent_id);
+    if workspace_ids.is_empty() {
+        return None;
+    }
+
+    // Try each workspace until we get hints
+    for ws_id in &workspace_ids {
+        if let Some(hints) = vector_memory_hints(&conn, ws_id, prompt) {
+            return Some(hints);
+        }
+    }
+    None
 }
