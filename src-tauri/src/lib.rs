@@ -19,6 +19,7 @@ mod managed_runtime;
 mod managed_runtime_extension;
 mod media_directives;
 mod memory_gate;
+mod memory_vector;
 mod peer_gateway;
 mod pi_runtime;
 mod pi_timeouts;

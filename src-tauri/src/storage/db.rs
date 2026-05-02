@@ -33,6 +33,7 @@ pub fn ensure_all_schemas(conn: &Connection) -> Result<(), String> {
     // New structured tables.
     super::chat_history::ensure_schema(conn)?;
     super::workspaces::ensure_schema(conn)?;
+    crate::memory_vector::migration::ensure_schema(conn)?;
     Ok(())
 }
 
