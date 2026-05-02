@@ -1,4 +1,5 @@
 pub mod onnx_local;
+pub mod remote_api;
 
 use std::collections::HashMap;
 use std::sync::Arc;
