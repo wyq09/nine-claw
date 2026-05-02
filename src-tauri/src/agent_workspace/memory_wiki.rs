@@ -525,17 +525,31 @@ fn vector_memory_hints(
 ) -> Option<String> {
     let registry = crate::managed_runtime::get_embedding_registry()?;
 
-    let embeddings = tokio::task::block_in_place(|| {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+    let embeddings = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(async {
             let guard = registry.read().await;
             if let Some(provider) = guard.default_provider() {
                 provider.embed(vec![prompt.to_string()]).await
             } else {
                 Err("no default embedding provider".to_string())
             }
-        })
-    })
+        }),
+        Err(_) => {
+            // No Tokio runtime available (e.g. called from spawn_blocking)
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            rt.block_on(async {
+                let guard = registry.read().await;
+                if let Some(provider) = guard.default_provider() {
+                    provider.embed(vec![prompt.to_string()]).await
+                } else {
+                    Err("no default embedding provider".to_string())
+                }
+            })
+        }
+    }
     .ok()?;
 
     let query_vec = &embeddings.get(0)?;

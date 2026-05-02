@@ -14,6 +14,24 @@ use std::collections::HashSet;
 use tauri::AppHandle;
 use uuid::Uuid;
 
+/// Run an async future from a synchronous context that may or may not have a Tokio runtime.
+/// Uses the current runtime if available, otherwise creates a temporary single-threaded runtime.
+fn run_async<F, T>(future: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = T>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => Ok(handle.block_on(future)),
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("创建 Tokio runtime 失败: {e}"))?;
+            Ok(rt.block_on(future))
+        }
+    }
+}
+
 const MEMORY_EXTRACTION_LLM_CHUNK: usize = 512;
 const MAX_RECENT_TURNS: usize = 6;
 const MAX_RECENT_MEMORIES: i64 = 12;
@@ -507,8 +525,7 @@ fn run_workspace_memory_extraction(
         let candidate_text = format!("{}\n{}", memory.title, memory.content);
         let mut vector_dedup_skip = false;
         if let Some(registry) = get_embedding_registry() {
-            let rt = tokio::runtime::Handle::current();
-            if let Ok(similar_result) = rt.block_on(async {
+            if let Ok(Ok(similar_result)) = run_async(async {
                 let provider = {
                     let guard = registry.read().await;
                     guard.default_provider()
@@ -566,8 +583,7 @@ fn run_workspace_memory_extraction(
             let index_text = format!("{}\n{}", record.title, record.content);
             let memory_id = record.id.clone();
             let workspace_id = request.workspace_id.clone();
-            let rt = tokio::runtime::Handle::current();
-            let _ = rt.block_on(async {
+            let _ = run_async(async {
                 let provider = {
                     let guard = registry.read().await;
                     guard.default_provider()
