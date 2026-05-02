@@ -1,3 +1,5 @@
+pub mod onnx_local;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
