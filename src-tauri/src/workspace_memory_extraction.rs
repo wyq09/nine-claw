@@ -694,6 +694,8 @@ mod tests {
             content: content.to_string(),
             author_agent_id: None,
             tags_json: "[]".to_string(),
+            scope: "workspace".to_string(),
+            scope_agent_id: None,
             created_at: 0,
             updated_at: 0,
         }

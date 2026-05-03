@@ -490,9 +490,9 @@ fn agent_id_from_home(agent_home: &Path) -> Option<String> {
 
 /// Look up workspace_id(s) that the given agent belongs to.
 fn find_workspace_ids_for_agent(conn: &Connection, agent_id: &str) -> Vec<String> {
-    let mut stmt = match conn.prepare(
-        "SELECT DISTINCT workspace_id FROM workspace_members WHERE agent_id = ?1",
-    ) {
+    let mut stmt = match conn
+        .prepare("SELECT DISTINCT workspace_id FROM workspace_members WHERE agent_id = ?1")
+    {
         Ok(s) => s,
         Err(e) => {
             log::warn!("vector_memory_hints: prepare workspace lookup failed: {e}");
@@ -518,11 +518,7 @@ fn find_workspace_ids_for_agent(conn: &Connection, agent_id: &str) -> Vec<String
 /// Generate semantic search hints using vector similarity.
 ///
 /// Returns `None` if anything fails (no registry, no provider, no hits, etc.).
-fn vector_memory_hints(
-    conn: &Connection,
-    workspace_id: &str,
-    prompt: &str,
-) -> Option<String> {
+fn vector_memory_hints(conn: &Connection, workspace_id: &str, prompt: &str) -> Option<String> {
     let registry = crate::managed_runtime::get_embedding_registry()?;
 
     let embeddings = match tokio::runtime::Handle::try_current() {
@@ -553,15 +549,14 @@ fn vector_memory_hints(
     .ok()?;
 
     let query_vec = &embeddings.get(0)?;
-    let hits = match crate::memory_vector::search_vectors(
-        conn, workspace_id, query_vec, 3, 0.6, None,
-    ) {
-        Ok(h) => h,
-        Err(e) => {
-            log::warn!("vector_memory_hints: search_vectors failed: {e}");
-            return None;
-        }
-    };
+    let hits =
+        match crate::memory_vector::search_vectors(conn, workspace_id, query_vec, 3, 0.6, None, None, None) {
+            Ok(h) => h,
+            Err(e) => {
+                log::warn!("vector_memory_hints: search_vectors failed: {e}");
+                return None;
+            }
+        };
 
     if hits.is_empty() {
         return None;
@@ -587,7 +582,10 @@ fn vector_memory_hints(
                 );
             }
             Err(e) => {
-                log::warn!("vector_memory_hints: get memory failed for {}: {e}", hit.memory_id);
+                log::warn!(
+                    "vector_memory_hints: get memory failed for {}: {e}",
+                    hit.memory_id
+                );
             }
         }
     }

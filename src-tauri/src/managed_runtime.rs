@@ -1990,6 +1990,8 @@ async fn memory_search_handler(
                 body.limit,
                 threshold,
                 tag_filter.as_deref(),
+                None,
+                None,
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 

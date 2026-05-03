@@ -61,6 +61,10 @@ pub struct SearchHit {
 /// 在指定工作空间内暴力余弦搜索。
 ///
 /// - `tag_filter`: 若提供，则只返回 workspace_memories.tags_json 包含全部指定 tag 的记录。
+/// - `scope_filter`: 若提供，则只返回 scope 在指定列表中的记录（如 `["system", "workspace"]`）。
+///   若为 None，则搜索所有 scope（向后兼容）。
+/// - `scope_agent_id`: 若提供，则 agent scope 的记忆只返回属于该 agent 的记录。
+///   同时也始终包含非 agent scope（system/workspace）的记忆。
 pub fn cosine_search(
     conn: &Connection,
     workspace_id: &str,
@@ -68,24 +72,52 @@ pub fn cosine_search(
     limit: usize,
     threshold: f32,
     tag_filter: Option<&[String]>,
+    scope_filter: Option<&[String]>,
+    scope_agent_id: Option<&str>,
 ) -> Result<Vec<SearchHit>, String> {
-    let sql = if tag_filter.is_some() {
+    // Always JOIN with workspace_memories for scope filtering
+    let mut sql = String::from(
         "SELECT mv.memory_id, mv.embedding, mv.embedding_model, mv.dimension, mv.updated_at
          FROM memory_vectors mv
          JOIN workspace_memories wm ON wm.id = mv.memory_id
-         WHERE mv.workspace_id = ?1"
-    } else {
-        "SELECT mv.memory_id, mv.embedding, mv.embedding_model, mv.dimension, mv.updated_at
-         FROM memory_vectors mv
-         WHERE mv.workspace_id = ?1"
-    };
+         WHERE (mv.workspace_id = ?1 OR wm.scope = 'system')",
+    );
+
+    // Scope filter: restrict to specified scopes
+    if let Some(scopes) = scope_filter {
+        if !scopes.is_empty() {
+            let placeholders: Vec<&str> = scopes.iter().map(|_| "?").collect();
+            sql.push_str(&format!(
+                " AND wm.scope IN ({})",
+                placeholders.join(",")
+            ));
+        }
+    }
+
+    // Agent scope filter: agent-scoped memories only visible to their owner (or supervisor if scope_agent_id is None)
+    if let Some(agent_id) = scope_agent_id {
+        sql.push_str(&format!(
+            " AND (wm.scope != 'agent' OR wm.scope_agent_id = '{}')",
+            agent_id.replace('\'', "''")
+        ));
+    }
+
+    // Build params: workspace_id first, then scope filter values
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(workspace_id.to_string())];
+    if let Some(scopes) = scope_filter {
+        for s in scopes {
+            param_values.push(Box::new(s.clone()));
+        }
+    }
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn
-        .prepare(sql)
+        .prepare(&sql)
         .map_err(|e| format!("准备向量搜索失败: {e}"))?;
 
     let rows: Vec<(String, Vec<u8>, String, i32, i64)> = stmt
-        .query_map(params![workspace_id], |row| {
+        .query_map(param_refs.as_slice(), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -111,8 +143,8 @@ pub fn cosine_search(
                 )
                 .unwrap_or_else(|_| "[]".to_string());
 
-            let memory_tags: Vec<String> = serde_json::from_str(&tags_json)
-                .unwrap_or_else(|_| Vec::new());
+            let memory_tags: Vec<String> =
+                serde_json::from_str(&tags_json).unwrap_or_else(|_| Vec::new());
             let all_match = tags.iter().all(|t| memory_tags.contains(t));
             if !all_match {
                 continue;
@@ -132,7 +164,11 @@ pub fn cosine_search(
         }
     }
 
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.truncate(limit);
     Ok(hits)
 }
@@ -144,7 +180,7 @@ pub fn find_similar(
     embedding: &[f32],
     threshold: f32,
 ) -> Result<Option<String>, String> {
-    let hits = cosine_search(conn, workspace_id, embedding, 1, threshold, None)?;
+    let hits = cosine_search(conn, workspace_id, embedding, 1, threshold, None, None, None)?;
     Ok(hits.into_iter().next().map(|h| h.memory_id))
 }
 
@@ -168,7 +204,10 @@ mod tests {
     fn test_cosine_similarity_identical() {
         let v = vec![1.0, 2.0, 3.0];
         let sim = cosine_similarity(&v, &v);
-        assert!(float_eq(sim, 1.0), "identical vectors should have similarity 1.0, got {sim}");
+        assert!(
+            float_eq(sim, 1.0),
+            "identical vectors should have similarity 1.0, got {sim}"
+        );
     }
 
     #[test]
@@ -176,7 +215,10 @@ mod tests {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![0.0, 1.0, 0.0];
         let sim = cosine_similarity(&a, &b);
-        assert!(float_eq(sim, 0.0), "orthogonal vectors should have similarity 0.0, got {sim}");
+        assert!(
+            float_eq(sim, 0.0),
+            "orthogonal vectors should have similarity 0.0, got {sim}"
+        );
     }
 
     #[test]
@@ -184,7 +226,10 @@ mod tests {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![-1.0, 0.0, 0.0];
         let sim = cosine_similarity(&a, &b);
-        assert!(float_eq(sim, -1.0), "opposite vectors should have similarity -1.0, got {sim}");
+        assert!(
+            float_eq(sim, -1.0),
+            "opposite vectors should have similarity -1.0, got {sim}"
+        );
     }
 
     #[test]
@@ -192,7 +237,10 @@ mod tests {
         let a = vec![0.0, 0.0, 0.0];
         let b = vec![1.0, 2.0, 3.0];
         let sim = cosine_similarity(&a, &b);
-        assert!(float_eq(sim, 0.0), "zero vector should yield 0.0, got {sim}");
+        assert!(
+            float_eq(sim, 0.0),
+            "zero vector should yield 0.0, got {sim}"
+        );
     }
 
     #[test]

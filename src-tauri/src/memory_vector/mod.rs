@@ -135,8 +135,88 @@ pub fn search_vectors(
     limit: usize,
     threshold: f32,
     tag_filter: Option<&[String]>,
+    scope_filter: Option<&[String]>,
+    scope_agent_id: Option<&str>,
 ) -> Result<Vec<vector_search::SearchHit>, String> {
-    vector_search::cosine_search(conn, workspace_id, query_embedding, limit, threshold, tag_filter)
+    vector_search::cosine_search(
+        conn,
+        workspace_id,
+        query_embedding,
+        limit,
+        threshold,
+        tag_filter,
+        scope_filter,
+        scope_agent_id,
+    )
+}
+
+/// Three-layer memory search: merges results from system, workspace, and agent scopes.
+///
+/// For agent A in workspace W:
+/// - System: scope='system' (all workspaces)
+/// - Workspace: scope='workspace', workspace_id=W
+/// - Agent: scope='agent', workspace_id=W, scope_agent_id=A (or all agents if is_supervisor)
+pub fn three_layer_search(
+    conn: &Connection,
+    workspace_id: &str,
+    agent_id: Option<&str>,
+    is_supervisor: bool,
+    query_embedding: &[f32],
+    limit: usize,
+    threshold: f32,
+) -> Result<Vec<vector_search::SearchHit>, String> {
+    // Build scope list
+    let mut scopes = vec!["system".to_string(), "workspace".to_string()];
+    let effective_agent_id: Option<&str>;
+
+    if is_supervisor {
+        // Supervisor sees all scopes including agent memories
+        scopes.push("agent".to_string());
+        effective_agent_id = None; // no agent filter — sees all agent memories
+    } else if let Some(aid) = agent_id {
+        scopes.push("agent".to_string());
+        effective_agent_id = Some(aid);
+    } else {
+        // No agent context — only system + workspace
+        effective_agent_id = None;
+    }
+
+    let hits = vector_search::cosine_search(
+        conn,
+        workspace_id,
+        query_embedding,
+        limit * 3, // fetch extra for dedup headroom
+        threshold,
+        None,
+        Some(&scopes),
+        effective_agent_id,
+    )?;
+
+    // Deduplicate by memory_id, keep highest score
+    let mut best: std::collections::HashMap<String, vector_search::SearchHit> =
+        std::collections::HashMap::new();
+    for hit in hits {
+        use std::collections::hash_map::Entry;
+        match best.entry(hit.memory_id.clone()) {
+            Entry::Vacant(e) => {
+                e.insert(hit);
+            }
+            Entry::Occupied(mut e) => {
+                if hit.score > e.get().score {
+                    e.insert(hit);
+                }
+            }
+        }
+    }
+
+    let mut results: Vec<vector_search::SearchHit> = best.into_values().collect();
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(limit);
+    Ok(results)
 }
 
 /// 查找还没有向量索引的记忆，返回 (id, title, content) 元组。
@@ -312,7 +392,12 @@ mod tests {
     }
 
     /// Helper: insert a vector for the given memory.
-    fn insert_test_vector(conn: &Connection, memory_id: &str, workspace_id: &str, embedding: &[f32]) {
+    fn insert_test_vector(
+        conn: &Connection,
+        memory_id: &str,
+        workspace_id: &str,
+        embedding: &[f32],
+    ) {
         let id = uuid::Uuid::new_v4().to_string();
         upsert_vector(conn, &id, memory_id, workspace_id, embedding, "test-model").unwrap();
     }
@@ -367,7 +452,7 @@ mod tests {
 
         // Query near m1
         let query = vec![0.99, 0.01, 0.0f32];
-        let hits = search_vectors(&conn, ws, &query, 10, 0.0, None).unwrap();
+        let hits = search_vectors(&conn, ws, &query, 10, 0.0, None, None, None).unwrap();
         assert!(!hits.is_empty(), "should have results");
         assert_eq!(hits[0].memory_id, "m1", "m1 should be top result");
     }
@@ -384,8 +469,11 @@ mod tests {
         insert_test_vector(&conn, "m-orth", ws, &[1.0, 0.0f32]);
 
         // Query orthogonal [0,1] vs stored [1,0] -> similarity = 0
-        let hits = search_vectors(&conn, ws, &[0.0, 1.0f32], 10, 0.5, None).unwrap();
-        assert!(hits.is_empty(), "orthogonal vectors should not meet threshold 0.5");
+        let hits = search_vectors(&conn, ws, &[0.0, 1.0f32], 10, 0.5, None, None, None).unwrap();
+        assert!(
+            hits.is_empty(),
+            "orthogonal vectors should not meet threshold 0.5"
+        );
     }
 
     // ── 4. Search is workspace-scoped ─────────────────────────────────
@@ -405,7 +493,7 @@ mod tests {
         insert_test_vector(&conn, "mem-b", ws2, &[1.0, 0.0f32]);
 
         // Search ws1 — should only get mem-a
-        let hits = search_vectors(&conn, ws1, &[1.0, 0.0f32], 10, 0.0, None).unwrap();
+        let hits = search_vectors(&conn, ws1, &[1.0, 0.0f32], 10, 0.0, None, None, None).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].memory_id, "mem-a");
     }
@@ -415,7 +503,7 @@ mod tests {
     #[test]
     fn test_search_empty_workspace() {
         let conn = open_in_memory().unwrap();
-        let hits = search_vectors(&conn, "ws-nonexistent", &[1.0, 0.0f32], 10, 0.0, None).unwrap();
+        let hits = search_vectors(&conn, "ws-nonexistent", &[1.0, 0.0f32], 10, 0.0, None, None, None).unwrap();
         assert!(hits.is_empty());
     }
 
@@ -460,11 +548,17 @@ mod tests {
         // Search with 512-dim query — only 512-dim results (256-dim vectors will have similarity 0 due to dimension mismatch in cosine)
         let mut query_512 = emb_512.clone();
         query_512[0] = 10.0; // boost to make similarity clear
-        let hits = search_vectors(&conn, ws, &query_512, 10, 0.5, None).unwrap();
+        let hits = search_vectors(&conn, ws, &query_512, 10, 0.5, None, None, None).unwrap();
         // The 512-dim vector should have high similarity, the 256-dim one should not
         // (cosine_similarity returns 0.0 for different-length vectors)
-        assert!(hits.iter().any(|h| h.memory_id == "mem-512"), "should find 512-dim memory");
-        assert!(!hits.iter().any(|h| h.memory_id == "mem-256"), "should not find 256-dim memory with 512-dim query");
+        assert!(
+            hits.iter().any(|h| h.memory_id == "mem-512"),
+            "should find 512-dim memory"
+        );
+        assert!(
+            !hits.iter().any(|h| h.memory_id == "mem-256"),
+            "should not find 256-dim memory with 512-dim query"
+        );
     }
 
     // ── 8. Embedding blob roundtrip with realistic 512 floats ──────────
@@ -477,10 +571,12 @@ mod tests {
         ensure_workspace(&conn, ws);
         insert_test_memory(&conn, mem_id, ws, "Roundtrip", "content");
 
-        let mut emb: Vec<f32> = (0..512).map(|i| {
-            let x = (i as f32) * 0.001 - 0.256;
-            (x * 1000.0).round() / 1000.0 // keep precision manageable
-        }).collect();
+        let mut emb: Vec<f32> = (0..512)
+            .map(|i| {
+                let x = (i as f32) * 0.001 - 0.256;
+                (x * 1000.0).round() / 1000.0 // keep precision manageable
+            })
+            .collect();
         emb[0] = 0.123;
         emb[511] = -0.987;
 
@@ -489,7 +585,10 @@ mod tests {
         let rec = get_vector_by_memory_id(&conn, mem_id).unwrap().unwrap();
         assert_eq!(rec.embedding.len(), 512);
         for (i, (a, b)) in emb.iter().zip(rec.embedding.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-5, "mismatch at index {i}: expected {a}, got {b}");
+            assert!(
+                (a - b).abs() < 1e-5,
+                "mismatch at index {i}: expected {a}, got {b}"
+            );
         }
     }
 
@@ -516,11 +615,14 @@ mod tests {
 
         // Query near m2
         let query = vec![0.01, 0.99, 0.01, 0.0, 0.0f32];
-        let hits = search_vectors(&conn, ws, &query, 10, 0.0, None).unwrap();
+        let hits = search_vectors(&conn, ws, &query, 10, 0.0, None, None, None).unwrap();
         assert_eq!(hits[0].memory_id, "m2", "m2 should be top result");
         // Verify scores are descending
         for window in hits.windows(2) {
-            assert!(window[0].score >= window[1].score, "results should be sorted by score descending");
+            assert!(
+                window[0].score >= window[1].score,
+                "results should be sorted by score descending"
+            );
         }
     }
 
@@ -541,7 +643,8 @@ mod tests {
         conn.execute(
             "UPDATE workspace_memories SET title = 'Updated title', updated_at = ?1 WHERE id = ?2",
             params![now, mem_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Vector should still be there
         let rec = get_vector_by_memory_id(&conn, mem_id).unwrap().unwrap();
@@ -593,6 +696,9 @@ mod tests {
         }
 
         let unindexed = find_memories_without_vectors(&conn, ws, 10).unwrap();
-        assert!(unindexed.is_empty(), "all memories are indexed, should return empty");
+        assert!(
+            unindexed.is_empty(),
+            "all memories are indexed, should return empty"
+        );
     }
 }
