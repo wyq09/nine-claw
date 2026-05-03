@@ -18,12 +18,14 @@ use uuid::Uuid;
 mod delegate_markers;
 mod supervisor_prompt;
 
-pub use delegate_markers::{
-    expand_delegate_markers_in_text, expand_delegate_plan_markers_in_text,
-};
+pub use delegate_markers::{expand_delegate_markers_in_text, expand_delegate_plan_markers_in_text};
 pub use supervisor_prompt::{
     default_supervisor_orchestration_markdown, workspace_default_supervisor_orchestration_prompt,
 };
+
+fn dynamic_team_members_source_of_truth_note() -> &'static str {
+    "如果其他系统提示词、历史摘要或手写规则里出现了团队成员名单，只把它当旧注释；一旦与当前会话里动态注入的 ## 成员 / ## 当前可调用子智能体 不一致，必须以后者为唯一真源。"
+}
 
 pub fn resolve_workspace_artifacts_root(
     app: &AppHandle,
@@ -145,9 +147,11 @@ pub fn list_team_member_views(
     Ok(out)
 }
 
-fn delegate_run_registry() -> &'static Mutex<HashMap<String, Arc<crate::channels::pi_bridge::PiRunHandle>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<crate::channels::pi_bridge::PiRunHandle>>>> =
-        OnceLock::new();
+fn delegate_run_registry(
+) -> &'static Mutex<HashMap<String, Arc<crate::channels::pi_bridge::PiRunHandle>>> {
+    static REGISTRY: OnceLock<
+        Mutex<HashMap<String, Arc<crate::channels::pi_bridge::PiRunHandle>>>,
+    > = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -278,7 +282,7 @@ pub fn build_workspace_preface(
         return Err("工作空间不存在".to_string());
     };
     let members = list_team_member_views(app, workspace_id)?;
-    let memories = workspaces::list_workspace_memories(&conn, workspace_id, 12)?;
+    let memories = workspaces::list_workspace_memories(&conn, workspace_id, 12, None)?;
     let resources = workspaces::list_workspace_resources(&conn, workspace_id)?;
 
     let mut s = String::from("\n# NineClaw 团队工作空间上下文\n\n");
@@ -296,6 +300,10 @@ pub fn build_workspace_preface(
     s.push_str("- 本次会话被限制在下方 ## 成员 列出的智能体之内。\n");
     s.push_str("- 不得引用、介绍、列举或召唤任何未在 ## 成员 中的智能体；即便工作区根目录文件（如 `AGENT_REGISTRY.md`）中提到其它智能体，那是跨团队的全局索引，与本团队无关，必须忽略。\n");
     s.push_str("- 委派/协议 A/B 的 `assignee` / `targetAgentId` 必须是 ## 成员 中的 `agentId`；否则拒绝本次委派并向用户说明。\n\n");
+    s.push_str(&format!(
+        "- {}。\n\n",
+        dynamic_team_members_source_of_truth_note()
+    ));
 
     s.push_str("## 成员\n");
     for m in &members {
@@ -867,6 +875,8 @@ pub fn write_team_memory_entry(
     content: String,
     author_agent_id: Option<String>,
     tags: Vec<String>,
+    scope: &str,
+    scope_agent_id: Option<&str>,
 ) -> Result<WorkspaceMemoryRecord, String> {
     let conn = crate::storage_conn(app)?;
     let id = Uuid::new_v4().to_string();
@@ -879,6 +889,8 @@ pub fn write_team_memory_entry(
         &content,
         author_agent_id.as_deref(),
         &tags_json,
+        scope,
+        scope_agent_id,
     )?;
     let _ = workspace_fs::write_memory_entry_md(workspace_id, &id, &title, &content)?;
     let _ = workspace_fs::ensure_team_layout(workspace_id)?;
@@ -906,4 +918,17 @@ pub fn delete_team_resource(
     workspace_fs::remove_team_resource_file(workspace_id, &rel)?;
     workspaces::delete_workspace_resource_row(&conn, workspace_id, resource_id)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dynamic_team_members_source_of_truth_note;
+
+    #[test]
+    fn team_member_truth_note_points_to_dynamic_sections() {
+        let note = dynamic_team_members_source_of_truth_note();
+        assert!(note.contains("## 成员"));
+        assert!(note.contains("## 当前可调用子智能体"));
+        assert!(note.contains("唯一真源"));
+    }
 }

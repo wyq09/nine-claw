@@ -463,7 +463,7 @@ pub(crate) fn workspace_list_memories(
     limit: Option<i64>,
 ) -> Result<Vec<storage::workspaces::WorkspaceMemoryRecord>, String> {
     let conn = storage_conn(&app)?;
-    storage::workspaces::list_workspace_memories(&conn, workspace_id.trim(), limit.unwrap_or(50))
+    storage::workspaces::list_workspace_memories(&conn, workspace_id.trim(), limit.unwrap_or(50), None)
 }
 
 #[tauri::command]
@@ -482,6 +482,8 @@ pub(crate) fn workspace_write_memory(
         content,
         author_agent_id,
         tags.unwrap_or_default(),
+        "workspace",
+        None,
     )
 }
 
@@ -556,6 +558,8 @@ pub(crate) async fn workspace_augment_delegate(
         note,
         None,
         vec!["delegate-note".to_string()],
+        "workspace",
+        None,
     );
     Ok(())
 }

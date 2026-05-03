@@ -11,6 +11,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCod
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use md5::{Digest, Md5};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -1089,6 +1090,11 @@ fn credential_proxy_server() -> Result<&'static CredentialProxyServer, String> {
         .route("/memory/:token/search", post(memory_search_handler))
         .route("/memory/:token/read", post(memory_read_handler))
         .route("/memory/:token/delete", post(memory_delete_handler))
+        .route("/memory/:token/store", post(memory_store_handler))
+        .route("/memory/:token/get", post(memory_get_handler))
+        .route("/memory/:token/forget", post(memory_forget_handler))
+        .route("/memory/:token/list", post(memory_list_handler))
+        .route("/chat/:token/search", post(chat_search_handler))
         .with_state(state.clone());
     tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::from_std(listener) {
@@ -1605,7 +1611,10 @@ async fn ask_user_proxy_handler(
     )
     .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
-    let timeout_ms = body.timeout_ms.unwrap_or(10 * 60 * 1000).clamp(1_000, 60 * 60 * 1000);
+    let timeout_ms = body
+        .timeout_ms
+        .unwrap_or(10 * 60 * 1000)
+        .clamp(1_000, 60 * 60 * 1000);
     let result = crate::widget_runtime::create_pending_widget_request(
         &app_handle,
         &session_id,
@@ -1622,7 +1631,66 @@ async fn ask_user_proxy_handler(
 // memory proxy handlers — memory tool endpoints
 // ---------------------------------------------------------------------------
 
-/// Resolve workspace_id for memory operations: prefer body value, fall back to session config.
+const AGENT_MEMORY_WORKSPACE_PREFIX: &str = "__agent_memory__:";
+
+fn build_agent_memory_workspace_id(agent_id: &str) -> String {
+    format!("{AGENT_MEMORY_WORKSPACE_PREFIX}{agent_id}")
+}
+
+fn kv_memory_vector_id(key: &str) -> String {
+    format!("kv::{key}")
+}
+
+fn extract_kv_key_from_vector_id(memory_id: &str) -> Option<&str> {
+    memory_id.strip_prefix("kv::")
+}
+
+fn ensure_memory_workspace_namespace(
+    conn: &Connection,
+    workspace_id: &str,
+    fallback_agent_id: Option<&str>,
+) -> Result<(), String> {
+    if !workspace_id.starts_with(AGENT_MEMORY_WORKSPACE_PREFIX) {
+        return Ok(());
+    }
+    if crate::storage::workspaces::get_workspace(conn, workspace_id)?.is_some() {
+        return Ok(());
+    }
+    let agent_id = fallback_agent_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("memory-agent");
+    crate::storage::workspaces::create_workspace(
+        conn,
+        &crate::storage::workspaces::CreateWorkspaceInput {
+            id: workspace_id.to_string(),
+            name: format!("Agent Memory {agent_id}"),
+            description: "Implicit agent-private memory namespace".to_string(),
+            supervisor_agent_id: agent_id.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+fn resolve_proxy_session(
+    state: &CredentialProxyState,
+    token: &str,
+) -> Result<ProxySessionConfig, (StatusCode, String)> {
+    let guard = state.sessions.lock().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session lock poisoned".to_string(),
+        )
+    })?;
+    guard.get(token).cloned().ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "unknown credential proxy session".to_string(),
+        )
+    })
+}
+
+/// Resolve workspace_id for memory operations: prefer body value, then session workspace,
+/// then fall back to an agent-private namespace so non-team agents can still use memory tools.
 fn resolve_memory_workspace(
     state: &CredentialProxyState,
     token: &str,
@@ -1633,48 +1701,159 @@ fn resolve_memory_workspace(
             return Ok(ws.to_string());
         }
     }
-    let guard = state.sessions.lock().map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "session lock poisoned".to_string(),
-        )
-    })?;
-    guard
-        .get(token)
-        .and_then(|cfg| cfg.workspace_id.clone())
-        .filter(|ws| !ws.trim().is_empty())
+    let session = resolve_proxy_session(state, token)?;
+    if let Some(workspace_id) = session.workspace_id.filter(|ws| !ws.trim().is_empty()) {
+        return Ok(workspace_id);
+    }
+    if let Some(agent_id) = session.caller_agent_id.filter(|id| !id.trim().is_empty()) {
+        return Ok(build_agent_memory_workspace_id(&agent_id));
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        "workspace_id is required for memory operations".to_string(),
+    ))
+}
+
+fn resolve_current_agent_id(
+    state: &CredentialProxyState,
+    token: &str,
+) -> Result<String, (StatusCode, String)> {
+    resolve_proxy_session(state, token)?
+        .caller_agent_id
+        .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
-                "workspace_id is required for memory operations".to_string(),
+                "current agent id is unavailable for memory file operations".to_string(),
             )
         })
+}
+
+fn memory_markdown_relative_path(agent_id: &str) -> String {
+    format!("agents/{agent_id}/MEMORY.md")
+}
+
+fn build_text_value_for_memory(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| String::new()),
+    }
+}
+
+fn build_chat_search_excerpt(prompt: &str, answer: &str, query: &str) -> String {
+    let query_lower = query.trim().to_lowercase();
+    let base = if prompt.to_lowercase().contains(&query_lower) {
+        prompt
+    } else if answer.to_lowercase().contains(&query_lower) {
+        answer
+    } else {
+        prompt
+    };
+    let compact = base.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= 160 {
+        return compact;
+    }
+    compact.chars().take(160).collect()
+}
+
+fn normalize_search_keyword(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+fn matches_search_keyword(haystack: &str, keyword: &str) -> bool {
+    if keyword.is_empty() {
+        return false;
+    }
+    haystack.to_lowercase().contains(keyword)
+}
+
+fn memory_search_keyword_fallback(
+    conn: &Connection,
+    workspace_id: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<Value>, String> {
+    let keyword = normalize_search_keyword(query);
+    let mut results = Vec::new();
+
+    for record in
+        crate::storage::workspaces::list_workspace_memories(conn, workspace_id, limit as i64, None)?
+    {
+        let tags = serde_json::from_str::<Vec<String>>(&record.tags_json).unwrap_or_default();
+        if matches_search_keyword(&record.title, &keyword)
+            || matches_search_keyword(&record.content, &keyword)
+            || tags.iter().any(|tag| matches_search_keyword(tag, &keyword))
+        {
+            results.push(json!({
+                "memoryType": "workspace_memory",
+                "searchMode": "keyword_fallback",
+                "memoryId": record.id,
+                "title": record.title,
+                "content": record.content,
+                "tags": tags,
+                "score": Value::Null,
+                "updatedAt": record.updated_at,
+            }));
+            if results.len() >= limit {
+                return Ok(results);
+            }
+        }
+    }
+
+    for record in
+        crate::storage::workspaces::list_workspace_kv_memories(conn, workspace_id, limit as i64)?
+    {
+        if matches_search_keyword(&record.memory_key, &keyword)
+            || matches_search_keyword(&record.text_value, &keyword)
+            || matches_search_keyword(&record.value_json, &keyword)
+        {
+            let value = serde_json::from_str::<Value>(&record.value_json)
+                .unwrap_or_else(|_| Value::String(record.value_json.clone()));
+            results.push(json!({
+                "memoryType": "kv",
+                "searchMode": "keyword_fallback",
+                "memoryId": kv_memory_vector_id(&record.memory_key),
+                "key": record.memory_key,
+                "value": value,
+                "score": Value::Null,
+                "updatedAt": record.updated_at,
+            }));
+            if results.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 /// Global embedding registry for memory tool handlers. Initialized at startup.
 static EMBEDDING_REGISTRY: OnceLock<Arc<tokio::sync::RwLock<crate::embedding::ProviderRegistry>>> =
     OnceLock::new();
 
-pub fn inject_embedding_registry(registry: Arc<tokio::sync::RwLock<crate::embedding::ProviderRegistry>>) {
+pub fn inject_embedding_registry(
+    registry: Arc<tokio::sync::RwLock<crate::embedding::ProviderRegistry>>,
+) {
     let _ = EMBEDDING_REGISTRY.set(registry);
 }
 
 /// Returns a reference-counted handle to the global embedding registry, if initialized.
-pub fn get_embedding_registry() -> Option<Arc<tokio::sync::RwLock<crate::embedding::ProviderRegistry>>> {
+pub fn get_embedding_registry(
+) -> Option<Arc<tokio::sync::RwLock<crate::embedding::ProviderRegistry>>> {
     EMBEDDING_REGISTRY.get().cloned()
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct MemoryUpdateRequest {
-    title: String,
     content: String,
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    memory_id: Option<String>,
-    #[serde(default)]
-    workspace_id: Option<String>,
+    #[serde(default = "default_memory_update_mode")]
+    mode: String,
+}
+
+fn default_memory_update_mode() -> String {
+    "replace".to_string()
 }
 
 async fn memory_update_handler(
@@ -1682,99 +1861,54 @@ async fn memory_update_handler(
     AxumPath(token): AxumPath<String>,
     Json(body): Json<MemoryUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "AppHandle 尚未注入".to_string(),
-        )
-    })?;
-
-    // Resolve workspace_id from session if not provided in body
-    let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
-
-    if workspace_id.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "workspace_id is required for memory operations".to_string(),
-        ));
-    }
-
-    let conn = crate::storage_conn(&app_handle)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    let tags_json = serde_json::to_string(&body.tags)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("序列化 tags 失败: {e}")))?;
-
-    let memory_id = body.memory_id.unwrap_or_else(|| {
-        format!("mem_{}", Uuid::new_v4().simple())
-    });
-
-    let record = if let Ok(existing) = crate::storage::workspaces::update_workspace_memory(
-        &conn,
-        &memory_id,
-        Some(&body.title),
-        Some(&body.content),
-        Some(&tags_json),
-    ) {
-        existing
+    let agent_id = resolve_current_agent_id(&state, &token)?;
+    let relative_path = memory_markdown_relative_path(&agent_id);
+    let next_content = if body.mode == "append" {
+        let existing = crate::agent_workspace::read_agent_workspace_file(&agent_id, &relative_path)
+            .map(|file| file.content)
+            .unwrap_or_default();
+        if existing.is_empty() {
+            body.content.clone()
+        } else if existing.ends_with('\n') {
+            format!("{existing}{}", body.content)
+        } else {
+            format!("{existing}\n{}", body.content)
+        }
     } else {
-        crate::storage::workspaces::insert_workspace_memory(
-            &conn,
-            &memory_id,
-            &workspace_id,
-            &body.title,
-            &body.content,
-            None::<&str>,
-            &tags_json,
-        )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        body.content.clone()
     };
 
-    // Generate embedding asynchronously
-    if let Some(registry) = EMBEDDING_REGISTRY.get() {
-        let registry = registry.clone();
-        let memory_id_clone = memory_id.clone();
-        let workspace_id_clone = workspace_id.clone();
-        let text_to_embed = format!("{} {}", body.title, body.content);
-        tauri::async_runtime::spawn(async move {
-            let provider = {
-                let guard = registry.read().await;
-                guard.default_provider()
-            };
-            if let Some(provider) = provider {
-                match provider.embed(vec![text_to_embed]).await {
-                    Ok(embeddings) => {
-                        if let Some(embedding) = embeddings.into_iter().next() {
-                            let conn = crate::storage_conn(&APP_HANDLE.get().unwrap());
-                            if let Ok(conn) = conn {
-                                let vector_id = format!("vec_{}", Uuid::new_v4().simple());
-                                if let Err(e) = crate::memory_vector::upsert_vector(
-                                    &conn,
-                                    &vector_id,
-                                    &memory_id_clone,
-                                    &workspace_id_clone,
-                                    &embedding,
-                                    provider.id(),
-                                ) {
-                                    log::warn!("生成记忆向量索引失败: {e}");
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("生成记忆嵌入失败: {e}");
-                    }
-                }
-            }
-        });
-    }
+    crate::agent_workspace::write_agent_workspace_file(&agent_id, &relative_path, &next_content)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
     Ok(Json(json!({
         "ok": true,
-        "memoryId": record.id,
-        "title": record.title,
-        "tags": body.tags,
-        "updatedAt": record.updated_at,
+        "agentId": agent_id,
+        "path": relative_path,
+        "mode": body.mode,
+        "content": next_content,
+    })))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+struct MemoryReadRequest {}
+
+async fn memory_read_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(_body): Json<MemoryReadRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let agent_id = resolve_current_agent_id(&state, &token)?;
+    let relative_path = memory_markdown_relative_path(&agent_id);
+    let file = crate::agent_workspace::read_agent_workspace_file(&agent_id, &relative_path)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "agentId": agent_id,
+        "path": relative_path,
+        "content": file.content,
     })))
 }
 
@@ -1808,6 +1942,7 @@ async fn memory_search_handler(
         )
     })?;
 
+    // Resolve workspace_id from session if not provided in body
     let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
 
     if workspace_id.trim().is_empty() {
@@ -1816,72 +1951,106 @@ async fn memory_search_handler(
             "workspace_id is required for memory operations".to_string(),
         ));
     }
+    let conn =
+        crate::storage_conn(&app_handle).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let semantic_results = if let Some(registry) = EMBEDDING_REGISTRY.get().cloned() {
+        let provider = {
+            let guard = registry.read().await;
+            guard.default_provider()
+        };
+        if let Some(provider) = provider {
+            let embeddings = provider
+                .embed(vec![body.query.clone()])
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("生成查询嵌入失败: {e}"),
+                    )
+                })?;
 
-    // Generate query embedding
-    let registry = EMBEDDING_REGISTRY.get().cloned().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "嵌入服务尚未初始化".to_string(),
-        )
-    })?;
+            let query_embedding = embeddings.into_iter().next().ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "嵌入结果为空".to_string(),
+                )
+            })?;
 
-    let provider = {
-        let guard = registry.read().await;
-        guard.default_provider().ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "无可用的嵌入提供者".to_string(),
+            let threshold = body.threshold.unwrap_or(0.3);
+            let tag_filter = if body.tags.is_empty() {
+                None
+            } else {
+                Some(body.tags.clone())
+            };
+
+            let hits = crate::memory_vector::search_vectors(
+                &conn,
+                &workspace_id,
+                &query_embedding,
+                body.limit,
+                threshold,
+                tag_filter.as_deref(),
             )
-        })?
-    };
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let embeddings = provider
-        .embed(vec![body.query.clone()])
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("生成查询嵌入失败: {e}")))?;
-
-    let query_embedding = embeddings
-        .into_iter()
-        .next()
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "嵌入结果为空".to_string()))?;
-
-    let threshold = body.threshold.unwrap_or(0.3);
-    let tag_filter = if body.tags.is_empty() {
-        None
-    } else {
-        Some(body.tags.clone())
-    };
-
-    let conn = crate::storage_conn(&app_handle)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    let hits = crate::memory_vector::search_vectors(
-        &conn,
-        &workspace_id,
-        &query_embedding,
-        body.limit,
-        threshold,
-        tag_filter.as_deref(),
-    )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    // Fetch full memory records for each hit
-    let mut results = Vec::new();
-    for hit in &hits {
-        if let Ok(Some(record)) = crate::storage::workspaces::get_workspace_memory(&conn, &hit.memory_id) {
-            results.push(json!({
-                "memoryId": record.id,
-                "title": record.title,
-                "content": record.content,
-                "tags": serde_json::from_str::<Vec<String>>(&record.tags_json).unwrap_or_default(),
-                "score": hit.score,
-                "updatedAt": record.updated_at,
-            }));
+            let mut results = Vec::new();
+            for hit in &hits {
+                if let Ok(Some(record)) =
+                    crate::storage::workspaces::get_workspace_memory(&conn, &hit.memory_id)
+                {
+                    results.push(json!({
+                        "memoryType": "workspace_memory",
+                        "searchMode": "semantic",
+                        "memoryId": record.id,
+                        "title": record.title,
+                        "content": record.content,
+                        "tags": serde_json::from_str::<Vec<String>>(&record.tags_json).unwrap_or_default(),
+                        "score": hit.score,
+                        "updatedAt": record.updated_at,
+                    }));
+                    continue;
+                }
+                if let Some(key) = extract_kv_key_from_vector_id(&hit.memory_id) {
+                    if let Ok(Some(record)) = crate::storage::workspaces::get_workspace_kv_memory(
+                        &conn,
+                        &workspace_id,
+                        key,
+                    ) {
+                        let value = serde_json::from_str::<Value>(&record.value_json)
+                            .unwrap_or_else(|_| Value::String(record.value_json.clone()));
+                        results.push(json!({
+                            "memoryType": "kv",
+                            "searchMode": "semantic",
+                            "memoryId": hit.memory_id,
+                            "key": record.memory_key,
+                            "value": value,
+                            "score": hit.score,
+                            "updatedAt": record.updated_at,
+                        }));
+                    }
+                }
+            }
+            Some(results)
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
+
+    let (results, search_mode) = if let Some(results) = semantic_results {
+        (results, "semantic")
+    } else {
+        (
+            memory_search_keyword_fallback(&conn, &workspace_id, &body.query, body.limit)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
+            "keyword_fallback",
+        )
+    };
 
     Ok(Json(json!({
         "ok": true,
+        "searchMode": search_mode,
         "results": results,
         "total": results.len(),
     })))
@@ -1889,16 +2058,17 @@ async fn memory_search_handler(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-struct MemoryReadRequest {
-    memory_id: String,
+struct MemoryStoreRequest {
+    key: String,
+    value: Value,
     #[serde(default)]
     workspace_id: Option<String>,
 }
 
-async fn memory_read_handler(
-    State(_state): State<CredentialProxyState>,
+async fn memory_store_handler(
+    State(state): State<CredentialProxyState>,
     AxumPath(token): AxumPath<String>,
-    Json(body): Json<MemoryReadRequest>,
+    Json(body): Json<MemoryStoreRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
         (
@@ -1906,42 +2076,199 @@ async fn memory_read_handler(
             "AppHandle 尚未注入".to_string(),
         )
     })?;
-
-    let _workspace_id = body.workspace_id.clone().unwrap_or_else(|| {
-        let proxy_server = credential_proxy_server().map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, e)
-        }).ok();
-        proxy_server
-            .and_then(|server| {
-                let guard = server.state.sessions.lock().ok()?;
-                guard.get(&token).and_then(|cfg| cfg.workspace_id.clone())
-            })
-            .unwrap_or_default()
-    });
-
-    let conn = crate::storage_conn(&app_handle)
+    let session = resolve_proxy_session(&state, &token)?;
+    let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
+    let conn =
+        crate::storage_conn(&app_handle).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    ensure_memory_workspace_namespace(&conn, &workspace_id, session.caller_agent_id.as_deref())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let record = crate::storage::workspaces::get_workspace_memory(&conn, &body.memory_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let value_json = serde_json::to_string(&body.value).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("序列化 K/V 记忆失败: {e}"),
+        )
+    })?;
+    let text_value = build_text_value_for_memory(&body.value);
+    let record = crate::storage::workspaces::upsert_workspace_kv_memory(
+        &conn,
+        &workspace_id,
+        &body.key,
+        &value_json,
+        &text_value,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let Some(record) = record else {
-        return Ok(Json(json!({
-            "ok": false,
-            "error": format!("记忆 {} 不存在", body.memory_id),
-        })));
-    };
+    if let Some(registry) = EMBEDDING_REGISTRY.get() {
+        let registry = registry.clone();
+        let workspace_id_clone = workspace_id.clone();
+        let key_clone = body.key.clone();
+        let text_to_embed = format!("{}\n{}", body.key, text_value);
+        tauri::async_runtime::spawn(async move {
+            let provider = {
+                let guard = registry.read().await;
+                guard.default_provider()
+            };
+            if let Some(provider) = provider {
+                match provider.embed(vec![text_to_embed]).await {
+                    Ok(embeddings) => {
+                        if let Some(embedding) = embeddings.into_iter().next() {
+                            if let Some(app_handle) = APP_HANDLE.get() {
+                                if let Ok(conn) = crate::storage_conn(app_handle) {
+                                    let vector_id = format!("vec_{}", Uuid::new_v4().simple());
+                                    let _ = crate::memory_vector::upsert_vector(
+                                        &conn,
+                                        &vector_id,
+                                        &kv_memory_vector_id(&key_clone),
+                                        &workspace_id_clone,
+                                        &embedding,
+                                        provider.id(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => log::warn!("生成 K/V 记忆嵌入失败: {error}"),
+                }
+            }
+        });
+    }
 
     Ok(Json(json!({
         "ok": true,
-        "memoryId": record.id,
         "workspaceId": record.workspace_id,
-        "title": record.title,
-        "content": record.content,
-        "tags": serde_json::from_str::<Vec<String>>(&record.tags_json).unwrap_or_default(),
-        "authorAgentId": record.author_agent_id,
-        "createdAt": record.created_at,
+        "key": record.memory_key,
+        "value": body.value,
         "updatedAt": record.updated_at,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct MemoryGetRequest {
+    key: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+async fn memory_get_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<MemoryGetRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入".to_string(),
+        )
+    })?;
+    let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
+    let conn =
+        crate::storage_conn(&app_handle).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let record =
+        crate::storage::workspaces::get_workspace_kv_memory(&conn, &workspace_id, &body.key)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let Some(record) = record else {
+        return Ok(Json(json!({
+            "ok": false,
+            "error": format!("K/V 记忆 {} 不存在", body.key),
+        })));
+    };
+    let value = serde_json::from_str::<Value>(&record.value_json)
+        .unwrap_or_else(|_| Value::String(record.value_json.clone()));
+
+    Ok(Json(json!({
+        "ok": true,
+        "workspaceId": record.workspace_id,
+        "key": record.memory_key,
+        "value": value,
+        "updatedAt": record.updated_at,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct MemoryListRequest {
+    #[serde(default = "default_memory_list_limit")]
+    limit: i64,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+fn default_memory_list_limit() -> i64 {
+    100
+}
+
+async fn memory_list_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<MemoryListRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入".to_string(),
+        )
+    })?;
+    let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
+    let conn =
+        crate::storage_conn(&app_handle).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let records =
+        crate::storage::workspaces::list_workspace_kv_memories(&conn, &workspace_id, body.limit)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let entries = records
+        .into_iter()
+        .map(|record| {
+            let value = serde_json::from_str::<Value>(&record.value_json)
+                .unwrap_or_else(|_| Value::String(record.value_json));
+            json!({
+                "key": record.memory_key,
+                "value": value,
+                "updatedAt": record.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let total = entries.len();
+
+    Ok(Json(json!({
+        "ok": true,
+        "workspaceId": workspace_id,
+        "entries": entries,
+        "total": total,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct MemoryForgetRequest {
+    key: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+async fn memory_forget_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<MemoryForgetRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入".to_string(),
+        )
+    })?;
+    let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
+    let conn =
+        crate::storage_conn(&app_handle).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let _ =
+        crate::memory_vector::delete_vector_by_memory_id(&conn, &kv_memory_vector_id(&body.key));
+    crate::storage::workspaces::delete_workspace_kv_memory(&conn, &workspace_id, &body.key)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "workspaceId": workspace_id,
+        "key": body.key,
     })))
 }
 
@@ -1964,28 +2291,81 @@ async fn memory_delete_handler(
             "AppHandle 尚未注入".to_string(),
         )
     })?;
-
     let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
-
-    if workspace_id.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "workspace_id is required for memory operations".to_string(),
-        ));
-    }
-
-    let conn = crate::storage_conn(&app_handle)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    // Also delete associated vector
+    let conn =
+        crate::storage_conn(&app_handle).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let _ = crate::memory_vector::delete_vector_by_memory_id(&conn, &body.memory_id);
-
     crate::storage::workspaces::delete_workspace_memory(&conn, &workspace_id, &body.memory_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(json!({
         "ok": true,
         "memoryId": body.memory_id,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ChatSearchRequest {
+    query: String,
+    #[serde(default = "default_chat_search_limit")]
+    limit: i64,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+fn default_chat_search_limit() -> i64 {
+    20
+}
+
+async fn chat_search_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<ChatSearchRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入".to_string(),
+        )
+    })?;
+    let conn =
+        crate::storage_conn(&app_handle).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let session = resolve_proxy_session(&state, &token)?;
+    let workspace_id = body
+        .workspace_id
+        .as_deref()
+        .or(session.workspace_id.as_deref());
+    let hits = crate::storage::chat_history::search_chat_turns(
+        &conn,
+        &body.query,
+        body.limit,
+        workspace_id,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let results = hits
+        .into_iter()
+        .map(|hit| {
+            json!({
+                "sessionId": hit.session_id,
+                "sessionTitle": hit.session_title,
+                "turnId": hit.turn_id,
+                "turnIndex": hit.turn_index,
+                "excerpt": build_chat_search_excerpt(&hit.prompt, &hit.answer, &body.query),
+                "prompt": hit.prompt,
+                "answer": hit.answer,
+                "createdAt": hit.created_at,
+                "workspaceId": hit.workspace_id,
+                "speakerAgentId": hit.speaker_agent_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    let total = results.len();
+
+    Ok(Json(json!({
+        "ok": true,
+        "results": results,
+        "total": total,
     })))
 }
 

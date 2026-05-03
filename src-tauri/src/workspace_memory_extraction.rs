@@ -392,7 +392,7 @@ fn run_workspace_memory_extraction(
     );
     let pi_rt = pi_runtime::require_pi_runtime_location(app)?;
     let recent_memories =
-        workspaces::list_workspace_memories(&conn, &request.workspace_id, MAX_RECENT_MEMORIES)?;
+        workspaces::list_workspace_memories(&conn, &request.workspace_id, MAX_RECENT_MEMORIES, None)?;
     let session_turns = crate::storage::chat_history::list_chat_turns(&conn, &request.session_id)
         .unwrap_or_default();
     let speaker_label = request
@@ -575,6 +575,8 @@ fn run_workspace_memory_extraction(
             memory.content,
             Some(workspace.supervisor_agent_id.clone()),
             memory.tags,
+            "workspace",
+            None,
         )?;
         inserted += 1;
 
