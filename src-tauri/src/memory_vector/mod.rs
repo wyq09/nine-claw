@@ -701,4 +701,181 @@ mod tests {
             "all memories are indexed, should return empty"
         );
     }
+
+    // ── Three-layer memory integration tests ───────────────────────────
+
+    #[test]
+    fn test_scope_default_is_workspace() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-default-scope";
+        ensure_workspace(&conn, ws);
+
+        // Insert via helper (uses direct SQL, no scope column specified)
+        insert_test_memory(&conn, "mem-default", ws, "Default scope", "content");
+
+        // Verify scope defaults to 'workspace'
+        let record = crate::storage::workspaces::get_workspace_memory(&conn, "mem-default")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.scope, "workspace");
+        assert!(record.scope_agent_id.is_none());
+    }
+
+    #[test]
+    fn test_scope_system_searchable_from_any_workspace() {
+        let conn = open_in_memory().unwrap();
+        let ws1 = "ws-sys-1";
+        let ws2 = "ws-sys-2";
+        ensure_workspace(&conn, ws1);
+        ensure_workspace(&conn, ws2);
+
+        // Create system memory in ws1
+        insert_test_memory(&conn, "mem-sys", ws1, "System memory", "global content");
+        // Set scope to system
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-sys", "system", None).unwrap();
+        // Index it
+        insert_test_vector(&conn, "mem-sys", ws1, &[1.0, 0.0, 0.0]);
+
+        // Search in ws2 — should find the system memory from ws1
+        let hits = search_vectors(&conn, ws2, &[1.0, 0.0, 0.0], 10, 0.5, None, None, None).unwrap();
+        assert_eq!(hits.len(), 1, "system memory should be searchable from any workspace");
+        assert_eq!(hits[0].memory_id, "mem-sys");
+    }
+
+    #[test]
+    fn test_scope_agent_isolated() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-agent-iso";
+        ensure_workspace(&conn, ws);
+
+        // Create agent-scoped memories for two different agents
+        insert_test_memory(&conn, "mem-agent-a", ws, "Agent A memory", "private to A");
+        insert_test_memory(&conn, "mem-agent-b", ws, "Agent B memory", "private to B");
+
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-agent-a", "agent", Some("agent-a")).unwrap();
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-agent-b", "agent", Some("agent-b")).unwrap();
+
+        insert_test_vector(&conn, "mem-agent-a", ws, &[1.0, 0.0]);
+        insert_test_vector(&conn, "mem-agent-b", ws, &[1.0, 0.0]);
+
+        // Agent A searching — should NOT see agent B's memories
+        let hits_a = three_layer_search(&conn, ws, Some("agent-a"), false, &[1.0, 0.0], 10, 0.5).unwrap();
+        let ids_a: Vec<&str> = hits_a.iter().map(|h| h.memory_id.as_str()).collect();
+        assert!(ids_a.contains(&"mem-agent-a"), "agent A should see own memory");
+        assert!(!ids_a.contains(&"mem-agent-b"), "agent A should NOT see agent B's memory");
+
+        // Agent B searching — should NOT see agent A's memories
+        let hits_b = three_layer_search(&conn, ws, Some("agent-b"), false, &[1.0, 0.0], 10, 0.5).unwrap();
+        let ids_b: Vec<&str> = hits_b.iter().map(|h| h.memory_id.as_str()).collect();
+        assert!(ids_b.contains(&"mem-agent-b"), "agent B should see own memory");
+        assert!(!ids_b.contains(&"mem-agent-a"), "agent B should NOT see agent A's memory");
+    }
+
+    #[test]
+    fn test_scope_agent_visible_to_supervisor() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-supervisor";
+        ensure_workspace(&conn, ws);
+
+        // Create agent-scoped memories
+        insert_test_memory(&conn, "mem-sup-a", ws, "Agent A private", "content A");
+        insert_test_memory(&conn, "mem-sup-b", ws, "Agent B private", "content B");
+
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-sup-a", "agent", Some("agent-a")).unwrap();
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-sup-b", "agent", Some("agent-b")).unwrap();
+
+        insert_test_vector(&conn, "mem-sup-a", ws, &[1.0, 0.0]);
+        insert_test_vector(&conn, "mem-sup-b", ws, &[1.0, 0.0]);
+
+        // Supervisor searching — should see ALL agent memories
+        let hits = three_layer_search(&conn, ws, Some("supervisor-id"), true, &[1.0, 0.0], 10, 0.5).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.memory_id.as_str()).collect();
+        assert!(ids.contains(&"mem-sup-a"), "supervisor should see agent A's memory");
+        assert!(ids.contains(&"mem-sup-b"), "supervisor should see agent B's memory");
+    }
+
+    #[test]
+    fn test_three_layer_search_priority() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-layers";
+        let ws_other = "ws-layers-other";
+        ensure_workspace(&conn, ws);
+        ensure_workspace(&conn, ws_other);
+
+        // System memory in ws_other
+        insert_test_memory(&conn, "mem-layer-sys", ws_other, "System fact", "global");
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-layer-sys", "system", None).unwrap();
+        insert_test_vector(&conn, "mem-layer-sys", ws_other, &[1.0, 0.0, 0.0]);
+
+        // Workspace memory in ws
+        insert_test_memory(&conn, "mem-layer-ws", ws, "Workspace fact", "project");
+        insert_test_vector(&conn, "mem-layer-ws", ws, &[1.0, 0.0, 0.0]);
+
+        // Agent memory in ws
+        insert_test_memory(&conn, "mem-layer-agent", ws, "Agent fact", "private");
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-layer-agent", "agent", Some("agent-x")).unwrap();
+        insert_test_vector(&conn, "mem-layer-agent", ws, &[1.0, 0.0, 0.0]);
+
+        // Agent x searching — should see all 3
+        let hits = three_layer_search(&conn, ws, Some("agent-x"), false, &[1.0, 0.0, 0.0], 10, 0.5).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.memory_id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "should find memories from all 3 layers");
+        assert!(ids.contains(&"mem-layer-sys"));
+        assert!(ids.contains(&"mem-layer-ws"));
+        assert!(ids.contains(&"mem-layer-agent"));
+    }
+
+    #[test]
+    fn test_scope_update_migration() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-migrate";
+        ensure_workspace(&conn, ws);
+
+        // Insert memory (default scope = workspace)
+        insert_test_memory(&conn, "mem-migrate", ws, "Migrate test", "content");
+
+        // Verify default
+        let rec = crate::storage::workspaces::get_workspace_memory(&conn, "mem-migrate").unwrap().unwrap();
+        assert_eq!(rec.scope, "workspace");
+
+        // Update to system
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-migrate", "system", None).unwrap();
+        let rec = crate::storage::workspaces::get_workspace_memory(&conn, "mem-migrate").unwrap().unwrap();
+        assert_eq!(rec.scope, "system");
+        assert!(rec.scope_agent_id.is_none());
+
+        // Update to agent
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-migrate", "agent", Some("agent-1")).unwrap();
+        let rec = crate::storage::workspaces::get_workspace_memory(&conn, "mem-migrate").unwrap().unwrap();
+        assert_eq!(rec.scope, "agent");
+        assert_eq!(rec.scope_agent_id.as_deref(), Some("agent-1"));
+    }
+
+    #[test]
+    fn test_count_memories_by_scope() {
+        let conn = open_in_memory().unwrap();
+        let ws = "ws-count";
+        ensure_workspace(&conn, ws);
+
+        // 0 initially
+        let (sys, ws_count, agent) = crate::storage::workspaces::count_memories_by_scope(&conn, ws).unwrap();
+        assert_eq!((sys, ws_count, agent), (0, 0, 0));
+
+        // Add 2 workspace memories
+        insert_test_memory(&conn, "mem-c1", ws, "W1", "c");
+        insert_test_memory(&conn, "mem-c2", ws, "W2", "c");
+        let (sys, ws_count, agent) = crate::storage::workspaces::count_memories_by_scope(&conn, ws).unwrap();
+        assert_eq!((sys, ws_count, agent), (0, 2, 0));
+
+        // Change one to system
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-c1", "system", None).unwrap();
+        let (sys, ws_count, agent) = crate::storage::workspaces::count_memories_by_scope(&conn, ws).unwrap();
+        assert_eq!((sys, ws_count, agent), (1, 1, 0));
+
+        // Add agent memory
+        insert_test_memory(&conn, "mem-c3", ws, "A1", "c");
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-c3", "agent", Some("agent-x")).unwrap();
+        let (sys, ws_count, agent) = crate::storage::workspaces::count_memories_by_scope(&conn, ws).unwrap();
+        assert_eq!((sys, ws_count, agent), (1, 1, 1));
+    }
 }
