@@ -518,7 +518,7 @@ fn find_workspace_ids_for_agent(conn: &Connection, agent_id: &str) -> Vec<String
 /// Generate semantic search hints using vector similarity.
 ///
 /// Returns `None` if anything fails (no registry, no provider, no hits, etc.).
-fn vector_memory_hints(conn: &Connection, workspace_id: &str, prompt: &str) -> Option<String> {
+fn vector_memory_hints(conn: &Connection, workspace_id: &str, agent_id: Option<&str>, prompt: &str) -> Option<String> {
     let registry = crate::managed_runtime::get_embedding_registry()?;
 
     let embeddings = match tokio::runtime::Handle::try_current() {
@@ -549,14 +549,21 @@ fn vector_memory_hints(conn: &Connection, workspace_id: &str, prompt: &str) -> O
     .ok()?;
 
     let query_vec = &embeddings.get(0)?;
-    let hits =
-        match crate::memory_vector::search_vectors(conn, workspace_id, query_vec, 3, 0.6, None, None, None) {
-            Ok(h) => h,
-            Err(e) => {
-                log::warn!("vector_memory_hints: search_vectors failed: {e}");
-                return None;
-            }
-        };
+    let hits = match crate::memory_vector::three_layer_search(
+        conn,
+        workspace_id,
+        agent_id,
+        false, // not supervisor — this is an individual agent
+        query_vec,
+        3,
+        0.6,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("vector_memory_hints: three_layer_search failed: {e}");
+            return None;
+        }
+    };
 
     if hits.is_empty() {
         return None;
@@ -619,7 +626,7 @@ fn append_vector_semantic_hints(agent_home: &Path, prompt: &str) -> Option<Strin
 
     // Try each workspace until we get hints
     for ws_id in &workspace_ids {
-        if let Some(hints) = vector_memory_hints(&conn, ws_id, prompt) {
+        if let Some(hints) = vector_memory_hints(&conn, ws_id, Some(&agent_id), prompt) {
             return Some(hints);
         }
     }
