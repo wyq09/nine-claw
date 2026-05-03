@@ -19,7 +19,7 @@ mod managed_runtime;
 mod managed_runtime_extension;
 mod media_directives;
 mod memory_gate;
-mod memory_vector;
+pub mod memory_vector;
 mod peer_gateway;
 mod pi_runtime;
 mod pi_timeouts;
@@ -28,9 +28,11 @@ mod proxy_settings;
 mod runtime_parameters;
 mod scheduler;
 mod skills;
-mod storage;
+pub mod storage;
 mod team_supervisor;
 mod team_workspace;
+mod user_memory_auto_extraction;
+mod user_memory_service;
 mod widget_runtime;
 mod workspace_fs;
 mod workspace_memory_extraction;
@@ -41,6 +43,7 @@ mod app_constants;
 mod commands_agents_skills;
 mod commands_chat_workspace;
 mod commands_workspace_kv_memory;
+mod user_kv_memory_reorganize;
 mod commands_llm_log_export;
 mod commands_llm_trace;
 mod commands_memory;
@@ -129,6 +132,14 @@ static DESKTOP_POOLED_PI: OnceLock<Mutex<HashMap<String, DesktopPooledPi>>> = On
 /// 同一桌面 session 串行化 `stream_pi_prompt`，避免并发时池替换/双进程互相 kill 导致 SIGKILL、stdout 空读。
 static DESKTOP_STREAM_SESSION_MUTEXES: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn workspace_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 
 fn desktop_session_stream_mutex(session_id: &str) -> Arc<Mutex<()>> {
     let map = DESKTOP_STREAM_SESSION_MUTEXES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -2171,6 +2182,25 @@ fn normalize_summary_text(text: &str, max_chars: usize) -> String {
 fn load_multimodal_summary_entries(
     summary_key: &str,
 ) -> Result<Vec<MultimodalSummaryEntry>, String> {
+    if let Some(app) = managed_runtime::injected_app_handle() {
+        if let Ok(conn) = storage_conn(&app) {
+            if let Ok(rows) =
+                crate::storage::core_memory::list_runtime_multimodal_summaries(&conn, summary_key, 8)
+            {
+                if !rows.is_empty() {
+                    return Ok(rows
+                        .into_iter()
+                        .map(|row| MultimodalSummaryEntry {
+                            timestamp_ms: row.created_at,
+                            user_prompt: row.user_prompt,
+                            assistant_response: row.assistant_response,
+                        })
+                        .collect());
+                }
+            }
+        }
+    }
+
     let path = summary_file_path(summary_key);
     if !path.exists() {
         return Ok(Vec::new());
@@ -2236,6 +2266,11 @@ pub(crate) fn build_turn_prompt_with_multimodal_summary(
 }
 
 pub(crate) fn clear_multimodal_summary(summary_key: &str) -> Result<(), String> {
+    if let Some(app) = managed_runtime::injected_app_handle() {
+        if let Ok(conn) = storage_conn(&app) {
+            let _ = crate::storage::core_memory::clear_runtime_multimodal_summaries(&conn, summary_key);
+        }
+    }
     let path = summary_file_path(summary_key);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
@@ -2265,6 +2300,20 @@ pub(crate) fn record_multimodal_summary(
     if entries.len() > 8 {
         let keep_from = entries.len() - 8;
         entries.drain(0..keep_from);
+    }
+
+    if let Some(app) = managed_runtime::injected_app_handle() {
+        if let Ok(conn) = storage_conn(&app) {
+            let _ = crate::storage::core_memory::clear_runtime_multimodal_summaries(&conn, summary_key);
+            for entry in &entries {
+                let _ = crate::storage::core_memory::insert_runtime_multimodal_summary(
+                    &conn,
+                    summary_key,
+                    &entry.user_prompt,
+                    &entry.assistant_response,
+                );
+            }
+        }
     }
 
     let path = summary_file_path(summary_key);
@@ -6450,6 +6499,7 @@ pub fn run() {
             workspace_kv_memory_ui_list,
             workspace_kv_memory_ui_store,
             workspace_kv_memory_ui_forget,
+            workspace_kv_memory_ui_reorganize,
             workspace_write_memory,
             workspace_delete_memory,
             memory_list,

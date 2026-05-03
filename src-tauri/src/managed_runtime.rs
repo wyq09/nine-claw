@@ -621,6 +621,7 @@ pub fn append_session_event(
     detail: Option<Value>,
 ) -> Result<(), String> {
     ensure_agent_runtime_scaffold(agent_home)?;
+    let detail_for_db = detail.clone();
     let event = SessionEventRecord {
         id: format!("sess_evt_{}", Uuid::new_v4().simple()),
         session_id: session_id.trim().to_string(),
@@ -639,6 +640,35 @@ pub fn append_session_event(
         .map_err(|error| format!("序列化 session event 失败: {error}"))?;
     writeln!(file, "{line}")
         .map_err(|error| format!("写入 session event 失败 {}: {error}", path.display()))?;
+
+    if let Some(app) = injected_app_handle() {
+        if let Ok(conn) = crate::storage_conn(&app) {
+            let agent_id = agent_home
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|value| value.to_string());
+            let detail_json = detail_for_db
+                .as_ref()
+                .and_then(|value| serde_json::to_string(value).ok());
+            let _ = crate::storage::core_memory::insert_runtime_session_event(
+                &conn,
+                &event.id,
+                agent_id.as_deref(),
+                &event.session_id,
+                match event.kind {
+                    SessionEventKind::Prompt => "prompt",
+                    SessionEventKind::ToolCall => "tool_call",
+                    SessionEventKind::ToolResult => "tool_result",
+                    SessionEventKind::AssistantOutput => "assistant_output",
+                    SessionEventKind::Decision => "decision",
+                    SessionEventKind::RuntimeError => "runtime_error",
+                    SessionEventKind::RuntimeRetry => "runtime_retry",
+                },
+                &event.summary,
+                detail_json.as_deref(),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -702,6 +732,33 @@ pub fn build_session_context_snapshot(
     limit: usize,
     char_limit: usize,
 ) -> Result<Option<String>, String> {
+    if let Some(app) = injected_app_handle() {
+        if let Ok(conn) = crate::storage_conn(&app) {
+            if let Some(agent_id) = agent_home.file_name().and_then(|name| name.to_str()) {
+                if let Ok(events) =
+                    crate::storage::core_memory::list_recent_runtime_session_events(
+                        &conn, agent_id, limit,
+                    )
+                {
+                    if !events.is_empty() {
+                        let mut lines = vec!["Recent Session Events:".to_string()];
+                        for event in events {
+                            lines.push(format!(
+                                "- [{}] {}",
+                                event.kind,
+                                truncate_summary(&event.summary, 120)
+                            ));
+                        }
+                        let rendered = trim_to_char_limit(&lines.join("\n"), char_limit);
+                        if !rendered.trim().is_empty() {
+                            return Ok(Some(rendered));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     ensure_agent_runtime_scaffold(agent_home)?;
     let sessions_dir = agent_home.join(SESSIONS_DIR);
     let mut files = fs::read_dir(&sessions_dir)
@@ -1733,6 +1790,10 @@ fn memory_markdown_relative_path(agent_id: &str) -> String {
     format!("agents/{agent_id}/MEMORY.md")
 }
 
+fn memory_md_record_id(agent_id: &str) -> String {
+    format!("memory_md_{agent_id}")
+}
+
 fn build_text_value_for_memory(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
@@ -1883,12 +1944,91 @@ async fn memory_update_handler(
     crate::agent_workspace::write_agent_workspace_file(&agent_id, &relative_path, &next_content)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
+    // Also index into workspace_memories + memory_vectors for semantic search.
+    // Use the same workspace resolution as memory_search_handler so that
+    // memory_search can find this content.
+    if let Some(app_handle) = APP_HANDLE.get().cloned() {
+        if let Ok(conn) = crate::storage_conn(&app_handle) {
+            let ws_id = resolve_memory_workspace(&state, &token, None).unwrap_or_else(|_| build_agent_memory_workspace_id(&agent_id));
+            let _ = ensure_memory_workspace_namespace(&conn, &ws_id, Some(&agent_id));
+
+            let record_id = memory_md_record_id(&agent_id);
+            let title = "MEMORY.md".to_string();
+            let tags_json = r#"["memory_md","agent_private"]"#.to_string();
+
+            if crate::storage::workspaces::get_workspace_memory(&conn, &record_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                let _ = crate::storage::workspaces::update_workspace_memory(
+                    &conn,
+                    &record_id,
+                    Some(&title),
+                    Some(&next_content),
+                    Some(&tags_json),
+                    Some("agent"),
+                    Some(&agent_id),
+                );
+            } else {
+                let _ = crate::storage::workspaces::insert_workspace_memory(
+                    &conn,
+                    &record_id,
+                    &ws_id,
+                    &title,
+                    &next_content,
+                    Some(&agent_id),
+                    &tags_json,
+                    "agent",
+                    Some(&agent_id),
+                );
+            }
+
+            // Spawn async embedding + vector upsert
+            if let Some(registry) = EMBEDDING_REGISTRY.get().cloned() {
+                let text_to_embed = next_content.clone();
+                let ws_id_clone = ws_id.clone();
+                let record_id_clone = record_id.clone();
+                let app_h = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let provider = {
+                        let guard = registry.read().await;
+                        guard.default_provider()
+                    };
+                    if let Some(provider) = provider {
+                        match provider.embed(vec![text_to_embed]).await {
+                            Ok(embeddings) => {
+                                if let Some(embedding) = embeddings.into_iter().next() {
+                                    if let Ok(conn) = crate::storage_conn(&app_h) {
+                                        let vector_id = format!("vec_{}", Uuid::new_v4().simple());
+                                        let _ = crate::memory_vector::upsert_vector(
+                                            &conn,
+                                            &vector_id,
+                                            &record_id_clone,
+                                            &ws_id_clone,
+                                            &embedding,
+                                            provider.id(),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                log::warn!("MEMORY.md 向量嵌入失败: {error}")
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     Ok(Json(json!({
         "ok": true,
         "agentId": agent_id,
         "path": relative_path,
         "mode": body.mode,
         "content": next_content,
+        "indexed": true,
     })))
 }
 
@@ -2007,6 +2147,25 @@ async fn memory_search_handler(
                 threshold,
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            if let Some(agent_id) = caller_agent_id {
+                let mut core_hits = crate::memory_vector::search_vectors_across_workspaces(
+                    &conn,
+                    &[crate::storage::core_memory::agent_vector_namespace(agent_id)],
+                    &query_embedding,
+                    body.limit,
+                    threshold,
+                )
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                hits.append(&mut core_hits);
+                hits.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let mut dedup = std::collections::HashSet::new();
+                hits.retain(|hit| dedup.insert(hit.memory_id.clone()));
+                hits.truncate(body.limit);
+            }
 
             // Post-filter by tags if specified
             if !body.tags.is_empty() {
@@ -2060,6 +2219,19 @@ async fn memory_search_handler(
                             "updatedAt": record.updated_at,
                         }));
                     }
+                    continue;
+                }
+                if let Ok(Some((source_kind, title, content))) =
+                    crate::storage::core_memory::fetch_search_text(&conn, &hit.memory_id)
+                {
+                    results.push(json!({
+                        "memoryType": source_kind,
+                        "searchMode": "semantic",
+                        "memoryId": hit.memory_id,
+                        "title": title,
+                        "content": content,
+                        "score": hit.score,
+                    }));
                 }
             }
             Some(results)
