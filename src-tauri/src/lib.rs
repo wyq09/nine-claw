@@ -31,17 +31,19 @@ mod skills;
 mod storage;
 mod team_supervisor;
 mod team_workspace;
+mod widget_runtime;
 mod workspace_fs;
 mod workspace_memory_extraction;
-mod widget_runtime;
 
 mod agent_package;
 mod agent_presets;
 mod app_constants;
 mod commands_agents_skills;
 mod commands_chat_workspace;
+mod commands_workspace_kv_memory;
 mod commands_llm_log_export;
 mod commands_llm_trace;
+mod commands_memory;
 mod history_app_state;
 mod pi_usage;
 mod prompts;
@@ -80,13 +82,15 @@ pub(crate) use time_util::chrono_like_timestamp;
 use app_log::{app_log_export_all, app_log_list, app_log_open_dir, app_log_read};
 use commands_agents_skills::*;
 use commands_chat_workspace::*;
+use commands_workspace_kv_memory::*;
 use commands_llm_log_export::*;
 use commands_llm_trace::*;
-use widget_runtime::{widget_cancel_response, widget_submit_response};
+use commands_memory::*;
 use history_app_state::{
     clear_history_state, list_token_usage_records, load_history_state, save_history_state,
 };
 use session_llm_titles::generate_session_conversation_title;
+use widget_runtime::{widget_cancel_response, widget_submit_response};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as _};
 use md5::{Digest, Md5};
@@ -6230,10 +6234,15 @@ pub fn run() {
             }
             llm_log_export::init(&app.handle());
 
+            // Initialize embedding provider registry
+            let embedding_registry = embedding::new_registry();
+            managed_runtime::inject_embedding_registry(embedding_registry.clone());
+
             // Defer heavy runtime initialization to a background thread so the
             // window renders immediately.  The frontend listens for the
             // "pi://runtime-ready" event to know when PI features are available.
             let app_handle = app.handle().clone();
+            let setup_embedding_registry = embedding_registry.clone();
             std::thread::spawn(move || {
                 dev_trace("app", "后台 runtime 初始化开始");
                 let status = pi_runtime::cached_ensure_runtime_dependencies(&app_handle);
@@ -6261,7 +6270,91 @@ pub fn run() {
                 if let Err(error) = peer_gateway::restart_peer_gateway(&app_handle) {
                     log::warn!("对等网关启动: {error}");
                 }
+                let post_scheduler_handle = app_handle.clone();
                 scheduler::start_embedded_scheduler(app_handle);
+
+                // --- Embedding provider init + background index rebuild ---
+                let resource_dir = match post_scheduler_handle.path().resource_dir() {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        log::warn!("无法解析资源目录，跳过嵌入初始化: {e}");
+                        return;
+                    }
+                };
+                let model_dir = resource_dir.join("embedding-models/bge-small-zh-v1.5");
+                if model_dir.exists() {
+                    match embedding::onnx_local::OnnxLocalProvider::new(&model_dir) {
+                        Ok(provider) => {
+                            let mut guard = setup_embedding_registry.blocking_write();
+                            guard.register(std::sync::Arc::new(provider));
+                            log::info!("bge-small-zh-local embedding provider initialized");
+                        }
+                        Err(e) => log::warn!("Failed to init embedding provider: {e}"),
+                    }
+                } else {
+                    log::warn!(
+                        "Embedding model directory not found: {}",
+                        model_dir.display()
+                    );
+                }
+
+                // Background: rebuild vector index for memories without embeddings
+                let rebuild_registry = setup_embedding_registry.clone();
+                let rebuild_app = post_scheduler_handle.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let Ok(conn) = storage_conn(&rebuild_app) else {
+                        return;
+                    };
+                    let Ok(workspaces) = storage::workspaces::list_workspaces(&conn, false) else {
+                        return;
+                    };
+
+                    for ws in &workspaces {
+                        let Ok(missing) =
+                            memory_vector::find_memories_without_vectors(&conn, &ws.id, 50)
+                        else {
+                            continue;
+                        };
+                        if missing.is_empty() {
+                            continue;
+                        }
+                        log::info!(
+                            "Rebuilding index for workspace {}: {} memories without vectors",
+                            ws.id,
+                            missing.len()
+                        );
+
+                        let texts: Vec<String> = missing
+                            .iter()
+                            .map(|(_, title, content)| format!("{title}\n{content}"))
+                            .collect();
+
+                        let rt = tokio::runtime::Handle::current();
+                        let Ok(embeddings) = rt.block_on(async {
+                            let guard = rebuild_registry.read().await;
+                            if let Some(provider) = guard.default_provider() {
+                                provider.embed(texts).await
+                            } else {
+                                Err("no provider".into())
+                            }
+                        }) else {
+                            continue;
+                        };
+
+                        for ((mid, _, _), emb) in missing.iter().zip(embeddings.iter()) {
+                            let vid = uuid::Uuid::new_v4().to_string();
+                            let _ = memory_vector::upsert_vector(
+                                &conn,
+                                &vid,
+                                mid,
+                                &ws.id,
+                                emb,
+                                "bge-small-zh-local",
+                            );
+                        }
+                        log::info!("Indexed {} memories for workspace {}", missing.len(), ws.id);
+                    }
+                });
             });
 
             Ok(())
@@ -6354,8 +6447,15 @@ pub fn run() {
             workspace_resource_absolute_path,
             workspace_delete_resource,
             workspace_list_memories,
+            workspace_kv_memory_ui_list,
+            workspace_kv_memory_ui_store,
+            workspace_kv_memory_ui_forget,
             workspace_write_memory,
             workspace_delete_memory,
+            memory_list,
+            memory_update_scope,
+            memory_stats,
+            memory_search_text,
             workspace_delegate,
             workspace_run_delegate_task,
             workspace_abort_delegate,
