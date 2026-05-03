@@ -55,6 +55,7 @@ struct ExtractedWorkspaceMemory {
     title: String,
     content: String,
     tags: Vec<String>,
+    scope: String,
 }
 
 #[derive(Clone, Debug)]
@@ -298,11 +299,18 @@ fn parse_memories_from_value(value: &serde_json::Value) -> Vec<ExtractedWorkspac
         if !seen.insert(fingerprint) {
             continue;
         }
+        let scope = item
+            .get("scope")
+            .and_then(|field| field.as_str())
+            .filter(|s| matches!(*s, "system" | "workspace" | "agent"))
+            .unwrap_or("workspace")
+            .to_string();
         out.push(ExtractedWorkspaceMemory {
             route,
             title,
             content,
             tags,
+            scope,
         });
         if out.len() >= MAX_MEMORY_ITEMS {
             break;
@@ -568,6 +576,11 @@ fn run_workspace_memory_extraction(
         if memory_exists(&memory, &recent_memories) {
             continue;
         }
+        let scope_agent_id = if memory.scope == "agent" {
+            request.speaker_agent_id.as_deref()
+        } else {
+            None
+        };
         let record = team_workspace::write_team_memory_entry(
             app,
             &request.workspace_id,
@@ -575,8 +588,8 @@ fn run_workspace_memory_extraction(
             memory.content,
             Some(workspace.supervisor_agent_id.clone()),
             memory.tags,
-            "workspace",
-            None,
+            &memory.scope,
+            scope_agent_id,
         )?;
         inserted += 1;
 
@@ -809,6 +822,7 @@ mod tests {
             title: "团队约束".to_string(),
             content: "所有成果写入 artifacts 目录。".to_string(),
             tags: vec!["constraint".to_string()],
+            scope: "workspace".to_string(),
         };
         assert!(memory_exists(
             &candidate,
