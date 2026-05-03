@@ -1792,6 +1792,8 @@ fn memory_search_keyword_fallback(
                 "title": record.title,
                 "content": record.content,
                 "tags": tags,
+                "scope": record.scope,
+                "scopeAgentId": record.scope_agent_id,
                 "score": Value::Null,
                 "updatedAt": record.updated_at,
             }));
@@ -1977,23 +1979,49 @@ async fn memory_search_handler(
             })?;
 
             let threshold = body.threshold.unwrap_or(0.3);
-            let tag_filter = if body.tags.is_empty() {
-                None
+
+            // Determine agent context for three-layer scope search
+            let session = resolve_proxy_session(&state, &token).ok();
+            let caller_agent_id = session
+                .as_ref()
+                .and_then(|s| s.caller_agent_id.as_deref())
+                .filter(|s| !s.trim().is_empty());
+            let is_supervisor = if let Some(ref aid) = caller_agent_id {
+                // Check if this agent is the workspace supervisor
+                crate::storage::workspaces::get_workspace(&conn, &workspace_id)
+                    .ok()
+                    .flatten()
+                    .map(|ws| ws.supervisor_agent_id == *aid)
+                    .unwrap_or(false)
             } else {
-                Some(body.tags.clone())
+                true // No agent id = assume supervisor/omniscient
             };
 
-            let hits = crate::memory_vector::search_vectors(
+            let mut hits = crate::memory_vector::three_layer_search(
                 &conn,
                 &workspace_id,
+                caller_agent_id,
+                is_supervisor,
                 &query_embedding,
                 body.limit,
                 threshold,
-                tag_filter.as_deref(),
-                None,
-                None,
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+            // Post-filter by tags if specified
+            if !body.tags.is_empty() {
+                hits.retain(|hit| {
+                    if let Ok(Some(record)) =
+                        crate::storage::workspaces::get_workspace_memory(&conn, &hit.memory_id)
+                    {
+                        let tags =
+                            serde_json::from_str::<Vec<String>>(&record.tags_json).unwrap_or_default();
+                        body.tags.iter().all(|t| tags.contains(t))
+                    } else {
+                        false
+                    }
+                });
+            }
 
             let mut results = Vec::new();
             for hit in &hits {
@@ -2007,6 +2035,8 @@ async fn memory_search_handler(
                         "title": record.title,
                         "content": record.content,
                         "tags": serde_json::from_str::<Vec<String>>(&record.tags_json).unwrap_or_default(),
+                        "scope": record.scope,
+                        "scopeAgentId": record.scope_agent_id,
                         "score": hit.score,
                         "updatedAt": record.updated_at,
                     }));
