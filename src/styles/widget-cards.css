@@ -1,0 +1,217 @@
+.widget-segments-block {
+  display: grid;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.widget-card {
+  border: 1px solid rgba(121, 143, 173, 0.22);
+  border-radius: 18px;
+  padding: 16px;
+  background:
+    linear-gradient(180deg, rgba(17, 24, 39, 0.88), rgba(9, 14, 24, 0.94)),
+    linear-gradient(135deg, rgba(70, 140, 255, 0.12), rgba(78, 205, 196, 0.08));
+  box-shadow: 0 16px 40px rgba(4, 10, 20, 0.22);
+}
+
+.widget-card-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.widget-card-eyebrow {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(148, 190, 255, 0.78);
+}
+
+.widget-card-title {
+  margin-top: 4px;
+  font-size: 16px;
+  font-weight: 700;
+  color: rgba(246, 250, 255, 0.96);
+}
+
+.widget-card-status {
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 11px;
+  line-height: 1;
+  text-transform: uppercase;
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(214, 227, 245, 0.82);
+}
+
+.widget-card-status-pending {
+  background: rgba(77, 163, 255, 0.14);
+  color: rgba(153, 212, 255, 0.92);
+}
+
+.widget-card-description {
+  margin: 10px 0 0;
+  color: rgba(214, 227, 245, 0.78);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.widget-question-list {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.widget-question-block {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.widget-question-label {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+  color: rgba(245, 248, 252, 0.96);
+}
+
+.widget-question-required {
+  font-size: 11px;
+  color: rgba(255, 174, 174, 0.9);
+}
+
+.widget-question-description {
+  margin: 0;
+  font-size: 12px;
+  color: rgba(190, 204, 222, 0.72);
+}
+
+.widget-input,
+.widget-textarea {
+  width: 100%;
+  border: 1px solid rgba(131, 154, 184, 0.22);
+  border-radius: 12px;
+  background: rgba(7, 11, 18, 0.48);
+  color: rgba(247, 250, 252, 0.96);
+  padding: 10px 12px;
+}
+
+.widget-choice-list {
+  display: grid;
+  gap: 10px;
+}
+
+.widget-choice-item {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  color: rgba(240, 246, 252, 0.92);
+}
+
+.widget-choice-item span {
+  display: grid;
+  gap: 3px;
+}
+
+.widget-choice-item small {
+  color: rgba(190, 204, 222, 0.72);
+}
+
+.widget-choice-recommended {
+  display: inline-flex;
+  margin-left: 8px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-style: normal;
+  font-size: 10px;
+  line-height: 1;
+  vertical-align: middle;
+  background: rgba(94, 182, 255, 0.16);
+  color: rgba(155, 220, 255, 0.95);
+}
+
+.widget-question-error {
+  font-size: 12px;
+  color: rgba(255, 166, 166, 0.92);
+}
+
+.widget-card-notice {
+  margin-top: 12px;
+  font-size: 12px;
+  color: rgba(150, 224, 196, 0.9);
+}
+
+.widget-card-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.widget-btn-primary,
+.widget-btn-secondary {
+  border: 0;
+  border-radius: 999px;
+  padding: 9px 14px;
+  font-weight: 600;
+}
+
+.widget-btn-primary {
+  background: linear-gradient(135deg, #6cb8ff, #49d2c2);
+  color: #07121d;
+}
+
+.widget-btn-secondary {
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(230, 238, 248, 0.9);
+}
+
+.widget-btn-primary:disabled,
+.widget-btn-secondary:disabled,
+.widget-input:disabled,
+.widget-textarea:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+:root[data-ui-theme='light'] .widget-card {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(245, 249, 255, 0.98)),
+    linear-gradient(135deg, rgba(70, 140, 255, 0.08), rgba(78, 205, 196, 0.08));
+  border-color: rgba(90, 120, 160, 0.16);
+  box-shadow: 0 18px 34px rgba(85, 118, 165, 0.12);
+}
+
+:root[data-ui-theme='light'] .widget-card-title,
+:root[data-ui-theme='light'] .widget-question-label,
+:root[data-ui-theme='light'] .widget-choice-item {
+  color: #10233d;
+}
+
+:root[data-ui-theme='light'] .widget-card-description,
+:root[data-ui-theme='light'] .widget-question-description,
+:root[data-ui-theme='light'] .widget-choice-item small {
+  color: rgba(53, 76, 109, 0.78);
+}
+
+:root[data-ui-theme='light'] .widget-choice-recommended {
+  background: rgba(86, 150, 235, 0.12);
+  color: rgba(35, 99, 190, 0.96);
+}
+
+:root[data-ui-theme='light'] .widget-question-block {
+  background: rgba(86, 121, 173, 0.05);
+  border-color: rgba(86, 121, 173, 0.1);
+}
+
+:root[data-ui-theme='light'] .widget-input,
+:root[data-ui-theme='light'] .widget-textarea {
+  background: rgba(255, 255, 255, 0.86);
+  color: #10233d;
+}

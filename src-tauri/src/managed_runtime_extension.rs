@@ -11,6 +11,18 @@ const MANAGED_RUNTIME_CURL_HTTP_FILE: &str = "curl_http.mjs";
 const MANAGED_RUNTIME_WEB_SEARCH_TRANSPORT_FILE: &str = "web_search_transport.mjs";
 const MANAGED_RUNTIME_IMAGE_DOWNLOADER_FILE: &str = "image_downloader.mjs";
 const MANAGED_RUNTIME_AGENT_DELEGATE_FILE: &str = "nineclaw-agent-delegate-tool.mjs";
+const MANAGED_RUNTIME_ASK_USER_FILE: &str = "nineclaw-ask-user-tool.mjs";
+const MANAGED_RUNTIME_MEMORY_UPDATE_FILE: &str = "memory_update_tool.mjs";
+const MANAGED_RUNTIME_MEMORY_SEARCH_FILE: &str = "memory_search_tool.mjs";
+const MANAGED_RUNTIME_MEMORY_READ_FILE: &str = "memory_read_tool.mjs";
+const MANAGED_RUNTIME_MEMORY_DELETE_FILE: &str = "memory_delete_tool.mjs";
+const MANAGED_RUNTIME_MEMORY_STORE_FILE: &str = "memory_store_tool.mjs";
+const MANAGED_RUNTIME_MEMORY_SAVE_FILE: &str = "memory_save_tool.mjs";
+const MANAGED_RUNTIME_MEMORY_GET_FILE: &str = "memory_get_tool.mjs";
+const MANAGED_RUNTIME_MEMORY_FORGET_FILE: &str = "memory_forget_tool.mjs";
+const MANAGED_RUNTIME_MEMORY_LIST_FILE: &str = "memory_list_tool.mjs";
+const MANAGED_RUNTIME_CHAT_SEARCH_FILE: &str = "chat_search_tool.mjs";
+const MANAGED_RUNTIME_MEMORY_TOOL_TRANSPORT_FILE: &str = "memory_tool_transport.mjs";
 const WEB_SEARCH_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/web_search_tool.mjs");
 const WEB_FETCH_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/web_fetch_tool.mjs");
 const IMAGE_GENERATION_TOOL_SOURCE: &str =
@@ -25,6 +37,24 @@ const WEB_SEARCH_TRANSPORT_SOURCE: &str =
 const IMAGE_DOWNLOADER_SOURCE: &str = include_str!("../../src/runtime-tools/image_downloader.mjs");
 const AGENT_DELEGATE_TOOL_SOURCE: &str =
     include_str!("../../src/runtime-tools/agent_delegate_tool.mjs");
+const ASK_USER_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/ask_user_tool.mjs");
+const MEMORY_UPDATE_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/memory_update_tool.mjs");
+const MEMORY_SEARCH_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/memory_search_tool.mjs");
+const MEMORY_READ_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/memory_read_tool.mjs");
+const MEMORY_DELETE_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/memory_delete_tool.mjs");
+const MEMORY_STORE_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/memory_store_tool.mjs");
+const MEMORY_SAVE_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/memory_save_tool.mjs");
+const MEMORY_GET_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/memory_get_tool.mjs");
+const MEMORY_FORGET_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/memory_forget_tool.mjs");
+const MEMORY_LIST_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/memory_list_tool.mjs");
+const CHAT_SEARCH_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/chat_search_tool.mjs");
+const MEMORY_TOOL_TRANSPORT_SOURCE: &str =
+    include_str!("../../src/runtime-tools/memory_tool_transport.mjs");
 
 pub(crate) fn write_managed_runtime_extension_files(
     runtime_dir: &Path,
@@ -109,6 +139,102 @@ pub(crate) fn write_managed_runtime_extension_files(
         )
     })?;
 
+    let ask_user_path = runtime_dir.join(MANAGED_RUNTIME_ASK_USER_FILE);
+    fs::write(&ask_user_path, ASK_USER_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 ask_user 运行时模块失败 {}: {error}",
+            ask_user_path.display()
+        )
+    })?;
+
+    let memory_update_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_UPDATE_FILE);
+    fs::write(&memory_update_path, MEMORY_UPDATE_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 memory_update 运行时模块失败 {}: {error}",
+            memory_update_path.display()
+        )
+    })?;
+
+    let memory_search_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_SEARCH_FILE);
+    fs::write(&memory_search_path, MEMORY_SEARCH_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 memory_search 运行时模块失败 {}: {error}",
+            memory_search_path.display()
+        )
+    })?;
+
+    let memory_read_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_READ_FILE);
+    fs::write(&memory_read_path, MEMORY_READ_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 memory_read 运行时模块失败 {}: {error}",
+            memory_read_path.display()
+        )
+    })?;
+
+    let memory_delete_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_DELETE_FILE);
+    fs::write(&memory_delete_path, MEMORY_DELETE_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 memory_delete 运行时模块失败 {}: {error}",
+            memory_delete_path.display()
+        )
+    })?;
+
+    let memory_store_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_STORE_FILE);
+    fs::write(&memory_store_path, MEMORY_STORE_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 memory_store 运行时模块失败 {}: {error}",
+            memory_store_path.display()
+        )
+    })?;
+
+    let memory_save_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_SAVE_FILE);
+    fs::write(&memory_save_path, MEMORY_SAVE_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 memory_save 运行时模块失败 {}: {error}",
+            memory_save_path.display()
+        )
+    })?;
+
+    let memory_get_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_GET_FILE);
+    fs::write(&memory_get_path, MEMORY_GET_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 memory_get 运行时模块失败 {}: {error}",
+            memory_get_path.display()
+        )
+    })?;
+
+    let memory_forget_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_FORGET_FILE);
+    fs::write(&memory_forget_path, MEMORY_FORGET_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 memory_forget 运行时模块失败 {}: {error}",
+            memory_forget_path.display()
+        )
+    })?;
+
+    let memory_list_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_LIST_FILE);
+    fs::write(&memory_list_path, MEMORY_LIST_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 memory_list 运行时模块失败 {}: {error}",
+            memory_list_path.display()
+        )
+    })?;
+
+    let chat_search_path = runtime_dir.join(MANAGED_RUNTIME_CHAT_SEARCH_FILE);
+    fs::write(&chat_search_path, CHAT_SEARCH_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 chat_search 运行时模块失败 {}: {error}",
+            chat_search_path.display()
+        )
+    })?;
+
+    let memory_tool_transport_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_TOOL_TRANSPORT_FILE);
+    fs::write(&memory_tool_transport_path, MEMORY_TOOL_TRANSPORT_SOURCE).map_err(|error| {
+        format!(
+            "写入 memory_tool_transport 运行时模块失败 {}: {error}",
+            memory_tool_transport_path.display()
+        )
+    })?;
+
     let extension_source = build_managed_runtime_extension_source(typebox_import_path)?;
     let extension_path = runtime_dir.join(MANAGED_RUNTIME_EXTENSION_FILE);
     fs::write(&extension_path, extension_source).map_err(|error| {
@@ -130,6 +256,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as crypto from "node:crypto";
+import http from "node:http";
 import {{ execFile as execFileCallback }} from "node:child_process";
 import {{ promisify }} from "node:util";
 import {{ Type }} from {import_path};
@@ -143,8 +270,59 @@ import {{ createWebFetchTool }} from "./{MANAGED_RUNTIME_WEB_FETCH_FILE}";
 import {{ createImageGenerationTool }} from "./{MANAGED_RUNTIME_IMAGE_GENERATION_FILE}";
 import {{ createImageTaskQueryTool }} from "./{MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE}";
 import {{ createAgentDelegateTool }} from "./{MANAGED_RUNTIME_AGENT_DELEGATE_FILE}";
+import {{ createAskUserTool }} from "./{MANAGED_RUNTIME_ASK_USER_FILE}";
+import {{ createMemoryUpdateTool }} from "./{MANAGED_RUNTIME_MEMORY_UPDATE_FILE}";
+import {{ createMemorySearchTool }} from "./{MANAGED_RUNTIME_MEMORY_SEARCH_FILE}";
+import {{ createMemoryReadTool }} from "./{MANAGED_RUNTIME_MEMORY_READ_FILE}";
+import {{ createMemoryDeleteTool }} from "./{MANAGED_RUNTIME_MEMORY_DELETE_FILE}";
+import {{ createMemoryStoreTool }} from "./{MANAGED_RUNTIME_MEMORY_STORE_FILE}";
+import {{ createMemorySaveTool }} from "./{MANAGED_RUNTIME_MEMORY_SAVE_FILE}";
+import {{ createMemoryGetTool }} from "./{MANAGED_RUNTIME_MEMORY_GET_FILE}";
+import {{ createMemoryForgetTool }} from "./{MANAGED_RUNTIME_MEMORY_FORGET_FILE}";
+import {{ createMemoryListTool }} from "./{MANAGED_RUNTIME_MEMORY_LIST_FILE}";
+import {{ createChatSearchTool }} from "./{MANAGED_RUNTIME_CHAT_SEARCH_FILE}";
 
 const execFile = promisify(execFileCallback);
+
+// node:http based POST for localhost proxy calls — bypasses undici fetch
+// which can emit UND_ERR_SOCKET on some Node.js builds.
+function localHttpPost(url, options) {{
+  return new Promise((resolve, reject) => {{
+    const urlObj = new URL(url);
+    const body = options?.body;
+    const headers = {{ ...(options?.headers || {{}}) }};
+    if (body != null && !headers["content-length"] && !headers["Content-Length"]) {{
+      headers["content-length"] = String(Buffer.byteLength(body));
+    }}
+    const req = http.request({{
+      hostname: urlObj.hostname,
+      port: urlObj.port,
+      path: urlObj.pathname,
+      method: options?.method || "POST",
+      headers,
+    }}, (res) => {{
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {{
+        const text = Buffer.concat(chunks).toString("utf8");
+        resolve({{
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          text: () => Promise.resolve(text),
+          json: () => {{ try {{ return Promise.resolve(JSON.parse(text)); }} catch(e) {{ return Promise.reject(e); }} }},
+        }});
+      }});
+    }});
+    req.on("error", reject);
+    if (options?.signal) {{
+      const onAbort = () => req.destroy(Object.assign(new Error("Aborted"), {{ name: "AbortError" }}));
+      if (options.signal.aborted) {{ onAbort(); return; }}
+      options.signal.addEventListener("abort", onAbort, {{ once: true }});
+    }}
+    if (body != null) req.write(body);
+    req.end();
+  }});
+}}
 
 const HTTP_PARAMS = Type.Object({{
   alias: Type.String({{ description: "Configured external API alias" }}),
@@ -183,6 +361,11 @@ function proxyUrl() {{
 
 const TOOL_REPEAT_LIMIT = 3;
 const TOOL_LOOP_GUARD_REASON_PREFIX = "[NineClaw loop guard]";
+const NINECLAW_SYSTEM_PROMPT_APPEND = [
+  "When you use ask_user and the user submits an answer, treat that tool result as clarification, not as the end of the turn.",
+  "After a successful ask_user result, continue the task immediately and answer the user using the submitted information.",
+  "Do not stop at the tool result unless the user explicitly asked you to only collect the answer.",
+].join("\\n");
 
 function stableToolInput(value) {{
   if (Array.isArray(value)) {{
@@ -205,6 +388,15 @@ function stableToolSignature(toolName, input) {{
   return `${{String(toolName ?? "")}}\n${{JSON.stringify(stableToolInput(input ?? {{}}))}}`;
 }}
 
+function buildSystemPromptAppend(harness) {{
+  const sections = [NINECLAW_SYSTEM_PROMPT_APPEND];
+  const promptAppend = typeof harness.promptAppend === "string" ? harness.promptAppend.trim() : "";
+  if (promptAppend) {{
+    sections.push(`# Active Harness\n\n${{promptAppend}}`);
+  }}
+  return sections.filter(Boolean).join("\n\n");
+}}
+
 export default function(pi) {{
   let externalToolRegistered = false;
   let webSearchToolRegistered = false;
@@ -212,6 +404,17 @@ export default function(pi) {{
   let imageGenerationToolRegistered = false;
   let imageTaskQueryToolRegistered = false;
   let agentDelegateToolRegistered = false;
+  let askUserToolRegistered = false;
+  let memoryUpdateToolRegistered = false;
+  let memorySearchToolRegistered = false;
+  let memoryReadToolRegistered = false;
+  let memoryDeleteToolRegistered = false;
+  let memoryStoreToolRegistered = false;
+  let memorySaveToolRegistered = false;
+  let memoryGetToolRegistered = false;
+  let memoryForgetToolRegistered = false;
+  let memoryListToolRegistered = false;
+  let chatSearchToolRegistered = false;
   let lastToolSignature = "";
   let repeatedToolSignatureCount = 0;
 
@@ -262,7 +465,7 @@ export default function(pi) {{
     pi.registerTool(
       createImageGenerationTool({{
         Type,
-        fetchImpl: fetch,
+        fetchImpl: localHttpPost,
         fsPromises,
         pathApi: path,
         osApi: os,
@@ -279,7 +482,7 @@ export default function(pi) {{
     pi.registerTool(
       createImageTaskQueryTool({{
         Type,
-        fetchImpl: fetch,
+        fetchImpl: localHttpPost,
         fsPromises,
         pathApi: path,
         osApi: os,
@@ -296,10 +499,82 @@ export default function(pi) {{
     pi.registerTool(
       createAgentDelegateTool({{
         Type,
-        fetchImpl: fetch,
+        fetchImpl: localHttpPost,
         processApi: process,
       }})
     );
+  }}
+
+  function ensureAskUserTool() {{
+    if (askUserToolRegistered) return;
+    askUserToolRegistered = true;
+    pi.registerTool(
+      createAskUserTool({{
+        Type,
+        fetchImpl: localHttpPost,
+        processApi: process,
+      }})
+    );
+  }}
+
+  function ensureMemoryUpdateTool() {{
+    if (memoryUpdateToolRegistered) return;
+    memoryUpdateToolRegistered = true;
+    pi.registerTool(createMemoryUpdateTool({{ Type }}));
+  }}
+
+  function ensureMemorySearchTool() {{
+    if (memorySearchToolRegistered) return;
+    memorySearchToolRegistered = true;
+    pi.registerTool(createMemorySearchTool({{ Type }}));
+  }}
+
+  function ensureMemoryReadTool() {{
+    if (memoryReadToolRegistered) return;
+    memoryReadToolRegistered = true;
+    pi.registerTool(createMemoryReadTool({{ Type }}));
+  }}
+
+  function ensureMemoryDeleteTool() {{
+    if (memoryDeleteToolRegistered) return;
+    memoryDeleteToolRegistered = true;
+    pi.registerTool(createMemoryDeleteTool({{ Type }}));
+  }}
+
+  function ensureMemoryStoreTool() {{
+    if (memoryStoreToolRegistered) return;
+    memoryStoreToolRegistered = true;
+    pi.registerTool(createMemoryStoreTool({{ Type }}));
+  }}
+
+  function ensureMemorySaveTool() {{
+    if (memorySaveToolRegistered) return;
+    memorySaveToolRegistered = true;
+    pi.registerTool(createMemorySaveTool({{ Type }}));
+  }}
+
+  function ensureMemoryGetTool() {{
+    if (memoryGetToolRegistered) return;
+    memoryGetToolRegistered = true;
+    pi.registerTool(createMemoryGetTool({{ Type }}));
+  }}
+
+  function ensureMemoryForgetTool() {{
+    if (memoryForgetToolRegistered) return;
+    memoryForgetToolRegistered = true;
+    pi.registerTool(createMemoryForgetTool({{ Type }}));
+  }}
+
+  function ensureMemoryListTool() {{
+    if (memoryListToolRegistered) return;
+    memoryListToolRegistered = true;
+    pi.registerTool(createMemoryListTool({{ Type }}));
+  }}
+
+  function ensureChatSearchTool() {{
+    if (chatSearchToolRegistered) return;
+    chatSearchToolRegistered = true;
+    pi.registerTool(createChatSearchTool({{ Type }}));
   }}
 
   function ensureExternalTool() {{
@@ -323,7 +598,7 @@ export default function(pi) {{
           }};
         }}
 
-        const response = await fetch(target, {{
+        const response = await localHttpPost(target, {{
           method: "POST",
           headers: {{ "content-type": "application/json" }},
           body: JSON.stringify(params ?? {{}})
@@ -346,6 +621,17 @@ export default function(pi) {{
     ensureImageGenerationTool();
     ensureImageTaskQueryTool();
     ensureAgentDelegateTool();
+    ensureAskUserTool();
+    ensureMemoryUpdateTool();
+    ensureMemorySearchTool();
+    ensureMemoryReadTool();
+    ensureMemoryDeleteTool();
+    ensureMemoryStoreTool();
+    ensureMemorySaveTool();
+    ensureMemoryGetTool();
+    ensureMemoryForgetTool();
+    ensureMemoryListTool();
+    ensureChatSearchTool();
     if (harness.enableExternalApiProxy) {{
       ensureExternalTool();
     }}
@@ -359,16 +645,24 @@ export default function(pi) {{
     ensureImageGenerationTool();
     ensureImageTaskQueryTool();
     ensureAgentDelegateTool();
+    ensureAskUserTool();
+    ensureMemoryUpdateTool();
+    ensureMemorySearchTool();
+    ensureMemoryReadTool();
+    ensureMemoryDeleteTool();
+    ensureMemoryStoreTool();
+    ensureMemorySaveTool();
+    ensureMemoryGetTool();
+    ensureMemoryForgetTool();
+    ensureMemoryListTool();
+    ensureChatSearchTool();
     if (harness.enableExternalApiProxy) {{
       ensureExternalTool();
     }}
     applyHarness(pi, harness);
-    const promptAppend = typeof harness.promptAppend === "string" ? harness.promptAppend.trim() : "";
-    if (!promptAppend) {{
-      return undefined;
-    }}
+    const promptAppend = buildSystemPromptAppend(harness);
     return {{
-      systemPrompt: `${{event.systemPrompt}}\n\n# Active Harness\n\n${{promptAppend}}`
+      systemPrompt: `${{event.systemPrompt}}\n\n${{promptAppend}}`
     }};
   }});
 
@@ -446,6 +740,12 @@ mod tests {
         assert!(extension_source.contains("ensureWebFetchTool"));
         assert!(extension_source.contains("ensureImageGenerationTool"));
         assert!(extension_source.contains("ensureImageTaskQueryTool"));
+        assert!(extension_source.contains("ensureAskUserTool"));
+        assert!(extension_source.contains("NINECLAW_SYSTEM_PROMPT_APPEND"));
+        assert!(extension_source.contains(
+            "After a successful ask_user result, continue the task immediately and answer the user using the submitted information."
+        ));
+        assert!(extension_source.contains("buildSystemPromptAppend"));
         assert!(extension_source.contains("createImageGenerationTool"));
         assert!(extension_source.contains("createImageTaskQueryTool"));
         assert!(extension_source.contains("createWebSearchTool"));
@@ -455,6 +755,10 @@ mod tests {
         assert!(extension_source.contains("const TOOL_REPEAT_LIMIT = 3"));
         assert!(extension_source.contains("stableToolSignature(event.toolName, event.input)"));
         assert!(extension_source.contains("[NineClaw loop guard]"));
+        assert!(extension_source.contains("import { Type } from \"/tmp/typebox/index.mjs\";"));
+        assert!(extension_source.contains("from \"@mariozechner/pi-coding-agent\";"));
+        assert!(extension_source.contains("createAgentDelegateTool"));
+        assert!(extension_source.contains("createAskUserTool"));
         assert!(helper_source.contains("name: \"web_search\""));
         assert!(fetch_helper_source.contains("name: \"web_fetch\""));
         assert!(image_generation_source.contains("name: \"image_generate\""));

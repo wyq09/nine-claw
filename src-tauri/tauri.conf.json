@@ -54,9 +54,11 @@
       }
     },
     "resources": [
+      "resources/default-agent-presets",
       "resources/system-skills",
       "resources/bot-helpers",
       "resources/pi-runtime-bundles",
+      "resources/embedding-models",
       "icons/128x128.png"
     ],
     "icon": [

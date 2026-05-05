@@ -19,6 +19,24 @@ vi.mock('../../lib/piClient', () => ({
     listenAddress: '127.0.0.1:1052',
     inboundUrl: 'http://127.0.0.1:1052/inbound',
   }),
+  getEmbeddingStatus: vi.fn().mockResolvedValue({
+    activeProviderId: null,
+    mode: 'local',
+    localModelReady: false,
+    localModelPath: '',
+    localDownloadState: 'idle',
+    remoteConfigured: false,
+    vectorCount: 0,
+    providerCount: 0,
+    message: '',
+  }),
+  loadEmbeddingSettings: vi.fn().mockResolvedValue({
+    mode: 'local',
+    remoteEndpoint: '',
+    remoteModelName: '',
+    remoteApiKey: '',
+    remoteDimension: 512,
+  }),
   loadNetworkProxySettings: vi.fn().mockResolvedValue({
     useSystemProxy: false,
     customProxyUrl: '',
@@ -31,8 +49,16 @@ vi.mock('../../lib/piClient', () => ({
   }),
   saveNetworkProxySettings: vi.fn(),
   savePeerGatewaySettings: vi.fn(),
+  saveEmbeddingSettings: vi.fn(),
   testNetworkProxyConnection: vi.fn(),
   testLlmProviderConnection: vi.fn(),
+  triggerEmbeddingReindex: vi.fn().mockResolvedValue({
+    indexed: 0,
+    skipped: 0,
+    providerId: null,
+    searchModeReady: false,
+    message: '',
+  }),
 }))
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({
@@ -44,6 +70,17 @@ vi.mock('../../lib/llmLogExportClient', () => ({
     file: null,
     tail: '',
   }),
+}))
+
+vi.mock('../../lib/appLogClient', () => ({
+  appLogList: vi.fn().mockResolvedValue({
+    dir: '/tmp/logs',
+    files: [],
+    totalBytes: 0,
+  }),
+  appLogRead: vi.fn().mockResolvedValue(''),
+  appLogOpenDir: vi.fn(),
+  appLogExportAll: vi.fn().mockResolvedValue(0),
 }))
 
 const generalSettings: GeneralSettings = {
@@ -120,9 +157,67 @@ const imageGenerationSystem: ImageGenerationSystemConfig = {
   count: 1,
 }
 
+const baseModalProps = {
+  activeProviderBadge: '系统默认：OpenAI',
+  allProviderDefinitions: [llmProviderDefinition],
+  appearanceSettings,
+  generalSettings,
+  imageGenerationSystem,
+  imageProviderConfigs: { openai_image: imageProviderConfig },
+  imageProviderDefinitions: [imageProviderDefinition],
+  onAddCustomProvider: vi.fn(),
+  onSaveImageGenerationSettings: vi.fn().mockResolvedValue(undefined),
+  onProviderConfigChange: vi.fn(),
+  onClose: vi.fn(),
+  onRemoveCustomProvider: vi.fn(),
+  onSelectProvider: vi.fn(),
+  onSelectTab: vi.fn(),
+  providerConfigs: { openai: llmProviderConfig },
+  selectedProviderConfig: llmProviderConfig,
+  selectedProviderDefinition: llmProviderDefinition,
+  selectedProviderId: 'openai',
+  setAppearanceSettings: vi.fn(),
+  setGeneralSettings: vi.fn(),
+  skillsLibrary: {
+    installedSkillCount: 0,
+    installedSkills: [],
+    onChangeTab: vi.fn(),
+    onInstallByLink: vi.fn(),
+    onInstallSystemSkill: vi.fn(),
+    onRefresh: vi.fn(),
+    sessionBusy: false,
+    setSearch: vi.fn(),
+    skillsError: '',
+    skillsLoading: false,
+    systemSkillCount: 0,
+    systemSkillCatalog: { available: false, skills: [], message: '' },
+    systemSkillInstallId: '',
+    tab: 'installed' as const,
+    skillSearch: '',
+    visibleSystemSkills: [],
+  },
+  resourcesLibrary: {
+    onSearch: vi.fn(),
+    resourceSearch: '',
+    visibleResources: [],
+  },
+}
+
 describe('SettingsModal provider tabs', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+  })
+
+  it('renders the shrimp tide theme option in the appearance tab', async () => {
+    render(
+      <SettingsModal
+        {...baseModalProps}
+        tab="appearance"
+      />,
+    )
+
+    expect(screen.getByDisplayValue('暖墨深色')).toBeInTheDocument()
+    expect(await screen.findByRole('option', { name: '虾游·潮汐间' })).toBeInTheDocument()
   })
 
   it('separates llm and image provider sections with nested tabs', () => {

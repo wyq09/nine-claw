@@ -56,6 +56,8 @@ pub struct SearchHit {
     pub embedding_model: String,
     pub dimension: usize,
     pub updated_at: i64,
+    pub metadata_json: Option<String>,
+    pub content_text: Option<String>,
 }
 
 /// 在指定工作空间内暴力余弦搜索。
@@ -77,7 +79,8 @@ pub fn cosine_search(
 ) -> Result<Vec<SearchHit>, String> {
     // Always JOIN with workspace_memories for scope filtering
     let mut sql = String::from(
-        "SELECT mv.memory_id, mv.embedding, mv.embedding_model, mv.dimension, mv.updated_at
+        "SELECT mv.memory_id, mv.embedding, mv.embedding_model, mv.dimension, mv.updated_at,
+                mv.metadata_json, mv.content_text
          FROM memory_vectors mv
          JOIN workspace_memories wm ON wm.id = mv.memory_id
          WHERE (mv.workspace_id = ?1 OR wm.scope = 'system')",
@@ -87,10 +90,7 @@ pub fn cosine_search(
     if let Some(scopes) = scope_filter {
         if !scopes.is_empty() {
             let placeholders: Vec<&str> = scopes.iter().map(|_| "?").collect();
-            sql.push_str(&format!(
-                " AND wm.scope IN ({})",
-                placeholders.join(",")
-            ));
+            sql.push_str(&format!(" AND wm.scope IN ({})", placeholders.join(",")));
         }
     }
 
@@ -103,20 +103,30 @@ pub fn cosine_search(
     }
 
     // Build params: workspace_id first, then scope filter values
-    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(workspace_id.to_string())];
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(workspace_id.to_string())];
     if let Some(scopes) = scope_filter {
         for s in scopes {
             param_values.push(Box::new(s.clone()));
         }
     }
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| format!("准备向量搜索失败: {e}"))?;
 
-    let rows: Vec<(String, Vec<u8>, String, i32, i64)> = stmt
+    let rows: Vec<(
+        String,
+        Vec<u8>,
+        String,
+        i32,
+        i64,
+        Option<String>,
+        Option<String>,
+    )> = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -124,6 +134,8 @@ pub fn cosine_search(
                 row.get::<_, String>(2)?,
                 row.get::<_, i32>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })
         .map_err(|e| format!("执行向量搜索失败: {e}"))?
@@ -132,7 +144,7 @@ pub fn cosine_search(
 
     let mut hits: Vec<SearchHit> = Vec::new();
 
-    for (memory_id, blob, embedding_model, dim, updated_at) in rows {
+    for (memory_id, blob, embedding_model, dim, updated_at, metadata_json, content_text) in rows {
         // 若提供 tag_filter，在 Rust 侧检查 tags_json
         if let Some(tags) = tag_filter {
             let tags_json: String = conn
@@ -160,6 +172,8 @@ pub fn cosine_search(
                 embedding_model,
                 dimension: dim as usize,
                 updated_at,
+                metadata_json,
+                content_text,
             });
         }
     }
@@ -173,15 +187,210 @@ pub fn cosine_search(
     Ok(hits)
 }
 
-/// 在工作空间中查找与给定嵌入最相似的记忆 ID。若最高分低于 threshold 则返回 None。
+/// K/V 记忆向量：`memory_id` 形如 `kv::<key>`，不参与 `workspace_memories` JOIN。
+pub fn find_similar_kv(
+    conn: &Connection,
+    workspace_id: &str,
+    query_embedding: &[f32],
+    threshold: f32,
+) -> Result<Option<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT memory_id, embedding FROM memory_vectors
+             WHERE workspace_id = ?1 AND memory_id LIKE 'kv::%' AND embedding IS NOT NULL",
+        )
+        .map_err(|e| format!("准备 K/V 向量查询失败: {e}"))?;
+    let rows = stmt
+        .query_map(params![workspace_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|e| format!("执行 K/V 向量查询失败: {e}"))?;
+
+    let mut best_id: Option<String> = None;
+    let mut best_score: f32 = 0.0;
+    for row in rows {
+        let Ok((memory_id, blob)) = row else {
+            continue;
+        };
+        let vec = blob_to_embedding(&blob)?;
+        let score = cosine_similarity(query_embedding, &vec);
+        if score > best_score && score >= threshold {
+            best_score = score;
+            best_id = Some(memory_id);
+        }
+    }
+    Ok(best_id)
+}
+
+/// 在工作空间中查找与给定嵌入最相似的记忆 ID（仅 `workspace_memories`）。若最高分低于 threshold 则返回 None。
 pub fn find_similar(
     conn: &Connection,
     workspace_id: &str,
     embedding: &[f32],
     threshold: f32,
 ) -> Result<Option<String>, String> {
-    let hits = cosine_search(conn, workspace_id, embedding, 1, threshold, None, None, None)?;
+    let hits = cosine_search(
+        conn,
+        workspace_id,
+        embedding,
+        1,
+        threshold,
+        None,
+        None,
+        None,
+    )?;
     Ok(hits.into_iter().next().map(|h| h.memory_id))
+}
+
+/// 在 memory_vectors 中搜索不依赖 workspace_memories JOIN 的独立向量（chat turns, saved memories 等）。
+/// 按前缀过滤 memory_id，支持时间范围过滤（通过 metadata_json 中的 timestamp）。
+pub fn standalone_vector_search(
+    conn: &Connection,
+    workspace_id: &str,
+    query_embedding: &[f32],
+    limit: usize,
+    threshold: f32,
+    memory_id_prefix: &str,
+    time_range_start: Option<i64>,
+    time_range_end: Option<i64>,
+    tag_filter: Option<&[String]>,
+) -> Result<Vec<SearchHit>, String> {
+    let mut sql = format!(
+        "SELECT mv.memory_id, mv.embedding, mv.embedding_model, mv.dimension, mv.updated_at,
+                mv.metadata_json, mv.content_text
+         FROM memory_vectors mv
+         WHERE mv.workspace_id = ?1 AND mv.memory_id LIKE '{}%'",
+        memory_id_prefix.replace('\'', "''")
+    );
+
+    if time_range_start.is_some() || time_range_end.is_some() {
+        // Filter by created_at in metadata_json — uses content_text column as a proxy if no metadata
+        // For chat turns we store timestamp in metadata_json
+        if let Some(start) = time_range_start {
+            sql.push_str(&format!(" AND mv.updated_at >= {}", start));
+        }
+        if let Some(end) = time_range_end {
+            sql.push_str(&format!(" AND mv.updated_at <= {}", end));
+        }
+    }
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("准备独立向量搜索失败: {e}"))?;
+
+    let rows: Vec<(
+        String,
+        Vec<u8>,
+        String,
+        i32,
+        i64,
+        Option<String>,
+        Option<String>,
+    )> = stmt
+        .query_map(params![workspace_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i32>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(|e| format!("执行独立向量搜索失败: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for (memory_id, blob, embedding_model, dim, updated_at, metadata_json, content_text) in rows {
+        // Tag filter: check tags_json in metadata
+        if let Some(tags) = tag_filter {
+            let row_tags: Vec<String> = if let Some(ref tj) = metadata_json {
+                if let Ok(meta) = serde_json::from_str::<serde_json::Value>(tj) {
+                    meta.get("tags")
+                        .and_then(|t| {
+                            serde_json::from_str::<Vec<String>>(
+                                &serde_json::to_string(t).unwrap_or_default(),
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            if !tags.iter().all(|t| row_tags.contains(t)) {
+                continue;
+            }
+        }
+
+        let vec = blob_to_embedding(&blob)?;
+        let score = cosine_similarity(query_embedding, &vec);
+        if score >= threshold {
+            hits.push(SearchHit {
+                memory_id,
+                score,
+                embedding_model,
+                dimension: dim as usize,
+                updated_at,
+                metadata_json,
+                content_text,
+            });
+        }
+    }
+
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+/// Search saved memories (memory_id prefix "saved::") across workspaces.
+pub fn saved_memory_search(
+    conn: &Connection,
+    workspace_ids: &[String],
+    query_embedding: &[f32],
+    limit: usize,
+    threshold: f32,
+    tag_filter: Option<&[String]>,
+) -> Result<Vec<SearchHit>, String> {
+    let mut merged = Vec::new();
+    for ws in workspace_ids {
+        let mut hits = standalone_vector_search(
+            conn,
+            ws,
+            query_embedding,
+            limit,
+            threshold,
+            "saved::",
+            None,
+            None,
+            tag_filter,
+        )?;
+        merged.append(&mut hits);
+    }
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut dedup = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for hit in merged {
+        if dedup.insert(hit.memory_id.clone()) {
+            out.push(hit);
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

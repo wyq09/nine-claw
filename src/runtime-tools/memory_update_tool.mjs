@@ -1,61 +1,52 @@
+import { parseProxyJsonResponse } from './memory_tool_transport.mjs'
+
 export function createMemoryUpdateParameters(Type) {
   return Type.Object({
-    title: Type.String({
-      minLength: 1,
-      description: "Title of the memory entry.",
-    }),
     content: Type.String({
       minLength: 1,
-      description: "Content/body of the memory entry.",
+      description: "Full content to write into the current agent's MEMORY.md file.",
     }),
-    tags: Type.Optional(
-      Type.Array(Type.String(), {
-        description: "Optional tags for categorizing the memory.",
+    mode: Type.Optional(
+      Type.Union([
+        Type.Literal('replace'),
+        Type.Literal('append'),
+      ], {
+        description: "replace overwrites the file, append adds content to the end. Default is replace.",
       }),
     ),
-    memory_id: Type.Optional(
-      Type.String({
-        description: "Optional existing memory ID to update. If omitted, a new memory is created.",
-      }),
-    ),
-  });
+  })
 }
 
 export function createMemoryUpdateTool(deps) {
   return {
-    name: "memory_update",
-    label: "Memory Update",
+    name: 'memory_update',
+    label: 'Memory Update',
     description:
-      "Create or update a memory entry in the vector memory store. " +
-      "Use it to persist important facts, decisions, or context for later retrieval.",
+      "Update the current agent's MEMORY.md file. Use it to maintain the agent's explicit user memory document.",
     promptSnippet:
-      "Create or update a memory entry with a title, content, and optional tags.",
+      "Write or append content to the current agent's MEMORY.md file.",
     promptGuidelines: [
-      "Use memory_update to store important facts, decisions, or context that should persist across sessions.",
-      "Provide a concise title and detailed content for the memory.",
-      "Use tags to categorize memories for easier filtering during search.",
-      "Pass memory_id only when updating an existing memory entry.",
+      'Use memory_update when the task explicitly needs to update the agent memory markdown file.',
+      'Prefer memory_read first if you need to inspect the current file before rewriting it.',
+      'Use mode=append only for small additive updates; use replace when supplying the full desired content.',
     ],
     parameters: createMemoryUpdateParameters(deps.Type),
-    async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
-      const proxyBase = process.env.NINECLAW_PROXY_BASE_URL?.trim();
-      const token = process.env.NINECLAW_PROXY_SESSION_TOKEN?.trim();
+    async execute(_toolCallId, input) {
+      const proxyBase = process.env.NINECLAW_PROXY_BASE_URL?.trim()
+      const token = process.env.NINECLAW_PROXY_SESSION_TOKEN?.trim()
       if (!proxyBase || !token) {
-        return { content: [{ type: "text", text: "Error: proxy not configured" }] };
+        return { content: [{ type: 'text', text: 'Error: proxy not configured' }] }
       }
       const resp = await fetch(`${proxyBase}/memory/${token}/update`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          title: input.title,
           content: input.content,
-          tags: input.tags ?? [],
-          memory_id: input.memory_id ?? null,
-          workspace_id: ctx?.workspace_id || null,
+          mode: input.mode ?? 'replace',
         }),
-      });
-      const data = await resp.json();
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      })
+      const { data } = await parseProxyJsonResponse(resp)
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }], details: data }
     },
-  };
+  }
 }

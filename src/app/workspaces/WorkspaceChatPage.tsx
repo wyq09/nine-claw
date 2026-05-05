@@ -16,6 +16,10 @@ import {
   DelegateSegmentsContext,
   type DelegateSegmentsContextValue,
 } from './chat/DelegateSegmentsBlock'
+import {
+  WidgetSegmentsContext,
+  type WidgetSegmentsContextValue,
+} from '../widgets/WidgetSegmentsContext'
 
 export type WorkspaceChatPageProps = Omit<ChatViewProps, 'onSubmit'> & {
   workspaceId: string
@@ -36,6 +40,8 @@ export type WorkspaceChatPageProps = Omit<ChatViewProps, 'onSubmit'> & {
     planId: string
     items: Array<{ assignee: string; task: string }>
   }) => Promise<void> | void
+  onSubmitWidgetResponse?: WidgetSegmentsContextValue['onSubmitWidget']
+  onCancelWidgetResponse?: WidgetSegmentsContextValue['onCancelWidget']
 }
 
 export function WorkspaceChatPage({
@@ -48,6 +54,8 @@ export function WorkspaceChatPage({
   onDeleteSession,
   onChatSubmit,
   onDispatchDelegatePlan,
+  onSubmitWidgetResponse,
+  onCancelWidgetResponse,
   ...chatProps
 }: WorkspaceChatPageProps) {
   const [workspace, setWorkspace] = useState<WorkspaceRecord | null>(null)
@@ -206,6 +214,13 @@ export function WorkspaceChatPage({
       },
     }),
     [workspaceId, onDispatchDelegatePlan],
+  )
+  const widgetCtxValue = useMemo<WidgetSegmentsContextValue>(
+    () => ({
+      onSubmitWidget: onSubmitWidgetResponse,
+      onCancelWidget: onCancelWidgetResponse,
+    }),
+    [onCancelWidgetResponse, onSubmitWidgetResponse],
   )
 
   const mentionPopover = mentionQuery !== null && mentionCandidates.length > 0 ? (
@@ -439,28 +454,30 @@ export function WorkspaceChatPage({
         />
         <div className="workspace-chat-surface">
           <DelegateSegmentsContext.Provider value={delegateCtxValue}>
-            <ChatView
-              {...chatProps}
-              onSubmit={handleWorkspaceSubmit}
-              composerSetTextRef={composerSetTextRef}
-              workspaceComposerNoteMode={isNoteMode}
-              workspaceComposerPlaceholder={
-                isNoteMode
-                  ? '旁白：Enter 保存便签，Shift+Enter 换行；关闭「旁白」后照常发送，便签会一并注入。'
-                  : null
-              }
-              workspaceHomeSlot={homeSlot}
-              workspaceHomeTitle={workspaceHomeTitle}
-              workspaceComposerOverlay={
-                <>
-                  {notesChipRow}
-                  {mentionChipRow}
-                  {mentionPopover}
-                </>
-              }
-              onComposerInput={handleComposerInput}
-              resolveSpeaker={resolveSpeaker}
-            />
+            <WidgetSegmentsContext.Provider value={widgetCtxValue}>
+              <ChatView
+                {...chatProps}
+                onSubmit={handleWorkspaceSubmit}
+                composerSetTextRef={composerSetTextRef}
+                workspaceComposerNoteMode={isNoteMode}
+                workspaceComposerPlaceholder={
+                  isNoteMode
+                    ? '旁白：Enter 保存便签，Shift+Enter 换行；关闭「旁白」后照常发送，便签会一并注入。'
+                    : null
+                }
+                workspaceHomeSlot={homeSlot}
+                workspaceHomeTitle={workspaceHomeTitle}
+                workspaceComposerOverlay={
+                  <>
+                    {notesChipRow}
+                    {mentionChipRow}
+                    {mentionPopover}
+                  </>
+                }
+                onComposerInput={handleComposerInput}
+                resolveSpeaker={resolveSpeaker}
+              />
+            </WidgetSegmentsContext.Provider>
           </DelegateSegmentsContext.Provider>
         </div>
         {workspace ? (

@@ -110,7 +110,7 @@ fn route_to_default_tag(route: &str) -> Option<String> {
     })
 }
 
-fn resolve_memory_extraction_model(record: &AgentRecord) -> (String, String) {
+pub(crate) fn resolve_memory_extraction_model(record: &AgentRecord) -> (String, String) {
     if let Some(slot) = record
         .scenario_llm_config
         .as_ref()
@@ -399,8 +399,12 @@ fn run_workspace_memory_extraction(
         &runtime.provider_id,
     );
     let pi_rt = pi_runtime::require_pi_runtime_location(app)?;
-    let recent_memories =
-        workspaces::list_workspace_memories(&conn, &request.workspace_id, MAX_RECENT_MEMORIES, None)?;
+    let recent_memories = workspaces::list_workspace_memories(
+        &conn,
+        &request.workspace_id,
+        MAX_RECENT_MEMORIES,
+        None,
+    )?;
     let session_turns = crate::storage::chat_history::list_chat_turns(&conn, &request.session_id)
         .unwrap_or_default();
     let speaker_label = request

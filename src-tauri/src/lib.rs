@@ -10,6 +10,7 @@ mod channels;
 mod chat_attachments;
 mod dev_trace;
 mod embedding;
+mod embedding_settings;
 mod heartbeat;
 mod image_generation;
 mod llm_log_export;
@@ -42,11 +43,10 @@ mod agent_presets;
 mod app_constants;
 mod commands_agents_skills;
 mod commands_chat_workspace;
-mod commands_workspace_kv_memory;
-mod user_kv_memory_reorganize;
 mod commands_llm_log_export;
 mod commands_llm_trace;
 mod commands_memory;
+mod commands_workspace_kv_memory;
 mod history_app_state;
 mod pi_usage;
 mod prompts;
@@ -56,8 +56,14 @@ mod runtime_agent_config;
 mod session_llm_titles;
 mod skill_broker;
 mod time_util;
+mod user_kv_memory_reorganize;
 
 pub(crate) use app_constants::*;
+pub(crate) use embedding_settings::{
+    configure_embedding_runtime, embedding_status_command, load_embedding_settings_command,
+    maybe_start_local_model_download, save_embedding_settings_command,
+    trigger_embedding_reindex_command,
+};
 pub(crate) use history_app_state::{
     ensure_app_state_schema, open_history_db, record_token_usage_for_scheduler_pi_completion,
     storage_conn,
@@ -85,10 +91,10 @@ pub(crate) use time_util::chrono_like_timestamp;
 use app_log::{app_log_export_all, app_log_list, app_log_open_dir, app_log_read};
 use commands_agents_skills::*;
 use commands_chat_workspace::*;
-use commands_workspace_kv_memory::*;
 use commands_llm_log_export::*;
 use commands_llm_trace::*;
 use commands_memory::*;
+use commands_workspace_kv_memory::*;
 use history_app_state::{
     clear_history_state, list_token_usage_records, load_history_state, save_history_state,
 };
@@ -987,12 +993,12 @@ mod lib_tests {
         aggregate_token_usage_from_history_turns, aggregate_usage_from_agent_messages,
         build_desktop_anthropic_compat_extension_source, build_desktop_outbound_display_text,
         build_provider_models_config_with_input, build_turn_prompt_with_multimodal_summary,
-        desktop_incomplete_reply_error, desktop_media_reply_prompt, infer_media_mime_type,
-        is_provider_image_block_rejection_error, is_provider_reasoning_history_rejection_error,
-        parse_context_stats_from_rpc_response, prepend_multimodal_summary_context,
-        quarantine_pi_session_file, record_multimodal_summary, render_multimodal_summary_context,
-        resolve_context_window_from_sources, resolve_pi_ai_import_path,
-        sanitize_pi_session_replay_state, should_force_pi_thinking_off,
+        desktop_incomplete_reply_error, desktop_media_reply_prompt, desktop_pi_fingerprint,
+        infer_media_mime_type, is_provider_image_block_rejection_error,
+        is_provider_reasoning_history_rejection_error, parse_context_stats_from_rpc_response,
+        prepend_multimodal_summary_context, quarantine_pi_session_file, record_multimodal_summary,
+        render_multimodal_summary_context, resolve_context_window_from_sources,
+        resolve_pi_ai_import_path, sanitize_pi_session_replay_state, should_force_pi_thinking_off,
         should_retry_text_only_after_image_rejection, summary_file_path, usage_row_total_tokens,
         DesktopParsedMediaItem, ProviderRuntimeConfig,
     };
@@ -1027,6 +1033,45 @@ mod lib_tests {
         let mime = infer_media_mime_type(&path, None);
         let _ = fs::remove_file(&path);
         assert_eq!(mime, "image/png");
+    }
+
+    #[test]
+    fn desktop_pi_fingerprint_changes_when_proxy_binding_changes() {
+        let provider = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "gpt-5".to_string(),
+        };
+
+        let base = desktop_pi_fingerprint(
+            Some(&provider),
+            "/tmp/session.jsonl",
+            "http://127.0.0.1:3000",
+            "token-a",
+            &[("agent_system_prompt".to_string(), "hello".to_string())],
+            &[],
+        );
+        let changed_proxy_url = desktop_pi_fingerprint(
+            Some(&provider),
+            "/tmp/session.jsonl",
+            "http://127.0.0.1:4000",
+            "token-a",
+            &[("agent_system_prompt".to_string(), "hello".to_string())],
+            &[],
+        );
+        let changed_proxy_token = desktop_pi_fingerprint(
+            Some(&provider),
+            "/tmp/session.jsonl",
+            "http://127.0.0.1:3000",
+            "token-b",
+            &[("agent_system_prompt".to_string(), "hello".to_string())],
+            &[],
+        );
+
+        assert_ne!(base, changed_proxy_url);
+        assert_ne!(base, changed_proxy_token);
     }
 
     #[test]
@@ -1922,6 +1967,8 @@ fn kill_desktop_pooled_pi(mut pooled: DesktopPooledPi, session_id: Option<&str>,
 fn desktop_pi_fingerprint(
     provider_config: Option<&ProviderRuntimeConfig>,
     session_path: &str,
+    proxy_base_url: &str,
+    proxy_session_token: &str,
     system_prompt_sections: &[(String, String)],
     skill_paths: &[PathBuf],
 ) -> String {
@@ -1949,6 +1996,8 @@ fn desktop_pi_fingerprint(
         api_key,
         model,
         session_path,
+        proxy_base_url,
+        proxy_session_token,
     ] {
         blob.extend_from_slice(value.as_bytes());
         blob.push(0);
@@ -2184,9 +2233,11 @@ fn load_multimodal_summary_entries(
 ) -> Result<Vec<MultimodalSummaryEntry>, String> {
     if let Some(app) = managed_runtime::injected_app_handle() {
         if let Ok(conn) = storage_conn(&app) {
-            if let Ok(rows) =
-                crate::storage::core_memory::list_runtime_multimodal_summaries(&conn, summary_key, 8)
-            {
+            if let Ok(rows) = crate::storage::core_memory::list_runtime_multimodal_summaries(
+                &conn,
+                summary_key,
+                8,
+            ) {
                 if !rows.is_empty() {
                     return Ok(rows
                         .into_iter()
@@ -2268,7 +2319,8 @@ pub(crate) fn build_turn_prompt_with_multimodal_summary(
 pub(crate) fn clear_multimodal_summary(summary_key: &str) -> Result<(), String> {
     if let Some(app) = managed_runtime::injected_app_handle() {
         if let Ok(conn) = storage_conn(&app) {
-            let _ = crate::storage::core_memory::clear_runtime_multimodal_summaries(&conn, summary_key);
+            let _ =
+                crate::storage::core_memory::clear_runtime_multimodal_summaries(&conn, summary_key);
         }
     }
     let path = summary_file_path(summary_key);
@@ -2304,7 +2356,8 @@ pub(crate) fn record_multimodal_summary(
 
     if let Some(app) = managed_runtime::injected_app_handle() {
         if let Ok(conn) = storage_conn(&app) {
-            let _ = crate::storage::core_memory::clear_runtime_multimodal_summaries(&conn, summary_key);
+            let _ =
+                crate::storage::core_memory::clear_runtime_multimodal_summaries(&conn, summary_key);
             for entry in &entries {
                 let _ = crate::storage::core_memory::insert_runtime_multimodal_summary(
                     &conn,
@@ -4163,6 +4216,14 @@ async fn stream_pi_prompt(
         let desktop_fingerprint = desktop_pi_fingerprint(
             provider_config.as_ref(),
             &session_path_string,
+            managed_runtime_prepared
+                .as_ref()
+                .and_then(|prepared| prepared.proxy_base_url.as_deref())
+                .unwrap_or_default(),
+            managed_runtime_prepared
+                .as_ref()
+                .and_then(|prepared| prepared.session_token.as_deref())
+                .unwrap_or_default(),
             &system_prompt_sections,
             &skill_paths,
         );
@@ -5088,6 +5149,16 @@ async fn stream_pi_prompt(
                     agent_config.as_ref().map(|config| config.name.as_str()),
                 );
             }
+            if let Some(agent_config) = agent_config.as_ref() {
+                user_memory_auto_extraction::spawn_user_memory_auto_extraction(
+                    &app,
+                    &normalized_session_id,
+                    &trimmed_prompt,
+                    &emitted_assistant_text,
+                    &agent_config.id,
+                    &agent_config.name,
+                );
+            }
             managed_runtime::append_assistant_output_events(
                 desktop_agent_home.as_deref(),
                 &normalized_session_id,
@@ -5342,6 +5413,16 @@ async fn stream_pi_prompt(
                     &emitted_assistant_text,
                     agent_config.as_ref().map(|config| config.id.as_str()),
                     agent_config.as_ref().map(|config| config.name.as_str()),
+                );
+            }
+            if let Some(agent_config) = agent_config.as_ref() {
+                user_memory_auto_extraction::spawn_user_memory_auto_extraction(
+                    &app,
+                    &normalized_session_id,
+                    &trimmed_prompt,
+                    &emitted_assistant_text,
+                    &agent_config.id,
+                    &agent_config.name,
                 );
             }
         }
@@ -6220,6 +6301,36 @@ async fn agent_loop_abort(loop_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn agent_loop_respond_approval(
+    app: tauri::AppHandle,
+    loop_id: String,
+    approved: bool,
+) -> Result<(), String> {
+    use agent_loop_types::ActiveLoops;
+    let active_loops = app.state::<ActiveLoops>();
+    let sender = active_loops
+        .approval_pending
+        .lock()
+        .map_err(|e| format!("锁 poisoned: {e}"))?
+        .remove(&loop_id);
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(approved);
+            log::info!(
+                "Agent Loop 审批响应已发送: loop_id={}, approved={}",
+                loop_id,
+                approved
+            );
+            Ok(())
+        }
+        None => {
+            log::warn!("Agent Loop 审批响应无待处理请求: loop_id={}", loop_id);
+            Err(format!("没有待处理的审批请求: loop_id={loop_id}"))
+        }
+    }
+}
+
+#[tauri::command]
 fn macos_open_native_dictation_panel(app: tauri::AppHandle) -> Result<(), String> {
     macos_native_dictation_panel::open(&app)
 }
@@ -6323,28 +6434,25 @@ pub fn run() {
                 scheduler::start_embedded_scheduler(app_handle);
 
                 // --- Embedding provider init + background index rebuild ---
-                let resource_dir = match post_scheduler_handle.path().resource_dir() {
-                    Ok(dir) => dir,
-                    Err(e) => {
-                        log::warn!("无法解析资源目录，跳过嵌入初始化: {e}");
-                        return;
-                    }
-                };
-                let model_dir = resource_dir.join("embedding-models/bge-small-zh-v1.5");
-                if model_dir.exists() {
-                    match embedding::onnx_local::OnnxLocalProvider::new(&model_dir) {
-                        Ok(provider) => {
-                            let mut guard = setup_embedding_registry.blocking_write();
-                            guard.register(std::sync::Arc::new(provider));
-                            log::info!("bge-small-zh-local embedding provider initialized");
+                let init_result = tauri::async_runtime::block_on(configure_embedding_runtime(
+                    &post_scheduler_handle,
+                    &setup_embedding_registry,
+                ));
+                match init_result {
+                    Ok(status) => {
+                        if let Some(provider_id) = status.active_provider_id {
+                            log::info!("embedding provider initialized: {}", provider_id);
+                        } else {
+                            log::warn!("embedding provider unavailable: {}", status.message);
                         }
-                        Err(e) => log::warn!("Failed to init embedding provider: {e}"),
+                        maybe_start_local_model_download(
+                            post_scheduler_handle.clone(),
+                            setup_embedding_registry.clone(),
+                        );
                     }
-                } else {
-                    log::warn!(
-                        "Embedding model directory not found: {}",
-                        model_dir.display()
-                    );
+                    Err(error) => {
+                        log::warn!("embedding runtime init failed: {error}");
+                    }
                 }
 
                 // Background: rebuild vector index for memories without embeddings
@@ -6408,6 +6516,10 @@ pub fn run() {
 
             Ok(())
         })
+        .manage(agent_loop_types::ActiveLoops {
+            loops: std::sync::Mutex::new(std::collections::HashMap::new()),
+            approval_pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
         .invoke_handler(tauri::generate_handler![
             load_history_state,
             save_history_state,
@@ -6423,6 +6535,10 @@ pub fn run() {
             list_token_usage_records,
             load_provider_preferences,
             save_provider_preferences,
+            load_embedding_settings_command,
+            save_embedding_settings_command,
+            embedding_status_command,
+            trigger_embedding_reindex_command,
             load_image_generation_preferences,
             save_image_generation_preferences,
             list_installed_skills,
@@ -6441,6 +6557,7 @@ pub fn run() {
             test_network_proxy_connection,
             archive_agent,
             delete_agent,
+            migrate_agent_id,
             set_default_agent,
             list_default_agent_presets,
             reset_agent_to_default_preset,
@@ -6531,7 +6648,8 @@ pub fn run() {
             generate_session_conversation_title,
             get_session_context_stats,
             agent_loop_respond_review,
-            agent_loop_abort
+            agent_loop_abort,
+            agent_loop_respond_approval
         ])
         .run(app_context())
         .expect("error while running tauri application");

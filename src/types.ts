@@ -1,8 +1,12 @@
+import type { WidgetSegment } from './widgetTypes'
+
 export type PiStreamEventName =
   | 'start'
   | 'delta'
   | 'final_text'
   | 'skill_selection'
+  | 'widget_request'
+  | 'widget_resolved'
   | 'done'
   | 'error'
   | 'aborted'
@@ -57,6 +61,7 @@ export type PiStreamPayload = {
   mountedSkillIds?: string[]
   mounted_skill_ids?: string[]
   reasons?: string[]
+  widget?: unknown
   inputTokens?: number
   input_tokens?: number
   outputTokens?: number
@@ -221,6 +226,7 @@ export type AgentLoopReviewSegment = {
 export type ResponseSegment =
   | { type: 'text'; text: string }
   | { type: 'tool'; toolCallId: string }
+  | WidgetSegment
   | { type: 'delegate_plan'; planId: string; items: DelegatePlanItem[] }
   | { type: 'delegation_run'; run: DelegationRunSegment }
   | { type: 'agent_loop'; segment: AgentLoopSegment }
@@ -260,8 +266,18 @@ export type AgentToolId =
   | 'web_fetch'
   | 'image_generate'
   | 'image_task_query'
+  | 'ask_user'
   | 'agent_spawn'
   | 'external_api'
+  | 'memory_update'
+  | 'memory_search'
+  | 'memory_read'
+  | 'memory_delete'
+  | 'memory_store'
+  | 'memory_get'
+  | 'memory_forget'
+  | 'memory_list'
+  | 'chat_search'
 
 export type AgentCapabilityPolicy = {
   strategy: AgentSkillStrategy
@@ -493,6 +509,8 @@ export type WorkspaceMemoryRecord = {
   content: string
   authorAgentId: string | null
   tagsJson: string
+  scope: string
+  scopeAgentId: string | null
   createdAt: number
   updatedAt: number
 }
@@ -513,6 +531,7 @@ export type SettingsTab =
   | 'shortcuts'
   | 'skills'
   | 'resources'
+  | 'memory'
   | 'logs'
 
 export type TokenUsageRecord = {
@@ -602,6 +621,17 @@ export type AgentRecord = {
   heartbeatConfig: AgentHeartbeatConfig
   createdAt: number
   updatedAt: number
+}
+
+export type AgentPresetSummary = {
+  id: string
+  name: string
+  summary: string
+  description: string
+  accentColor?: string
+  skillIds: string[]
+  allowedToolIds: AgentToolId[]
+  isDefault: boolean
 }
 
 export type AgentInput = {
@@ -788,6 +818,38 @@ export type NetworkProxySettings = {
   customProxyUrl: string
 }
 
+export type EmbeddingMode = 'local' | 'remote'
+
+export type LocalModelDownloadState = 'idle' | 'downloading' | 'ready' | 'failed'
+
+export type EmbeddingSettings = {
+  mode: EmbeddingMode
+  remoteEndpoint: string
+  remoteModelName: string
+  remoteApiKey: string
+  remoteDimension: number
+}
+
+export type EmbeddingProviderStatus = {
+  activeProviderId?: string | null
+  mode: EmbeddingMode
+  localModelReady: boolean
+  localModelPath: string
+  localDownloadState: LocalModelDownloadState
+  remoteConfigured: boolean
+  vectorCount: number
+  providerCount: number
+  message: string
+}
+
+export type EmbeddingReindexResult = {
+  indexed: number
+  skipped: number
+  providerId?: string | null
+  searchModeReady: boolean
+  message: string
+}
+
 export type GeneralSettings = {
   language: '中文' | 'English'
   launchOnStartup: boolean
@@ -800,7 +862,7 @@ export type GeneralSettings = {
   runtimeParameters: RuntimeParameters
 }
 
-export type ThemeMode = 'dark' | 'light' | 'claude'
+export type ThemeMode = 'dark' | 'light' | 'claude' | 'shrimp_tide'
 
 export type AppearanceSettings = {
   themeMode: ThemeMode

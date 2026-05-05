@@ -2,8 +2,8 @@
 
 use super::{
     current_date_label, current_timestamp_file_label, read_workspace_file,
-    sanitize_workspace_file_name, sanitize_workspace_segment, trim_to_char_limit,
-    truncate_for_memory, AgentWorkspaceFile, MemoryCategoryDefinition,
+    sanitize_workspace_file_name, sanitize_workspace_segment, truncate_for_memory,
+    AgentWorkspaceFile, MemoryCategoryDefinition,
 };
 use rusqlite::Connection;
 use std::fmt::Write as _;
@@ -306,7 +306,7 @@ pub(super) fn record_attachment_source(
     title: &str,
     file_path: &Path,
     mime_type: Option<&str>,
-    note: Option<&str>,
+    _note: Option<&str>,
 ) -> Result<(), String> {
     ensure_memory_wiki_scaffold(agent_home)?;
 
@@ -518,7 +518,12 @@ fn find_workspace_ids_for_agent(conn: &Connection, agent_id: &str) -> Vec<String
 /// Generate semantic search hints using vector similarity.
 ///
 /// Returns `None` if anything fails (no registry, no provider, no hits, etc.).
-fn vector_memory_hints(conn: &Connection, workspace_id: &str, agent_id: Option<&str>, prompt: &str) -> Option<String> {
+fn vector_memory_hints(
+    conn: &Connection,
+    workspace_id: &str,
+    agent_id: Option<&str>,
+    prompt: &str,
+) -> Option<String> {
     let registry = crate::managed_runtime::get_embedding_registry()?;
 
     let embeddings = match tokio::runtime::Handle::try_current() {

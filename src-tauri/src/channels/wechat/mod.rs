@@ -1098,6 +1098,8 @@ const MAX_QR_REFRESH: u32 = 3;
 const CHUNK_SIZE: usize = 3900;
 /// Interval between consecutive getUpdates polls (seconds).
 const POLL_INTERVAL_SECS: u64 = 3;
+/// Interval between typing indicator refreshes (seconds).
+const TYPING_INTERVAL_SECS: u64 = 5;
 /// Chunk size for on_chunk frontend streaming (characters).
 const STREAM_CHUNK_SIZE: usize = 500;
 
@@ -1663,6 +1665,14 @@ impl Channel for WeChatChannel {
                             Some(ct.as_str())
                         };
 
+                        // Start typing indicator before AI processing
+                        let typing_stop = start_typing_loop(
+                            api.clone(),
+                            user_id.clone(),
+                            ct_opt.map(|_| ct.clone()),
+                            running.clone(),
+                        );
+
                         let user_id_for_chunk = user_id.clone();
                         let user_id_for_state = user_id.clone();
                         let app_for_cb = app_handle.clone();
@@ -1693,6 +1703,12 @@ impl Channel for WeChatChannel {
                             },
                             |_| {},
                         );
+
+                        // Stop typing indicator before sending reply
+                        typing_stop.store(true, Ordering::SeqCst);
+                        if ct_opt.is_some() {
+                            let _ = rt.block_on(api.send_typing(&user_id, ct_opt, 0));
+                        }
 
                         let has_pending_followup = {
                             let mut guard = match user_states.lock() {
@@ -1956,6 +1972,40 @@ fn generate_qr_data_uri(content: &str) -> Result<String, String> {
         "data:image/svg+xml;utf8,{}",
         urlencoding::encode(&svg)
     ))
+}
+
+/// Start a periodic typing indicator loop for a user.
+/// Returns an `Arc<AtomicBool>` that should be set to `true` to stop the loop.
+fn start_typing_loop(
+    api: WeChatApi,
+    user_id: String,
+    context_token: Option<String>,
+    channel_running: Arc<AtomicBool>,
+) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = stop.clone();
+
+    thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(_) => return,
+        };
+        let ct_ref = context_token.as_deref();
+
+        // Send initial typing indicator immediately
+        let _ = rt.block_on(api.send_typing(&user_id, ct_ref, 1));
+
+        // Keep refreshing every TYPING_INTERVAL_SECS until stopped
+        while !stop_flag.load(Ordering::SeqCst) && channel_running.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(TYPING_INTERVAL_SECS));
+            if stop_flag.load(Ordering::SeqCst) || !channel_running.load(Ordering::SeqCst) {
+                break;
+            }
+            let _ = rt.block_on(api.send_typing(&user_id, ct_ref, 1));
+        }
+    });
+
+    stop
 }
 
 /// Send a reply to WeChat, splitting into ≤CHUNK_SIZE character chunks.

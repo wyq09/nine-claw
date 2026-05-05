@@ -3,7 +3,7 @@ export function createAgentDelegateParameters(Type) {
     role: Type.String({
       minLength: 1,
       description:
-        "Exact sub-agent identifier: use the real agent id, or the exact display name, of a delegate that your session allowlist already lists (system prompt / team members / collaboration allowlist). Do not invent job titles or generic roles (no 'analyst', 'writer', 'researcher', etc. unless that is literally a configured agent's name).",
+        "Target hint for agent selection: in team workspace, use a real team member's agent id, display name, configured team role, or a short capability hint; in direct chat, use any real agent's id, display name, or capability hint. The runtime will match against agent id, name, team role, summary, and description. Do not invent generic roles unless that clearly matches a configured agent identity.",
     }),
     task: Type.String({
       minLength: 1,
@@ -84,16 +84,17 @@ export function createAgentDelegateTool(deps) {
     name: "agent_delegate",
     label: "Agent Delegate",
     description:
-      "Delegate a task to another agent that is already allowed for this session (team member or explicit allowlist). " +
-      "The `role` field must match a real agent id or exact name from that allowlist — never invent generic role names. " +
+      "Delegate a task to another agent. In team workspace, the target must be a real member of the current team; in direct chat, any real agent can be targeted. " +
+      "The `role` field is treated as a target hint and matched against real agent id, display name, current team role, summary, and description when applicable. " +
       "The sub-agent runs with its own system prompt and tools and returns a result.",
     promptSnippet:
-      "Delegate by passing the real allowed sub-agent id or name plus a self-contained task.",
+      "Delegate by passing the real target agent id or name plus a self-contained task.",
     promptGuidelines: [
-      "Only reference sub-agents that appear in the current allowlist; if unsure, list members from context or tools first.",
+      "In team workspace, only reference agents that appear in the current team member list; in direct chat, use a real existing agent or a capability hint that clearly maps to one.",
       "Provide clear, self-contained task descriptions — the sub-agent won't see your conversation history.",
       "Include all necessary context in the task or context field so the sub-agent can work independently.",
       "You can delegate to the same sub-agent multiple times if needed.",
+      "If the user explicitly names a teammate or sub-agent, delegate first; if delegation fails, report the blocker instead of silently doing the delegated work yourself.",
     ],
     parameters: createAgentDelegateParameters(deps.Type),
     async execute(_toolCallId, input, signal, _onUpdate, _ctx) {
@@ -113,6 +114,9 @@ export function createAgentDelegateTool(deps) {
 
       const baseUrl = deps.processApi?.env?.NINECLAW_PROXY_BASE_URL?.trim() || process.env.NINECLAW_PROXY_BASE_URL?.trim();
       const token = deps.processApi?.env?.NINECLAW_PROXY_SESSION_TOKEN?.trim() || process.env.NINECLAW_PROXY_SESSION_TOKEN?.trim();
+
+      const url = baseUrl && token ? `${baseUrl}/delegate/${token}/dispatch` : "";
+
       if (!baseUrl || !token) {
         return {
           content: [{ type: "text", text: "Agent delegation is not available — proxy not configured." }],
@@ -120,7 +124,6 @@ export function createAgentDelegateTool(deps) {
         };
       }
 
-      const url = `${baseUrl}/delegate/${token}/dispatch`;
       const body = { role: role.trim(), task: task.trim(), context: context?.trim() || "" };
 
       try {
@@ -139,7 +142,10 @@ export function createAgentDelegateTool(deps) {
         if (!response.ok) {
           const errorText = await response.text().catch(() => "");
           return {
-            content: [{ type: "text", text: `Delegation failed (HTTP ${response.status}): ${errorText}` }],
+            content: [{
+              type: "text",
+              text: `Delegation failed (HTTP ${response.status}): ${errorText}\nReport this blocker to the user instead of silently completing the delegated work yourself.`,
+            }],
             details: { ok: false, reason: "http_error", status: response.status },
           };
         }
@@ -147,7 +153,10 @@ export function createAgentDelegateTool(deps) {
         const result = await response.json();
         if (!result.ok) {
           return {
-            content: [{ type: "text", text: result.error || "Delegation failed with unknown error." }],
+            content: [{
+              type: "text",
+              text: `${result.error || "Delegation failed with unknown error."}\nReport this blocker to the user instead of silently completing the delegated work yourself.`,
+            }],
             details: { ok: false, reason: "delegate_error", error: result.error },
           };
         }
@@ -174,8 +183,11 @@ export function createAgentDelegateTool(deps) {
           };
         }
         return {
-          content: [{ type: "text", text: `Delegation error: ${formatDelegateFetchError(err)}` }],
-          details: { ok: false, reason: "fetch_error", error: formatDelegateFetchError(err) },
+          content: [{
+            type: "text",
+            text: `Delegation error: ${formatDelegateFetchError(err)}\nURL: ${url || "(empty)"}\nReport this blocker to the user instead of silently completing the delegated work yourself.`,
+          }],
+          details: { ok: false, reason: "fetch_error", error: formatDelegateFetchError(err), url },
         };
       }
     },

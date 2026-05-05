@@ -16,6 +16,8 @@ import {
   subscribeAgentLoopStarted,
   subscribeBotMessage,
   subscribePiStream,
+  widgetCancelResponse,
+  widgetSubmitResponse,
 } from '../lib/piClient'
 import type { BotMessageEvent } from '../lib/piClient'
 import { generateSessionConversationTitle } from '../lib/sessionTitleClient'
@@ -42,6 +44,9 @@ import type {
   ToolCallEntry,
 } from '../types'
 import {
+  appendOrReplaceWidgetSegment,
+} from './piAgent/piAgentWidgets'
+import {
   appendAgentTaskDeliveriesToHistory,
   appendTextToSegments,
   buildBotConversationTitle,
@@ -49,9 +54,10 @@ import {
   buildToolCallEntry,
   cleanLlmSessionTitle,
   clearLegacyHistoryStorage,
+  createEmptyHistoryItem,
   createActivity,
   createId,
-  deriveConversationTitle,
+  deriveFirstUserTurnConversationTitle,
   extractTokenUsage,
   HISTORY_STORAGE_KEY,
   loadLegacyHistoryFromStorage,
@@ -62,6 +68,7 @@ import {
   updateLatestActivityState,
   withBotAgentMetadata,
 } from './piAgent/piAgentPure'
+import { parseWidgetSegment } from '../widgetTypes'
 
 export { getHistoryStatusLabel } from './piAgent/piAgentPure'
 
@@ -98,6 +105,8 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
   const notifiedToolLoopGuardIdsRef = useRef<Set<string>>(new Set())
   /** 防止同一会话重复并发「标题 LLM」请求 */
   const sessionTitleLlmInflightRef = useRef<Set<string>>(new Set())
+  /** 首轮用户文案（submit 时同步写入）；避免 `done` 早于 startTransition 提交时读到 turns 仍为空而跳过 LLM 标题 */
+  const sessionFirstUserPromptRef = useRef<Map<string, string>>(new Map())
   const latestHistoryRef = useRef<HistoryItem[]>([])
   const latestHistorySerializedRef = useRef<string>('')
   const historyHydratedRef = useRef(false)
@@ -202,60 +211,105 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     setStreamingHistoryIds((previous) => (previous.includes(historyId) ? previous : [...previous, historyId]))
   }
 
-  /** 首轮完成后用智能体「标题生成」模型起名；多轮仅按首轮文案做本地摘要；无智能体则始终本地摘要。 */
-  const finalizeHistoryTitleAfterTurn = (historyId: string) => {
-    setHistory((prev) => {
-      const item = prev.find((h) => h.id === historyId)
-      if (!item) {
-        return prev
-      }
+  const requestLlmSessionTitle = (payload: {
+    historyId: string
+    agentId: string
+    userMsg: string
+    heuristicTitle: string
+  }) => {
+    if (sessionTitleLlmInflightRef.current.has(payload.historyId)) {
+      return
+    }
+    sessionTitleLlmInflightRef.current.add(payload.historyId)
 
-      const firstTurn = item.turns[0]
-      const applyHeuristic = () =>
-        truncateTitle(
-          deriveConversationTitle(firstTurn?.prompt ?? item.title, firstTurn?.answer ?? '', item.title),
-        )
-
-      if (item.turns.length !== 1) {
-        const nextTitle = applyHeuristic()
-        if (nextTitle === item.title) {
-          return prev
-        }
-        return prev.map((h) => (h.id === historyId ? { ...h, title: nextTitle } : h))
-      }
-
-      const agentId = item.agent?.id?.trim()
-      if (!agentId) {
-        const nextTitle = applyHeuristic()
-        if (nextTitle === item.title) {
-          return prev
-        }
-        return prev.map((h) => (h.id === historyId ? { ...h, title: nextTitle } : h))
-      }
-
-      if (sessionTitleLlmInflightRef.current.has(historyId)) {
-        return prev
-      }
-      sessionTitleLlmInflightRef.current.add(historyId)
-
-      const userMsg = firstTurn?.prompt ?? ''
-      const assistantMsg = firstTurn?.answer ?? ''
-
+    queueMicrotask(() => {
       void (async () => {
         try {
-          const raw = await generateSessionConversationTitle(agentId, historyId, userMsg, assistantMsg)
+          const raw = await generateSessionConversationTitle(
+            payload.agentId,
+            payload.historyId,
+            payload.userMsg,
+          )
           const cleaned = cleanLlmSessionTitle(raw).trim()
-          const nextTitle = cleaned.length > 0 ? truncateTitle(cleaned) : applyHeuristic()
-          setHistory((p) => p.map((h) => (h.id === historyId ? { ...h, title: nextTitle } : h)))
+          const nextTitle = cleaned.length > 0 ? truncateTitle(cleaned) : payload.heuristicTitle
+          setHistory((p) => p.map((h) => (h.id === payload.historyId ? { ...h, title: nextTitle } : h)))
         } catch {
-          const nextTitle = applyHeuristic()
-          setHistory((p) => p.map((h) => (h.id === historyId ? { ...h, title: nextTitle } : h)))
+          setHistory((p) =>
+            p.map((h) =>
+              h.id === payload.historyId ? { ...h, title: payload.heuristicTitle } : h,
+            ),
+          )
         } finally {
-          sessionTitleLlmInflightRef.current.delete(historyId)
+          sessionTitleLlmInflightRef.current.delete(payload.historyId)
         }
       })()
+    })
+  }
 
-      return prev
+  /** 首轮完成后用智能体「标题生成」模型起名；多轮仅按首轮文案做本地摘要；无智能体则始终本地摘要。 */
+  const finalizeHistoryTitleAfterTurn = (historyId: string) => {
+    queueMicrotask(() => {
+      queueMicrotask(() => {
+        let asyncTitleJob:
+          | {
+              agentId: string
+              userMsg: string
+              heuristicTitle: string
+            }
+          | null = null
+
+        setHistory((prev) => {
+          const item = prev.find((h) => h.id === historyId)
+          if (!item) {
+            return prev
+          }
+
+          const storedFirst = sessionFirstUserPromptRef.current.get(historyId)?.trim() ?? ''
+          const firstTurn = item.turns[0]
+          const userMsg = (storedFirst || firstTurn?.prompt || '').trim()
+
+          const applyHeuristic = () =>
+            truncateTitle(
+              deriveFirstUserTurnConversationTitle(userMsg || item.title, item.title),
+            )
+
+          const turnCount = item.turns.length
+          if (turnCount >= 2) {
+            const nextTitle = applyHeuristic()
+            if (nextTitle === item.title) {
+              return prev
+            }
+            return prev.map((h) => (h.id === historyId ? { ...h, title: nextTitle } : h))
+          }
+
+          if (turnCount === 0 && !storedFirst) {
+            return prev
+          }
+
+          const agentId = item.agent?.id?.trim()
+          if (!agentId || !userMsg) {
+            const nextTitle = applyHeuristic()
+            if (nextTitle === item.title) {
+              return prev
+            }
+            return prev.map((h) => (h.id === historyId ? { ...h, title: nextTitle } : h))
+          }
+
+          const heuristicTitle = applyHeuristic()
+          asyncTitleJob = { agentId, userMsg, heuristicTitle }
+          return prev
+        })
+
+        if (!asyncTitleJob) {
+          return
+        }
+        requestLlmSessionTitle({
+          historyId,
+          agentId: asyncTitleJob.agentId,
+          userMsg: asyncTitleJob.userMsg,
+          heuristicTitle: asyncTitleJob.heuristicTitle,
+        })
+      })
     })
   }
 
@@ -469,6 +523,21 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
         responseSegments: payload.text
           ? [...(turn.responseSegments ?? []).filter((segment) => segment.type === 'tool'), { type: 'text', text: payload.text }]
           : turn.responseSegments,
+      }))
+      return
+    }
+
+    if (payload.event === 'widget_request' || payload.event === 'widget_resolved') {
+      const parsedWidget = parseWidgetSegment({
+        type: 'widget',
+        widget: payload.widget,
+      })
+      if (!parsedWidget) {
+        return
+      }
+      updateTurn(currentHistoryId, currentTurnId, (turn) => ({
+        ...turn,
+        responseSegments: appendOrReplaceWidgetSegment(turn.responseSegments, parsedWidget),
       }))
       return
     }
@@ -1047,6 +1116,12 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     const hasActiveConversation =
       !options?.forceNewSession && Boolean(activeHistoryId && history.some((item) => item.id === activeHistoryId))
 
+    const prevTurnCountForTitle =
+      history.find((item) => item.id === nextHistoryId)?.turns.length ?? 0
+    if (!hasActiveConversation || prevTurnCountForTitle === 0) {
+      sessionFirstUserPromptRef.current.set(nextHistoryId, trimmedPrompt)
+    }
+
     /** 先清输入（同步）；仅将 `setHistory` 放入 transition，减轻长会话下列表 diff / 虚拟列表的同步阻塞 */
     composerClearRef?.current?.()
     markSessionRunning(nextHistoryId)
@@ -1057,7 +1132,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
         if (!hasActiveConversation) {
           const nextConversation: HistoryItem = {
             id: nextHistoryId,
-            title: deriveConversationTitle(trimmedPrompt),
+            title: '新会话',
             status: 'running',
             createdAt: turn.createdAt,
             updatedAt: turn.createdAt,
@@ -1134,7 +1209,8 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
         desktopStreamFlyRef.current.set(nextHistoryId, streamFly)
         await streamFly
 
-        if (currentTurnIdsRef.current.get(nextHistoryId) === turn.id) {
+        const latestTurnIdAfterFly = currentTurnIdsRef.current.get(nextHistoryId)
+        if (latestTurnIdAfterFly === turn.id) {
           setLatestActivityState(nextHistoryId, turn.id, '连接 pi 主脑', 'done')
           setLatestActivityState(nextHistoryId, turn.id, '流式输出中', 'done')
           setLatestActivityState(nextHistoryId, turn.id, '深度思考中', 'done')
@@ -1145,7 +1221,27 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
             completedAt: current.completedAt ?? Date.now(),
           }))
           updateSessionStatus(nextHistoryId, 'done')
+          const agentIdForTitle = context?.agent?.id?.trim()
+          if (agentIdForTitle && prevTurnCountForTitle === 0) {
+            requestLlmSessionTitle({
+              historyId: nextHistoryId,
+              agentId: agentIdForTitle,
+              userMsg: trimmedPrompt,
+              heuristicTitle: truncateTitle(
+                deriveFirstUserTurnConversationTitle(trimmedPrompt, '新会话'),
+              ),
+            })
+          } else {
+            queueMicrotask(() => {
+              finalizeHistoryTitleAfterTurn(nextHistoryId)
+            })
+          }
           markSessionSettled(nextHistoryId)
+        } else if (latestTurnIdAfterFly === undefined) {
+          /** `done` 已收尾并清空 turn ref；补充首轮标题，避免 fly resolve 略晚时整块跳过 */
+          queueMicrotask(() => {
+            finalizeHistoryTitleAfterTurn(nextHistoryId)
+          })
         }
 
         return true
@@ -1197,6 +1293,25 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     },
   ) => submitPromptInternal(rawPrompt, context, { forceNewSession: true })
 
+  const submitWidgetResponse = async (payload: {
+    widgetId: string
+    kind: 'ask_user'
+    answers: Array<{ questionId: string; value: string | string[]; customValue?: string }>
+  }) => {
+    await widgetSubmitResponse({
+      widgetId: payload.widgetId,
+      kind: payload.kind,
+      answers: payload.answers,
+    })
+  }
+
+  const cancelWidgetResponse = async (payload: {
+    widgetId: string
+    kind: 'ask_user'
+  }) => {
+    await widgetCancelResponse(payload)
+  }
+
   const abortPrompt = async () => {
     const targetHistoryId = activeHistoryId.trim()
     if (!targetHistoryId) {
@@ -1214,6 +1329,18 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     composerClearRef?.current?.()
     setError('')
     setActiveHistoryId('')
+  }
+
+  const createEmptySession = (context?: {
+    agent?: ConversationAgentSnapshot | null
+    sessionLlm?: { providerId: ProviderId; model: string } | null
+    workspaceId?: string | null
+  }) => {
+    const nextConversation = createEmptyHistoryItem(context)
+    setError('')
+    setActiveHistoryId(nextConversation.id)
+    setHistory((previous) => [nextConversation, ...previous].slice(0, MAX_HISTORY_ITEMS))
+    return nextConversation.id
   }
 
   const updateSessionLlm = (historyId: string, providerId: ProviderId, model: string) => {
@@ -1310,6 +1437,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
   return {
     error,
     loading,
+    historyHydrated,
     runtimeReady,
     runtimeBlockingReason,
     runningHistoryIds,
@@ -1319,8 +1447,11 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     activeHistoryItem,
     submitPrompt,
     submitPromptInNewSession,
+    submitWidgetResponse,
+    cancelWidgetResponse,
     abortPrompt,
     resetSessionDraft,
+    createEmptySession,
     selectHistoryItem,
     clearHistory,
     deleteHistoryItem,

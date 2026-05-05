@@ -1,4 +1,4 @@
-import { lazy, Suspense, useMemo, useState } from 'react'
+import { Fragment, lazy, Suspense, useMemo, useState } from 'react'
 import type { MouseEvent, ReactNode } from 'react'
 import { Check, Copy } from 'lucide-react'
 import { AppIcon } from '../../components/AppIcon'
@@ -9,7 +9,15 @@ import { openExternalUrl } from '../../lib/piClient'
 import { resolveReplyCardItems } from '../../lib/replyCardFormat'
 import type { AgentBuilderDraft, ConversationTurn, TokenUsage, ToolCallEntry } from '../../types'
 import { DelegateSegmentsBlock } from '../workspaces/chat/DelegateSegmentsBlock'
+import { WidgetSegmentsBlock } from '../widgets/WidgetSegmentsBlock'
+import {
+  DelegateToolResultCard,
+  isDelegateToolName,
+  parseDelegateToolPayload,
+  parseDelegateToolResult,
+} from './delegateToolResult'
 import { LazyDetails } from './LazyDetails'
+import { partitionPsychActivityContent, TurnPsychActivityStrip } from './psychActivity'
 import { TurnThinkingBlock } from './TurnThinkingBlock'
 import {
   formatAgentExecutionModeLabel,
@@ -25,6 +33,14 @@ import {
 } from '../lib'
 
 const MarkdownRenderer = lazy(() => import('../../components/MarkdownRenderer'))
+
+function lastNonemptyTextPsychPartsIndex(parts: ReturnType<typeof partitionPsychActivityContent>): number {
+  for (let i = parts.length - 1; i >= 0; i -= 1) {
+    const p = parts[i]
+    if (p?.kind === 'text' && p.body.trim()) return i
+  }
+  return -1
+}
 
 export function TurnResponseBody({
   turn,
@@ -78,6 +94,9 @@ export function TurnResponseBody({
     (s): s is Extract<typeof s, { type: 'delegate_plan' | 'delegation_run' }> =>
       s.type === 'delegate_plan' || s.type === 'delegation_run',
   )
+  const widgetSegments = (segments ?? []).filter(
+    (s): s is Extract<typeof s, { type: 'widget' }> => s.type === 'widget',
+  )
 
   if (segments && segments.length > 0) {
     const renderBlocks: Array<
@@ -107,7 +126,7 @@ export function TurnResponseBody({
         return
       }
 
-      if (segment.type === 'delegate_plan' || segment.type === 'delegation_run') {
+      if (segment.type === 'delegate_plan' || segment.type === 'delegation_run' || segment.type === 'widget') {
         // 委派卡片在正文之后统一渲染（见下方 DelegateSegmentsBlock）。
         return
       }
@@ -180,34 +199,57 @@ export function TurnResponseBody({
         ) : null}
         {renderBlocks.map((block, blockIndex) => {
           if (block.type === 'text') {
-            const isStreaming = Boolean(
+            const psychParts = partitionPsychActivityContent(block.text)
+            const hasPsychBody = psychParts.some((p) => p.kind === 'psych' && p.body.trim())
+            const hasTextBody = psychParts.some((p) => p.kind === 'text' && p.body.trim())
+            const lastTextFragIx = lastNonemptyTextPsychPartsIndex(psychParts)
+            const isStreamingWhole = Boolean(
               isActiveStreamingTurn && block.index === lastTextSegmentIndex,
             )
-            if ((!block.text.trim() && !isStreaming) || isTurnPlaceholderNoOutputText(block.text)) {
+            if ((!hasTextBody && !hasPsychBody && !isStreamingWhole) || isTurnPlaceholderNoOutputText(block.text)) {
               return null
             }
-            const showUsageBesideAttachments =
-              hasUsageMetrics(turn.usage) && block.index === lastTextIndexWithAttachments
-            const attachmentCopySlot =
-              copyAnswerControlSlot && block.index === lastTextIndexWithFileAttachments
-                ? copyAnswerControlSlot
-                : undefined
+            const wrapKey = `${turn.id}-t-${block.index}`
             return (
-              <MarkdownBlock
-                key={`${turn.id}-t-${block.index}`}
-                actionId={`${turn.id}-t-${block.index}`}
-                actionBusyId={agentBuilderActionBusyId}
-                actionError={agentBuilderActionError}
-                actionNotice={agentBuilderActionNotice}
-                actionTargetId={agentBuilderActionTargetId}
-                content={block.text}
-                isStreaming={isStreaming}
-                onCreateAgentDraft={onCreateAgentDraft}
-                onImageClick={onImageClick}
-                usage={turn.usage}
-                showUsageBesideAttachments={showUsageBesideAttachments}
-                attachmentCopySlot={attachmentCopySlot}
-              />
+              <Fragment key={wrapKey}>
+                {psychParts.map((part, fragIndex) => {
+                  if (part.kind === 'psych') {
+                    return (
+                      <TurnPsychActivityStrip key={`${wrapKey}-psych-${fragIndex}`} body={part.body} />
+                    )
+                  }
+                  if (!part.body.trim()) return null
+                  const mdStream =
+                    isStreamingWhole && fragIndex === lastTextFragIx && lastTextFragIx >= 0
+                  const showUsageBesideAttachments =
+                    hasUsageMetrics(turn.usage) &&
+                    block.index === lastTextIndexWithAttachments &&
+                    extractInlineMediaAttachments(part.body).attachments.length > 0
+                  const attachmentCopySlot =
+                    copyAnswerControlSlot &&
+                    block.index === lastTextIndexWithFileAttachments &&
+                    extractInlineMediaAttachments(part.body).attachments.some((a) => a.kind === 'file')
+                      ? copyAnswerControlSlot
+                      : undefined
+                  return (
+                    <MarkdownBlock
+                      key={`${wrapKey}-md-${fragIndex}`}
+                      actionId={`${turn.id}-t-${block.index}-frag-${fragIndex}`}
+                      actionBusyId={agentBuilderActionBusyId}
+                      actionError={agentBuilderActionError}
+                      actionNotice={agentBuilderActionNotice}
+                      actionTargetId={agentBuilderActionTargetId}
+                      content={part.body}
+                      isStreaming={mdStream}
+                      onCreateAgentDraft={onCreateAgentDraft}
+                      onImageClick={onImageClick}
+                      usage={turn.usage}
+                      showUsageBesideAttachments={showUsageBesideAttachments}
+                      attachmentCopySlot={attachmentCopySlot}
+                    />
+                  )
+                })}
+              </Fragment>
             )
           }
 
@@ -233,6 +275,9 @@ export function TurnResponseBody({
             resolveSpeaker={resolveSpeaker}
           />
         ) : null}
+        {widgetSegments.length > 0 ? (
+          <WidgetSegmentsBlock segments={widgetSegments} turnId={turn.id} />
+        ) : null}
         {preparing && turn.id === activeTurnId ? (
           <TurnPreparingIndicator />
         ) : showStreamWaitIndicator ? (
@@ -251,29 +296,54 @@ export function TurnResponseBody({
       {showThinkingProcess && turn.thinking.trim() && !legacyThinkingInRail ? (
         <TurnThinkingBlock isStreaming={isActiveStreamingTurn} thinking={turn.thinking} />
       ) : null}
-      {turn.answer && !isTurnPlaceholderNoOutputText(turn.answer) ? (
-        <MarkdownBlock
-          actionId={`${turn.id}-legacy`}
-          actionBusyId={agentBuilderActionBusyId}
-          actionError={agentBuilderActionError}
-          actionNotice={agentBuilderActionNotice}
-          actionTargetId={agentBuilderActionTargetId}
-          content={turn.answer}
-          isStreaming={streamLive && turn.id === activeTurnId}
-          onCreateAgentDraft={onCreateAgentDraft}
-          onImageClick={onImageClick}
-          usage={turn.usage}
-          showUsageBesideAttachments={
-            hasUsageMetrics(turn.usage) &&
-            extractInlineMediaAttachments(turn.answer).attachments.length > 0
-          }
-          attachmentCopySlot={
-            copyAnswerControlSlot &&
-            extractInlineMediaAttachments(turn.answer).attachments.some((a) => a.kind === 'file')
-              ? copyAnswerControlSlot
-              : undefined
-          }
-        />
+      {!isTurnPlaceholderNoOutputText(turn.answer ?? '') ? (
+        (() => {
+          const legacyParts = partitionPsychActivityContent(turn.answer ?? '')
+          const hasPsychBody = legacyParts.some((p) => p.kind === 'psych' && p.body.trim())
+          const hasTextBody = legacyParts.some((p) => p.kind === 'text' && p.body.trim())
+          const streamingLegacy = Boolean(streamLive && turn.id === activeTurnId)
+          if (!hasPsychBody && !hasTextBody && !streamingLegacy) return null
+          const lastMdIx = lastNonemptyTextPsychPartsIndex(legacyParts)
+          const legacyKeyStem = `${turn.id}-legacy`
+          return (
+            <Fragment key={legacyKeyStem}>
+              {legacyParts.map((part, fragIndex) => {
+                if (part.kind === 'psych') {
+                  return (
+                    <TurnPsychActivityStrip key={`${legacyKeyStem}-psych-${fragIndex}`} body={part.body} />
+                  )
+                }
+                if (!part.body.trim()) return null
+                const mdStream = streamingLegacy && fragIndex === lastMdIx && lastMdIx >= 0
+                const showUsageBesideAttachments =
+                  hasUsageMetrics(turn.usage) &&
+                  extractInlineMediaAttachments(part.body).attachments.length > 0
+                const attachmentCopySlot =
+                  copyAnswerControlSlot &&
+                  extractInlineMediaAttachments(part.body).attachments.some((a) => a.kind === 'file')
+                    ? copyAnswerControlSlot
+                    : undefined
+                return (
+                  <MarkdownBlock
+                    key={`${legacyKeyStem}-md-${fragIndex}`}
+                    actionId={`${turn.id}-legacy-frag-${fragIndex}`}
+                    actionBusyId={agentBuilderActionBusyId}
+                    actionError={agentBuilderActionError}
+                    actionNotice={agentBuilderActionNotice}
+                    actionTargetId={agentBuilderActionTargetId}
+                    content={part.body}
+                    isStreaming={mdStream}
+                    onCreateAgentDraft={onCreateAgentDraft}
+                    onImageClick={onImageClick}
+                    usage={turn.usage}
+                    showUsageBesideAttachments={showUsageBesideAttachments}
+                    attachmentCopySlot={attachmentCopySlot}
+                  />
+                )
+              })}
+            </Fragment>
+          )
+        })()
       ) : null}
       {hasLegacyTools ? (
         <TurnExecutionRail
@@ -290,6 +360,9 @@ export function TurnResponseBody({
           turnId={turn.id}
           resolveSpeaker={resolveSpeaker}
         />
+      ) : null}
+      {widgetSegments.length > 0 ? (
+        <WidgetSegmentsBlock segments={widgetSegments} turnId={turn.id} />
       ) : null}
       {preparing && turn.id === activeTurnId ? (
         <TurnPreparingIndicator />
@@ -663,11 +736,22 @@ export function ToolRoundIoPanels({
   onImageClick?: (src: string, alt: string) => void
 }) {
   const isStreaming = toolCall.state === 'running'
+  const isDelegateTool = isDelegateToolName(toolCall.toolName)
   const argsLive = formatToolCallText(toolCall.argsText, '无参数', false)
   const resultLive = formatToolCallText(toolCall.resultText, '暂无输出', false)
   const argsPretty = formatToolCallText(toolCall.argsText, '无参数')
   const resultPretty = formatToolCallText(toolCall.resultText, '暂无输出')
+  const delegatePayload = useMemo(
+    () => (isDelegateTool ? parseDelegateToolPayload(toolCall.argsText) : null),
+    [isDelegateTool, toolCall.argsText],
+  )
+  const delegateResult = useMemo(
+    () => (isDelegateTool ? parseDelegateToolResult(toolCall.resultText) : null),
+    [isDelegateTool, toolCall.resultText],
+  )
   const [copiedKey, setCopiedKey] = useState<'input' | 'output' | ''>('')
+  const [inputOpen, setInputOpen] = useState(() => !isDelegateTool)
+  const [resultOpen, setResultOpen] = useState(true)
 
   const handleCopy = async (key: 'input' | 'output', text: string) => {
     await navigator.clipboard.writeText(text)
@@ -679,7 +763,22 @@ export function ToolRoundIoPanels({
     <div className="tool-exec-io-stack">
       <div className="tool-io-panel tool-io-panel-input">
         <div className="tool-io-panel-head">
-          <span className="tool-io-label">INPUT</span>
+          {isDelegateTool ? (
+            <button
+              type="button"
+              className="tool-io-head-toggle"
+              onClick={() => setInputOpen((open) => !open)}
+              aria-expanded={inputOpen}
+              aria-label={inputOpen ? '折叠 INPUT' : '展开 INPUT'}
+            >
+              <span className="tool-io-label">INPUT</span>
+              <span className={`tool-io-head-chevron${inputOpen ? ' is-open' : ''}`} aria-hidden>
+                <AppIcon name="chevron-down" size={12} />
+              </span>
+            </button>
+          ) : (
+            <span className="tool-io-label">INPUT</span>
+          )}
           <button
             type="button"
             className={`tool-io-copy-button ${copiedKey === 'input' ? 'copied' : ''}`}
@@ -690,13 +789,15 @@ export function ToolRoundIoPanels({
             {copiedKey === 'input' ? <Check size={14} /> : <Copy size={14} />}
           </button>
         </div>
-        <div className="tool-io-panel-body">
-          <ToolCallContentBlock
-            content={isStreaming ? argsLive : argsPretty}
-            isStreaming={isStreaming}
-            onImageClick={onImageClick}
-          />
-        </div>
+        {inputOpen ? (
+          <div className="tool-io-panel-body">
+            <ToolCallContentBlock
+              content={isStreaming ? argsLive : argsPretty}
+              isStreaming={isStreaming}
+              onImageClick={onImageClick}
+            />
+          </div>
+        ) : null}
       </div>
       <div className="tool-io-panel tool-io-panel-output">
         <div className="tool-io-panel-head">
@@ -711,12 +812,24 @@ export function ToolRoundIoPanels({
             {copiedKey === 'output' ? <Check size={14} /> : <Copy size={14} />}
           </button>
         </div>
-        <div className="tool-io-panel-body">
-          <ToolCallContentBlock
-            content={isStreaming ? resultLive : resultPretty}
-            isStreaming={isStreaming}
-            onImageClick={onImageClick}
-          />
+        <div className={`tool-io-panel-body${delegateResult ? ' tool-io-panel-body-delegate' : ''}`}>
+          {delegateResult ? (
+            <DelegateToolResultCard
+              agentName={delegateResult.agentName}
+              durationLabel={delegateResult.durationLabel}
+              task={delegatePayload?.task ?? ''}
+              body={delegateResult.body}
+              open={resultOpen}
+              onToggleOpen={() => setResultOpen((open) => !open)}
+              onImageClick={onImageClick}
+            />
+          ) : (
+            <ToolCallContentBlock
+              content={isStreaming ? resultLive : resultPretty}
+              isStreaming={isStreaming}
+              onImageClick={onImageClick}
+            />
+          )}
         </div>
       </div>
     </div>
@@ -747,6 +860,7 @@ export function TurnExecutionRail({
   const thinkingRoundCount = n + (tailOnly.trim() ? 1 : 0)
   const groupState = getToolGroupState(sorted)
   const runningInSorted = sorted.filter((t) => t.state === 'running').length
+  const hasDelegateToolCall = sorted.some((tool) => isDelegateToolName(tool.toolName))
 
   if (n === 0) {
     return null
@@ -758,6 +872,7 @@ export function TurnExecutionRail({
     <LazyDetails
       className={`assistant-exec-rail tool-call-card ${groupState}${parallelRunning ? ' parallel-running' : ''}`}
       summaryClassName="assistant-exec-rail-summary"
+      defaultOpen={hasDelegateToolCall}
       summary={
         <>
           <div className="assistant-exec-rail-summary-main">
@@ -780,11 +895,13 @@ export function TurnExecutionRail({
             const thought = perRound[i]?.trim() ?? ''
             const isStreaming = tool.state === 'running'
             const isParallelRunning = isStreaming && runningToolCount > 1
+            const isDelegateRound = isDelegateToolName(tool.toolName)
             return (
               <LazyDetails
                 key={tool.id}
                 className={`tool-exec-round ${tool.state}`}
                 summaryClassName="tool-exec-round-summary"
+                defaultOpen={isDelegateRound}
                 summary={
                   <>
                     <span className="tool-exec-round-summary-text">

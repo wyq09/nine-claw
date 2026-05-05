@@ -43,8 +43,18 @@ export const AGENT_TOOL_OPTIONS: { id: AgentToolId; label: string; description: 
   { id: 'web_fetch', label: 'web_fetch', description: '抓取网页内容' },
   { id: 'image_generate', label: 'image_generate', description: '生成图片' },
   { id: 'image_task_query', label: 'image_task_query', description: '查询图片任务' },
+  { id: 'ask_user', label: 'ask_user', description: '向用户发起澄清提问卡片' },
   { id: 'agent_spawn', label: 'agent_spawn', description: '委派子智能体' },
   { id: 'external_api', label: 'external_api', description: '调用外部 API 扩展' },
+  { id: 'memory_update', label: 'memory_update', description: '更新当前智能体的 MEMORY.md 记忆文件' },
+  { id: 'memory_search', label: 'memory_search', description: '语义搜索共享 / K/V 记忆库' },
+  { id: 'memory_read', label: 'memory_read', description: '读取当前智能体的 MEMORY.md 记忆文件' },
+  { id: 'memory_delete', label: 'memory_delete', description: '删除共享向量记忆条目' },
+  { id: 'memory_store', label: 'memory_store', description: '把结构化信息写入 K/V 记忆库' },
+  { id: 'memory_get', label: 'memory_get', description: '按 key 读取 K/V 记忆' },
+  { id: 'memory_forget', label: 'memory_forget', description: '按 key 删除 K/V 记忆' },
+  { id: 'memory_list', label: 'memory_list', description: '列出 K/V 记忆条目' },
+  { id: 'chat_search', label: 'chat_search', description: '跨会话关键词搜索历史消息' },
 ]
 
 const AGENT_TOOL_ID_SET = new Set<AgentToolId>(AGENT_TOOL_OPTIONS.map((tool) => tool.id))
@@ -566,6 +576,18 @@ export function normalizeAgentDraft(input: AgentInput): AgentInput {
     heartbeatConfig: normalizeHeartbeatConfig(input.heartbeatConfig),
     scenarioLlmConfig: normalizeAgentScenarioLlmConfigInDraft(input.scenarioLlmConfig),
   }
+}
+
+/** 根据智能体名称生成推荐的 Agent_ID（仅保留英文字母/数字/下划线/连字符） */
+export function suggestAgentIdFromName(name: string): string {
+  const base = name
+    .trim()
+    .toLowerCase()
+    .replace(/[\s]+/g, '-')
+    .replace(/[^a-z0-9_-]/g, '')
+  if (!base) return ''
+  // 去掉首尾的连字符
+  return base.replace(/^-+|-+$/g, '')
 }
 
 export function validateAgentDraft(input: AgentInput): string | null {

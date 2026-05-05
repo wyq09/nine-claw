@@ -5,7 +5,15 @@ vi.mock('@tauri-apps/api/core', () => ({
 }))
 
 import { invoke } from '@tauri-apps/api/core'
-import { getSessionContextStats, streamPiPrompt, syncRuntimeParameters } from '../piClient'
+import {
+  getSessionContextStats,
+  listDefaultAgentPresets,
+  resetAgentToDefaultPreset,
+  streamPiPrompt,
+  syncRuntimeParameters,
+  widgetCancelResponse,
+  widgetSubmitResponse,
+} from '../piClient'
 
 describe('getSessionContextStats', () => {
   beforeEach(() => {
@@ -78,5 +86,69 @@ describe('streamPiPrompt / syncRuntimeParameters', () => {
 
     expect(invoke).toHaveBeenCalledWith('sync_runtime_parameters', { payload: rp })
     expect(result).toEqual(returned)
+  })
+})
+
+describe('widget response commands', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('submits widget answers through invoke', async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined)
+
+    await widgetSubmitResponse({
+      widgetId: 'ask-1',
+      kind: 'ask_user',
+      answers: [{ questionId: 'format', value: 'doc' }],
+    })
+
+    expect(invoke).toHaveBeenCalledWith('widget_submit_response', {
+      payload: {
+        widgetId: 'ask-1',
+        kind: 'ask_user',
+        answers: [{ questionId: 'format', value: 'doc' }],
+      },
+    })
+  })
+
+  it('cancels widgets through invoke', async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined)
+
+    await widgetCancelResponse({
+      widgetId: 'ask-1',
+      kind: 'ask_user',
+    })
+
+    expect(invoke).toHaveBeenCalledWith('widget_cancel_response', {
+      payload: {
+        widgetId: 'ask-1',
+        kind: 'ask_user',
+      },
+    })
+  })
+})
+
+describe('default agent preset commands', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('lists default agent presets through invoke', async () => {
+    vi.mocked(invoke).mockResolvedValue([{ id: 'jiujiexia', isDefault: true }])
+
+    const result = await listDefaultAgentPresets()
+
+    expect(invoke).toHaveBeenCalledWith('list_default_agent_presets')
+    expect(result).toEqual([{ id: 'jiujiexia', isDefault: true }])
+  })
+
+  it('resets an agent to its default preset through invoke', async () => {
+    vi.mocked(invoke).mockResolvedValue({ id: 'jiujiexia', name: '九节虾' })
+
+    const result = await resetAgentToDefaultPreset('jiujiexia')
+
+    expect(invoke).toHaveBeenCalledWith('reset_agent_to_default_preset', { agentId: 'jiujiexia' })
+    expect(result).toEqual({ id: 'jiujiexia', name: '九节虾' })
   })
 })

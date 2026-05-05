@@ -108,9 +108,16 @@ fn prepare_upload(upload: ChatAttachmentUpload) -> Result<PreparedUpload, String
         upload.file_name.trim().to_string()
     };
 
+    let source_is_existing_dir = source_path.map(Path::new).is_some_and(|path| path.is_dir());
+
     let data = if let Some(source_path) = source_path {
-        fs::read(source_path)
-            .map_err(|error| format!("读取附件源文件失败 {}: {error}", source_path))?
+        // 目录路径只把「路径字符串」交给 agent，不尝试读入目录内容
+        if source_is_existing_dir {
+            source_path.to_string().into_bytes()
+        } else {
+            fs::read(source_path)
+                .map_err(|error| format!("读取附件源文件失败 {}: {error}", source_path))?
+        }
     } else if let Some(data_base64) = upload
         .data_base64
         .as_deref()
@@ -124,12 +131,19 @@ fn prepare_upload(upload: ChatAttachmentUpload) -> Result<PreparedUpload, String
         return Err(format!("附件 `{file_name}` 缺少可导入的数据"));
     };
 
+    let mime_type = upload
+        .mime_type
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mime_type = if source_is_existing_dir && mime_type.is_none() {
+        Some("text/plain".to_string())
+    } else {
+        mime_type
+    };
+
     Ok(PreparedUpload {
         file_name,
-        mime_type: upload
-            .mime_type
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
+        mime_type,
         data,
     })
 }

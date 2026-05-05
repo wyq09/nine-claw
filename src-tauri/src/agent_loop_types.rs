@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{Mutex as TokioMutex, oneshot};
+use tokio::sync::{oneshot, Mutex as TokioMutex};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -55,6 +55,10 @@ pub struct AgentLoopConfig {
     pub max_concurrent: u32,
     #[serde(default)]
     pub batch_fail_strategy: BatchFailStrategy,
+    #[serde(default)]
+    pub verify_config: VerifyConfig,
+    #[serde(default)]
+    pub retry_budget: RetryBudget,
 }
 
 fn default_max_iterations() -> u32 {
@@ -91,6 +95,8 @@ impl Default for AgentLoopConfig {
             max_extend_limit: default_max_extend_limit(),
             max_concurrent: default_max_concurrent(),
             batch_fail_strategy: BatchFailStrategy::default(),
+            verify_config: VerifyConfig::default(),
+            retry_budget: RetryBudget::default(),
         }
     }
 }
@@ -165,6 +171,7 @@ pub enum ParsedLoopMarker {
     Call(AgentLoopCallMarker),
     Batch(AgentLoopBatchMarker),
     Extend(AgentLoopExtendMarker),
+    Verify(VerifyResult),
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +221,158 @@ pub struct ActiveLoopHandle {
 /// Global registry of all currently running agent loops.
 pub struct ActiveLoops {
     pub loops: StdMutex<HashMap<String, ActiveLoopHandle>>,
+    /// Pending human-approval requests keyed by loop_id.
+    pub approval_pending: StdMutex<HashMap<String, oneshot::Sender<bool>>>,
+}
+
+// ---------------------------------------------------------------------------
+// 4-Phase Cycle Types
+// ---------------------------------------------------------------------------
+
+/// Phase within a single iteration of the 4-phase agent loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoopPhase {
+    Observe,
+    Plan,
+    Execute,
+    Verify,
+}
+
+impl fmt::Display for LoopPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observe => write!(f, "observe"),
+            Self::Plan => write!(f, "plan"),
+            Self::Execute => write!(f, "execute"),
+            Self::Verify => write!(f, "verify"),
+        }
+    }
+}
+
+/// Environment snapshot collected at the start of each iteration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentSnapshot {
+    pub workspace_summary: String,
+    pub recent_file_changes: String,
+    pub conversation_context: String,
+    pub loop_state: LoopStateSummary,
+}
+
+/// Summary of loop state for context injection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopStateSummary {
+    pub iteration: u32,
+    pub max_iterations: u32,
+    pub failed_actions: Vec<FailedAction>,
+    pub total_duration_ms: u64,
+    pub budget_remaining_ms: Option<u64>,
+}
+
+/// Record of a failed action within the loop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FailedAction {
+    pub action_key: String,
+    pub task: String,
+    pub error: String,
+    pub attempt_count: u32,
+}
+
+/// Decision from a pre-execution guard layer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GuardDecision {
+    pub allowed: bool,
+    pub reason: String,
+    pub needs_approval: bool,
+    pub retry_eligible: bool,
+}
+
+/// Retry budget and tracking for the execute phase.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryBudget {
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: Vec<u64>,
+    #[serde(default)]
+    pub per_action_failures: HashMap<String, u32>,
+    #[serde(default = "default_max_consecutive_failures")]
+    pub max_consecutive_failures: u32,
+}
+
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_retry_backoff_ms() -> Vec<u64> {
+    vec![1000, 3000, 9000]
+}
+fn default_max_consecutive_failures() -> u32 {
+    3
+}
+
+impl Default for RetryBudget {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+            retry_backoff_ms: default_retry_backoff_ms(),
+            per_action_failures: HashMap::new(),
+            max_consecutive_failures: default_max_consecutive_failures(),
+        }
+    }
+}
+
+/// Configuration for the verify phase.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyConfig {
+    #[serde(default = "default_score_threshold")]
+    pub score_threshold: u8,
+    #[serde(default = "default_consecutive_required")]
+    pub consecutive_required: u8,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_score_threshold() -> u8 {
+    8
+}
+fn default_consecutive_required() -> u8 {
+    2
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            score_threshold: default_score_threshold(),
+            consecutive_required: default_consecutive_required(),
+            enabled: default_true(),
+        }
+    }
+}
+
+/// Result from the verify phase — LLM self-evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyResult {
+    pub score: u8,
+    pub evidence: String,
+    pub remaining: Vec<String>,
+    pub should_continue: bool,
+}
+
+/// An action awaiting guard evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GuardedAction {
+    pub agent_id: String,
+    pub task: String,
+    pub risk_level: String,
+    pub reason: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -235,11 +394,19 @@ impl fmt::Display for UnrecoverableError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ContextCorrupted => write!(f, "ContextCorrupted: loop context is unreadable"),
-            Self::InvalidModelOutput => write!(f, "InvalidModelOutput: model output could not be parsed"),
-            Self::SafetyViolation => write!(f, "SafetyViolation: loop action blocked by safety policy"),
+            Self::InvalidModelOutput => {
+                write!(f, "InvalidModelOutput: model output could not be parsed")
+            }
+            Self::SafetyViolation => {
+                write!(f, "SafetyViolation: loop action blocked by safety policy")
+            }
             Self::AgentNotFound(id) => write!(f, "AgentNotFound: agent '{id}' does not exist"),
-            Self::ProviderAuthFailed => write!(f, "ProviderAuthFailed: LLM provider authentication failed"),
-            Self::NestedDepthExceeded => write!(f, "NestedDepthExceeded: maximum nesting depth exceeded"),
+            Self::ProviderAuthFailed => {
+                write!(f, "ProviderAuthFailed: LLM provider authentication failed")
+            }
+            Self::NestedDepthExceeded => {
+                write!(f, "NestedDepthExceeded: maximum nesting depth exceeded")
+            }
         }
     }
 }

@@ -56,16 +56,15 @@ pub(crate) fn memory_update_scope(
     let conn = storage_conn(&app)?;
     let valid_scopes = ["system", "workspace", "agent"];
     if !valid_scopes.contains(&scope.as_str()) {
-        return Err(format!("无效的 scope 值: {scope}，必须是 system/workspace/agent"));
+        return Err(format!(
+            "无效的 scope 值: {scope}，必须是 system/workspace/agent"
+        ));
     }
     workspaces::update_memory_scope(&conn, &memory_id, &scope, scope_agent_id.as_deref())
 }
 
 #[tauri::command]
-pub(crate) fn memory_stats(
-    app: AppHandle,
-    workspace_id: String,
-) -> Result<MemoryStats, String> {
+pub(crate) fn memory_stats(app: AppHandle, workspace_id: String) -> Result<MemoryStats, String> {
     let conn = storage_conn(&app)?;
     let (system, workspace, agent) = workspaces::count_memories_by_scope(&conn, &workspace_id)?;
     Ok(MemoryStats {

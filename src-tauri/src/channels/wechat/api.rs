@@ -24,6 +24,7 @@ const GET_UPDATES_TIMEOUT_MS: u64 = 8_000;
 const API_TIMEOUT_MS: u64 = 15_000;
 const CDN_UPLOAD_TIMEOUT_MS: u64 = 30_000;
 const CDN_UPLOAD_MAX_RETRIES: usize = 3;
+const TYPING_API_TIMEOUT_MS: u64 = 10_000;
 const WECHAT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 const ILINK_APP_ID: &str = "bot";
 const ILINK_APP_CLIENT_VERSION: &str = "131335";
@@ -35,6 +36,11 @@ const UPLOAD_MEDIA_TYPE_FILE: i32 = 3;
 struct UploadUrlResponse {
     upload_param: Option<String>,
     upload_full_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetConfigResponse {
+    typing_ticket: Option<String>,
 }
 
 #[derive(Debug)]
@@ -457,6 +463,78 @@ impl WeChatApi {
             .map_err(|e| format!("解析 getUpdates 响应失败: {e}"))
     }
 
+    /// Fetch a typing ticket from the getconfig API (step 1 of typing).
+    async fn get_typing_ticket(
+        &self,
+        user_id: &str,
+        context_token: Option<&str>,
+    ) -> Result<Option<String>, ()> {
+        let url = format!("{}/ilink/bot/getconfig", self.base_url);
+        let body = json!({
+            "ilink_user_id": user_id,
+            "context_token": context_token,
+            "base_info": { "channel_version": CHANNEL_VERSION }
+        });
+        let body_str = serde_json::to_string(&body).map_err(|_| ())?;
+
+        let response = match self
+            .client
+            .post(&url)
+            .headers(self.build_headers(body_str.len()))
+            .body(body_str)
+            .timeout(Duration::from_millis(TYPING_API_TIMEOUT_MS))
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(_) => return Ok(None),
+        };
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        match response.json::<GetConfigResponse>().await {
+            Ok(config) => Ok(config.typing_ticket),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Send typing indicator to a user.
+    /// `status`: 1 = "正在输入", 0 = 取消.
+    /// Typing is optional — errors are silently swallowed.
+    pub async fn send_typing(
+        &self,
+        user_id: &str,
+        context_token: Option<&str>,
+        status: i32,
+    ) -> Result<(), ()> {
+        let typing_ticket = match self.get_typing_ticket(user_id, context_token).await {
+            Ok(Some(ticket)) => ticket,
+            _ => return Ok(()),
+        };
+
+        let url = format!("{}/ilink/bot/sendtyping", self.base_url);
+        let body = json!({
+            "ilink_user_id": user_id,
+            "typing_ticket": typing_ticket,
+            "status": status,
+            "base_info": { "channel_version": CHANNEL_VERSION }
+        });
+        let body_str = serde_json::to_string(&body).map_err(|_| ())?;
+
+        let _ = self
+            .client
+            .post(&url)
+            .headers(self.build_headers(body_str.len()))
+            .body(body_str)
+            .timeout(Duration::from_millis(TYPING_API_TIMEOUT_MS))
+            .send()
+            .await;
+
+        Ok(())
+    }
+
     /// Send a text message to a user.
     /// All "ghost fields" (from_user_id, client_id, message_type, message_state)
     /// are REQUIRED by the iLink protocol — without them the API returns 200 but
@@ -749,6 +827,109 @@ mod tests {
             .as_str()
             .map(|value| !value.is_empty())
             .unwrap_or(false));
+
+        server.abort();
+    }
+
+    // ── Typing indicator test ──
+
+    #[derive(Clone)]
+    struct TypingTestState {
+        getconfig_bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+        sendtyping_bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    async fn getconfig_handler(
+        State(state): State<TypingTestState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        state.getconfig_bodies.lock().unwrap().push(body);
+        Json(json!({ "typing_ticket": "test-ticket-123" }))
+    }
+
+    async fn sendtyping_handler(
+        State(state): State<TypingTestState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        state.sendtyping_bodies.lock().unwrap().push(body);
+        Json(json!({}))
+    }
+
+    #[tokio::test]
+    async fn send_typing_calls_getconfig_then_sendtyping() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let base_url = format!("http://{addr}");
+
+        let state = TypingTestState {
+            getconfig_bodies: Arc::new(Mutex::new(Vec::new())),
+            sendtyping_bodies: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let router = Router::new()
+            .route("/ilink/bot/getconfig", post(getconfig_handler))
+            .route("/ilink/bot/sendtyping", post(sendtyping_handler))
+            .with_state(state.clone());
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve test router");
+        });
+
+        let api = WeChatApi::new(&base_url, "test-token", None);
+        api.send_typing("wxid-test-user", Some("ctx-token"), 1)
+            .await
+            .expect("send typing");
+
+        let gc = state.getconfig_bodies.lock().unwrap().clone();
+        assert_eq!(gc.len(), 1);
+        assert_eq!(gc[0]["ilink_user_id"], "wxid-test-user");
+        assert_eq!(gc[0]["context_token"], "ctx-token");
+
+        let st = state.sendtyping_bodies.lock().unwrap().clone();
+        assert_eq!(st.len(), 1);
+        assert_eq!(st[0]["ilink_user_id"], "wxid-test-user");
+        assert_eq!(st[0]["typing_ticket"], "test-ticket-123");
+        assert_eq!(st[0]["status"], 1);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_typing_stop_sends_status_zero() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let base_url = format!("http://{addr}");
+
+        let state = TypingTestState {
+            getconfig_bodies: Arc::new(Mutex::new(Vec::new())),
+            sendtyping_bodies: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let router = Router::new()
+            .route("/ilink/bot/getconfig", post(getconfig_handler))
+            .route("/ilink/bot/sendtyping", post(sendtyping_handler))
+            .with_state(state.clone());
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve test router");
+        });
+
+        let api = WeChatApi::new(&base_url, "test-token", None);
+        api.send_typing("wxid-test-user", Some("ctx-token"), 0)
+            .await
+            .expect("send typing stop");
+
+        let st = state.sendtyping_bodies.lock().unwrap().clone();
+        assert_eq!(st.len(), 1);
+        assert_eq!(st[0]["status"], 0);
 
         server.abort();
     }

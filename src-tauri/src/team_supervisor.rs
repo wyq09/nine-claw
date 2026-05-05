@@ -130,6 +130,8 @@ mod tests {
             required_skill_ids: vec!["team-supervisor-orchestrator".to_string()],
             forbidden_skill_ids: vec![],
             max_dynamic_skills: 4,
+            forbidden_paths: vec![],
+            high_risk_actions: vec![],
         };
         record.collaboration_config = Some(AgentCollaborationConfig {
             allowed_delegate_agent_ids: vec!["old-worker".to_string()],

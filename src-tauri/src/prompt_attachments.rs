@@ -90,6 +90,14 @@ pub fn prepare_prompt_input(
     })
 }
 
+pub(crate) fn attachments_include_visual_context(attachments: &[PromptAttachmentInput]) -> bool {
+    attachments.iter().any(|attachment| {
+        is_image_attachment(attachment)
+            || is_video_attachment(attachment)
+            || is_pdf_attachment(attachment)
+    })
+}
+
 fn strip_nc_media_directive_lines(message: &str) -> String {
     message
         .lines()
@@ -970,5 +978,34 @@ mod tests {
         let timestamps = compute_video_frame_timestamps(Some(40.0));
         assert_eq!(timestamps.len(), MAX_VIDEO_FRAMES);
         assert!(timestamps.iter().all(|value| *value > 0.0));
+    }
+
+    #[test]
+    fn detects_visual_context_for_image_and_pdf_attachments() {
+        let image = PromptAttachmentInput {
+            file_name: "screen.png".to_string(),
+            file_path: "/tmp/screen.png".to_string(),
+            mime_type: "image/png".to_string(),
+            kind: "image".to_string(),
+            transcript: None,
+        };
+        let pdf = PromptAttachmentInput {
+            file_name: "report.pdf".to_string(),
+            file_path: "/tmp/report.pdf".to_string(),
+            mime_type: "application/pdf".to_string(),
+            kind: "file".to_string(),
+            transcript: None,
+        };
+        let audio = PromptAttachmentInput {
+            file_name: "voice.mp3".to_string(),
+            file_path: "/tmp/voice.mp3".to_string(),
+            mime_type: "audio/mpeg".to_string(),
+            kind: "audio".to_string(),
+            transcript: None,
+        };
+
+        assert!(attachments_include_visual_context(&[image]));
+        assert!(attachments_include_visual_context(&[pdf]));
+        assert!(!attachments_include_visual_context(&[audio]));
     }
 }

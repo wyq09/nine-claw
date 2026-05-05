@@ -244,6 +244,39 @@ pub(crate) fn build_http_client() -> reqwest::Client {
     build_http_client_for_settings(&current_proxy_settings())
 }
 
+fn build_blocking_http_client_for_settings(
+    settings: &NetworkProxySettings,
+) -> reqwest::blocking::Client {
+    let mut builder = reqwest::blocking::Client::builder();
+
+    match effective_proxy_mode(settings) {
+        EffectiveProxyMode::Disabled => {
+            builder = builder.no_proxy();
+        }
+        EffectiveProxyMode::System => {}
+        EffectiveProxyMode::Custom(proxy_url) => match reqwest::Proxy::all(&proxy_url) {
+            Ok(proxy) => {
+                builder = builder.proxy(proxy);
+            }
+            Err(error) => {
+                log::warn!("创建自定义阻塞代理失败 {proxy_url}: {error}");
+                if !settings.use_system_proxy {
+                    builder = builder.no_proxy();
+                }
+            }
+        },
+    }
+
+    builder.build().unwrap_or_else(|error| {
+        log::warn!("创建阻塞 HTTP client 失败，回退默认 client: {error}");
+        reqwest::blocking::Client::new()
+    })
+}
+
+pub(crate) fn build_blocking_http_client() -> reqwest::blocking::Client {
+    build_blocking_http_client_for_settings(&current_proxy_settings())
+}
+
 pub async fn test_proxy_connection(settings: &NetworkProxySettings) -> Result<String, String> {
     let normalized = normalize_settings(settings.clone());
     if !normalized.custom_proxy_url.is_empty()

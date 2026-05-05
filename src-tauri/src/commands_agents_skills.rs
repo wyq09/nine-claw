@@ -56,11 +56,35 @@ pub(crate) fn delete_agent(app: AppHandle, agent_id: String) -> Result<(), Strin
 }
 
 #[tauri::command]
+pub(crate) fn migrate_agent_id(
+    app: AppHandle,
+    old_agent_id: String,
+    new_agent_id: String,
+) -> Result<String, String> {
+    agents::migrate_agent_id(&app, old_agent_id, new_agent_id)
+}
+
+#[tauri::command]
 pub(crate) fn set_default_agent(
     app: AppHandle,
     agent_id: String,
 ) -> Result<Option<AgentRecord>, String> {
     agents::set_default_agent(&app, agent_id)
+}
+
+#[tauri::command]
+pub(crate) fn list_default_agent_presets(
+    app: AppHandle,
+) -> Result<Vec<crate::agent_presets::AgentPresetSummary>, String> {
+    agents::list_default_agent_presets(&app)
+}
+
+#[tauri::command]
+pub(crate) fn reset_agent_to_default_preset(
+    app: AppHandle,
+    agent_id: String,
+) -> Result<AgentRecord, String> {
+    agents::reset_agent_to_default_preset(&app, agent_id)
 }
 
 #[tauri::command]

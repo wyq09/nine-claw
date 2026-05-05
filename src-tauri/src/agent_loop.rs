@@ -3,16 +3,25 @@
 //! Provides functions for extracting, parsing, stripping, and formatting the
 //! structured markers (`NC_AGENT_LOOP_*`) that the LLM emits to control the
 //! agent loop runtime, plus the main `run_agent_loop` orchestration function.
+//!
+//! The loop is structured as a 4-phase cycle:
+//! 1. **Observe** — harness collects environment snapshot
+//! 2. **Plan** — LLM outputs structured action plan (markers)
+//! 3. **Execute** — delegated execution with 3-layer pre-guards
+//! 4. **Verify** — LLM self-evaluation with score + evidence
 
 use crate::agent_loop_types::{
-    AgentLoopBatchResult, AgentLoopBatchMarker, AgentLoopCallMarker,
-    AgentLoopExtendMarker, AgentLoopResult, AgentLoopConfig, ParsedLoopMarker,
-    ReviewResponse,
+    AgentLoopBatchMarker, AgentLoopBatchResult, AgentLoopCallMarker, AgentLoopConfig,
+    AgentLoopExtendMarker, AgentLoopResult, EnvironmentSnapshot, FailedAction, GuardDecision,
+    GuardedAction, LoopPhase, LoopStateSummary, ParsedLoopMarker, RetryBudget, ReviewResponse,
+    VerifyConfig, VerifyResult,
 };
 
+use crate::agent_capabilities::AgentCapabilityPolicy;
 use chrono::Local;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::time::{Duration, timeout as tokio_timeout};
+use std::sync::Arc;
+use tokio::time::{timeout as tokio_timeout, Duration};
 
 // ---------------------------------------------------------------------------
 // Marker constants
@@ -28,9 +37,11 @@ pub const MARKER_EXTEND: &str = "NC_AGENT_LOOP_EXTEND_JSON:";
 pub const MARKER_FINAL: &str = "NC_AGENT_LOOP_FINAL:";
 /// Marker carrying a single agent result back to the LLM.
 pub const MARKER_RESULT: &str = "NC_AGENT_LOOP_RESULT_JSON:";
+/// Marker carrying a verify result from the LLM.
+pub const MARKER_VERIFY: &str = "NC_AGENT_LOOP_VERIFY_JSON:";
 
 /// All prefix markers (everything except FINAL which has no JSON payload).
-const LOOP_MARKERS: &[&str] = &[MARKER_BATCH, MARKER_CALL, MARKER_EXTEND];
+const LOOP_MARKERS: &[&str] = &[MARKER_BATCH, MARKER_CALL, MARKER_EXTEND, MARKER_VERIFY];
 
 // ---------------------------------------------------------------------------
 // extract_first_loop_marker
@@ -71,6 +82,10 @@ pub fn extract_first_loop_marker(text: &str) -> Option<(ParsedLoopMarker, usize)
         MARKER_EXTEND => {
             let extend: AgentLoopExtendMarker = serde_json::from_value(value).ok()?;
             Some((ParsedLoopMarker::Extend(extend), *offset))
+        }
+        MARKER_VERIFY => {
+            let verify: VerifyResult = serde_json::from_value(value).ok()?;
+            Some((ParsedLoopMarker::Verify(verify), *offset))
         }
         _ => None,
     }
@@ -145,6 +160,7 @@ pub fn strip_loop_markers(text: &str) -> String {
                 && !line.contains(MARKER_EXTEND)
                 && !line.contains(MARKER_FINAL)
                 && !line.contains(MARKER_RESULT)
+                && !line.contains(MARKER_VERIFY)
         })
         .collect();
 
@@ -245,10 +261,7 @@ pub fn heal_orphaned_tool_calls(history: &mut Vec<serde_json::Value>) {
 /// Find the **last** message with `"role": "system"` in `history` and append
 /// a dynamic context block (current time + permission denials) to its
 /// `content`. Appending at the end protects the KV Cache prefix.
-pub fn inject_dynamic_context(
-    history: &mut Vec<serde_json::Value>,
-    permission_denials: &[String],
-) {
+pub fn inject_dynamic_context(history: &mut Vec<serde_json::Value>, permission_denials: &[String]) {
     let now_str = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
     let denials_text = if permission_denials.is_empty() {
         "无".to_string()
@@ -310,10 +323,7 @@ pub fn compress_assistant_message(msg: &mut serde_json::Value) {
 
 /// Prepare the conversation history for a new agent-loop iteration:
 /// heal orphaned tool calls first, then inject dynamic context.
-pub fn prepare_loop_iteration(
-    history: &mut Vec<serde_json::Value>,
-    permission_denials: &[String],
-) {
+pub fn prepare_loop_iteration(history: &mut Vec<serde_json::Value>, permission_denials: &[String]) {
     heal_orphaned_tool_calls(history);
     inject_dynamic_context(history, permission_denials);
 }
@@ -322,9 +332,8 @@ pub fn prepare_loop_iteration(
 // Agent Loop Engine — delegate execution & loop control
 // ===========================================================================
 
-use std::sync::Arc;
 use std::time::Instant;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -396,7 +405,10 @@ async fn execute_delegate_with_timeout(
             duration_ms: 0,
         },
         Err(_) => {
-            log::warn!("AgentLoop [{loop_id}] iteration {iteration} timed out after {:?}", timeout);
+            log::warn!(
+                "AgentLoop [{loop_id}] iteration {iteration} timed out after {:?}",
+                timeout
+            );
             AgentLoopResult {
                 agent_id: call_for_error.agent_id.clone(),
                 agent_name: String::new(),
@@ -457,7 +469,10 @@ async fn execute_batch_with_timeout(
             total_duration_ms: 0,
         },
         Err(_) => {
-            log::warn!("AgentLoop [{loop_id}] batch at iteration {iteration} timed out after {:?}", timeout);
+            log::warn!(
+                "AgentLoop [{loop_id}] batch at iteration {iteration} timed out after {:?}",
+                timeout
+            );
             AgentLoopBatchResult {
                 batch_id: format!("batch:{}:{}", loop_id, iteration),
                 results: vec![AgentLoopResult {
@@ -518,7 +533,15 @@ pub(crate) fn delegate_to_agent_with_trace(
     };
 
     let abort_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    execute_single_delegate_internal(app, &call, "delegate-tool", 1, provider, &abort_flag, trace_id)
+    execute_single_delegate_internal(
+        app,
+        &call,
+        "delegate-tool",
+        1,
+        provider,
+        &abort_flag,
+        trace_id,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -625,10 +648,36 @@ fn execute_single_delegate_internal(
         }
     };
 
+    // Resolve the sub-agent's own provider config instead of using the parent's.
+    let sub_provider = match crate::provider_runtime::resolve_im_llm_runtime(
+        app,
+        &agent_record.default_provider_id,
+        &agent_record.default_model,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!(
+                "AgentLoop [{loop_id}] sub-agent '{}' provider '{}' resolution failed: {e}, falling back to parent provider",
+                call.agent_id,
+                agent_record.default_provider_id,
+            );
+            provider.clone()
+        }
+    };
+
+    log::info!(
+        "AgentLoop [{loop_id}] delegate to '{}' using provider: id={}, format={}, url={}, model={}",
+        call.agent_id,
+        sub_provider.provider_id,
+        sub_provider.api_format,
+        sub_provider.base_url,
+        sub_provider.model,
+    );
+
     let base_normalized = crate::normalized_provider_runtime_base_url(
-        &provider.base_url,
-        &provider.api_format,
-        &provider.provider_id,
+        &sub_provider.base_url,
+        &sub_provider.api_format,
+        &sub_provider.provider_id,
     );
 
     let pi_rt = match crate::pi_runtime::require_pi_runtime_location(app) {
@@ -648,13 +697,17 @@ fn execute_single_delegate_internal(
 
     let bridge = crate::channels::pi_bridge::PiBridge::new(
         pi_rt,
-        &provider.provider_id,
-        &provider.api_format,
+        &sub_provider.provider_id,
+        &sub_provider.api_format,
         &base_normalized,
-        &provider.api_key,
-        &provider.model,
+        &sub_provider.api_key,
+        &sub_provider.model,
         Some(agent_cfg),
-    );
+    )
+    .with_runtime_dir(std::env::temp_dir().join(format!(
+        "nineclaw-pi-delegate-{}",
+        call.agent_id.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+    )));
 
     let _run_id = format!("nc-al:{}:{}:{}", loop_id, iteration, call.agent_id);
     let channel_id = format!("nc:agent-loop:{}", Uuid::new_v4());
@@ -795,8 +848,8 @@ async fn execute_batch_delegates(
     let batch_id = format!("batch:{}:{}", loop_id, iteration);
     let max_concurrent = config.max_concurrent.max(1) as usize;
     let total = batch.calls.len();
-    let fail_fast = config.batch_fail_strategy
-        == crate::agent_loop_types::BatchFailStrategy::FailFast;
+    let fail_fast =
+        config.batch_fail_strategy == crate::agent_loop_types::BatchFailStrategy::FailFast;
 
     let mut results: Vec<AgentLoopResult> = Vec::with_capacity(total);
     let mut set: JoinSet<(usize, AgentLoopResult)> = JoinSet::new();
@@ -979,18 +1032,791 @@ async fn request_user_review(
     }
 }
 
+// ===========================================================================
+// 4-Phase Cycle — helper functions
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
-// run_agent_loop — THE MAIN FUNCTION
+// collect_environment_snapshot
 // ---------------------------------------------------------------------------
 
-/// Main Agent Loop orchestration function.
+/// Collect an environment snapshot for the current iteration.
 ///
-/// Runs an iterative loop that:
-/// 1. Extracts loop markers from the LLM's accumulated output text.
-/// 2. Dispatches single calls (`Call`), concurrent batches (`Batch`), or
-///    iteration-limit extension requests (`Extend`).
-/// 3. Emits structured events to the frontend for real-time UI updates.
-/// 4. Terminates on `max_iterations`, abort, natural end (no marker), or error.
+/// Reads WORKING.md (first 50 lines) and MEMORY.md (first 20 lines) from the
+/// agent workspace via the core_memory DB projection, plus the last 10 turns
+/// from the session's chat history. If files or history are unavailable, empty
+/// strings are returned.
+fn collect_environment_snapshot(
+    app: &AppHandle,
+    agent_id: &str,
+    session_id: &str,
+    loop_state: &LoopStateSummary,
+) -> EnvironmentSnapshot {
+    let workspace_summary = read_workspace_summary(app, agent_id);
+    let conversation_context = read_conversation_context(app, session_id);
+
+    EnvironmentSnapshot {
+        workspace_summary,
+        recent_file_changes: String::new(),
+        conversation_context,
+        loop_state: loop_state.clone(),
+    }
+}
+
+/// Read the WORKING.md and MEMORY.md summaries from the core_memory DB.
+fn read_workspace_summary(app: &AppHandle, agent_id: &str) -> String {
+    let conn = match crate::storage_conn(app) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+
+    let mut parts = Vec::new();
+
+    if let Ok(Some(doc)) =
+        crate::storage::core_memory::get_document_by_type(&conn, agent_id, "working")
+    {
+        let lines: Vec<&str> = doc.content_md.lines().take(50).collect();
+        if !lines.is_empty() {
+            parts.push(format!("WORKING.md:\n{}", lines.join("\n")));
+        }
+    }
+
+    if let Ok(Some(doc)) =
+        crate::storage::core_memory::get_document_by_type(&conn, agent_id, "memory")
+    {
+        let lines: Vec<&str> = doc.content_md.lines().take(20).collect();
+        if !lines.is_empty() {
+            parts.push(format!("MEMORY.md:\n{}", lines.join("\n")));
+        }
+    }
+
+    parts.join("\n\n")
+}
+
+/// Read the last 10 chat turns from the session history.
+fn read_conversation_context(app: &AppHandle, session_id: &str) -> String {
+    let conn = match crate::storage_conn(app) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+
+    match crate::storage::chat_history::list_chat_turns(&conn, session_id) {
+        Ok(turns) => {
+            let recent: Vec<&crate::storage::chat_history::ChatTurn> =
+                turns.iter().rev().take(10).collect();
+            let mut reversed: Vec<&crate::storage::chat_history::ChatTurn> = recent;
+            reversed.reverse();
+
+            let mut lines = Vec::new();
+            for turn in reversed {
+                if !turn.prompt.is_empty() {
+                    lines.push(format!("User: {}", truncate_str(&turn.prompt, 200)));
+                }
+                if !turn.answer.is_empty() {
+                    lines.push(format!("Assistant: {}", truncate_str(&turn.answer, 200)));
+                }
+            }
+            lines.join("\n")
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// Truncate a string to at most `max_len` characters, appending "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{truncated}...")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// format_environment_snapshot_for_injection
+// ---------------------------------------------------------------------------
+
+/// Format an `EnvironmentSnapshot` as structured text suitable for injection
+/// into the LLM context.
+fn format_environment_snapshot_for_injection(snapshot: &EnvironmentSnapshot) -> String {
+    let mut blocks = Vec::new();
+
+    blocks.push(format!(
+        "[环境快照 - 轮次 {}/{}]",
+        snapshot.loop_state.iteration, snapshot.loop_state.max_iterations
+    ));
+
+    if !snapshot.workspace_summary.is_empty() {
+        blocks.push(format!("工作空间状态:\n{}", snapshot.workspace_summary));
+    }
+
+    if !snapshot.conversation_context.is_empty() {
+        blocks.push(format!("最近对话:\n{}", snapshot.conversation_context));
+    }
+
+    if !snapshot.loop_state.failed_actions.is_empty() {
+        let failure_lines: Vec<String> = snapshot
+            .loop_state
+            .failed_actions
+            .iter()
+            .map(|f| format!("- '{}' 失败 ({}次): {}", f.task, f.attempt_count, f.error))
+            .collect();
+        blocks.push(format!("失败动作:\n{}", failure_lines.join("\n")));
+    }
+
+    if let Some(remaining) = snapshot.loop_state.budget_remaining_ms {
+        blocks.push(format!("剩余预算: {}s", remaining / 1000));
+    }
+
+    blocks.join("\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// inject_environment_snapshot
+// ---------------------------------------------------------------------------
+
+/// Inject the environment snapshot into the last system message in history.
+fn inject_environment_snapshot(
+    history: &mut Vec<serde_json::Value>,
+    snapshot: &EnvironmentSnapshot,
+) {
+    let snapshot_text = format_environment_snapshot_for_injection(snapshot);
+    let context_block = format!("\n\n{}", snapshot_text);
+
+    let last_sys_idx = history
+        .iter()
+        .rposition(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("system"));
+
+    if let Some(idx) = last_sys_idx {
+        let content = history[idx]
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let new_content = format!("{}{}", content, context_block);
+        history[idx]["content"] = serde_json::Value::String(new_content);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// run_guard_chain
+// ---------------------------------------------------------------------------
+
+/// Run the 3-layer guard chain before executing an action.
+///
+/// Layer 1 (Policy): checks budget, retry count, consecutive failures.
+/// Layer 2 (Safety): checks forbidden skills, paths, high-risk actions.
+/// Layer 3 (Human Approval): if needed, emits approval request and waits.
+///
+/// Returns a `GuardDecision` with `allowed=true` if all guards pass.
+async fn run_guard_chain(
+    app: &AppHandle,
+    loop_id: &str,
+    iteration: u32,
+    action: &GuardedAction,
+    retry_budget: &mut RetryBudget,
+    policy: &AgentCapabilityPolicy,
+    abort_flag: &Arc<AtomicBool>,
+    approval_timeout: Duration,
+) -> GuardDecision {
+    // ── Guard 1: Policy Control ──
+    let policy_decision = guard_policy_control(action, retry_budget);
+    if !policy_decision.allowed {
+        emit_loop_event(
+            app,
+            "agent-loop://guard/rejected",
+            serde_json::json!({
+                "loopId": loop_id,
+                "iteration": iteration,
+                "action": action,
+                "guard": "policy",
+                "reason": policy_decision.reason,
+            }),
+        );
+        return policy_decision;
+    }
+
+    // ── Guard 2: Safety Rules ──
+    let safety_decision = guard_safety_rules(action, policy);
+    if !safety_decision.allowed && !safety_decision.needs_approval {
+        emit_loop_event(
+            app,
+            "agent-loop://guard/rejected",
+            serde_json::json!({
+                "loopId": loop_id,
+                "iteration": iteration,
+                "action": action,
+                "guard": "safety",
+                "reason": safety_decision.reason,
+            }),
+        );
+        return safety_decision;
+    }
+
+    // ── Guard 3: Human Approval (if needed) ──
+    if safety_decision.needs_approval {
+        let approved = request_guard_approval(
+            app,
+            loop_id,
+            iteration,
+            action,
+            approval_timeout,
+            abort_flag,
+        )
+        .await;
+
+        if !approved {
+            return GuardDecision {
+                allowed: false,
+                reason: "人类审核拒绝或超时".to_string(),
+                needs_approval: false,
+                retry_eligible: false,
+            };
+        }
+    }
+
+    GuardDecision {
+        allowed: true,
+        reason: String::new(),
+        needs_approval: false,
+        retry_eligible: true,
+    }
+}
+
+/// Guard Layer 1: Policy Control — budget, retry, consecutive failure checks.
+fn guard_policy_control(action: &GuardedAction, retry_budget: &RetryBudget) -> GuardDecision {
+    let failures = retry_budget
+        .per_action_failures
+        .get(&action.action_key())
+        .copied()
+        .unwrap_or(0);
+
+    if failures >= retry_budget.max_retries {
+        return GuardDecision {
+            allowed: false,
+            reason: format!(
+                "动作 '{}' 已达最大重试次数 ({}/{})",
+                action.task, failures, retry_budget.max_retries
+            ),
+            needs_approval: false,
+            retry_eligible: false,
+        };
+    }
+
+    let total_consecutive: u32 = retry_budget.per_action_failures.values().sum();
+    if total_consecutive >= retry_budget.max_consecutive_failures {
+        return GuardDecision {
+            allowed: false,
+            reason: format!(
+                "连续失败次数过多 ({}/{})",
+                total_consecutive, retry_budget.max_consecutive_failures
+            ),
+            needs_approval: false,
+            retry_eligible: false,
+        };
+    }
+
+    GuardDecision {
+        allowed: true,
+        reason: String::new(),
+        needs_approval: false,
+        retry_eligible: true,
+    }
+}
+
+/// Guard Layer 2: Safety Rules — forbidden skills, paths, high-risk actions.
+fn guard_safety_rules(action: &GuardedAction, policy: &AgentCapabilityPolicy) -> GuardDecision {
+    for forbidden_path in &policy.forbidden_paths {
+        if action.task.contains(forbidden_path) {
+            return GuardDecision {
+                allowed: false,
+                reason: format!("任务涉及禁止路径: {}", forbidden_path),
+                needs_approval: false,
+                retry_eligible: false,
+            };
+        }
+    }
+
+    for forbidden_skill in &policy.forbidden_skill_ids {
+        if action.agent_id.contains(forbidden_skill) {
+            return GuardDecision {
+                allowed: false,
+                reason: format!("智能体 '{}' 被禁止", forbidden_skill),
+                needs_approval: false,
+                retry_eligible: false,
+            };
+        }
+    }
+
+    for high_risk in &policy.high_risk_actions {
+        if action
+            .task
+            .to_lowercase()
+            .contains(&high_risk.to_lowercase())
+        {
+            return GuardDecision {
+                allowed: true,
+                reason: format!("高风险操作需要审核: {}", high_risk),
+                needs_approval: true,
+                retry_eligible: true,
+            };
+        }
+    }
+
+    GuardDecision {
+        allowed: true,
+        reason: String::new(),
+        needs_approval: false,
+        retry_eligible: true,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// request_guard_approval
+// ---------------------------------------------------------------------------
+
+/// Emit an approval request event and wait for a human response.
+///
+/// Registers a oneshot sender in the `ActiveLoops::approval_pending` map,
+/// then waits with a timeout. Default deny on timeout.
+async fn request_guard_approval(
+    app: &AppHandle,
+    loop_id: &str,
+    iteration: u32,
+    action: &GuardedAction,
+    timeout_duration: Duration,
+    abort_flag: &Arc<AtomicBool>,
+) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+
+    // Try to register the sender in the global ActiveLoops registry.
+    let registered = {
+        use crate::agent_loop_types::ActiveLoops;
+        let active_loops = app.state::<ActiveLoops>();
+        let Ok(mut pending) = active_loops.approval_pending.lock() else {
+            drop(tx);
+            return false;
+        };
+        pending.insert(loop_id.to_string(), tx);
+        true
+    };
+
+    if !registered {
+        return false;
+    }
+
+    // Emit approval request event.
+    emit_loop_event(
+        app,
+        "agent-loop://approval/request",
+        serde_json::json!({
+            "loopId": loop_id,
+            "iteration": iteration,
+            "action": {
+                "agentId": action.agent_id,
+                "task": action.task,
+            },
+            "riskLevel": action.risk_level,
+            "reason": action.reason,
+            "timeoutMs": timeout_duration.as_millis() as u64,
+        }),
+    );
+
+    // Wait with timeout + abort check.
+    let start = Instant::now();
+    let mut rx = rx;
+    loop {
+        if abort_flag.load(Ordering::Relaxed) {
+            cleanup_approval_pending(app, loop_id);
+            return false;
+        }
+
+        if start.elapsed() >= timeout_duration {
+            cleanup_approval_pending(app, loop_id);
+            log::warn!(
+                "AgentLoop [{loop_id}] guard approval timed out after {:?}",
+                timeout_duration
+            );
+            return false;
+        }
+
+        match tokio_timeout(Duration::from_millis(500), &mut rx).await {
+            Ok(Ok(approved)) => {
+                cleanup_approval_pending(app, loop_id);
+                return approved;
+            }
+            Ok(Err(_)) => {
+                cleanup_approval_pending(app, loop_id);
+                return false;
+            }
+            Err(_) => {
+                continue;
+            }
+        }
+    }
+}
+
+/// Remove the approval pending entry for a loop.
+fn cleanup_approval_pending(app: &AppHandle, loop_id: &str) {
+    use crate::agent_loop_types::ActiveLoops;
+    let active_loops = app.state::<ActiveLoops>();
+    let _ = active_loops
+        .approval_pending
+        .lock()
+        .map(|mut pending| pending.remove(loop_id));
+}
+
+// ---------------------------------------------------------------------------
+// should_retry
+// ---------------------------------------------------------------------------
+
+/// Determine whether a failed action should be retried.
+///
+/// Checks max retries, consecutive failures, and retry eligibility.
+fn should_retry(
+    action: &GuardedAction,
+    result: &AgentLoopResult,
+    retry_budget: &RetryBudget,
+    guard_decision: Option<&GuardDecision>,
+) -> bool {
+    if let Some(guard) = guard_decision {
+        if !guard.retry_eligible {
+            return false;
+        }
+    }
+
+    if result.status != "error" {
+        return false;
+    }
+
+    let failures = retry_budget
+        .per_action_failures
+        .get(&action.action_key())
+        .copied()
+        .unwrap_or(0);
+
+    if failures >= retry_budget.max_retries {
+        return false;
+    }
+
+    let total_consecutive: u32 = retry_budget.per_action_failures.values().sum();
+    if total_consecutive >= retry_budget.max_consecutive_failures {
+        return false;
+    }
+
+    true
+}
+
+// ---------------------------------------------------------------------------
+// run_verify
+// ---------------------------------------------------------------------------
+
+/// Run the verify phase: construct a verify prompt, call the LLM, and parse
+/// the `NC_AGENT_LOOP_VERIFY_JSON` marker from the response.
+async fn run_verify(
+    app: &AppHandle,
+    loop_id: &str,
+    iteration: u32,
+    accumulated_text: &str,
+    provider: &crate::provider_runtime::ProviderRuntimeConfig,
+    verify_config: &VerifyConfig,
+    abort_flag: &Arc<AtomicBool>,
+) -> VerifyResult {
+    let clean_text = strip_loop_markers(accumulated_text);
+
+    let verify_prompt = format!(
+        "请评估当前任务完成度。根据以下工作输出，给出 0-10 的完成度评分。\n\n\
+         要求：只输出一个 JSON 对象（以 {} 开头），格式为：\n\
+         {{\"score\": <0-10>, \"evidence\": \"评分依据\", \"remaining\": [\"未完成项\"], \"shouldContinue\": <true/false>}}\n\n\
+         当前工作输出：\n{}\n\n\
+         评分标准：\n\
+         - 8-10: 任务基本完成，输出质量高\n\
+         - 5-7: 有进展但还有明显未完成部分\n\
+         - 0-4: 进展很少或方向错误\n\n\
+         完成度评分达到 {} 分即视为通过。",
+        MARKER_VERIFY,
+        truncate_str(&clean_text, 4000),
+        verify_config.score_threshold,
+    );
+
+    let base_normalized = crate::normalized_provider_runtime_base_url(
+        &provider.base_url,
+        &provider.api_format,
+        &provider.provider_id,
+    );
+
+    let pi_rt = match crate::pi_runtime::require_pi_runtime_location(app) {
+        Ok(rt) => rt,
+        Err(e) => {
+            log::warn!("AgentLoop [{loop_id}] verify: Pi runtime unavailable: {e}");
+            return VerifyResult::default_fail();
+        }
+    };
+
+    let bridge = crate::channels::pi_bridge::PiBridge::new(
+        pi_rt,
+        &provider.provider_id,
+        &provider.api_format,
+        &base_normalized,
+        &provider.api_key,
+        &provider.model,
+        None,
+    );
+
+    let channel_id = format!("nc:agent-loop-verify:{}", uuid::Uuid::new_v4());
+    let user_id = uuid::Uuid::new_v4().simple().to_string();
+
+    if abort_flag.load(Ordering::Relaxed) {
+        return VerifyResult::default_fail();
+    }
+
+    let outcome = bridge.process_message_interruptible_with_events(
+        &channel_id,
+        &user_id,
+        &verify_prompt,
+        2048,
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+
+    match outcome {
+        Ok(crate::channels::pi_bridge::PiProcessOutcome::Completed(response)) => {
+            if let Some((ParsedLoopMarker::Verify(verify_result), _)) =
+                extract_first_loop_marker(&response.full_text)
+            {
+                emit_loop_event(
+                    app,
+                    "agent-loop://verify",
+                    serde_json::json!({
+                        "loopId": loop_id,
+                        "iteration": iteration,
+                        "score": verify_result.score,
+                        "evidence": verify_result.evidence,
+                        "remaining": verify_result.remaining,
+                    }),
+                );
+                verify_result
+            } else {
+                parse_verify_from_free_text(&response.full_text)
+            }
+        }
+        Ok(crate::channels::pi_bridge::PiProcessOutcome::Aborted) => {
+            log::info!("AgentLoop [{loop_id}] verify aborted");
+            VerifyResult::default_fail()
+        }
+        Err(e) => {
+            log::warn!("AgentLoop [{loop_id}] verify failed: {e}");
+            VerifyResult::default_fail()
+        }
+    }
+}
+
+/// Try to extract a VerifyResult from free-form LLM text (fallback).
+fn parse_verify_from_free_text(text: &str) -> VerifyResult {
+    if let Some(start) = text.find('{') {
+        let remaining = &text[start..];
+        if let Some(value) = parse_json_after_marker(remaining) {
+            if let Ok(result) = serde_json::from_value::<VerifyResult>(value) {
+                return result;
+            }
+        }
+    }
+    VerifyResult::default_fail()
+}
+
+// ---------------------------------------------------------------------------
+// reflect_for_next_action
+// ---------------------------------------------------------------------------
+
+/// Reflect on current progress and ask the LLM to plan the next action.
+///
+/// This is the key function that enables multi-round iteration: after executing
+/// a sub-agent call and running verification, we call the LLM again with the
+/// accumulated context so it can decide what to do next.
+async fn reflect_for_next_action(
+    app: &AppHandle,
+    loop_id: &str,
+    iteration: u32,
+    max_iterations: u32,
+    accumulated_text: &str,
+    failed_actions: &[FailedAction],
+    original_task: &str,
+    provider: &crate::provider_runtime::ProviderRuntimeConfig,
+    abort_flag: &Arc<AtomicBool>,
+) -> Option<String> {
+    let clean_text = strip_loop_markers(accumulated_text);
+
+    let failed_summary = if failed_actions.is_empty() {
+        String::new()
+    } else {
+        let items: Vec<String> = failed_actions
+            .iter()
+            .map(|f| format!("- {} ({}次): {}", f.task, f.attempt_count, f.error))
+            .collect();
+        format!("\n失败动作:\n{}", items.join("\n"))
+    };
+
+    let prompt = format!(
+        "你是 Agent Loop 规划引擎。根据当前进展决定下一步动作。\n\n\
+         任务: {}\n\
+         进度: 第 {} 轮，上限 {} 轮\n\n\
+         已完成的工作:\n{}\n\
+         {}\n\n\
+         请选择下一步:\n\
+         1. 委派子任务 → 输出: NC_AGENT_LOOP_CALL_JSON:{{\"agentId\":\"...\",\"task\":\"...\",\"params\":{{}}}}\n\
+         2. 并行委派   → 输出: NC_AGENT_LOOP_BATCH_JSON:{{\"calls\":[...]}}\n\
+         3. 评估完成   → 输出: NC_AGENT_LOOP_VERIFY_JSON:{{\"score\":N,\"evidence\":\"...\",\"remaining\":[],\"shouldContinue\":false}}\n\
+         4. 任务完成   → 不输出任何 marker\n\n\
+         先简要说明你的判断理由，然后输出 marker。",
+        original_task,
+        iteration,
+        max_iterations,
+        truncate_str(&clean_text, 3000),
+        failed_summary,
+    );
+
+    let base_normalized = crate::normalized_provider_runtime_base_url(
+        &provider.base_url,
+        &provider.api_format,
+        &provider.provider_id,
+    );
+
+    let pi_rt = match crate::pi_runtime::require_pi_runtime_location(app) {
+        Ok(rt) => rt,
+        Err(e) => {
+            log::warn!("AgentLoop [{loop_id}] reflect: Pi runtime unavailable: {e}");
+            return None;
+        }
+    };
+
+    let bridge = crate::channels::pi_bridge::PiBridge::new(
+        pi_rt,
+        &provider.provider_id,
+        &provider.api_format,
+        &base_normalized,
+        &provider.api_key,
+        &provider.model,
+        None,
+    );
+
+    let channel_id = format!("nc:agent-loop-reflect:{}", uuid::Uuid::new_v4());
+    let user_id = uuid::Uuid::new_v4().simple().to_string();
+
+    if abort_flag.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    let outcome = bridge.process_message_interruptible_with_events(
+        &channel_id,
+        &user_id,
+        &prompt,
+        2048,
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+
+    match outcome {
+        Ok(crate::channels::pi_bridge::PiProcessOutcome::Completed(response)) => {
+            let text = response.full_text;
+            if text.trim().is_empty() {
+                log::info!("AgentLoop [{loop_id}] reflect returned empty text");
+                None
+            } else {
+                log::info!(
+                    "AgentLoop [{loop_id}] reflect produced {} chars, has_marker={}",
+                    text.len(),
+                    extract_first_loop_marker(&text).is_some()
+                );
+                Some(text)
+            }
+        }
+        Ok(crate::channels::pi_bridge::PiProcessOutcome::Aborted) => {
+            log::info!("AgentLoop [{loop_id}] reflect aborted");
+            None
+        }
+        Err(e) => {
+            log::warn!("AgentLoop [{loop_id}] reflect failed: {e}");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default/Helper impls
+// ---------------------------------------------------------------------------
+
+impl VerifyResult {
+    fn default_fail() -> Self {
+        VerifyResult {
+            score: 0,
+            evidence: "验证阶段未能获取有效评分".to_string(),
+            remaining: vec!["无法确定剩余任务".to_string()],
+            should_continue: false,
+        }
+    }
+}
+
+impl GuardedAction {
+    fn from_call_marker(call: &AgentLoopCallMarker) -> Self {
+        GuardedAction {
+            agent_id: call.agent_id.clone(),
+            task: call.task.clone(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        }
+    }
+
+    fn from_batch_marker(batch: &AgentLoopBatchMarker) -> Self {
+        let agents: Vec<String> = batch.calls.iter().map(|c| c.agent_id.clone()).collect();
+        let tasks: Vec<String> = batch
+            .calls
+            .iter()
+            .map(|c| truncate_str(&c.task, 80))
+            .collect();
+        GuardedAction {
+            agent_id: format!("batch:{}", agents.join(",")),
+            task: format!("[{}]", tasks.join("; ")),
+            risk_level: if batch.pause_for_review {
+                "high"
+            } else {
+                "normal"
+            }
+            .to_string(),
+            reason: String::new(),
+        }
+    }
+
+    fn action_key(&self) -> String {
+        format!("{}:{}", self.agent_id, truncate_str(&self.task, 100))
+    }
+}
+
+/// Compute the backoff duration for a retry attempt.
+fn compute_retry_backoff(retry_budget: &RetryBudget, attempt: u32) -> Duration {
+    let idx = (attempt as usize).min(retry_budget.retry_backoff_ms.len().saturating_sub(1));
+    let backoff_ms = retry_budget
+        .retry_backoff_ms
+        .get(idx)
+        .copied()
+        .unwrap_or(9000);
+    Duration::from_millis(backoff_ms)
+}
+
+// ---------------------------------------------------------------------------
+// run_agent_loop — THE MAIN FUNCTION (4-Phase Refactored)
+// ---------------------------------------------------------------------------
+
+/// Main Agent Loop orchestration function (4-phase cycle).
+///
+/// Each iteration runs through four phases:
+/// 1. **Observe** — collects an environment snapshot (workspace state, history, loop state)
+/// 2. **Plan** — extracts the LLM's action marker from accumulated text
+/// 3. **Execute** — runs the action through the 3-layer guard chain, then delegates
+/// 4. **Verify** — (when enabled) asks the LLM to score completion (0-10)
+///
+/// The loop terminates on: max_iterations, total_timeout, abort, natural end
+/// (no marker), FINAL marker, or verify threshold reached.
 ///
 /// Returns the final accumulated text (with markers stripped).
 pub async fn run_agent_loop(
@@ -1037,6 +1863,17 @@ pub async fn run_agent_loop(
 
     let loop_start = Instant::now();
 
+    // 4-phase state tracking
+    let mut retry_budget = config.retry_budget.clone();
+    let mut failed_actions: Vec<FailedAction> = Vec::new();
+    let mut consecutive_pass_count: u8 = 0;
+    let verify_config = &config.verify_config;
+    let approval_timeout = Duration::from_secs(30);
+    let mut original_task = String::new();
+
+    // Load a default capability policy (can be refined later to use agent-specific policy).
+    let capability_policy = AgentCapabilityPolicy::default();
+
     loop {
         // ── Guard: max_iterations ──
         if iteration >= max_iterations {
@@ -1055,36 +1892,214 @@ pub async fn run_agent_loop(
 
         // ── Guard: abort flag ──
         if abort_flag.load(Ordering::Relaxed) {
-            emit_loop_event(app, "agent-loop://aborted", serde_json::json!({
-                "loopId": loop_id, "iteration": iteration,
-                "totalDurationMs": loop_start.elapsed().as_millis() as u64,
-            }));
+            emit_loop_event(
+                app,
+                "agent-loop://aborted",
+                serde_json::json!({
+                    "loopId": loop_id, "iteration": iteration,
+                    "totalDurationMs": loop_start.elapsed().as_millis() as u64,
+                }),
+            );
             log::info!("AgentLoop [{loop_id}] aborted at iteration {iteration}");
             break;
         }
 
+        // ══════════════════════════════════════════════════════════════════════
+        // PHASE 1: OBSERVE — collect environment snapshot
+        // ══════════════════════════════════════════════════════════════════════
+
+        let budget_remaining_ms = total_deadline.map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64
+        });
+
+        let loop_state = LoopStateSummary {
+            iteration,
+            max_iterations,
+            failed_actions: failed_actions.clone(),
+            total_duration_ms: loop_start.elapsed().as_millis() as u64,
+            budget_remaining_ms,
+        };
+
+        let snapshot = collect_environment_snapshot(app, agent_id, session_id, &loop_state);
+
+        // Emit observe event.
+        emit_loop_event(
+            app,
+            "agent-loop://observe",
+            serde_json::json!({
+                "loopId": loop_id,
+                "iteration": iteration,
+                "snapshot": &snapshot,
+            }),
+        );
+
+        log::debug!("AgentLoop [{loop_id}] OBSERVE phase complete (iteration {iteration})");
+
+        // ══════════════════════════════════════════════════════════════════════
+        // PHASE 2: PLAN — extract action marker from accumulated text
+        // ══════════════════════════════════════════════════════════════════════
+
         let marker = extract_first_loop_marker(&accumulated_text);
+
+        // Check for FINAL marker anywhere in the text.
+        if has_final_marker(&accumulated_text) {
+            emit_completed(&app, &loop_id, "final_marker", iteration, &loop_start);
+            break;
+        }
 
         match marker {
             None => {
+                // No marker found — natural end.
+                // If verify is enabled, run verify once before ending.
+                if verify_config.enabled {
+                    let verify_result = run_verify(
+                        app,
+                        &loop_id,
+                        iteration,
+                        &accumulated_text,
+                        provider,
+                        verify_config,
+                        &abort_flag,
+                    )
+                    .await;
+
+                    if verify_result.score >= verify_config.score_threshold {
+                        emit_completed(&app, &loop_id, "verify_pass", iteration, &loop_start);
+                        break;
+                    }
+
+                    // Score below threshold but no marker — treat as natural end.
+                    log::info!(
+                        "AgentLoop [{loop_id}] verify score {} < {} but no more markers, ending",
+                        verify_result.score,
+                        verify_config.score_threshold
+                    );
+                }
+
                 emit_completed(&app, &loop_id, "natural", iteration, &loop_start);
                 break;
             }
 
+            // ══════════════════════════════════════════════════════════════════════
+            // PHASE 3: EXECUTE — guarded delegation
+            // ══════════════════════════════════════════════════════════════════════
             Some((ParsedLoopMarker::Call(call), _offset)) => {
-                emit_loop_event(app, "agent-loop://iteration/start", serde_json::json!({
-                    "loopId": loop_id, "iteration": iteration, "type": "call",
-                    "agentId": call.agent_id, "task": call.task,
-                }));
+                if original_task.is_empty() {
+                    original_task = call.task.clone();
+                }
+                emit_loop_event(
+                    app,
+                    "agent-loop://iteration/start",
+                    serde_json::json!({
+                        "loopId": loop_id, "iteration": iteration, "type": "call",
+                        "agentId": call.agent_id, "task": call.task,
+                        "phase": LoopPhase::Execute.to_string(),
+                    }),
+                );
 
-                let result = execute_delegate_with_timeout(
-                    app, call, iteration, &loop_id, provider, &abort_flag, iter_timeout,
-                )
-                .await;
+                // Build guard action and run guard chain.
+                let guard_action = GuardedAction::from_call_marker(&call);
+                let pause_requested = call.pause_for_review;
 
-                emit_loop_event(app, "agent-loop://iteration/end", serde_json::json!({
-                    "loopId": loop_id, "iteration": iteration, "type": "call", "result": &result,
-                }));
+                let guard_decision = if pause_requested {
+                    // Force approval for pause_for_review calls.
+                    let approved = request_guard_approval(
+                        app,
+                        &loop_id,
+                        iteration,
+                        &guard_action,
+                        approval_timeout,
+                        &abort_flag,
+                    )
+                    .await;
+                    GuardDecision {
+                        allowed: approved,
+                        reason: if approved {
+                            String::new()
+                        } else {
+                            "用户拒绝审核".to_string()
+                        },
+                        needs_approval: false,
+                        retry_eligible: approved,
+                    }
+                } else {
+                    run_guard_chain(
+                        app,
+                        &loop_id,
+                        iteration,
+                        &guard_action,
+                        &mut retry_budget,
+                        &capability_policy,
+                        &abort_flag,
+                        approval_timeout,
+                    )
+                    .await
+                };
+
+                let result = if guard_decision.allowed {
+                    execute_delegate_with_timeout(
+                        app,
+                        call,
+                        iteration,
+                        &loop_id,
+                        provider,
+                        &abort_flag,
+                        iter_timeout,
+                    )
+                    .await
+                } else {
+                    // Guard rejected — synthesize a rejection result.
+                    AgentLoopResult {
+                        agent_id: guard_action.agent_id.clone(),
+                        agent_name: String::new(),
+                        task: guard_action.task.clone(),
+                        status: "rejected".to_string(),
+                        output: format!("Guard 拒绝: {}", guard_decision.reason),
+                        tool_calls_count: 0,
+                        duration_ms: 0,
+                    }
+                };
+
+                // Track failures for retry logic.
+                if result.status == "error" || result.status == "rejected" {
+                    let key = guard_action.action_key();
+                    let entry = retry_budget
+                        .per_action_failures
+                        .entry(key.clone())
+                        .or_insert(0);
+                    *entry += 1;
+
+                    // Update failed_actions list.
+                    if let Some(existing) = failed_actions.iter_mut().find(|f| f.action_key == key)
+                    {
+                        existing.attempt_count += 1;
+                        existing.error = result.output.clone();
+                    } else {
+                        failed_actions.push(FailedAction {
+                            action_key: key,
+                            task: guard_action.task.clone(),
+                            error: result.output.clone(),
+                            attempt_count: 1,
+                        });
+                    }
+                } else {
+                    // Success — reset per-action failures for this key.
+                    retry_budget
+                        .per_action_failures
+                        .remove(&guard_action.action_key());
+                }
+
+                emit_loop_event(
+                    app,
+                    "agent-loop://iteration/end",
+                    serde_json::json!({
+                        "loopId": loop_id, "iteration": iteration, "type": "call",
+                        "result": &result,
+                        "guardDecision": &guard_decision,
+                    }),
+                );
 
                 let clean_text = strip_loop_markers(&accumulated_text);
                 accumulated_text = format!("{}\n{}", clean_text, format_single_result(&result));
@@ -1092,25 +2107,173 @@ pub async fn run_agent_loop(
             }
 
             Some((ParsedLoopMarker::Batch(batch), _offset)) => {
-                emit_loop_event(app, "agent-loop://iteration/start", serde_json::json!({
-                    "loopId": loop_id, "iteration": iteration, "type": "batch",
-                    "callCount": batch.calls.len(),
-                }));
+                if original_task.is_empty() {
+                    original_task = batch
+                        .calls
+                        .first()
+                        .map(|c| c.task.clone())
+                        .unwrap_or_default();
+                }
+                emit_loop_event(
+                    app,
+                    "agent-loop://iteration/start",
+                    serde_json::json!({
+                        "loopId": loop_id, "iteration": iteration, "type": "batch",
+                        "callCount": batch.calls.len(),
+                        "phase": LoopPhase::Execute.to_string(),
+                    }),
+                );
 
-                let batch_result = execute_batch_with_timeout(
-                    app, &batch, &loop_id, iteration, config, provider, &abort_flag, iter_timeout,
-                )
-                .await;
+                // Build guard action for the batch and run guard chain.
+                let guard_action = GuardedAction::from_batch_marker(&batch);
+                let pause_requested = batch.pause_for_review;
 
-                emit_loop_event(app, "agent-loop://iteration/end", serde_json::json!({
-                    "loopId": loop_id, "iteration": iteration, "type": "batch", "result": &batch_result,
-                }));
+                let guard_decision = if pause_requested {
+                    let approved = request_guard_approval(
+                        app,
+                        &loop_id,
+                        iteration,
+                        &guard_action,
+                        approval_timeout,
+                        &abort_flag,
+                    )
+                    .await;
+                    GuardDecision {
+                        allowed: approved,
+                        reason: if approved {
+                            String::new()
+                        } else {
+                            "用户拒绝审核".to_string()
+                        },
+                        needs_approval: false,
+                        retry_eligible: approved,
+                    }
+                } else {
+                    run_guard_chain(
+                        app,
+                        &loop_id,
+                        iteration,
+                        &guard_action,
+                        &mut retry_budget,
+                        &capability_policy,
+                        &abort_flag,
+                        approval_timeout,
+                    )
+                    .await
+                };
+
+                let batch_result = if guard_decision.allowed {
+                    execute_batch_with_timeout(
+                        app,
+                        &batch,
+                        &loop_id,
+                        iteration,
+                        config,
+                        provider,
+                        &abort_flag,
+                        iter_timeout,
+                    )
+                    .await
+                } else {
+                    AgentLoopBatchResult {
+                        batch_id: format!("batch:{}:{}", loop_id, iteration),
+                        results: batch
+                            .calls
+                            .iter()
+                            .map(|call| AgentLoopResult {
+                                agent_id: call.agent_id.clone(),
+                                agent_name: String::new(),
+                                task: call.task.clone(),
+                                status: "rejected".to_string(),
+                                output: format!("Guard 拒绝: {}", guard_decision.reason),
+                                tool_calls_count: 0,
+                                duration_ms: 0,
+                            })
+                            .collect(),
+                        total_duration_ms: 0,
+                    }
+                };
+
+                // Track batch failures.
+                for result in &batch_result.results {
+                    if result.status == "error" || result.status == "rejected" {
+                        let key =
+                            format!("{}:{}", result.agent_id, truncate_str(&result.task, 100));
+                        let entry = retry_budget
+                            .per_action_failures
+                            .entry(key.clone())
+                            .or_insert(0);
+                        *entry += 1;
+                    }
+                }
+
+                emit_loop_event(
+                    app,
+                    "agent-loop://iteration/end",
+                    serde_json::json!({
+                        "loopId": loop_id, "iteration": iteration, "type": "batch",
+                        "result": &batch_result,
+                        "guardDecision": &guard_decision,
+                    }),
+                );
 
                 let clean_text = strip_loop_markers(&accumulated_text);
-                accumulated_text = format!("{}\n{}", clean_text, format_batch_result(&batch_result));
+                accumulated_text =
+                    format!("{}\n{}", clean_text, format_batch_result(&batch_result));
                 iteration += 1;
             }
 
+            // ══════════════════════════════════════════════════════════════════════
+            // VERIFY MARKER — LLM provided a self-evaluation
+            // ══════════════════════════════════════════════════════════════════════
+            Some((ParsedLoopMarker::Verify(verify_result), _offset)) => {
+                emit_loop_event(
+                    app,
+                    "agent-loop://verify",
+                    serde_json::json!({
+                        "loopId": loop_id,
+                        "iteration": iteration,
+                        "score": verify_result.score,
+                        "evidence": verify_result.evidence,
+                        "remaining": verify_result.remaining,
+                    }),
+                );
+
+                if verify_config.enabled {
+                    if verify_result.score >= verify_config.score_threshold {
+                        consecutive_pass_count += 1;
+                        if consecutive_pass_count >= verify_config.consecutive_required {
+                            log::info!(
+                                "AgentLoop [{loop_id}] verify threshold met: {} consecutive passes",
+                                consecutive_pass_count
+                            );
+                            emit_completed(&app, &loop_id, "verify_pass", iteration, &loop_start);
+                            break;
+                        }
+                    } else {
+                        consecutive_pass_count = 0;
+                    }
+
+                    if !verify_result.should_continue {
+                        emit_completed(
+                            &app,
+                            &loop_id,
+                            "verify_should_stop",
+                            iteration,
+                            &loop_start,
+                        );
+                        break;
+                    }
+                }
+
+                // Continue loop — strip the verify marker and accumulate.
+                accumulated_text = strip_loop_markers(&accumulated_text);
+                iteration += 1;
+            }
+
+            // ══════════════════════════════════════════════════════════════════════
+            // EXTEND — iteration limit extension
+            // ══════════════════════════════════════════════════════════════════════
             Some((ParsedLoopMarker::Extend(extend), _offset)) => {
                 if !config.allow_extend {
                     emit_completed(&app, &loop_id, "natural", iteration, &loop_start);
@@ -1118,7 +2281,8 @@ pub async fn run_agent_loop(
                     break;
                 }
 
-                let review = request_user_review(app, &loop_id, iteration, &extend, &abort_flag).await;
+                let review =
+                    request_user_review(app, &loop_id, iteration, &extend, &abort_flag).await;
 
                 if review.approved {
                     if let Some(new_max) = review.extend_to {
@@ -1126,14 +2290,112 @@ pub async fn run_agent_loop(
                         max_iterations = capped;
                         log::info!("AgentLoop [{loop_id}] EXTEND approved: max_iterations -> {max_iterations}");
                     }
-                    emit_loop_event(app, "agent-loop://review/request", serde_json::json!({
-                        "loopId": loop_id, "approved": true, "newMaxIterations": max_iterations,
-                    }));
+                    emit_loop_event(
+                        app,
+                        "agent-loop://review/request",
+                        serde_json::json!({
+                            "loopId": loop_id, "approved": true, "newMaxIterations": max_iterations,
+                        }),
+                    );
                     accumulated_text = strip_loop_markers(&accumulated_text);
                 } else {
                     emit_completed(&app, &loop_id, "extend_denied", iteration, &loop_start);
                     log::info!("AgentLoop [{loop_id}] EXTEND denied, ending");
                     break;
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // PHASE 4: VERIFY — post-execution self-evaluation (if enabled)
+        // ══════════════════════════════════════════════════════════════════════
+
+        if verify_config.enabled && iteration > 0 {
+            let verify_result = run_verify(
+                app,
+                &loop_id,
+                iteration,
+                &accumulated_text,
+                provider,
+                verify_config,
+                &abort_flag,
+            )
+            .await;
+
+            if verify_result.score >= verify_config.score_threshold {
+                consecutive_pass_count += 1;
+                if consecutive_pass_count >= verify_config.consecutive_required {
+                    log::info!(
+                        "AgentLoop [{loop_id}] verify threshold met after {} consecutive passes",
+                        consecutive_pass_count
+                    );
+                    emit_completed(&app, &loop_id, "verify_pass", iteration, &loop_start);
+                    break;
+                }
+            } else {
+                consecutive_pass_count = 0;
+            }
+
+            if !verify_result.should_continue {
+                emit_completed(&app, &loop_id, "verify_should_stop", iteration, &loop_start);
+                break;
+            }
+
+            // Inject verify feedback into the accumulated text so the LLM can adjust.
+            if verify_result.score < verify_config.score_threshold {
+                let remaining_text = if verify_result.remaining.is_empty() {
+                    String::new()
+                } else {
+                    format!("未完成项: {}", verify_result.remaining.join(", "))
+                };
+                let feedback = format!(
+                    "\n\n[验证反馈] 完成度: {}/{}. 依据: {}. {}",
+                    verify_result.score,
+                    verify_config.score_threshold,
+                    verify_result.evidence,
+                    remaining_text,
+                );
+                accumulated_text = format!("{}{}", strip_loop_markers(&accumulated_text), feedback);
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════════
+        // REFLECT: call LLM to generate next action for the following iteration
+        // ══════════════════════════════════════════════════════════════════════
+
+        if !original_task.is_empty() {
+            match reflect_for_next_action(
+                app,
+                &loop_id,
+                iteration,
+                max_iterations,
+                &accumulated_text,
+                &failed_actions,
+                &original_task,
+                provider,
+                &abort_flag,
+            )
+            .await
+            {
+                Some(new_text) => {
+                    emit_loop_event(
+                        app,
+                        "agent-loop://reflect",
+                        serde_json::json!({
+                            "loopId": loop_id,
+                            "iteration": iteration,
+                            "hasNewMarkers": extract_first_loop_marker(&new_text).is_some(),
+                        }),
+                    );
+                    accumulated_text = new_text;
+                    log::debug!(
+                        "AgentLoop [{loop_id}] REFLECT phase complete (iteration {iteration})"
+                    );
+                }
+                None => {
+                    log::debug!(
+                        "AgentLoop [{loop_id}] REFLECT produced no output, accumulated text unchanged"
+                    );
                 }
             }
         }
@@ -1301,7 +2563,11 @@ mod tests {
         ];
         let original_len = history.len();
         heal_orphaned_tool_calls(&mut history);
-        assert_eq!(history.len(), original_len, "no synthetic messages should be injected");
+        assert_eq!(
+            history.len(),
+            original_len,
+            "no synthetic messages should be injected"
+        );
     }
 
     #[test]
@@ -1337,9 +2603,18 @@ mod tests {
         inject_dynamic_context(&mut history, &denials);
 
         let sys_content = history[0]["content"].as_str().unwrap();
-        assert!(sys_content.contains("[动态上下文]"), "should contain context marker");
-        assert!(sys_content.contains("权限拒绝：file_write，shell_exec"), "should list denials");
-        assert!(sys_content.starts_with("You are helpful."), "original content preserved at start");
+        assert!(
+            sys_content.contains("[动态上下文]"),
+            "should contain context marker"
+        );
+        assert!(
+            sys_content.contains("权限拒绝：file_write，shell_exec"),
+            "should list denials"
+        );
+        assert!(
+            sys_content.starts_with("You are helpful."),
+            "original content preserved at start"
+        );
     }
 
     #[test]
@@ -1352,7 +2627,11 @@ mod tests {
             ]
         });
         compress_assistant_message(&mut msg);
-        assert_eq!(msg["content"].as_str().unwrap(), "", "short content should be cleared");
+        assert_eq!(
+            msg["content"].as_str().unwrap(),
+            "",
+            "short content should be cleared"
+        );
     }
 
     #[test]
@@ -1366,7 +2645,11 @@ mod tests {
             ]
         });
         compress_assistant_message(&mut msg);
-        assert_eq!(msg["content"].as_str().unwrap(), long_reasoning, "long content should be kept");
+        assert_eq!(
+            msg["content"].as_str().unwrap(),
+            long_reasoning,
+            "long content should be kept"
+        );
     }
 
     #[test]
@@ -1376,7 +2659,11 @@ mod tests {
             "content": "好的"
         });
         compress_assistant_message(&mut msg);
-        assert_eq!(msg["content"].as_str().unwrap(), "好的", "content without tool_calls should be kept");
+        assert_eq!(
+            msg["content"].as_str().unwrap(),
+            "好的",
+            "content without tool_calls should be kept"
+        );
     }
 
     // ── Integration: end-to-end marker cycle ────────────────────
@@ -1407,7 +2694,11 @@ mod tests {
             tool_calls_count: 2,
             duration_ms: 5000,
         };
-        let text_with_result = format!("{}\n{}", strip_loop_markers(&text1), format_single_result(&result));
+        let text_with_result = format!(
+            "{}\n{}",
+            strip_loop_markers(&text1),
+            format_single_result(&result)
+        );
 
         // Verify result text contains RESULT marker
         assert!(text_with_result.contains(MARKER_RESULT));
@@ -1424,14 +2715,20 @@ mod tests {
             "{}{{\"calls\":[{{\"agentId\":\"a1\",\"task\":\"t1\",\"params\":{{}},\"expectStructuredOutput\":false,\"pauseForReview\":false}},{{\"agentId\":\"a2\",\"task\":\"t2\",\"params\":{{}},\"expectStructuredOutput\":false,\"pauseForReview\":false}}],\"pauseForReview\":false}}",
             MARKER_BATCH
         );
-        assert!(matches!(extract_first_loop_marker(&batch_text), Some((ParsedLoopMarker::Batch(_), _))));
+        assert!(matches!(
+            extract_first_loop_marker(&batch_text),
+            Some((ParsedLoopMarker::Batch(_), _))
+        ));
 
         // EXTEND marker
         let extend_text = format!(
             "{}{{\"currentIteration\":48,\"maxIterations\":50,\"reason\":\"need more\",\"requestedExtra\":20}}",
             MARKER_EXTEND
         );
-        assert!(matches!(extract_first_loop_marker(&extend_text), Some((ParsedLoopMarker::Extend(_), _))));
+        assert!(matches!(
+            extract_first_loop_marker(&extend_text),
+            Some((ParsedLoopMarker::Extend(_), _))
+        ));
 
         // FINAL marker
         assert!(has_final_marker(&format!("done\n{}", MARKER_FINAL)));
@@ -1447,5 +2744,383 @@ mod tests {
         let marker = extract_first_loop_marker(&text);
         assert!(matches!(marker, Some((ParsedLoopMarker::Call(_), _))));
         assert!(has_final_marker(&text));
+    }
+
+    // ── 4-Phase Cycle tests ──────────────────────────────────────
+
+    #[test]
+    fn test_guard_policy_control_allows_within_budget() {
+        let action = GuardedAction {
+            agent_id: "coder".to_string(),
+            task: "implement auth".to_string(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        };
+        let budget = RetryBudget::default();
+        let decision = guard_policy_control(&action, &budget);
+        assert!(decision.allowed);
+        assert!(decision.retry_eligible);
+    }
+
+    #[test]
+    fn test_guard_policy_control_rejects_max_retries() {
+        let action = GuardedAction {
+            agent_id: "coder".to_string(),
+            task: "implement auth".to_string(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        };
+        let mut budget = RetryBudget::default();
+        budget
+            .per_action_failures
+            .insert(action.action_key(), budget.max_retries);
+        let decision = guard_policy_control(&action, &budget);
+        assert!(!decision.allowed);
+        assert!(!decision.retry_eligible);
+        assert!(decision.reason.contains("最大重试次数"));
+    }
+
+    #[test]
+    fn test_guard_policy_control_rejects_consecutive_failures() {
+        let action = GuardedAction {
+            agent_id: "coder".to_string(),
+            task: "implement auth".to_string(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        };
+        let mut budget = RetryBudget::default();
+        // Fill up failures across different keys to hit consecutive limit.
+        for i in 0..budget.max_consecutive_failures {
+            budget.per_action_failures.insert(format!("other:{i}"), 1);
+        }
+        let decision = guard_policy_control(&action, &budget);
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("连续失败"));
+    }
+
+    #[test]
+    fn test_guard_safety_allows_normal() {
+        let action = GuardedAction {
+            agent_id: "coder".to_string(),
+            task: "implement feature".to_string(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        };
+        let policy = AgentCapabilityPolicy::default();
+        let decision = guard_safety_rules(&action, &policy);
+        assert!(decision.allowed);
+        assert!(!decision.needs_approval);
+    }
+
+    #[test]
+    fn test_guard_safety_rejects_forbidden_path() {
+        let action = GuardedAction {
+            agent_id: "coder".to_string(),
+            task: "delete /etc/passwd and rewrite".to_string(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        };
+        let policy = AgentCapabilityPolicy {
+            forbidden_paths: vec!["/etc/passwd".to_string()],
+            ..AgentCapabilityPolicy::default()
+        };
+        let decision = guard_safety_rules(&action, &policy);
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("禁止路径"));
+    }
+
+    #[test]
+    fn test_guard_safety_rejects_forbidden_skill() {
+        let action = GuardedAction {
+            agent_id: "dangerous-skill".to_string(),
+            task: "do something".to_string(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        };
+        let policy = AgentCapabilityPolicy {
+            forbidden_skill_ids: vec!["dangerous-skill".to_string()],
+            ..AgentCapabilityPolicy::default()
+        };
+        let decision = guard_safety_rules(&action, &policy);
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("被禁止"));
+    }
+
+    #[test]
+    fn test_guard_safety_needs_approval_for_high_risk() {
+        let action = GuardedAction {
+            agent_id: "coder".to_string(),
+            task: "DROP TABLE users; -- truncate database".to_string(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        };
+        let policy = AgentCapabilityPolicy {
+            high_risk_actions: vec!["DROP TABLE".to_string()],
+            ..AgentCapabilityPolicy::default()
+        };
+        let decision = guard_safety_rules(&action, &policy);
+        assert!(decision.allowed);
+        assert!(decision.needs_approval);
+        assert!(decision.reason.contains("高风险"));
+    }
+
+    #[test]
+    fn test_should_retry_allows_error_within_budget() {
+        let action = GuardedAction {
+            agent_id: "coder".to_string(),
+            task: "build".to_string(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        };
+        let result = AgentLoopResult {
+            agent_id: "coder".to_string(),
+            agent_name: "Coder".to_string(),
+            task: "build".to_string(),
+            status: "error".to_string(),
+            output: "build failed".to_string(),
+            tool_calls_count: 0,
+            duration_ms: 5000,
+        };
+        let budget = RetryBudget::default();
+        assert!(should_retry(&action, &result, &budget, None));
+    }
+
+    #[test]
+    fn test_should_retry_rejects_success() {
+        let action = GuardedAction {
+            agent_id: "coder".to_string(),
+            task: "build".to_string(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        };
+        let result = AgentLoopResult {
+            agent_id: "coder".to_string(),
+            agent_name: "Coder".to_string(),
+            task: "build".to_string(),
+            status: "success".to_string(),
+            output: "ok".to_string(),
+            tool_calls_count: 0,
+            duration_ms: 5000,
+        };
+        let budget = RetryBudget::default();
+        assert!(!should_retry(&action, &result, &budget, None));
+    }
+
+    #[test]
+    fn test_should_retry_rejects_guard_non_retryable() {
+        let action = GuardedAction {
+            agent_id: "coder".to_string(),
+            task: "build".to_string(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        };
+        let result = AgentLoopResult {
+            agent_id: "coder".to_string(),
+            agent_name: "Coder".to_string(),
+            task: "build".to_string(),
+            status: "error".to_string(),
+            output: "failed".to_string(),
+            tool_calls_count: 0,
+            duration_ms: 5000,
+        };
+        let budget = RetryBudget::default();
+        let guard = GuardDecision {
+            allowed: false,
+            reason: "policy rejection".to_string(),
+            needs_approval: false,
+            retry_eligible: false,
+        };
+        assert!(!should_retry(&action, &result, &budget, Some(&guard)));
+    }
+
+    #[test]
+    fn test_should_retry_rejects_max_retries_exhausted() {
+        let action = GuardedAction {
+            agent_id: "coder".to_string(),
+            task: "build".to_string(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        };
+        let result = AgentLoopResult {
+            agent_id: "coder".to_string(),
+            agent_name: "Coder".to_string(),
+            task: "build".to_string(),
+            status: "error".to_string(),
+            output: "failed".to_string(),
+            tool_calls_count: 0,
+            duration_ms: 5000,
+        };
+        let mut budget = RetryBudget::default();
+        budget
+            .per_action_failures
+            .insert(action.action_key(), budget.max_retries);
+        assert!(!should_retry(&action, &result, &budget, None));
+    }
+
+    #[test]
+    fn test_extract_verify_marker() {
+        let text = format!(
+            "some text\n{}{{\"score\":8,\"evidence\":\"test passed\",\"remaining\":[],\"shouldContinue\":false}}\nmore text",
+            MARKER_VERIFY
+        );
+        let (marker, _) = extract_first_loop_marker(&text).unwrap();
+        match marker {
+            ParsedLoopMarker::Verify(v) => {
+                assert_eq!(v.score, 8);
+                assert_eq!(v.evidence, "test passed");
+                assert!(v.remaining.is_empty());
+                assert!(!v.should_continue);
+            }
+            other => panic!("expected Verify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_strip_includes_verify_marker() {
+        let text = format!(
+            "Line 1\n{}{{\"score\":5,\"evidence\":\"wip\",\"remaining\":[],\"shouldContinue\":true}}\nLine 2",
+            MARKER_VERIFY
+        );
+        let stripped = strip_loop_markers(&text);
+        assert_eq!(stripped, "Line 1\nLine 2");
+    }
+
+    #[test]
+    fn test_parse_verify_from_free_text() {
+        let text = r#"Here is my evaluation: {"score": 7, "evidence": "mostly done", "remaining": ["tests"], "shouldContinue": true}"#;
+        let result = parse_verify_from_free_text(text);
+        assert_eq!(result.score, 7);
+        assert_eq!(result.evidence, "mostly done");
+        assert_eq!(result.remaining, vec!["tests".to_string()]);
+        assert!(result.should_continue);
+    }
+
+    #[test]
+    fn test_parse_verify_from_free_text_invalid() {
+        let text = "No valid JSON here";
+        let result = parse_verify_from_free_text(text);
+        assert_eq!(result.score, 0);
+        assert!(!result.should_continue);
+    }
+
+    #[test]
+    fn test_verify_result_default_fail() {
+        let result = VerifyResult::default_fail();
+        assert_eq!(result.score, 0);
+        assert!(!result.should_continue);
+    }
+
+    #[test]
+    fn test_guarded_action_from_call_marker() {
+        let call = AgentLoopCallMarker {
+            agent_id: "coder".to_string(),
+            task: "implement auth".to_string(),
+            params: serde_json::Value::Null,
+            context_injection: None,
+            expect_structured_output: false,
+            output_format_hint: None,
+            pause_for_review: false,
+        };
+        let action = GuardedAction::from_call_marker(&call);
+        assert_eq!(action.agent_id, "coder");
+        assert_eq!(action.task, "implement auth");
+        assert_eq!(action.risk_level, "normal");
+    }
+
+    #[test]
+    fn test_guarded_action_from_batch_marker() {
+        let batch = AgentLoopBatchMarker {
+            calls: vec![AgentLoopCallMarker {
+                agent_id: "a1".to_string(),
+                task: "task1".to_string(),
+                params: serde_json::Value::Null,
+                context_injection: None,
+                expect_structured_output: false,
+                output_format_hint: None,
+                pause_for_review: false,
+            }],
+            pause_for_review: true,
+        };
+        let action = GuardedAction::from_batch_marker(&batch);
+        assert!(action.agent_id.starts_with("batch:"));
+        assert_eq!(action.risk_level, "high");
+    }
+
+    #[test]
+    fn test_guarded_action_key_stability() {
+        let action = GuardedAction {
+            agent_id: "coder".to_string(),
+            task: "implement auth".to_string(),
+            risk_level: "normal".to_string(),
+            reason: String::new(),
+        };
+        let key1 = action.action_key();
+        let key2 = action.action_key();
+        assert_eq!(key1, key2);
+        assert!(key1.starts_with("coder:"));
+    }
+
+    #[test]
+    fn test_compute_retry_backoff() {
+        let budget = RetryBudget::default();
+        // Default backoff is [1000, 3000, 9000]
+        assert_eq!(
+            compute_retry_backoff(&budget, 0),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            compute_retry_backoff(&budget, 1),
+            Duration::from_millis(3000)
+        );
+        assert_eq!(
+            compute_retry_backoff(&budget, 2),
+            Duration::from_millis(9000)
+        );
+        // Beyond array length, use last value.
+        assert_eq!(
+            compute_retry_backoff(&budget, 5),
+            Duration::from_millis(9000)
+        );
+    }
+
+    #[test]
+    fn test_truncate_str_short() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_long() {
+        let long = "abcdefghij".repeat(10);
+        let truncated = truncate_str(&long, 50);
+        assert!(truncated.len() <= 53); // 50 chars + "..."
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn test_format_environment_snapshot_for_injection() {
+        let snapshot = EnvironmentSnapshot {
+            workspace_summary: "WORKING.md:\ncurrent task".to_string(),
+            recent_file_changes: String::new(),
+            conversation_context: "User: hello\nAssistant: hi".to_string(),
+            loop_state: LoopStateSummary {
+                iteration: 3,
+                max_iterations: 50,
+                failed_actions: vec![FailedAction {
+                    action_key: "coder:build".to_string(),
+                    task: "build".to_string(),
+                    error: "compile error".to_string(),
+                    attempt_count: 2,
+                }],
+                total_duration_ms: 30000,
+                budget_remaining_ms: Some(120000),
+            },
+        };
+
+        let text = format_environment_snapshot_for_injection(&snapshot);
+        assert!(text.contains("[环境快照 - 轮次 3/50]"));
+        assert!(text.contains("工作空间状态"));
+        assert!(text.contains("最近对话"));
+        assert!(text.contains("失败动作"));
+        assert!(text.contains("剩余预算"));
     }
 }

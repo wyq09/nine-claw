@@ -81,6 +81,71 @@ impl From<storage::chat_history::ChatSession> for ChatSessionDetail {
     }
 }
 
+fn index_chat_turn_async(app: &AppHandle, turn_id: &str, session_id: &str) {
+    let Some(registry) = crate::managed_runtime::get_embedding_registry() else {
+        return;
+    };
+    let app = app.clone();
+    let turn_id = turn_id.to_string();
+    let session_id = session_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        let provider = {
+            let guard = registry.read().await;
+            guard.default_provider()
+        };
+        let Some(provider) = provider else {
+            return;
+        };
+        let Ok(conn) = storage_conn(&app) else {
+            return;
+        };
+        let Ok(Some(session)) = storage::chat_history::get_chat_session(&conn, &session_id) else {
+            return;
+        };
+        let Some(agent_id) = session.agent_id.as_deref() else {
+            return;
+        };
+        let Ok(Some(turn)) = storage::chat_history::get_chat_turn(&conn, &turn_id) else {
+            return;
+        };
+        // Only index completed turns with non-empty answer
+        if turn.answer.is_empty() {
+            return;
+        }
+        let text = format!("{}\n{}", turn.prompt, turn.answer);
+        let metadata = serde_json::json!({
+            "sessionId": session.id,
+            "sessionTitle": session.title,
+            "agentId": agent_id,
+            "turnIndex": turn.turn_index,
+            "turnId": turn.id,
+            "timestamp": turn.created_at,
+            "completedAt": turn.completed_at,
+            "workspaceId": session.workspace_id,
+        });
+        let metadata_str = serde_json::to_string(&metadata).unwrap_or_default();
+        match provider.embed(vec![text.clone()]).await {
+            Ok(embeddings) => {
+                if let Some(embedding) = embeddings.into_iter().next() {
+                    let vector_id = format!("vec_{}", uuid::Uuid::new_v4().simple());
+                    let _ = crate::memory_vector::upsert_vector_with_meta(
+                        &conn,
+                        &vector_id,
+                        &storage::core_memory::chat_turn_vector_memory_id(&turn.id),
+                        &storage::core_memory::agent_vector_namespace(agent_id),
+                        &embedding,
+                        provider.id(),
+                        Some(&metadata_str),
+                        Some(&text),
+                        None,
+                    );
+                }
+            }
+            Err(error) => log::warn!("聊天轮次向量写入失败: {error}"),
+        }
+    });
+}
+
 #[tauri::command]
 pub(crate) fn chat_list_sessions(app: AppHandle) -> Result<Vec<ChatSessionListItem>, String> {
     let conn = storage_conn(&app)?;
@@ -158,7 +223,7 @@ pub(crate) fn chat_append_turn(
     speaker_agent_id: Option<String>,
 ) -> Result<storage::chat_history::ChatTurn, String> {
     let conn = storage_conn(&app)?;
-    storage::chat_history::append_chat_turn(
+    let turn = storage::chat_history::append_chat_turn(
         &conn,
         &storage::chat_history::AppendChatTurnInput {
             id,
@@ -174,7 +239,9 @@ pub(crate) fn chat_append_turn(
             activity_json,
             speaker_agent_id,
         },
-    )
+    )?;
+    index_chat_turn_async(&app, &turn.id, &turn.session_id);
+    Ok(turn)
 }
 
 #[tauri::command]
@@ -191,7 +258,7 @@ pub(crate) fn chat_update_turn(
     activity_json: Option<String>,
 ) -> Result<storage::chat_history::ChatTurn, String> {
     let conn = storage_conn(&app)?;
-    storage::chat_history::update_chat_turn(
+    let turn = storage::chat_history::update_chat_turn(
         &conn,
         &storage::chat_history::UpdateChatTurnInput {
             id,
@@ -204,7 +271,9 @@ pub(crate) fn chat_update_turn(
             tool_calls_json,
             activity_json,
         },
-    )
+    )?;
+    index_chat_turn_async(&app, &turn.id, &turn.session_id);
+    Ok(turn)
 }
 
 #[tauri::command]
@@ -463,7 +532,12 @@ pub(crate) fn workspace_list_memories(
     limit: Option<i64>,
 ) -> Result<Vec<storage::workspaces::WorkspaceMemoryRecord>, String> {
     let conn = storage_conn(&app)?;
-    storage::workspaces::list_workspace_memories(&conn, workspace_id.trim(), limit.unwrap_or(50), None)
+    storage::workspaces::list_workspace_memories(
+        &conn,
+        workspace_id.trim(),
+        limit.unwrap_or(50),
+        None,
+    )
 }
 
 #[tauri::command]

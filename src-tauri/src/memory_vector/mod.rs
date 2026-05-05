@@ -37,11 +37,35 @@ pub fn upsert_vector(
     embedding: &[f32],
     model_id: &str,
 ) -> Result<(), String> {
+    upsert_vector_with_meta(
+        conn,
+        id,
+        memory_id,
+        workspace_id,
+        embedding,
+        model_id,
+        None,
+        None,
+        None,
+    )
+}
+
+/// 插入或更新向量（带元数据）。若 memory_id 已有向量则更新，否则插入。
+pub fn upsert_vector_with_meta(
+    conn: &Connection,
+    id: &str,
+    memory_id: &str,
+    workspace_id: &str,
+    embedding: &[f32],
+    model_id: &str,
+    metadata_json: Option<&str>,
+    content_text: Option<&str>,
+    tags_json: Option<&str>,
+) -> Result<(), String> {
     let dim = embedding.len() as i32;
     let blob = embedding_to_blob(embedding);
     let now = now_ms();
 
-    // 检查 memory_id 是否已有向量
     let existing: Option<String> = conn
         .query_row(
             "SELECT id FROM memory_vectors WHERE memory_id = ?1",
@@ -52,20 +76,30 @@ pub fn upsert_vector(
         .map_err(|e| format!("查询已有向量失败: {e}"))?;
 
     if let Some(existing_id) = existing {
-        // 更新
         conn.execute(
             "UPDATE memory_vectors
-             SET embedding = ?1, embedding_model = ?2, dimension = ?3, updated_at = ?4
-             WHERE id = ?5",
-            params![blob, model_id, dim, now, existing_id],
+             SET embedding = ?1, embedding_model = ?2, dimension = ?3, updated_at = ?4,
+                 metadata_json = COALESCE(?5, metadata_json),
+                 content_text = COALESCE(?6, content_text),
+                 tags_json = COALESCE(?7, tags_json)
+             WHERE id = ?8",
+            params![
+                blob,
+                model_id,
+                dim,
+                now,
+                metadata_json,
+                content_text,
+                tags_json,
+                existing_id
+            ],
         )
         .map_err(|e| format!("更新向量失败: {e}"))?;
     } else {
-        // 插入
         conn.execute(
-            "INSERT INTO memory_vectors (id, memory_id, workspace_id, embedding, embedding_model, dimension, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![id, memory_id, workspace_id, blob, model_id, dim, now, now],
+            "INSERT INTO memory_vectors (id, memory_id, workspace_id, embedding, embedding_model, dimension, created_at, updated_at, metadata_json, content_text, tags_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![id, memory_id, workspace_id, blob, model_id, dim, now, now, metadata_json, content_text, tags_json],
         )
         .map_err(|e| format!("插入向量失败: {e}"))?;
     }
@@ -148,6 +182,47 @@ pub fn search_vectors(
         scope_filter,
         scope_agent_id,
     )
+}
+
+pub fn search_vectors_across_workspaces(
+    conn: &Connection,
+    workspace_ids: &[String],
+    query_embedding: &[f32],
+    limit: usize,
+    threshold: f32,
+) -> Result<Vec<vector_search::SearchHit>, String> {
+    let mut merged = Vec::new();
+    for workspace_id in workspace_ids {
+        let mut hits = vector_search::cosine_search(
+            conn,
+            workspace_id,
+            query_embedding,
+            limit,
+            threshold,
+            None,
+            None,
+            None,
+        )?;
+        merged.append(&mut hits);
+    }
+
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut dedup = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for hit in merged {
+        if dedup.insert(hit.memory_id.clone()) {
+            out.push(hit);
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// Three-layer memory search: merges results from system, workspace, and agent scopes.
@@ -503,7 +578,17 @@ mod tests {
     #[test]
     fn test_search_empty_workspace() {
         let conn = open_in_memory().unwrap();
-        let hits = search_vectors(&conn, "ws-nonexistent", &[1.0, 0.0f32], 10, 0.0, None, None, None).unwrap();
+        let hits = search_vectors(
+            &conn,
+            "ws-nonexistent",
+            &[1.0, 0.0f32],
+            10,
+            0.0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(hits.is_empty());
     }
 
@@ -738,7 +823,11 @@ mod tests {
 
         // Search in ws2 — should find the system memory from ws1
         let hits = search_vectors(&conn, ws2, &[1.0, 0.0, 0.0], 10, 0.5, None, None, None).unwrap();
-        assert_eq!(hits.len(), 1, "system memory should be searchable from any workspace");
+        assert_eq!(
+            hits.len(),
+            1,
+            "system memory should be searchable from any workspace"
+        );
         assert_eq!(hits[0].memory_id, "mem-sys");
     }
 
@@ -752,23 +841,49 @@ mod tests {
         insert_test_memory(&conn, "mem-agent-a", ws, "Agent A memory", "private to A");
         insert_test_memory(&conn, "mem-agent-b", ws, "Agent B memory", "private to B");
 
-        crate::storage::workspaces::update_memory_scope(&conn, "mem-agent-a", "agent", Some("agent-a")).unwrap();
-        crate::storage::workspaces::update_memory_scope(&conn, "mem-agent-b", "agent", Some("agent-b")).unwrap();
+        crate::storage::workspaces::update_memory_scope(
+            &conn,
+            "mem-agent-a",
+            "agent",
+            Some("agent-a"),
+        )
+        .unwrap();
+        crate::storage::workspaces::update_memory_scope(
+            &conn,
+            "mem-agent-b",
+            "agent",
+            Some("agent-b"),
+        )
+        .unwrap();
 
         insert_test_vector(&conn, "mem-agent-a", ws, &[1.0, 0.0]);
         insert_test_vector(&conn, "mem-agent-b", ws, &[1.0, 0.0]);
 
         // Agent A searching — should NOT see agent B's memories
-        let hits_a = three_layer_search(&conn, ws, Some("agent-a"), false, &[1.0, 0.0], 10, 0.5).unwrap();
+        let hits_a =
+            three_layer_search(&conn, ws, Some("agent-a"), false, &[1.0, 0.0], 10, 0.5).unwrap();
         let ids_a: Vec<&str> = hits_a.iter().map(|h| h.memory_id.as_str()).collect();
-        assert!(ids_a.contains(&"mem-agent-a"), "agent A should see own memory");
-        assert!(!ids_a.contains(&"mem-agent-b"), "agent A should NOT see agent B's memory");
+        assert!(
+            ids_a.contains(&"mem-agent-a"),
+            "agent A should see own memory"
+        );
+        assert!(
+            !ids_a.contains(&"mem-agent-b"),
+            "agent A should NOT see agent B's memory"
+        );
 
         // Agent B searching — should NOT see agent A's memories
-        let hits_b = three_layer_search(&conn, ws, Some("agent-b"), false, &[1.0, 0.0], 10, 0.5).unwrap();
+        let hits_b =
+            three_layer_search(&conn, ws, Some("agent-b"), false, &[1.0, 0.0], 10, 0.5).unwrap();
         let ids_b: Vec<&str> = hits_b.iter().map(|h| h.memory_id.as_str()).collect();
-        assert!(ids_b.contains(&"mem-agent-b"), "agent B should see own memory");
-        assert!(!ids_b.contains(&"mem-agent-a"), "agent B should NOT see agent A's memory");
+        assert!(
+            ids_b.contains(&"mem-agent-b"),
+            "agent B should see own memory"
+        );
+        assert!(
+            !ids_b.contains(&"mem-agent-a"),
+            "agent B should NOT see agent A's memory"
+        );
     }
 
     #[test]
@@ -781,17 +896,36 @@ mod tests {
         insert_test_memory(&conn, "mem-sup-a", ws, "Agent A private", "content A");
         insert_test_memory(&conn, "mem-sup-b", ws, "Agent B private", "content B");
 
-        crate::storage::workspaces::update_memory_scope(&conn, "mem-sup-a", "agent", Some("agent-a")).unwrap();
-        crate::storage::workspaces::update_memory_scope(&conn, "mem-sup-b", "agent", Some("agent-b")).unwrap();
+        crate::storage::workspaces::update_memory_scope(
+            &conn,
+            "mem-sup-a",
+            "agent",
+            Some("agent-a"),
+        )
+        .unwrap();
+        crate::storage::workspaces::update_memory_scope(
+            &conn,
+            "mem-sup-b",
+            "agent",
+            Some("agent-b"),
+        )
+        .unwrap();
 
         insert_test_vector(&conn, "mem-sup-a", ws, &[1.0, 0.0]);
         insert_test_vector(&conn, "mem-sup-b", ws, &[1.0, 0.0]);
 
         // Supervisor searching — should see ALL agent memories
-        let hits = three_layer_search(&conn, ws, Some("supervisor-id"), true, &[1.0, 0.0], 10, 0.5).unwrap();
+        let hits = three_layer_search(&conn, ws, Some("supervisor-id"), true, &[1.0, 0.0], 10, 0.5)
+            .unwrap();
         let ids: Vec<&str> = hits.iter().map(|h| h.memory_id.as_str()).collect();
-        assert!(ids.contains(&"mem-sup-a"), "supervisor should see agent A's memory");
-        assert!(ids.contains(&"mem-sup-b"), "supervisor should see agent B's memory");
+        assert!(
+            ids.contains(&"mem-sup-a"),
+            "supervisor should see agent A's memory"
+        );
+        assert!(
+            ids.contains(&"mem-sup-b"),
+            "supervisor should see agent B's memory"
+        );
     }
 
     #[test]
@@ -804,7 +938,8 @@ mod tests {
 
         // System memory in ws_other
         insert_test_memory(&conn, "mem-layer-sys", ws_other, "System fact", "global");
-        crate::storage::workspaces::update_memory_scope(&conn, "mem-layer-sys", "system", None).unwrap();
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-layer-sys", "system", None)
+            .unwrap();
         insert_test_vector(&conn, "mem-layer-sys", ws_other, &[1.0, 0.0, 0.0]);
 
         // Workspace memory in ws
@@ -813,11 +948,18 @@ mod tests {
 
         // Agent memory in ws
         insert_test_memory(&conn, "mem-layer-agent", ws, "Agent fact", "private");
-        crate::storage::workspaces::update_memory_scope(&conn, "mem-layer-agent", "agent", Some("agent-x")).unwrap();
+        crate::storage::workspaces::update_memory_scope(
+            &conn,
+            "mem-layer-agent",
+            "agent",
+            Some("agent-x"),
+        )
+        .unwrap();
         insert_test_vector(&conn, "mem-layer-agent", ws, &[1.0, 0.0, 0.0]);
 
         // Agent x searching — should see all 3
-        let hits = three_layer_search(&conn, ws, Some("agent-x"), false, &[1.0, 0.0, 0.0], 10, 0.5).unwrap();
+        let hits = three_layer_search(&conn, ws, Some("agent-x"), false, &[1.0, 0.0, 0.0], 10, 0.5)
+            .unwrap();
         let ids: Vec<&str> = hits.iter().map(|h| h.memory_id.as_str()).collect();
         assert_eq!(ids.len(), 3, "should find memories from all 3 layers");
         assert!(ids.contains(&"mem-layer-sys"));
@@ -835,18 +977,31 @@ mod tests {
         insert_test_memory(&conn, "mem-migrate", ws, "Migrate test", "content");
 
         // Verify default
-        let rec = crate::storage::workspaces::get_workspace_memory(&conn, "mem-migrate").unwrap().unwrap();
+        let rec = crate::storage::workspaces::get_workspace_memory(&conn, "mem-migrate")
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.scope, "workspace");
 
         // Update to system
-        crate::storage::workspaces::update_memory_scope(&conn, "mem-migrate", "system", None).unwrap();
-        let rec = crate::storage::workspaces::get_workspace_memory(&conn, "mem-migrate").unwrap().unwrap();
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-migrate", "system", None)
+            .unwrap();
+        let rec = crate::storage::workspaces::get_workspace_memory(&conn, "mem-migrate")
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.scope, "system");
         assert!(rec.scope_agent_id.is_none());
 
         // Update to agent
-        crate::storage::workspaces::update_memory_scope(&conn, "mem-migrate", "agent", Some("agent-1")).unwrap();
-        let rec = crate::storage::workspaces::get_workspace_memory(&conn, "mem-migrate").unwrap().unwrap();
+        crate::storage::workspaces::update_memory_scope(
+            &conn,
+            "mem-migrate",
+            "agent",
+            Some("agent-1"),
+        )
+        .unwrap();
+        let rec = crate::storage::workspaces::get_workspace_memory(&conn, "mem-migrate")
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.scope, "agent");
         assert_eq!(rec.scope_agent_id.as_deref(), Some("agent-1"));
     }
@@ -858,24 +1013,29 @@ mod tests {
         ensure_workspace(&conn, ws);
 
         // 0 initially
-        let (sys, ws_count, agent) = crate::storage::workspaces::count_memories_by_scope(&conn, ws).unwrap();
+        let (sys, ws_count, agent) =
+            crate::storage::workspaces::count_memories_by_scope(&conn, ws).unwrap();
         assert_eq!((sys, ws_count, agent), (0, 0, 0));
 
         // Add 2 workspace memories
         insert_test_memory(&conn, "mem-c1", ws, "W1", "c");
         insert_test_memory(&conn, "mem-c2", ws, "W2", "c");
-        let (sys, ws_count, agent) = crate::storage::workspaces::count_memories_by_scope(&conn, ws).unwrap();
+        let (sys, ws_count, agent) =
+            crate::storage::workspaces::count_memories_by_scope(&conn, ws).unwrap();
         assert_eq!((sys, ws_count, agent), (0, 2, 0));
 
         // Change one to system
         crate::storage::workspaces::update_memory_scope(&conn, "mem-c1", "system", None).unwrap();
-        let (sys, ws_count, agent) = crate::storage::workspaces::count_memories_by_scope(&conn, ws).unwrap();
+        let (sys, ws_count, agent) =
+            crate::storage::workspaces::count_memories_by_scope(&conn, ws).unwrap();
         assert_eq!((sys, ws_count, agent), (1, 1, 0));
 
         // Add agent memory
         insert_test_memory(&conn, "mem-c3", ws, "A1", "c");
-        crate::storage::workspaces::update_memory_scope(&conn, "mem-c3", "agent", Some("agent-x")).unwrap();
-        let (sys, ws_count, agent) = crate::storage::workspaces::count_memories_by_scope(&conn, ws).unwrap();
+        crate::storage::workspaces::update_memory_scope(&conn, "mem-c3", "agent", Some("agent-x"))
+            .unwrap();
+        let (sys, ws_count, agent) =
+            crate::storage::workspaces::count_memories_by_scope(&conn, ws).unwrap();
         assert_eq!((sys, ws_count, agent), (1, 1, 1));
     }
 }

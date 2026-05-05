@@ -107,7 +107,8 @@ describe('AgentLoopBlock', () => {
       ],
     }
     render(<AgentLoopBlock segment={batchSegment} />)
-    expect(screen.getByText('[2 个 Agent 并发]')).toBeInTheDocument()
+    expect(screen.getByText('并发子智能体')).toBeInTheDocument()
+    expect(screen.getByText(/2 个 Agent 并发/)).toBeInTheDocument()
     expect(screen.getByText('Agent-A')).toBeInTheDocument()
     expect(screen.getByText('Agent-B')).toBeInTheDocument()
   })

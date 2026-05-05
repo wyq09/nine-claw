@@ -37,6 +37,9 @@ describe('agent draft formatting', () => {
     expect(normalized.skillIds).toEqual(['pdf', 'pptx'])
     expect(normalized.allowedToolIds).toEqual(createDefaultAgentAllowedToolIds())
     expect(normalized.capabilityPolicy?.strategy).toBe('static')
+    expect(normalized.allowedToolIds).toContain('memory_read')
+    expect(normalized.allowedToolIds).toContain('memory_store')
+    expect(normalized.allowedToolIds).toContain('chat_search')
   })
 
   it('normalizes agent tool permissions and runtime aliases', () => {
@@ -47,6 +50,11 @@ describe('agent draft formatting', () => {
     ])
     expect(normalizeAgentAllowedToolIds([])).toEqual([])
     expect(normalizeAgentAllowedToolIds(undefined)).toEqual(createDefaultAgentAllowedToolIds())
+    expect(normalizeAgentAllowedToolIds(['memory_read', 'memory_store', 'chat_search'])).toEqual([
+      'memory_read',
+      'memory_store',
+      'chat_search',
+    ])
   })
 
   it('rejects invalid editable Agent_ID values', () => {

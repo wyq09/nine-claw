@@ -17,10 +17,12 @@ import type {
   HistoryItem,
   HistoryStatus,
   PiStreamPayload,
+  ProviderId,
   ResponseSegment,
   ToolCallEntry,
   TokenUsage,
 } from '../../types'
+import { parseWidgetSegment } from '../../widgetTypes'
 
 export const HISTORY_STORAGE_KEY = 'nineclaw.history.v4'
 const LEGACY_HISTORY_STORAGE_KEYS = ['yqagent.history.v4']
@@ -368,6 +370,40 @@ export function deriveConversationTitle(prompt: string, answer = '', existingTit
   return `${prefix}${compactTitle}`.trim()
 }
 
+export function deriveFirstUserTurnConversationTitle(prompt: string, existingTitle?: string): string {
+  return deriveConversationTitle(prompt, '', existingTitle)
+}
+
+function shouldRegenerateStoredConversationTitle(title: string): boolean {
+  const normalized = title.trim()
+  return normalized.length === 0 || normalized === '新会话'
+}
+
+export function createEmptyHistoryItem(input?: {
+  agent?: ConversationAgentSnapshot | null
+  sessionLlm?: { providerId: ProviderId; model: string } | null
+  workspaceId?: string | null
+  createdAt?: number
+}): HistoryItem {
+  const createdAt = input?.createdAt ?? Date.now()
+  return {
+    id: createId(),
+    title: '新会话',
+    status: 'done',
+    createdAt,
+    updatedAt: createdAt,
+    turns: [],
+    ...(input?.agent ? { agent: input.agent } : {}),
+    ...(input?.workspaceId ? { workspaceId: input.workspaceId } : {}),
+    ...(input?.sessionLlm
+      ? {
+          sessionLlmProviderId: input.sessionLlm.providerId,
+          sessionLlmModel: input.sessionLlm.model,
+        }
+      : {}),
+  }
+}
+
 export function deriveBotChannelLabel(channelId: string): string {
   const baseChannelId = channelId.split(':')[0] ?? channelId
   if (baseChannelId === 'wechat') {
@@ -532,6 +568,11 @@ export function parseResponseSegments(raw: unknown): ResponseSegment[] | undefin
     }
     if (seg.type === 'tool' && typeof seg.toolCallId === 'string') {
       out.push({ type: 'tool', toolCallId: seg.toolCallId })
+      continue
+    }
+    const widgetSegment = parseWidgetSegment(seg)
+    if (widgetSegment) {
+      out.push(widgetSegment)
       continue
     }
     if (
@@ -821,9 +862,14 @@ export function parseHistorySnapshot(raw: string | null): HistoryItem[] {
         const agent = parseConversationAgentSnapshot(candidate.agent)
         const botTarget = parseBotConversationTarget(candidate.botTarget)
 
+        const storedTitle = title.trim()
+        const nextTitle = shouldRegenerateStoredConversationTitle(storedTitle)
+          ? deriveConversationTitle(parsedTurns[0]?.prompt ?? storedTitle, parsedTurns[0]?.answer ?? '', storedTitle)
+          : storedTitle
+
         return {
           id,
-          title: deriveConversationTitle(parsedTurns[0]?.prompt ?? title, parsedTurns[0]?.answer ?? '', title),
+          title: nextTitle,
           status,
           createdAt,
           updatedAt,

@@ -234,13 +234,13 @@ fn parse_session_title_llm_output(raw: &str) -> Option<String> {
     Some(clamp_display_chars(line, 28))
 }
 
-/// 用智能体「标题生成」场景模型（未配置则用默认对话模型）根据首轮用户提问 + 助手回复生成会话列表短标题。
+/// 用智能体「标题生成」场景模型（未配置则用默认对话模型）只根据首轮用户提问生成会话列表短标题。
 fn generate_conversation_session_title_llm(
     app: &AppHandle,
     agent_id: &str,
     session_id: Option<&str>,
     user_message: &str,
-    assistant_message: &str,
+    _assistant_message: &str,
 ) -> Result<String, String> {
     if std::env::var("NINECLAW_SKIP_SESSION_TITLE_LLM")
         .map(|v| v.trim() == "1")
@@ -260,9 +260,6 @@ fn generate_conversation_session_title_llm(
     }
 
     let Some(record) = agents::get_agent_record(app, agent_id)? else {
-        return Ok(String::new());
-    };
-    let Some(agent_config) = agents::get_conversation_agent_config(app, agent_id)? else {
         return Ok(String::new());
     };
     let session_id = session_id
@@ -302,7 +299,6 @@ fn generate_conversation_session_title_llm(
         &runtime.provider_id,
     );
     let pi_rt = pi_runtime::require_pi_runtime_location(app)?;
-    let trace_agent_system_prompt = crate::agents::build_agent_system_prompt(&agent_config);
     let bridge = PiBridge::new(
         pi_rt,
         &runtime.provider_id,
@@ -310,13 +306,12 @@ fn generate_conversation_session_title_llm(
         &base_normalized,
         &runtime.api_key,
         &runtime.model,
-        Some(agent_config),
+        None,
     );
     let channel_id = format!("nc:sessiontitle:{agent_id}");
     let user_id = format!("title_{}", uuid::Uuid::new_v4().simple());
     let um_snip = clamp_chars_head(um, 6000);
-    let am_snip = clamp_chars_head(assistant_message.trim(), 8000);
-    let prompt = prompts::build_session_title_prompt(&um_snip, &am_snip);
+    let prompt = prompts::build_session_title_prompt(&um_snip);
     let workspace_id = session_id.as_deref().and_then(|sid| {
         storage_conn(app)
             .ok()
@@ -341,18 +336,11 @@ fn generate_conversation_session_title_llm(
         session_id.is_some()
     };
     let mut trace_guard = if trace_enabled {
-        let mut system_prompts = Vec::new();
-        if let Some(system_prompt) = trace_agent_system_prompt {
-            system_prompts.push(llm_trace::TraceSystemPromptSection {
-                label: "agent_system_prompt".to_string(),
-                content: system_prompt,
-            });
-        }
-        system_prompts.push(llm_trace::TraceSystemPromptSection {
+        let system_prompts = vec![llm_trace::TraceSystemPromptSection {
             label: "title_generation_action".to_string(),
-            content: "为当前 session 生成简短标题，只输出最终标题或 JSON 包裹的标题字段。"
+            content: "为当前 session 生成简短标题；只参考首条用户消息，不参考助手回复或 agent 系统提示。只输出最终标题或 JSON 包裹的标题字段。"
                 .to_string(),
-        });
+        }];
         Some(llm_trace::TraceGuard::new(
             app,
             llm_trace::begin(
@@ -444,13 +432,13 @@ pub(crate) fn generate_session_conversation_title(
     agent_id: String,
     session_id: Option<String>,
     user_message: String,
-    assistant_message: String,
+    assistant_message: Option<String>,
 ) -> Result<String, String> {
     generate_conversation_session_title_llm(
         &app,
         &agent_id,
         session_id.as_deref(),
         &user_message,
-        &assistant_message,
+        assistant_message.as_deref().unwrap_or_default(),
     )
 }

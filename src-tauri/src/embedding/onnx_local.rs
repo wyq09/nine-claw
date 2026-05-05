@@ -5,12 +5,13 @@ use async_trait::async_trait;
 use ndarray::{Array1, Array2, ArrayD};
 use ort::session::Session;
 use ort::value::Tensor;
-use tokenizers::Tokenizer;
+use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
 
 use super::EmbeddingProvider;
 
 const PROVIDER_ID: &str = "bge-small-zh-local";
 const DIMENSION: usize = 512;
+const MAX_SEQ_LENGTH: usize = 512;
 
 /// Local ONNX embedding provider using bge-small-zh model.
 ///
@@ -33,10 +34,7 @@ impl OnnxLocalProvider {
         let tokenizer_path = model_dir.join("tokenizer.json");
 
         if !model_path.exists() {
-            return Err(format!(
-                "ONNX model not found at {}",
-                model_path.display()
-            ));
+            return Err(format!("ONNX model not found at {}", model_path.display()));
         }
         if !tokenizer_path.exists() {
             return Err(format!(
@@ -50,8 +48,14 @@ impl OnnxLocalProvider {
             .commit_from_file(&model_path)
             .map_err(|e| format!("Failed to load ONNX model: {}", e))?;
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
+        tokenizer.with_truncation(Some(TruncationParams {
+            max_length: MAX_SEQ_LENGTH,
+            strategy: TruncationStrategy::LongestFirst,
+            stride: 0,
+            direction: TruncationDirection::Right,
+        }));
 
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
@@ -62,7 +66,11 @@ impl OnnxLocalProvider {
     /// Compute embedding for a single text string via ONNX inference.
     ///
     /// Tokenizes input, runs the model, then applies mean pooling + L2 norm.
-    fn embed_single(session: &Mutex<Session>, tokenizer: &Tokenizer, text: &str) -> Result<Vec<f32>, String> {
+    fn embed_single(
+        session: &Mutex<Session>,
+        tokenizer: &Tokenizer,
+        text: &str,
+    ) -> Result<Vec<f32>, String> {
         let encoding = tokenizer
             .encode(text, true)
             .map_err(|e| format!("Tokenization failed: {}", e))?;
@@ -82,21 +90,17 @@ impl OnnxLocalProvider {
         let input_ids_i64: Vec<i64> = input_ids.iter().map(|&v| v as i64).collect();
         let attention_mask_i64: Vec<i64> = attention_mask.iter().map(|&v| v as i64).collect();
 
-        let input_ids_tensor =
-            Tensor::from_array((vec![1i64, seq_len as i64], input_ids_i64))
-                .map_err(|e| format!("Failed to create input_ids tensor: {}", e))?;
-        let attention_mask_tensor = Tensor::from_array((
-            vec![1i64, seq_len as i64],
-            attention_mask_i64,
-        ))
-        .map_err(|e| format!("Failed to create attention_mask tensor: {}", e))?;
-        let token_type_ids_tensor =
-            Tensor::from_array((vec![1i64, seq_len as i64], type_ids))
-                .map_err(|e| format!("Failed to create token_type_ids tensor: {}", e))?;
+        let input_ids_tensor = Tensor::from_array((vec![1i64, seq_len as i64], input_ids_i64))
+            .map_err(|e| format!("Failed to create input_ids tensor: {}", e))?;
+        let attention_mask_tensor =
+            Tensor::from_array((vec![1i64, seq_len as i64], attention_mask_i64))
+                .map_err(|e| format!("Failed to create attention_mask tensor: {}", e))?;
+        let token_type_ids_tensor = Tensor::from_array((vec![1i64, seq_len as i64], type_ids))
+            .map_err(|e| format!("Failed to create token_type_ids tensor: {}", e))?;
 
-        let mut session_guard = session.lock().map_err(|e| {
-            format!("Failed to lock ONNX session: {}", e)
-        })?;
+        let mut session_guard = session
+            .lock()
+            .map_err(|e| format!("Failed to lock ONNX session: {}", e))?;
 
         let outputs = session_guard
             .run(ort::inputs![
@@ -129,10 +133,7 @@ impl OnnxLocalProvider {
             .map_err(|e| format!("Failed to reshape output: {}", e))?;
 
         // Convert attention mask to f64 for mean pooling
-        let mask_f64: Vec<f64> = attention_mask
-            .iter()
-            .map(|&v| v as f64)
-            .collect();
+        let mask_f64: Vec<f64> = attention_mask.iter().map(|&v| v as f64).collect();
 
         let pooled = Self::mean_pool(&token_embeddings, &mask_f64);
 

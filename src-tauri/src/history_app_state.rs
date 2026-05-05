@@ -1,12 +1,12 @@
 use crate::agent_workspace;
-use crate::app_constants::{HISTORY_DB_FILE, HISTORY_STATE_KEY, LEGACY_HISTORY_DB_FILES};
+use crate::app_constants::{HISTORY_DB_FILE, LEGACY_HISTORY_DB_FILES};
 use crate::pi_usage::{
     extract_usage_metadata_payload, extract_usage_payload, json_i64, json_string,
     usage_row_total_tokens, PiTokenUsagePayload, PiUsageMetadataPayload,
 };
 use crate::storage;
 use crate::time_util::chrono_like_timestamp;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -383,8 +383,7 @@ pub(crate) fn open_history_db(app: &AppHandle) -> Result<Connection, String> {
     let connection =
         Connection::open(db_path).map_err(|error| format!("打开历史数据库失败: {error}"))?;
 
-    ensure_app_state_schema(&connection)?;
-    ensure_token_usage_schema(&connection)?;
+    storage::db::ensure_all_schemas(&connection)?;
 
     Ok(connection)
 }
@@ -392,31 +391,17 @@ pub(crate) fn open_history_db(app: &AppHandle) -> Result<Connection, String> {
 #[tauri::command]
 pub(crate) fn load_history_state(app: AppHandle) -> Result<Option<String>, String> {
     let connection = open_history_db(&app)?;
-    connection
-        .query_row(
-            "SELECT value FROM app_state WHERE key = ?1",
-            params![HISTORY_STATE_KEY],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| format!("读取历史任务失败: {error}"))
+    let payload = storage::chat_history_snapshot::export_history_snapshot_json(&connection)?;
+    Ok(Some(payload))
 }
 
 #[tauri::command]
 pub(crate) fn save_history_state(app: AppHandle, payload: String) -> Result<(), String> {
     let mut connection = open_history_db(&app)?;
-    let updated_at = chrono_like_timestamp();
-
-    connection
-        .execute(
-            "INSERT INTO app_state (key, value, updated_at)
-       VALUES (?1, ?2, ?3)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![HISTORY_STATE_KEY, payload, updated_at],
-        )
-        .map_err(|error| format!("保存历史任务失败: {error}"))?;
+    storage::chat_history_snapshot::replace_history_snapshot_json(&connection, &payload)?;
 
     sync_usage_records_from_history_payload(&mut connection, &payload)?;
+    reindex_chat_turn_vectors_async(app);
 
     Ok(())
 }
@@ -424,18 +409,97 @@ pub(crate) fn save_history_state(app: AppHandle, payload: String) -> Result<(), 
 #[tauri::command]
 pub(crate) fn clear_history_state(app: AppHandle) -> Result<(), String> {
     let connection = open_history_db(&app)?;
-    connection
-        .execute(
-            "DELETE FROM app_state WHERE key = ?1",
-            params![HISTORY_STATE_KEY],
-        )
-        .map_err(|error| format!("清空历史任务失败: {error}"))?;
+    storage::chat_history::clear_all_chat_sessions(&connection)?;
     Ok(())
 }
 
 pub(crate) fn storage_conn(app: &AppHandle) -> Result<rusqlite::Connection, String> {
     let db_path = history_db_path(app)?;
     storage::db::open_at(&db_path)
+}
+
+fn reindex_chat_turn_vectors_async(app: AppHandle) {
+    if cfg!(test) {
+        return;
+    }
+    let Some(registry) = crate::managed_runtime::get_embedding_registry() else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        let provider = {
+            let guard = registry.read().await;
+            guard.default_provider()
+        };
+        let Some(provider) = provider else {
+            return;
+        };
+        let Ok(conn) = storage_conn(&app) else {
+            return;
+        };
+        let Ok(sessions) = storage::chat_history::list_chat_sessions(&conn) else {
+            return;
+        };
+
+        for session in sessions {
+            let Some(agent_id) = session.agent_id.as_deref() else {
+                continue;
+            };
+            let Ok(turns) = storage::chat_history::list_chat_turns(&conn, &session.id) else {
+                continue;
+            };
+            for turn in turns {
+                // Only index turns with non-empty answer
+                if turn.answer.is_empty() {
+                    continue;
+                }
+                // Skip if already indexed (has metadata)
+                let memory_id = storage::core_memory::chat_turn_vector_memory_id(&turn.id);
+                let existing_meta: Option<String> = conn
+                    .query_row(
+                        "SELECT metadata_json FROM memory_vectors WHERE memory_id = ?1",
+                        rusqlite::params![memory_id],
+                        |row| row.get(0),
+                    )
+                    .ok()
+                    .flatten();
+                if existing_meta.is_some() {
+                    continue; // Already indexed
+                }
+
+                let text = format!("{}\n{}", turn.prompt, turn.answer);
+                let metadata = serde_json::json!({
+                    "sessionId": session.id,
+                    "sessionTitle": session.title,
+                    "agentId": agent_id,
+                    "turnIndex": turn.turn_index,
+                    "turnId": turn.id,
+                    "timestamp": turn.created_at,
+                    "completedAt": turn.completed_at,
+                    "workspaceId": session.workspace_id,
+                });
+                let metadata_str = serde_json::to_string(&metadata).unwrap_or_default();
+                match provider.embed(vec![text.clone()]).await {
+                    Ok(embeddings) => {
+                        if let Some(embedding) = embeddings.into_iter().next() {
+                            let vector_id = format!("vec_{}", uuid::Uuid::new_v4().simple());
+                            let _ = crate::memory_vector::upsert_vector_with_meta(
+                                &conn,
+                                &vector_id,
+                                &memory_id,
+                                &storage::core_memory::agent_vector_namespace(agent_id),
+                                &embedding,
+                                provider.id(),
+                                Some(&metadata_str),
+                                Some(&text),
+                                None,
+                            );
+                        }
+                    }
+                    Err(error) => log::warn!("聊天轮次向量写入失败: {error}"),
+                }
+            }
+        }
+    });
 }
 
 #[tauri::command]

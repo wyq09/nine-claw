@@ -7,7 +7,10 @@ use app_lib::storage::db::open_in_memory;
 
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or_default()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 fn insert_workspace(conn: &rusqlite::Connection, id: &str, supervisor: &str) {
@@ -46,12 +49,20 @@ fn insert_vector(
     model: &str,
 ) {
     let id = format!("vec_{}", uuid::Uuid::new_v4().simple());
-    app_lib::memory_vector::upsert_vector(conn, &id, memory_id, workspace_id, embedding, model).unwrap();
+    app_lib::memory_vector::upsert_vector(conn, &id, memory_id, workspace_id, embedding, model)
+        .unwrap();
 }
 
 /// Wrapper around search_vectors with no scope/tag filters.
-fn search(conn: &rusqlite::Connection, ws: &str, query: &[f32], limit: usize, threshold: f32) -> Vec<app_lib::memory_vector::vector_search::SearchHit> {
-    app_lib::memory_vector::search_vectors(conn, ws, query, limit, threshold, None, None, None).unwrap()
+fn search(
+    conn: &rusqlite::Connection,
+    ws: &str,
+    query: &[f32],
+    limit: usize,
+    threshold: f32,
+) -> Vec<app_lib::memory_vector::vector_search::SearchHit> {
+    app_lib::memory_vector::search_vectors(conn, ws, query, limit, threshold, None, None, None)
+        .unwrap()
 }
 
 fn setup() -> rusqlite::Connection {
@@ -64,7 +75,15 @@ fn setup() -> rusqlite::Connection {
 fn test_full_crud_lifecycle() {
     let conn = setup();
     insert_workspace(&conn, "ws1", "sup-1");
-    insert_memory(&conn, "m1", "ws1", "项目架构决策", "采用微服务架构，使用 Rust 后端", "workspace", None);
+    insert_memory(
+        &conn,
+        "m1",
+        "ws1",
+        "项目架构决策",
+        "采用微服务架构，使用 Rust 后端",
+        "workspace",
+        None,
+    );
 
     // Create vector
     let emb = vec![0.1; 8];
@@ -102,9 +121,33 @@ fn test_cosine_search_returns_similar() {
     let conn = setup();
     insert_workspace(&conn, "ws1", "sup-1");
 
-    insert_memory(&conn, "m1", "ws1", "Rust 后端", "使用 Rust 开发后端", "workspace", None);
-    insert_memory(&conn, "m2", "ws1", "前端框架", "使用 React 开发前端", "workspace", None);
-    insert_memory(&conn, "m3", "ws1", "数据库选型", "选择 SQLite 作为存储", "workspace", None);
+    insert_memory(
+        &conn,
+        "m1",
+        "ws1",
+        "Rust 后端",
+        "使用 Rust 开发后端",
+        "workspace",
+        None,
+    );
+    insert_memory(
+        &conn,
+        "m2",
+        "ws1",
+        "前端框架",
+        "使用 React 开发前端",
+        "workspace",
+        None,
+    );
+    insert_memory(
+        &conn,
+        "m3",
+        "ws1",
+        "数据库选型",
+        "选择 SQLite 作为存储",
+        "workspace",
+        None,
+    );
 
     let query_emb = vec![0.9, 0.1];
     let m1_emb = vec![1.0, 0.0]; // very similar to query
@@ -168,8 +211,24 @@ fn test_find_missing_vectors() {
     let conn = setup();
     insert_workspace(&conn, "ws1", "sup-1");
     insert_memory(&conn, "m1", "ws1", "indexed", "content", "workspace", None);
-    insert_memory(&conn, "m2", "ws1", "not indexed", "content", "workspace", None);
-    insert_memory(&conn, "m3", "ws1", "also not indexed", "content", "workspace", None);
+    insert_memory(
+        &conn,
+        "m2",
+        "ws1",
+        "not indexed",
+        "content",
+        "workspace",
+        None,
+    );
+    insert_memory(
+        &conn,
+        "m3",
+        "ws1",
+        "also not indexed",
+        "content",
+        "workspace",
+        None,
+    );
     insert_vector(&conn, "m1", "ws1", &vec![0.1; 4], "model");
 
     let missing = app_lib::memory_vector::find_memories_without_vectors(&conn, "ws1", 10).unwrap();
@@ -210,7 +269,13 @@ fn test_embedding_blob_roundtrip_realistic() {
         .unwrap();
     assert_eq!(rec.embedding.len(), 32);
     for (i, (a, b)) in original.iter().zip(rec.embedding.iter()).enumerate() {
-        assert!((a - b).abs() < 1e-6, "Mismatch at index {}: {} vs {}", i, a, b);
+        assert!(
+            (a - b).abs() < 1e-6,
+            "Mismatch at index {}: {} vs {}",
+            i,
+            a,
+            b
+        );
     }
 }
 
@@ -223,7 +288,15 @@ fn test_multiple_vectors_ranked_by_similarity() {
 
     for i in 0..5 {
         let id = format!("m{i}");
-        insert_memory(&conn, &id, "ws1", &format!("Memory {i}"), "content", "workspace", None);
+        insert_memory(
+            &conn,
+            &id,
+            "ws1",
+            &format!("Memory {i}"),
+            "content",
+            "workspace",
+            None,
+        );
         let mut emb = vec![0.0; 8];
         emb[i] = 1.0;
         insert_vector(&conn, &id, "ws1", &emb, "model");
@@ -270,8 +343,9 @@ fn test_find_similar_above_threshold() {
     insert_memory(&conn, "m1", "ws1", "test", "content", "workspace", None);
     insert_vector(&conn, "m1", "ws1", &vec![1.0, 0.0], "model");
 
-    let similar = app_lib::memory_vector::vector_search::find_similar(&conn, "ws1", &vec![0.99, 0.01], 0.9)
-        .unwrap();
+    let similar =
+        app_lib::memory_vector::vector_search::find_similar(&conn, "ws1", &vec![0.99, 0.01], 0.9)
+            .unwrap();
     assert!(similar.is_some());
     assert_eq!(similar.unwrap(), "m1");
 }
@@ -285,8 +359,9 @@ fn test_find_similar_below_threshold() {
     insert_memory(&conn, "m1", "ws1", "test", "content", "workspace", None);
     insert_vector(&conn, "m1", "ws1", &vec![1.0, 0.0], "model");
 
-    let similar = app_lib::memory_vector::vector_search::find_similar(&conn, "ws1", &vec![0.0, 1.0], 0.9)
-        .unwrap();
+    let similar =
+        app_lib::memory_vector::vector_search::find_similar(&conn, "ws1", &vec![0.0, 1.0], 0.9)
+            .unwrap();
     assert!(similar.is_none());
 }
 
@@ -298,11 +373,25 @@ fn test_three_layer_system_cross_workspace() {
     insert_workspace(&conn, "ws1", "sup-1");
     insert_workspace(&conn, "ws2", "sup-2");
 
-    insert_memory(&conn, "sys1", "ws2", "全局规则", "所有 workspace 共享", "system", None);
+    insert_memory(
+        &conn,
+        "sys1",
+        "ws2",
+        "全局规则",
+        "所有 workspace 共享",
+        "system",
+        None,
+    );
     insert_vector(&conn, "sys1", "ws2", &vec![1.0, 0.0], "model");
 
     let results = app_lib::memory_vector::three_layer_search(
-        &conn, "ws1", None, true, &vec![0.99, 0.01], 10, 0.5,
+        &conn,
+        "ws1",
+        None,
+        true,
+        &vec![0.99, 0.01],
+        10,
+        0.5,
     )
     .unwrap();
     assert_eq!(results.len(), 1);
@@ -316,13 +405,35 @@ fn test_three_layer_agent_isolation() {
     let conn = setup();
     insert_workspace(&conn, "ws1", "sup-1");
 
-    insert_memory(&conn, "a1", "ws1", "Agent A 私有", "agent-a 私有记忆", "agent", Some("agent-a"));
-    insert_memory(&conn, "a2", "ws1", "Agent B 私有", "agent-b 私有记忆", "agent", Some("agent-b"));
+    insert_memory(
+        &conn,
+        "a1",
+        "ws1",
+        "Agent A 私有",
+        "agent-a 私有记忆",
+        "agent",
+        Some("agent-a"),
+    );
+    insert_memory(
+        &conn,
+        "a2",
+        "ws1",
+        "Agent B 私有",
+        "agent-b 私有记忆",
+        "agent",
+        Some("agent-b"),
+    );
     insert_vector(&conn, "a1", "ws1", &vec![1.0, 0.0], "model");
     insert_vector(&conn, "a2", "ws1", &vec![1.0, 0.0], "model");
 
     let results = app_lib::memory_vector::three_layer_search(
-        &conn, "ws1", Some("agent-a"), false, &vec![1.0, 0.0], 10, 0.5,
+        &conn,
+        "ws1",
+        Some("agent-a"),
+        false,
+        &vec![1.0, 0.0],
+        10,
+        0.5,
     )
     .unwrap();
     let ids: Vec<&str> = results.iter().map(|h| h.memory_id.as_str()).collect();
@@ -337,11 +448,25 @@ fn test_three_layer_supervisor_sees_all() {
     let conn = setup();
     insert_workspace(&conn, "ws1", "sup-1");
 
-    insert_memory(&conn, "a1", "ws1", "Agent A 私有", "private", "agent", Some("agent-a"));
+    insert_memory(
+        &conn,
+        "a1",
+        "ws1",
+        "Agent A 私有",
+        "private",
+        "agent",
+        Some("agent-a"),
+    );
     insert_vector(&conn, "a1", "ws1", &vec![1.0, 0.0], "model");
 
     let results = app_lib::memory_vector::three_layer_search(
-        &conn, "ws1", Some("sup-1"), true, &vec![1.0, 0.0], 10, 0.5,
+        &conn,
+        "ws1",
+        Some("sup-1"),
+        true,
+        &vec![1.0, 0.0],
+        10,
+        0.5,
     )
     .unwrap();
     assert_eq!(results.len(), 1);
@@ -434,9 +559,11 @@ fn test_workspace_memory_storage_crud() {
     assert_eq!(updated.title, "更新标题");
 
     app_lib::storage::workspaces::delete_workspace_memory(&conn, "ws1", "mem-crud-1").unwrap();
-    assert!(app_lib::storage::workspaces::get_workspace_memory(&conn, "mem-crud-1")
-        .unwrap()
-        .is_none());
+    assert!(
+        app_lib::storage::workspaces::get_workspace_memory(&conn, "mem-crud-1")
+            .unwrap()
+            .is_none()
+    );
 }
 
 // ── Three-layer scope: three-layer merge combines system + workspace + agent ──
@@ -447,8 +574,24 @@ fn test_three_layer_merge_all_scopes() {
     insert_workspace(&conn, "ws1", "sup-1");
 
     insert_memory(&conn, "sys1", "ws1", "全局规则", "全局共享", "system", None);
-    insert_memory(&conn, "ws-mem", "ws1", "工作空间记忆", "团队共享", "workspace", None);
-    insert_memory(&conn, "ag1", "ws1", "私有记忆", "agent-a 私有", "agent", Some("agent-a"));
+    insert_memory(
+        &conn,
+        "ws-mem",
+        "ws1",
+        "工作空间记忆",
+        "团队共享",
+        "workspace",
+        None,
+    );
+    insert_memory(
+        &conn,
+        "ag1",
+        "ws1",
+        "私有记忆",
+        "agent-a 私有",
+        "agent",
+        Some("agent-a"),
+    );
 
     // All use same direction vector
     let dir = vec![1.0, 0.0];
@@ -458,7 +601,13 @@ fn test_three_layer_merge_all_scopes() {
 
     // agent-a sees system + workspace + its own agent memories
     let results = app_lib::memory_vector::three_layer_search(
-        &conn, "ws1", Some("agent-a"), false, &vec![0.99, 0.01], 10, 0.5,
+        &conn,
+        "ws1",
+        Some("agent-a"),
+        false,
+        &vec![0.99, 0.01],
+        10,
+        0.5,
     )
     .unwrap();
     let ids: Vec<&str> = results.iter().map(|h| h.memory_id.as_str()).collect();

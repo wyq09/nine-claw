@@ -1,3 +1,5 @@
+import { parseProxyJsonResponse } from './memory_tool_transport.mjs'
+
 export function createMemorySearchParameters(Type) {
   return Type.Object({
     query: Type.String({
@@ -59,8 +61,8 @@ export function createMemorySearchTool(deps) {
           workspace_id: ctx?.workspace_id || null,
         }),
       });
-      const data = await resp.json();
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      const { data } = await parseProxyJsonResponse(resp);
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }], details: data };
     },
   };
 }

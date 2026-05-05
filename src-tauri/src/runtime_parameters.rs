@@ -32,9 +32,8 @@ impl RuntimeParametersPayload {
 
     #[must_use]
     pub fn sanitized(mut self) -> Self {
-        self.max_agent_tool_rounds_per_dialogue = self
-            .max_agent_tool_rounds_per_dialogue
-            .clamp(1, 500);
+        self.max_agent_tool_rounds_per_dialogue =
+            self.max_agent_tool_rounds_per_dialogue.clamp(1, 500);
         self.stream_disconnect_max_retries = self.stream_disconnect_max_retries.clamp(0, 20);
         self.llm_outer_max_attempt_rounds = self.llm_outer_max_attempt_rounds.clamp(1, 24);
         self

@@ -29,6 +29,17 @@ fn pi_reuse_im_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn channel_formatting_prompt(channel_id: &str) -> Option<&'static str> {
+    let normalized = channel_id.trim().to_ascii_lowercase();
+    if normalized.starts_with("wechat:") || normalized == "wechat" {
+        Some(
+            "当前通道是微信。默认只用纯文本自然段回复，不要使用 Markdown 标题、列表、表格、加粗、代码块或项目符号；除非用户明确要求，否则不要输出任何 Markdown 结构。",
+        )
+    } else {
+        None
+    }
+}
+
 struct ImPooledPi {
     child: Child,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -51,6 +62,8 @@ fn fingerprint_im_pi_turn(
     api_key: &str,
     model: &str,
     session_path: &str,
+    proxy_base_url: &str,
+    proxy_session_token: &str,
     system_prompt_sections: &[(String, String)],
     skill_paths: &[PathBuf],
 ) -> String {
@@ -66,6 +79,10 @@ fn fingerprint_im_pi_turn(
     blob.extend_from_slice(model.as_bytes());
     blob.push(0);
     blob.extend_from_slice(session_path.as_bytes());
+    blob.push(0);
+    blob.extend_from_slice(proxy_base_url.as_bytes());
+    blob.push(0);
+    blob.extend_from_slice(proxy_session_token.as_bytes());
     blob.push(0);
     for (label, content) in system_prompt_sections {
         blob.extend_from_slice(label.as_bytes());
@@ -195,7 +212,10 @@ impl PiRunHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{BotSlashCommand, PiBridge, ProviderRuntimeConfig};
+    use super::{
+        channel_formatting_prompt, fingerprint_im_pi_turn, BotSlashCommand, PiBridge,
+        ProviderRuntimeConfig,
+    };
     use crate::pi_runtime::{PiRuntimeLocation, PiRuntimeSource};
     use serde_json::json;
     use std::fs;
@@ -292,6 +312,13 @@ mod tests {
     }
 
     #[test]
+    fn channel_formatting_prompt_only_applies_to_wechat() {
+        let prompt = channel_formatting_prompt("wechat:test-agent").expect("wechat prompt");
+        assert!(prompt.contains("纯文本自然段"));
+        assert!(channel_formatting_prompt("lark:test-agent").is_none());
+    }
+
+    #[test]
     fn slash_new_deletes_existing_im_session_file() {
         let bridge = PiBridge::new(
             PiRuntimeLocation {
@@ -322,6 +349,50 @@ mod tests {
         };
         assert_eq!(result.full_text, "已开启一个新的会话。");
         assert_eq!(result.control_command.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn im_pi_fingerprint_changes_when_proxy_binding_changes() {
+        let base = fingerprint_im_pi_turn(
+            "provider",
+            "openai",
+            "https://example.com/v1",
+            "secret",
+            "gpt-5",
+            "/tmp/session.jsonl",
+            "http://127.0.0.1:3000",
+            "token-a",
+            &[("agent_system_prompt".to_string(), "hello".to_string())],
+            &[],
+        );
+
+        let changed_proxy_url = fingerprint_im_pi_turn(
+            "provider",
+            "openai",
+            "https://example.com/v1",
+            "secret",
+            "gpt-5",
+            "/tmp/session.jsonl",
+            "http://127.0.0.1:4000",
+            "token-a",
+            &[("agent_system_prompt".to_string(), "hello".to_string())],
+            &[],
+        );
+        let changed_proxy_token = fingerprint_im_pi_turn(
+            "provider",
+            "openai",
+            "https://example.com/v1",
+            "secret",
+            "gpt-5",
+            "/tmp/session.jsonl",
+            "http://127.0.0.1:3000",
+            "token-b",
+            &[("agent_system_prompt".to_string(), "hello".to_string())],
+            &[],
+        );
+
+        assert_ne!(base, changed_proxy_url);
+        assert_ne!(base, changed_proxy_token);
     }
 }
 
@@ -364,6 +435,7 @@ pub struct PiBridge {
     api_key: String,
     model: String,
     agent_config: Option<ConversationAgentConfig>,
+    runtime_dir_override: Option<PathBuf>,
 }
 
 impl PiBridge {
@@ -385,7 +457,13 @@ impl PiBridge {
             api_key: api_key.to_string(),
             model: model.to_string(),
             agent_config,
+            runtime_dir_override: None,
         }
+    }
+
+    pub fn with_runtime_dir(mut self, dir: PathBuf) -> Self {
+        self.runtime_dir_override = Some(dir);
+        self
     }
 
     /// Generate a deterministic session key from (channel, user) pair.
@@ -737,10 +815,7 @@ impl PiBridge {
                 if requires_explicit_thinking_disable {
                     compat.insert("thinkingFormat".to_string(), json!("qwen"));
                 }
-                provider.insert(
-                    "compat".to_string(),
-                    serde_json::Value::Object(compat),
-                );
+                provider.insert("compat".to_string(), serde_json::Value::Object(compat));
                 provider.insert(
                     "models".to_string(),
                     json!([{ "id": model, "api": "openai-completions", "input": model_input, "reasoning": reasoning }]),
@@ -760,8 +835,8 @@ impl PiBridge {
         Some(json!({ "providers": providers }))
     }
 
-    fn prepare_runtime_dir() -> Result<PathBuf, String> {
-        let dir = Self::pi_runtime_dir();
+    fn prepare_runtime_dir(&self) -> Result<PathBuf, String> {
+        let dir = self.runtime_dir_override.clone().unwrap_or_else(Self::pi_runtime_dir);
         fs::create_dir_all(&dir).map_err(|e| format!("创建 pi runtime 目录失败: {e}"))?;
 
         fs::write(dir.join("auth.json"), "{}").map_err(|e| format!("写入 auth.json 失败: {e}"))?;
@@ -1059,6 +1134,12 @@ impl PiBridge {
         S: FnOnce(Arc<PiRunHandle>),
         E: FnMut(&serde_json::Value),
     {
+        let agent_config =
+            crate::runtime_agent_config::refresh_runtime_agent_config_with_optional_app(
+                crate::managed_runtime::injected_app_handle().as_ref(),
+                self.agent_config.clone(),
+            )
+            .unwrap_or_else(|_| self.agent_config.clone());
         let key = self.session_key(channel_id, user_id);
         if let Some(command) = Self::parse_bot_slash_command(prompt) {
             dev_trace(
@@ -1101,11 +1182,12 @@ impl PiBridge {
                 ),
             }
         }
-        let runtime_dir = Self::prepare_runtime_dir()?;
-        let prompt_with_summary = crate::prepend_multimodal_summary_context(prompt, &key)?;
+        let runtime_dir = self.prepare_runtime_dir()?;
+        let prompt_with_summary =
+            crate::build_turn_prompt_with_multimodal_summary(prompt, &key, attachments)?;
         let prepared_input =
             prompt_attachments::prepare_prompt_input(&prompt_with_summary, attachments)?;
-        let agent_home = self.agent_config.as_ref().and_then(|agent_config| {
+        let agent_home = agent_config.as_ref().and_then(|agent_config| {
             crate::agent_workspace::resolve_workspace_root()
                 .ok()
                 .map(|root| root.join("agents").join(&agent_config.id))
@@ -1149,7 +1231,7 @@ impl PiBridge {
             })
         };
         if let (Some(agent_config), Some(provider_config)) =
-            (self.agent_config.as_ref(), runtime_provider_config.as_ref())
+            (agent_config.as_ref(), runtime_provider_config.as_ref())
         {
             managed_runtime_prepared = Some(managed_runtime::prepare_managed_runtime(
                 &self.pi_runtime.executable,
@@ -1252,7 +1334,7 @@ impl PiBridge {
         let mut skill_paths: Vec<PathBuf> = Vec::new();
         let mut system_prompt_chars = 0usize;
         let mut system_prompt_sections: Vec<(String, String)> = Vec::new();
-        if let Some(agent_config) = self.agent_config.as_ref() {
+        if let Some(agent_config) = agent_config.as_ref() {
             let media_prompt = "当前回复目标是 IM 用户。NineClaw 已具备把本地图片、文件、视频发送给用户的能力，微信等通道会在你输出媒体指令后自动上传并下发。用户要图片或文件时，不要回答“当前通道不支持”“不能稳定发送”“只能读取展示”之类的限制性描述；如果文件已经存在或刚生成，请直接单独输出一行 `::nc-media{type=\"image|file|video\" path=\"/absolute/path/to/file\"}`。该指令行不要附加解释文字；普通文本说明单独写在其他行。若你在正文里单独列出本地绝对路径，NineClaw 也会把它视为待发送媒体，但优先使用 `::nc-media`。";
             if let Ok(workspace_root) = crate::agent_workspace::resolve_workspace_root() {
                 let agent_home = workspace_root.join("agents").join(&agent_config.id);
@@ -1283,6 +1365,13 @@ impl PiBridge {
             ));
             cmd.args(["--append-system-prompt", memory_isolation_prompt]);
 
+            if let Some(channel_prompt) = channel_formatting_prompt(channel_id) {
+                system_prompt_chars += channel_prompt.chars().count();
+                system_prompt_sections
+                    .push(("channel_formatting".to_string(), channel_prompt.to_string()));
+                cmd.args(["--append-system-prompt", channel_prompt]);
+            }
+
             let skill_decision = crate::skill_broker::select_skills_for_turn(
                 agent_config,
                 prepared_input.message.as_str(),
@@ -1309,6 +1398,14 @@ impl PiBridge {
             self.api_key.trim(),
             self.model.trim(),
             &session_path_str,
+            managed_runtime_prepared
+                .as_ref()
+                .and_then(|prepared| prepared.proxy_base_url.as_deref())
+                .unwrap_or_default(),
+            managed_runtime_prepared
+                .as_ref()
+                .and_then(|prepared| prepared.session_token.as_deref())
+                .unwrap_or_default(),
             &system_prompt_sections,
             &skill_paths,
         );

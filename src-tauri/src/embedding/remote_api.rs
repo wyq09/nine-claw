@@ -17,8 +17,7 @@ pub struct RemoteApiProvider {
 }
 
 impl RemoteApiProvider {
-    pub fn new(config: RemoteApiConfig) -> Self {
-        let client = reqwest::Client::new();
+    pub fn new(config: RemoteApiConfig, client: reqwest::Client) -> Self {
         Self { config, client }
     }
 
@@ -119,19 +118,19 @@ mod tests {
 
     #[test]
     fn test_provider_id() {
-        let provider = RemoteApiProvider::new(make_config());
+        let provider = RemoteApiProvider::new(make_config(), reqwest::Client::new());
         assert_eq!(provider.id(), "test-remote");
     }
 
     #[test]
     fn test_provider_dimension() {
-        let provider = RemoteApiProvider::new(make_config());
+        let provider = RemoteApiProvider::new(make_config(), reqwest::Client::new());
         assert_eq!(provider.dimension(), 1536);
     }
 
     #[test]
     fn test_config_accessible() {
-        let provider = RemoteApiProvider::new(make_config());
+        let provider = RemoteApiProvider::new(make_config(), reqwest::Client::new());
         let cfg = provider.config();
         assert_eq!(cfg.id, "test-remote");
         assert_eq!(cfg.name, "Test Remote API");
@@ -143,11 +142,9 @@ mod tests {
         let mut config = make_config();
         // httpbin /status/500 returns a 500 status code
         config.endpoint = "https://httpbin.org/status/500".to_string();
-        let provider = RemoteApiProvider::new(config);
+        let provider = RemoteApiProvider::new(config, reqwest::Client::new());
 
-        let result = provider
-            .embed(vec!["hello".to_string()])
-            .await;
+        let result = provider.embed(vec!["hello".to_string()]).await;
         assert!(result.is_err(), "expected embed to fail on 500 endpoint");
         let err = result.unwrap_err();
         assert!(

@@ -11,6 +11,7 @@ import {
 import { THEME_OPTIONS } from '../theme/themePresets'
 import { describeNetworkProxyMode } from '../app/lib'
 import type {
+  AgentRecord,
   AppearanceSettings,
   GeneralSettings,
   PeerGatewayInfo,
@@ -28,8 +29,12 @@ import type {
 } from '../types/imageGeneration'
 import type { ResourcesViewProps, SkillsViewProps } from '../app/pages/LibraryAndTasks'
 import { AppIcon, type IconName } from './AppIcon'
+import { ApplicationLogsPanel } from './settings/ApplicationLogsPanel'
+import { LlmLogPreview } from './settings/LlmLogPreview'
 import { NumericDraftField } from './NumericDraftField'
 import { ImageGenerationSettingsSection } from './settings/ImageGenerationSettingsSection'
+import { UserMemorySettingsPanel } from './settings/UserMemorySettingsPanel'
+import { VectorMemoryPanel } from './settings/VectorMemoryPanel'
 import { UsageStatsPanel } from './UsageStatsPanel'
 import { open } from '@tauri-apps/plugin-dialog'
 import { llmLogExportPreview } from '../lib/llmLogExportClient'
@@ -71,6 +76,8 @@ type SettingsModalProps = {
   tab: SettingsTab
   skillsLibrary: SkillsViewProps
   resourcesLibrary: ResourcesViewProps
+  memoryAgents?: AgentRecord[]
+  memoryDefaultAgentId?: string
 }
 
 function getProviderStatus(config: ProviderConfig, preserveVerifiedStatus = true): ProviderConfig['status'] {
@@ -217,6 +224,8 @@ export function SettingsModal({
   tab,
   skillsLibrary,
   resourcesLibrary,
+  memoryAgents = [],
+  memoryDefaultAgentId = '',
 }: SettingsModalProps) {
   const [providerAddMode, setProviderAddMode] = useState(false)
   const [customFormOpen, setCustomFormOpen] = useState(false)
@@ -436,9 +445,11 @@ export function SettingsModal({
                 ? '探索技能'
                 : tab === 'resources'
                   ? '资源库'
-                  : tab === 'logs'
-                    ? '日志'
-                    : '快捷键'
+                  : tab === 'memory'
+                    ? '用户记忆'
+                    : tab === 'logs'
+                      ? '日志'
+                      : '快捷键'
 
   const currentTabDescription =
     tab === 'general'
@@ -455,9 +466,11 @@ export function SettingsModal({
                 ? '浏览已安装技能与系统技能库，通过链接安装或刷新目录。'
                 : tab === 'resources'
                   ? '模板、规范与可复用资产，统一检索与编排入口。'
-                  : tab === 'logs'
-                    ? '将已完成的 LLM 调用链（与调试面板同源）额外写入你选择的目录，便于外部工具分析。'
-                    : '配置发送方式与常用桌面快捷操作。'
+                  : tab === 'memory'
+                    ? '按维度查看与工作区记忆库同步的结构化事实，亦可手动写入（与会话内记忆工具同源）。markdown 形态的长期人设仍在各智能体的 MEMORY / USER_MODEL 文件。'
+                    : tab === 'logs'
+                      ? '将已完成的 LLM 调用链（与调试面板同源）额外写入你选择的目录，便于外部工具分析。'
+                      : '配置发送方式与常用桌面快捷操作。'
   const selectedProviderFormatDefaults = getProviderFormatDefaults(selectedProviderConfig.apiFormat)
 
   return (
@@ -484,6 +497,7 @@ export function SettingsModal({
               <SettingsTabButton active={tab === 'usage'} icon="zap" label="用量统计" onClick={() => onSelectTab('usage')} />
               <SettingsTabButton active={tab === 'skills'} icon="puzzle" label="探索技能" onClick={() => onSelectTab('skills')} />
               <SettingsTabButton active={tab === 'resources'} icon="book" label="资源库" onClick={() => onSelectTab('resources')} />
+              <SettingsTabButton active={tab === 'memory'} icon="spark" label="用户记忆" onClick={() => onSelectTab('memory')} />
               <SettingsTabButton active={tab === 'logs'} icon="folder" label="日志" onClick={() => onSelectTab('logs')} />
               <SettingsTabButton active={tab === 'shortcuts'} icon="keyboard" label="快捷键" onClick={() => onSelectTab('shortcuts')} />
             </div>
@@ -1341,14 +1355,22 @@ export function SettingsModal({
               </div>
             ) : null}
 
+            {tab === 'memory' ? (
+              <div className="settings-tab-body-scroll user-memory-tab-body">
+                <UserMemorySettingsPanel agents={memoryAgents} defaultAgentId={memoryDefaultAgentId} />
+                <VectorMemoryPanel />
+              </div>
+            ) : null}
+
             {tab === 'logs' ? (
               <div className="settings-section-stack">
+                <ApplicationLogsPanel />
                 <div className="settings-row stacked">
                   <div>
-                    <strong>LLM 调用日志目录</strong>
+                    <strong>LLM 调用日志导出（可选）</strong>
                     <p>
                       每条已完成的调用链会额外以 jsonl 追加到该目录下的 <code>llm-trace-日期.jsonl</code>（与团队空间内{' '}
-                      <code>.debug</code> 并行，不替代原文件）。
+                      <code>.debug</code> 并行，不替代原文件）。与应用运行日志相互独立。
                     </p>
                   </div>
                   <div className="settings-row-actions" style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
@@ -1390,26 +1412,12 @@ export function SettingsModal({
                   </label>
                 </div>
                 <div className="settings-row stacked">
-                  <strong>最新文件预览</strong>
-                  {logPreviewFile ? (
-                    <p className="settings-note" style={{ wordBreak: 'break-all' }}>
-                      {logPreviewFile}
-                    </p>
-                  ) : null}
-                  <pre
-                    className="mono"
-                    style={{
-                      maxHeight: 280,
-                      overflow: 'auto',
-                      fontSize: 12,
-                      padding: 12,
-                      borderRadius: 8,
-                      background: 'var(--surface-elevated, rgba(0,0,0,0.2))',
-                      margin: 0,
-                    }}
-                  >
-                    {logPreviewTail || (logPreviewBusy ? '加载中…' : '')}
-                  </pre>
+                  <strong>LLM 导出新文件预览</strong>
+                  <LlmLogPreview
+                    busy={logPreviewBusy}
+                    file={logPreviewFile}
+                    tail={logPreviewTail}
+                  />
                 </div>
               </div>
             ) : null}
@@ -1447,8 +1455,9 @@ export function SettingsModal({
                     </button>
                   </div>
                   <p className="settings-note">
-                    macOS 上 NineClaw 使用与 Safari 相同的 WebKit
-                    网页引擎；「按住 Fn 系统听写」在网页里可能与 Chrome
+                    macOS 桌面版输入栏提供「键盘」图标：打开系统原生文本框，便于 Fn / 豆包等听写；与网页麦克风听写互为补充。NineClaw 使用与 Safari
+                    相同的 WebKit
+                    网页引擎；「按住 Fn 系统听写」在网页内可能与 Chrome
                     不一致。聊天输入框旁提供「麦克风」网页语音转文字（需麦克风权限）；也可使用菜单「编辑 → 听写」或系统听写快捷键。
                   </p>
                 </div>

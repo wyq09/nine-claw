@@ -391,6 +391,102 @@ pub fn count_chat_turns(conn: &Connection, session_id: &str) -> Result<i64, Stri
     .map_err(|e| format!("计数轮次失败: {e}"))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatSearchHit {
+    pub session_id: String,
+    pub session_title: String,
+    pub turn_id: String,
+    pub turn_index: i32,
+    pub prompt: String,
+    pub answer: String,
+    pub thinking: String,
+    pub created_at: i64,
+    pub workspace_id: Option<String>,
+    pub speaker_agent_id: Option<String>,
+}
+
+pub fn search_chat_turns(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    workspace_id: Option<&str>,
+) -> Result<Vec<ChatSearchHit>, String> {
+    let pattern = format!("%{}%", query.trim().to_lowercase());
+    let mut sql = String::from(
+        "SELECT
+            t.session_id,
+            s.title,
+            t.id,
+            t.turn_index,
+            t.prompt,
+            t.answer,
+            t.thinking,
+            t.created_at,
+            s.workspace_id,
+            t.speaker_agent_id
+         FROM chat_turns t
+         JOIN chat_sessions s ON s.id = t.session_id
+         WHERE (
+            lower(t.prompt) LIKE ?1 OR
+            lower(t.answer) LIKE ?1 OR
+            lower(t.thinking) LIKE ?1
+         )",
+    );
+    if workspace_id.is_some() {
+        sql.push_str(" AND s.workspace_id = ?2");
+    }
+    sql.push_str(" ORDER BY t.created_at DESC LIMIT ");
+    sql.push_str(&limit.max(1).to_string());
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("准备搜索聊天记录失败: {e}"))?;
+    let mut out = Vec::new();
+    if let Some(workspace_id) = workspace_id {
+        let rows = stmt
+            .query_map(params![pattern, workspace_id], |row| {
+                Ok(ChatSearchHit {
+                    session_id: row.get(0)?,
+                    session_title: row.get(1)?,
+                    turn_id: row.get(2)?,
+                    turn_index: row.get(3)?,
+                    prompt: row.get(4)?,
+                    answer: row.get(5)?,
+                    thinking: row.get(6)?,
+                    created_at: row.get(7)?,
+                    workspace_id: row.get(8)?,
+                    speaker_agent_id: row.get(9)?,
+                })
+            })
+            .map_err(|e| format!("搜索聊天记录失败: {e}"))?;
+        for row in rows {
+            out.push(row.map_err(|e| format!("读取聊天搜索结果失败: {e}"))?);
+        }
+    } else {
+        let rows = stmt
+            .query_map(params![pattern], |row| {
+                Ok(ChatSearchHit {
+                    session_id: row.get(0)?,
+                    session_title: row.get(1)?,
+                    turn_id: row.get(2)?,
+                    turn_index: row.get(3)?,
+                    prompt: row.get(4)?,
+                    answer: row.get(5)?,
+                    thinking: row.get(6)?,
+                    created_at: row.get(7)?,
+                    workspace_id: row.get(8)?,
+                    speaker_agent_id: row.get(9)?,
+                })
+            })
+            .map_err(|e| format!("搜索聊天记录失败: {e}"))?;
+        for row in rows {
+            out.push(row.map_err(|e| format!("读取聊天搜索结果失败: {e}"))?);
+        }
+    }
+    Ok(out)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -714,5 +810,35 @@ mod tests {
 
         let after_update = get_chat_session(&conn, "s1").unwrap().unwrap().updated_at;
         assert!(after_update > after_append);
+    }
+
+    #[test]
+    fn test_search_chat_turns_matches_prompt_and_answer() {
+        let conn = open_in_memory().unwrap();
+        create_chat_session(
+            &conn,
+            &CreateChatSessionInput {
+                workspace_id: Some("ws-search".to_string()),
+                ..make_session_input("s1")
+            },
+        )
+        .unwrap();
+        append_chat_turn(
+            &conn,
+            &AppendChatTurnInput {
+                prompt: "请记住 Ada 的偏好".to_string(),
+                answer: "已经记录 Ada 偏好".to_string(),
+                ..make_turn_input("s1", 0, "t1")
+            },
+        )
+        .unwrap();
+
+        let hits = search_chat_turns(&conn, "ada", 10, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].turn_id, "t1");
+
+        let scoped = search_chat_turns(&conn, "偏好", 10, Some("ws-search")).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].workspace_id.as_deref(), Some("ws-search"));
     }
 }

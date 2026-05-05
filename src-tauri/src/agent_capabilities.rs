@@ -19,6 +19,10 @@ pub struct AgentCapabilityPolicy {
     pub forbidden_skill_ids: Vec<String>,
     #[serde(default = "default_max_dynamic_skills")]
     pub max_dynamic_skills: usize,
+    #[serde(default)]
+    pub forbidden_paths: Vec<String>,
+    #[serde(default)]
+    pub high_risk_actions: Vec<String>,
 }
 
 impl Default for AgentCapabilityPolicy {
@@ -41,6 +45,8 @@ pub fn static_capability_policy() -> AgentCapabilityPolicy {
         required_skill_ids: Vec::new(),
         forbidden_skill_ids: Vec::new(),
         max_dynamic_skills: DEFAULT_MAX_DYNAMIC_SKILLS,
+        forbidden_paths: Vec::new(),
+        high_risk_actions: Vec::new(),
     }
 }
 
@@ -50,6 +56,8 @@ pub fn new_agent_default_capability_policy() -> AgentCapabilityPolicy {
         required_skill_ids: Vec::new(),
         forbidden_skill_ids: Vec::new(),
         max_dynamic_skills: DEFAULT_MAX_DYNAMIC_SKILLS,
+        forbidden_paths: Vec::new(),
+        high_risk_actions: Vec::new(),
     }
 }
 
@@ -156,6 +164,8 @@ mod tests {
                 required_skill_ids: vec!["alpha".into(), "alpha".into()],
                 forbidden_skill_ids: vec!["alpha".into(), "beta".into()],
                 max_dynamic_skills: 99,
+                forbidden_paths: vec![],
+                high_risk_actions: vec![],
             }),
             static_capability_policy(),
         );
@@ -172,6 +182,8 @@ mod tests {
             required_skill_ids: vec!["alpha".into()],
             forbidden_skill_ids: vec![],
             max_dynamic_skills: DEFAULT_MAX_DYNAMIC_SKILLS,
+            forbidden_paths: vec![],
+            high_risk_actions: vec![],
         };
 
         assert_eq!(

@@ -7,11 +7,15 @@ import type {
   AgentTaskListItem,
   AgentTaskUpdateInput,
   AgentRecord,
+  AgentPresetSummary,
   AgentWorkspaceBundle,
   AgentWorkspaceFile,
   ChatSessionDetail,
   ChatSessionListItem,
   ChatTurnRow,
+  EmbeddingProviderStatus,
+  EmbeddingReindexResult,
+  EmbeddingSettings,
   PeerGatewayInfo,
   PeerGatewaySettings,
   ConversationAgentSnapshot,
@@ -36,6 +40,7 @@ import type {
   WorkspaceRecord,
   WorkspaceResourceRecord,
 } from '../types'
+import type { AskUserAnswerDraft } from '../widgetTypes'
 
 export type PiStreamUnsubscribe = () => void
 
@@ -187,6 +192,24 @@ export async function testNetworkProxyConnection(
   return invoke<string>('test_network_proxy_connection', {
     settings,
   })
+}
+
+export async function loadEmbeddingSettings(): Promise<EmbeddingSettings> {
+  return invoke<EmbeddingSettings>('load_embedding_settings_command')
+}
+
+export async function saveEmbeddingSettings(
+  settings: EmbeddingSettings,
+): Promise<EmbeddingProviderStatus> {
+  return invoke<EmbeddingProviderStatus>('save_embedding_settings_command', { settings })
+}
+
+export async function getEmbeddingStatus(): Promise<EmbeddingProviderStatus> {
+  return invoke<EmbeddingProviderStatus>('embedding_status_command')
+}
+
+export async function triggerEmbeddingReindex(): Promise<EmbeddingReindexResult> {
+  return invoke<EmbeddingReindexResult>('trigger_embedding_reindex_command')
 }
 
 /** 使用智能体「标题生成」模型（未配置则用默认对话模型）根据首轮问答生成会话标题。 */
@@ -738,8 +761,20 @@ export async function deleteAgent(agentId: string): Promise<void> {
   await invoke('delete_agent', { agentId })
 }
 
+export async function migrateAgentId(oldAgentId: string, newAgentId: string): Promise<string> {
+  return invoke<string>('migrate_agent_id', { oldAgentId, newAgentId })
+}
+
 export async function setDefaultAgent(agentId: string): Promise<AgentRecord | null> {
   return invoke<AgentRecord | null>('set_default_agent', { agentId })
+}
+
+export async function listDefaultAgentPresets(): Promise<AgentPresetSummary[]> {
+  return invoke<AgentPresetSummary[]>('list_default_agent_presets')
+}
+
+export async function resetAgentToDefaultPreset(agentId: string): Promise<AgentRecord> {
+  return invoke<AgentRecord>('reset_agent_to_default_preset', { agentId })
 }
 
 export async function readAgentWorkspaceBundle(agentId: string): Promise<AgentWorkspaceBundle> {
@@ -815,6 +850,21 @@ export async function subscribePiStream(
   return listen<PiStreamPayload>('pi://stream', (event) => {
     onMessage(event.payload)
   })
+}
+
+export async function widgetSubmitResponse(payload: {
+  widgetId: string
+  kind: 'ask_user'
+  answers: AskUserAnswerDraft[]
+}): Promise<void> {
+  await invoke('widget_submit_response', { payload })
+}
+
+export async function widgetCancelResponse(payload: {
+  widgetId: string
+  kind: 'ask_user'
+}): Promise<void> {
+  await invoke('widget_cancel_response', { payload })
 }
 
 // ── Bot Channel Commands ──
@@ -998,6 +1048,28 @@ export async function getSessionContextStats(
   sessionId: string,
 ): Promise<SessionContextStatsPayload> {
   return invoke<SessionContextStatsPayload>('get_session_context_stats', { sessionId })
+}
+
+// ── Agent Loop Guard Approval ──
+
+export type ApprovalRequest = {
+  loopId: string
+  iteration: number
+  action: {
+    type: 'call' | 'batch'
+    agentId: string
+    task: string
+    riskLevel: string
+    reason: string
+  }
+  timeoutMs: number
+}
+
+export async function agentLoopRespondApproval(
+  loopId: string,
+  approved: boolean,
+): Promise<void> {
+  await invoke('agent_loop_respond_approval', { loopId, approved })
 }
 
 // ── Agent Loop ─────────────────────────────────────────────

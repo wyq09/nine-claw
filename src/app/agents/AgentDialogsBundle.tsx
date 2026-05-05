@@ -21,6 +21,7 @@ import {
   sessionLlmDecode,
   sessionLlmEncode,
   SkillDescriptionDisclosure,
+  suggestAgentIdFromName,
 } from '../lib'
 import { defaultRuntimeParameters } from '../../mockData'
 
@@ -407,18 +408,36 @@ export function AgentEditorDialog({
               <div className="agent-section-header">
                 <div>
                   <strong>智能体配置</strong>
-                  <p>Agent_ID 会自动生成，也可以在保存前后改成更稳定的业务标识。</p>
+                  <p>{mode === 'create' ? 'Agent_ID 会自动生成，也可以自定义一个业务标识。' : 'Agent_ID 创建后不可修改。'}</p>
                 </div>
               </div>
 
               <div className="agent-form-grid">
                 <label className="input-field">
                   <span>Agent_ID</span>
-                  <input
-                    value={agentDraft.id ?? ''}
-                    onChange={(event) => onDraftChange({ id: event.target.value })}
-                    placeholder={mode === 'create' ? '留空自动生成' : selectedAgent?.id ?? 'agent_id'}
-                  />
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <input
+                      style={{ flex: 1 }}
+                      value={agentDraft.id ?? ''}
+                      onChange={(event) => onDraftChange({ id: event.target.value })}
+                      placeholder={mode === 'create' ? '留空自动生成' : selectedAgent?.id ?? 'agent_id'}
+                      disabled={mode === 'edit'}
+                    />
+                    {mode === 'create' ? (
+                      <button
+                        type="button"
+                        className="ghost-link"
+                        style={{ whiteSpace: 'nowrap', alignSelf: 'center' }}
+                        onClick={() => {
+                          const suggested = suggestAgentIdFromName(agentDraft.name)
+                          if (suggested) onDraftChange({ id: suggested })
+                        }}
+                        title="根据展示名称生成推荐 ID"
+                      >
+                        根据名称生成
+                      </button>
+                    ) : null}
+                  </div>
                 </label>
                 <label className="input-field">
                   <span>展示名称</span>

@@ -135,6 +135,8 @@ export type NineClawAppChromeProps = {
   settingsTab: SettingsTab
   settingsSkillsLibrary: SkillsViewProps
   settingsResourcesLibrary: ResourcesViewProps
+  settingsMemoryAgents: import('../../types').AgentRecord[]
+  settingsMemoryDefaultAgentId: string
   /** 当前可调试的会话 id（含团队空间内会话，与侧栏「单独会话」过滤无关） */
   llmTraceSessionId: string
   /** 在团队空间聊天页时传入工作空间 id，供调试窗口按作用域拉取 */
@@ -223,6 +225,8 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
     settingsTab,
     settingsSkillsLibrary,
     settingsResourcesLibrary,
+    settingsMemoryAgents,
+    settingsMemoryDefaultAgentId,
     llmTraceSessionId: llmTraceSessionIdProp,
     llmTraceWorkspaceId,
   } = props
@@ -659,6 +663,8 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
           tab={settingsTab}
           skillsLibrary={settingsSkillsLibrary}
           resourcesLibrary={settingsResourcesLibrary}
+          memoryAgents={settingsMemoryAgents}
+          memoryDefaultAgentId={settingsMemoryDefaultAgentId}
         />
       ) : null}
     </>

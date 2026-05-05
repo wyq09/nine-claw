@@ -136,9 +136,34 @@ describe('agent_delegate tool execute', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2)
     expect(result.content[0].text).toContain('Delegation error: fetch failed')
     expect(result.content[0].text).toContain('ECONNREFUSED')
+    expect(result.content[0].text).toContain('Report this blocker to the user')
     expect(result.details).toMatchObject({
       ok: false,
       reason: 'fetch_error',
+    })
+  })
+
+  it('tells the caller to surface delegate failures instead of silently doing the work', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: false, error: 'worker unavailable' }),
+    })
+    const tool = createAgentDelegateTool(createDeps({ fetchImpl }) as never)
+
+    const result = await tool.execute(
+      'tool-call-5',
+      { role: 'worker', task: 'Use the named sub-agent' },
+      undefined,
+      undefined,
+      {},
+    )
+
+    expect(result.content[0].text).toContain('worker unavailable')
+    expect(result.content[0].text).toContain('Report this blocker to the user')
+    expect(result.details).toMatchObject({
+      ok: false,
+      reason: 'delegate_error',
     })
   })
 

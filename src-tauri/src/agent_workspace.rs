@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
+mod db_projection;
 mod memory_wiki;
 
+use crate::memory_gate::MemoryGate;
 use serde::Serialize;
 use std::fmt::Write as _;
 use std::fs;
@@ -13,6 +15,7 @@ const PRIMARY_WORKSPACE_ROOT_ENV: &str = "NINECLAW_WORKSPACE_ROOT";
 const LEGACY_WORKSPACE_ROOT_ENVS: &[&str] = &["NINECLAW_AGENT_WORKSPACE_ROOT"];
 const TEMPLATE_DIR: &str = "agents/_template";
 const LEGACY_TEMPLATE_DIR: &str = "agents/_templates";
+const LEGACY_REVIEW_QUEUE_RELATIVE_PATH: &str = "memory/REVIEW_QUEUE.md";
 const WORKSPACE_SYSTEM_PROMPT_CHAR_LIMIT: usize = 1600;
 const ROOT_FILES: &[&str] = &[
     "AGENTS.md",
@@ -466,6 +469,7 @@ pub fn ensure_agent_workspace(
 
     cleanup_generated_bootstrap(&agent_home, seed)?;
     memory_wiki::ensure_memory_wiki_scaffold(&agent_home)?;
+    migrate_legacy_review_queue_into_working(&agent_home)?;
     crate::managed_runtime::ensure_agent_runtime_scaffold(&agent_home)?;
 
     Ok(agent_home)
@@ -571,6 +575,9 @@ pub fn build_workspace_system_prompt_for_query(
     {
         sections.push(daily_index_snapshot);
     }
+    if let Some(db_snapshot) = db_projection::build_db_memory_snapshot(agent_id, current_prompt)? {
+        sections.push(db_snapshot);
+    }
     sections.push(build_legacy_workspace_memory_snapshot(&root, agent_id)?);
 
     Ok(trim_to_char_limit(
@@ -614,6 +621,33 @@ pub fn read_agent_heartbeat_instructions(agent_id: &str) -> Result<Option<String
     } else {
         Ok(Some(sections.join("\n\n")))
     }
+}
+
+pub fn write_agent_preset_workspace_files(
+    agent_id: &str,
+    files: &std::collections::HashMap<String, String>,
+    overwrite_existing: bool,
+) -> Result<(), String> {
+    let root = resolve_workspace_root()?;
+    let agent_home = root.join("agents").join(agent_id);
+    fs::create_dir_all(&agent_home)
+        .map_err(|error| format!("创建智能体目录失败 {}: {error}", agent_home.display()))?;
+
+    for (relative_path, content) in files {
+        let normalized = normalize_relative_workspace_path(relative_path)?;
+        let target = agent_preset_workspace_target(&agent_home, &normalized)?;
+        if !overwrite_existing && target.exists() {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("创建预设目录失败 {}: {error}", parent.display()))?;
+        }
+        fs::write(&target, content)
+            .map_err(|error| format!("写入预设工作区文件失败 {}: {error}", target.display()))?;
+    }
+
+    Ok(())
 }
 
 /// 按相对路径读取单个工作区文件（用于 `lazy_fetch` 条目的按需加载）。
@@ -710,6 +744,14 @@ pub fn write_agent_workspace_file(
 
     fs::write(&target, content).map_err(|error| format!("写入 workspace 文件失败: {error}"))?;
 
+    let normalized = normalize_relative_workspace_path(relative_path)?;
+    let normalized_path = normalized
+        .iter()
+        .fold(PathBuf::new(), |acc, seg| acc.join(seg))
+        .display()
+        .to_string();
+    let _ = db_projection::sync_core_file_to_db(agent_id, &normalized_path, content);
+
     read_agent_workspace_bundle(agent_id)
 }
 
@@ -726,10 +768,12 @@ pub fn append_agent_memory_entry(
     fs::create_dir_all(agent_home.join("memory"))
         .map_err(|error| format!("创建 agent memory 目录失败: {error}"))?;
     memory_wiki::ensure_memory_wiki_scaffold(&agent_home)?;
+    migrate_legacy_review_queue_into_working(&agent_home)?;
 
     let timestamp = current_timestamp_label();
     let summary = summarize_memory_entry(user_message, assistant_message);
     let categories = classify_memory_categories(user_message, assistant_message, &summary);
+    let gate = build_private_memory_gate(user_message, assistant_message, &summary, &categories);
     let category_notes =
         build_category_memory_notes(user_message, assistant_message, &summary, &categories);
     let ingest_summary = build_ingest_summary(&category_notes, &summary);
@@ -776,9 +820,21 @@ pub fn append_agent_memory_entry(
     fs::write(&working_path, working_with_review)
         .map_err(|error| format!("写入 WORKING.md 失败: {error}"))?;
 
-    append_pitfall_entries(
+    if gate.pitfall {
+        append_pitfall_entries(
+            &agent_home,
+            &build_pitfall_entries(user_message, assistant_message, &source_ref),
+        )?;
+    }
+
+    append_user_model_entries(&agent_home, &build_user_model_entries(user_message, &gate))?;
+    append_relationship_entries(
         &agent_home,
-        &build_pitfall_entries(user_message, assistant_message, &source_ref),
+        &build_relationship_entries(user_message, &gate),
+    )?;
+    append_emotional_memory_entries(
+        &agent_home,
+        &build_emotional_memory_entries(user_message, assistant_message, &gate),
     )?;
 
     // MEMORY.md 不再自动写入 — 仅保留人设和核心原则，由用户手动编辑
@@ -809,6 +865,39 @@ pub fn append_agent_memory_entry(
         &ingest_summary,
         &categories,
     )?;
+
+    let _ = db_projection::sync_core_file_to_db(
+        agent_id,
+        &format!("agents/{agent_id}/WORKING.md"),
+        &fs::read_to_string(&working_path).unwrap_or_default(),
+    );
+    for (relative_path, path) in [
+        ("USER_MODEL.md", agent_home.join("USER_MODEL.md")),
+        (
+            "RELATIONSHIP_MAP.md",
+            agent_home.join("RELATIONSHIP_MAP.md"),
+        ),
+        ("PITFALLS.md", agent_home.join("PITFALLS.md")),
+        ("DECISIONS.md", agent_home.join("DECISIONS.md")),
+        ("PUBLIC_CONTEXT.md", agent_home.join("PUBLIC_CONTEXT.md")),
+        ("MEMORY.md", agent_home.join("MEMORY.md")),
+    ] {
+        if let Ok(content) = fs::read_to_string(&path) {
+            let _ = db_projection::sync_core_file_to_db(
+                agent_id,
+                &format!("agents/{agent_id}/{relative_path}"),
+                &content,
+            );
+        }
+    }
+    let _ = db_projection::record_memory_ingest_to_db(
+        agent_id,
+        &ingest_summary,
+        &source_ref,
+        &categories,
+        user_message,
+        assistant_message,
+    );
 
     Ok(())
 }
@@ -1185,6 +1274,9 @@ pub(crate) fn ensure_root_scaffold(root: &Path) -> Result<(), String> {
 
     let readme_path = root.join("agents").join("README.md");
     if !readme_path.exists() {
+        if let Some(parent) = readme_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("创建 agents 目录失败: {error}"))?;
+        }
         fs::write(&readme_path, agents_readme_fallback())
             .map_err(|error| format!("写入 agents/README.md 失败: {error}"))?;
     }
@@ -1205,6 +1297,9 @@ pub(crate) fn ensure_root_scaffold(root: &Path) -> Result<(), String> {
             format!("写入 agent 模板 {} 失败: {error}", template_path.display())
         })?;
     }
+
+    remove_legacy_review_queue_file(&root.join(TEMPLATE_DIR))?;
+    remove_legacy_review_queue_file(&root.join(LEGACY_TEMPLATE_DIR))?;
 
     Ok(())
 }
@@ -2184,6 +2279,33 @@ fn normalize_relative_workspace_path(relative_path: &str) -> Result<Vec<String>,
     Ok(segments)
 }
 
+fn agent_preset_workspace_target(
+    agent_home: &Path,
+    normalized: &[String],
+) -> Result<PathBuf, String> {
+    if normalized.len() == 1 && AGENT_VIEW_FILES.contains(&normalized[0].as_str()) {
+        return Ok(agent_home.join(&normalized[0]));
+    }
+    if normalized.len() == 2 && normalized[0] == "memory" && normalized[1].ends_with(".md") {
+        return Ok(agent_home.join("memory").join(&normalized[1]));
+    }
+    if normalized.len() >= 2
+        && normalized[0] == "wiki"
+        && normalized
+            .last()
+            .is_some_and(|segment| segment.ends_with(".md"))
+    {
+        return Ok(normalized
+            .iter()
+            .skip(1)
+            .fold(agent_home.join("wiki"), |path, segment| path.join(segment)));
+    }
+    if normalized.len() == 2 && normalized[0] == "harness" && normalized[1].ends_with(".json") {
+        return Ok(agent_home.join("harness").join(&normalized[1]));
+    }
+    Err("默认智能体预设只允许覆盖当前智能体的核心 markdown / harness 文件".to_string())
+}
+
 fn read_workspace_root_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -2350,8 +2472,8 @@ fn current_timestamp_file_label() -> String {
 }
 
 fn summarize_memory_entry(user_message: &str, assistant_message: &str) -> String {
-    let user_compact = user_message.replace('\n', " ").trim().to_string();
-    let assistant_compact = assistant_message.replace('\n', " ").trim().to_string();
+    let user_compact = normalize_memory_snippet(user_message);
+    let assistant_compact = normalize_memory_snippet(assistant_message);
     let user_summary = truncate_for_memory(&user_compact, 80);
     let assistant_summary = truncate_for_memory(&assistant_compact, 100);
     format!(
@@ -2361,7 +2483,7 @@ fn summarize_memory_entry(user_message: &str, assistant_message: &str) -> String
 }
 
 fn compact_memory_text(value: &str, limit: usize) -> String {
-    truncate_for_memory(&value.replace('\n', " ").trim().to_string(), limit)
+    truncate_for_memory(&normalize_memory_snippet(value), limit)
 }
 
 fn build_category_memory_notes(
@@ -2397,6 +2519,263 @@ fn build_category_memory_notes(
     }
 
     dedupe_memory_notes(notes)
+}
+
+fn build_private_memory_gate(
+    user_message: &str,
+    assistant_message: &str,
+    summary: &str,
+    categories: &[MemoryCategoryDefinition],
+) -> MemoryGate {
+    let combined = normalize_memory_match_text(&format!(
+        "{}\n{}\n{}",
+        user_message, assistant_message, summary
+    ));
+    let has_category = |key: &str| categories.iter().any(|category| category.key == key);
+
+    let gate = MemoryGate {
+        user_profile: has_category("user_profile")
+            && contains_any_keyword(
+                &combined,
+                &[
+                    "我是",
+                    "我负责",
+                    "我的职位",
+                    "我的角色",
+                    "我的公司",
+                    "我在",
+                    "我来自",
+                    "我住在",
+                    "时区",
+                    "背景",
+                ],
+            )
+            && !looks_like_task_payload(user_message),
+        preference: has_category("preferences")
+            && contains_any_keyword(
+                &combined,
+                &[
+                    "喜欢",
+                    "不喜欢",
+                    "偏好",
+                    "风格",
+                    "口吻",
+                    "称呼",
+                    "叫我",
+                    "尽量",
+                    "不要",
+                    "格式",
+                ],
+            )
+            && !looks_like_task_payload(user_message),
+        relationship: has_category("relationships")
+            && contains_any_keyword(
+                &combined,
+                &[
+                    "老板",
+                    "客户",
+                    "合作方",
+                    "负责人",
+                    "联系人",
+                    "同事",
+                    "朋友",
+                    "家人",
+                ],
+            )
+            && !looks_like_task_payload(user_message),
+        commitment: has_category("commitments")
+            || contains_any_keyword(
+                &combined,
+                &[
+                    "待办",
+                    "跟进",
+                    "下一步",
+                    "明天",
+                    "下周",
+                    "截止",
+                    "ddl",
+                    "等待",
+                    "缺少",
+                    "webhook",
+                    "blocked",
+                    "blocker",
+                ],
+            ),
+        pitfall: is_explicit_pitfall_correction(&combined)
+            && !looks_like_task_payload(user_message),
+        emotional_event: is_emotional_event_text(&combined)
+            && !looks_like_task_payload(user_message),
+        ..MemoryGate::default()
+    };
+
+    MemoryGate {
+        should_write: gate.any_route_enabled(),
+        ..gate
+    }
+}
+
+fn is_emotional_event_text(content: &str) -> bool {
+    if contains_any_keyword(
+        content,
+        &[
+            "夸你",
+            "夸我",
+            "可爱",
+            "心动",
+            "感动",
+            "开心",
+            "难过",
+            "失望",
+            "生气",
+            "骄傲",
+            "害羞",
+            "摸摸头",
+            "抱抱",
+            "鼓励",
+            "批评",
+            "表扬",
+        ],
+    ) {
+        return true;
+    }
+
+    content.contains("喜欢你")
+        && !contains_any_keyword(
+            content,
+            &["喜欢你直接", "喜欢你先", "喜欢你给", "我喜欢你直接"],
+        )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UserModelEntry {
+    section: &'static str,
+    text: String,
+}
+
+fn build_user_model_entries(user_message: &str, gate: &MemoryGate) -> Vec<UserModelEntry> {
+    let note = compact_memory_text(user_message, 160);
+    if note.is_empty() {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::new();
+    if gate.user_profile {
+        entries.push(UserModelEntry {
+            section: "## Implicit Signals",
+            text: note.clone(),
+        });
+    }
+    if gate.preference {
+        let section = if contains_any_keyword(
+            &normalize_memory_match_text(user_message),
+            &["称呼", "叫我", "格式", "风格", "口吻", "尽量", "不要"],
+        ) {
+            "## Interaction Style"
+        } else {
+            "## Stable Preferences"
+        };
+        entries.push(UserModelEntry {
+            section,
+            text: note,
+        });
+    }
+    entries
+}
+
+fn append_user_model_entries(agent_home: &Path, entries: &[UserModelEntry]) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let path = agent_home.join("USER_MODEL.md");
+    let existing = fs::read_to_string(&path).unwrap_or_else(|_| fallback_template("USER_MODEL.md"));
+    fs::write(&path, append_user_model_file(&existing, entries))
+        .map_err(|error| format!("写入 USER_MODEL.md 失败: {error}"))
+}
+
+fn append_user_model_file(existing: &str, entries: &[UserModelEntry]) -> String {
+    let mut next = existing.trim_end().to_string();
+    for entry in entries {
+        next = append_bullet_to_section(&next, entry.section, &entry.text, 8);
+    }
+    next.push('\n');
+    next
+}
+
+fn build_relationship_entries(user_message: &str, gate: &MemoryGate) -> Vec<String> {
+    if !gate.relationship {
+        return Vec::new();
+    }
+    let note = compact_memory_text(user_message, 160);
+    if note.is_empty() {
+        Vec::new()
+    } else {
+        vec![note]
+    }
+}
+
+fn append_relationship_entries(agent_home: &Path, entries: &[String]) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let path = agent_home.join("RELATIONSHIP_MAP.md");
+    let existing =
+        fs::read_to_string(&path).unwrap_or_else(|_| fallback_template("RELATIONSHIP_MAP.md"));
+    fs::write(&path, append_relationship_file(&existing, entries))
+        .map_err(|error| format!("写入 RELATIONSHIP_MAP.md 失败: {error}"))
+}
+
+fn append_relationship_file(existing: &str, entries: &[String]) -> String {
+    let mut next = existing.trim_end().to_string();
+    for entry in entries {
+        next = append_bullet_to_section(&next, "## Key People", entry, 8);
+    }
+    next.push('\n');
+    next
+}
+
+fn build_emotional_memory_entries(
+    user_message: &str,
+    assistant_message: &str,
+    gate: &MemoryGate,
+) -> Vec<String> {
+    if !gate.emotional_event {
+        return Vec::new();
+    }
+    let note = compact_memory_text(
+        &format!(
+            "用户互动：{}；当时回应：{}",
+            user_message, assistant_message
+        ),
+        180,
+    );
+    if note.is_empty() {
+        Vec::new()
+    } else {
+        vec![note]
+    }
+}
+
+fn append_emotional_memory_entries(agent_home: &Path, entries: &[String]) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let path = agent_home.join("RELATIONSHIP_MAP.md");
+    let existing =
+        fs::read_to_string(&path).unwrap_or_else(|_| fallback_template("RELATIONSHIP_MAP.md"));
+    fs::write(&path, append_emotional_memory_file(&existing, entries))
+        .map_err(|error| format!("写入 RELATIONSHIP_MAP.md 情感事件失败: {error}"))
+}
+
+fn append_emotional_memory_file(existing: &str, entries: &[String]) -> String {
+    let mut next = existing.trim_end().to_string();
+    for entry in entries {
+        next = append_bullet_to_section(&next, "## Emotional Signals", entry, 8);
+    }
+    next.push('\n');
+    next
 }
 
 fn dedupe_memory_notes(notes: Vec<(String, String)>) -> Vec<(String, String)> {
@@ -2448,10 +2827,10 @@ fn build_ingest_summary(notes: &[(String, String)], fallback: &str) -> String {
         .collect::<Vec<_>>();
 
     if !selected.is_empty() {
-        return truncate_for_memory(&selected.join("；"), 180);
+        return truncate_for_memory(&dedupe_joined_clauses(&selected.join("；")), 180);
     }
 
-    truncate_for_memory(fallback, 180)
+    truncate_for_memory(&dedupe_joined_clauses(fallback), 180)
 }
 
 fn truncate_for_memory(value: &str, limit: usize) -> String {
@@ -2463,6 +2842,32 @@ fn truncate_for_memory(value: &str, limit: usize) -> String {
         truncated.push('…');
     }
     truncated
+}
+
+fn normalize_memory_snippet(value: &str) -> String {
+    dedupe_joined_clauses(&value.replace('\n', " ").trim().to_string())
+}
+
+fn dedupe_joined_clauses(value: &str) -> String {
+    let mut deduped = Vec::new();
+    for clause in value.split('；') {
+        let trimmed = clause.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if deduped
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        deduped.push(trimmed.to_string());
+    }
+    if deduped.is_empty() {
+        value.trim().to_string()
+    } else {
+        deduped.join("；")
+    }
 }
 
 fn sanitize_workspace_segment(value: &str, fallback: &str) -> String {
@@ -2511,9 +2916,10 @@ fn upsert_working_memory(
     let marker = "## IM Latest Context";
     let category_titles =
         format_category_titles(categories).unwrap_or_else(|| "GENERAL_MEMORY".to_string());
+    let clean_summary = dedupe_joined_clauses(summary);
     let replacement = format!(
         "{marker}\n\n- Last user: `{}`\n- Current note: {}\n- Categories: {}\n- Source: `{}`\n",
-        user_id, summary, category_titles, source_ref
+        user_id, clean_summary, category_titles, source_ref
     );
 
     if let Some(index) = existing.find(marker) {
@@ -2624,13 +3030,11 @@ fn upsert_working_open_loops(existing: &str, open_loops: &[String]) -> String {
 
 /// REVIEW_QUEUE 合并到 WORKING.md：在 `## REVIEW_ITEMS` 下追加复查项。
 fn upsert_working_review_items(existing: &str, items: &[String]) -> String {
-    if items.is_empty() {
-        return existing.to_string();
-    }
     let marker = "## REVIEW_ITEMS";
     let mut entries = extract_section_bullets(existing, marker)
         .into_iter()
         .filter(|item| !item.contains("No review items yet"))
+        .filter(|item| review_item_is_active(item))
         .collect::<Vec<_>>();
 
     for item in items {
@@ -2679,6 +3083,7 @@ fn build_review_items_for_working(
     );
     items
         .into_iter()
+        .filter(|item| is_meaningful_review_item(&item.item))
         .map(|item| {
             format!(
                 "[{}] {}（reason: {}，review_at: {}，source: `{}`）",
@@ -2699,29 +3104,15 @@ struct PitfallEntry {
 
 fn build_pitfall_entries(
     user_message: &str,
-    assistant_message: &str,
+    _assistant_message: &str,
     source_ref: &str,
 ) -> Vec<PitfallEntry> {
     let normalized = normalize_memory_match_text(user_message);
-    if !contains_any_keyword(
-        &normalized,
-        &[
-            "别",
-            "不要",
-            "别再",
-            "记错",
-            "误判",
-            "翻车",
-            "时间线",
-            "别问",
-            "不要废话",
-            "不是这个意思",
-        ],
-    ) {
+    if !is_explicit_pitfall_correction(&normalized) || looks_like_task_payload(user_message) {
         return Vec::new();
     }
 
-    let item = truncate_for_memory(user_message.trim(), 160);
+    let item = truncate_for_memory(&dedupe_joined_clauses(user_message.trim()), 160);
     let action = if contains_any_keyword(&normalized, &["时间线", "今天", "明天", "下周"])
     {
         "先核时间线与相对日期，再回答。".to_string()
@@ -2729,8 +3120,16 @@ fn build_pitfall_entries(
         "先用已有上下文推断，避免追问显然可推出的问题。".to_string()
     } else if contains_any_keyword(&normalized, &["不要废话", "废话", "正确但没用"]) {
         "压缩废话，优先给出直接可执行的结论。".to_string()
+    } else if contains_any_keyword(&normalized, &["markdown", "纯文字", "纯文本", "微信"]) {
+        "微信场景默认使用纯文本自然段，不要输出 markdown 结构。".to_string()
+    } else if contains_any_keyword(&normalized, &["安排人", "派人", "委派", "小8", "团队的人"])
+    {
+        "用户点名团队成员时先委派；委派失败就说明阻塞，不要自己顶上。".to_string()
+    } else if contains_any_keyword(&normalized, &["不要主动", "太加戏", "建个任务", "提醒我"])
+    {
+        "只有用户明确要求创建任务或提醒时再落任务，平时不要主动加戏。".to_string()
     } else {
-        truncate_for_memory(assistant_message.trim(), 120)
+        "把这条纠正收敛成可复用的默认规则，下次直接照做。".to_string()
     };
 
     vec![PitfallEntry {
@@ -2778,6 +3177,175 @@ fn append_pitfall_file(existing: &str, entries: &[PitfallEntry]) -> String {
     next
 }
 
+fn is_explicit_pitfall_correction(normalized: &str) -> bool {
+    contains_any_keyword(
+        normalized,
+        &[
+            "记住",
+            "以后",
+            "别再",
+            "不要再",
+            "第二遍",
+            "你应该",
+            "不该",
+            "不要主动",
+            "别问",
+            "不要废话",
+            "你要",
+            "误判",
+            "时间线",
+        ],
+    )
+}
+
+fn looks_like_task_payload(message: &str) -> bool {
+    let normalized = normalize_memory_match_text(message);
+    contains_any_keyword(
+        &normalized,
+        &[
+            "http://",
+            "https://",
+            "::nc-media",
+            "/read_gzh",
+            "帮我",
+            "给这篇文章",
+            "做一个",
+            "做个",
+            "网页",
+            "页面",
+            "海报",
+            "配色方案",
+            "总结的网页",
+        ],
+    ) && !contains_any_keyword(&normalized, &["记住", "以后", "第二遍", "不要主动", "不该"])
+}
+
+fn is_meaningful_review_item(item: &str) -> bool {
+    let normalized = normalize_memory_match_text(item);
+    if normalized.len() < 8 {
+        return false;
+    }
+    !matches!(
+        normalized.as_str(),
+        "好的" | "ok" | "okay" | "测试一下" | "nani" | "确认"
+    )
+}
+
+fn review_item_is_active(item: &str) -> bool {
+    if !item.contains("[pending]") {
+        return false;
+    }
+    let Some(review_at) = extract_between(item, "review_at: ", "，source") else {
+        return true;
+    };
+    review_at.trim() >= current_date_label().as_str()
+}
+
+fn extract_between<'a>(value: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let start_idx = value.find(start)? + start.len();
+    let rest = &value[start_idx..];
+    let end_idx = rest.find(end)?;
+    Some(&rest[..end_idx])
+}
+
+fn remove_legacy_review_queue_file(root: &Path) -> Result<(), String> {
+    let path = root.join(LEGACY_REVIEW_QUEUE_RELATIVE_PATH);
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(&path)
+        .map_err(|error| format!("删除旧 REVIEW_QUEUE 文件失败 {}: {error}", path.display()))
+}
+
+fn migrate_legacy_review_queue_into_working(agent_home: &Path) -> Result<(), String> {
+    let review_path = agent_home.join(LEGACY_REVIEW_QUEUE_RELATIVE_PATH);
+    if !review_path.exists() {
+        return Ok(());
+    }
+
+    let legacy = fs::read_to_string(&review_path).unwrap_or_default();
+    let migrated_items = parse_legacy_review_queue_entries(&legacy)
+        .into_iter()
+        .filter(|item| review_item_is_active(item))
+        .collect::<Vec<_>>();
+
+    let working_path = agent_home.join("WORKING.md");
+    let existing =
+        fs::read_to_string(&working_path).unwrap_or_else(|_| fallback_template("WORKING.md"));
+    let next = upsert_working_review_items(&existing, &migrated_items);
+    fs::write(&working_path, next)
+        .map_err(|error| format!("迁移 REVIEW_QUEUE 到 WORKING.md 失败: {error}"))?;
+    fs::remove_file(&review_path)
+        .map_err(|error| format!("删除旧 REVIEW_QUEUE 文件失败: {error}"))?;
+    Ok(())
+}
+
+fn parse_legacy_review_queue_entries(content: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut item = None::<String>;
+    let mut status = None::<String>;
+    let mut review_at = None::<String>;
+    let mut reason = None::<String>;
+    let mut source = None::<String>;
+
+    let flush = |entries: &mut Vec<String>,
+                 item: &mut Option<String>,
+                 status: &mut Option<String>,
+                 review_at: &mut Option<String>,
+                 reason: &mut Option<String>,
+                 source: &mut Option<String>| {
+        if let (Some(item), Some(status), Some(review_at), Some(reason), Some(source)) = (
+            item.take(),
+            status.take(),
+            review_at.take(),
+            reason.take(),
+            source.take(),
+        ) {
+            entries.push(format!(
+                "[{}] {}（reason: {}，review_at: {}，source: `{}`）",
+                status.trim(),
+                dedupe_joined_clauses(item.trim()),
+                reason.trim(),
+                review_at.trim(),
+                source.trim()
+            ));
+        }
+    };
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("- item: ") {
+            flush(
+                &mut entries,
+                &mut item,
+                &mut status,
+                &mut review_at,
+                &mut reason,
+                &mut source,
+            );
+            item = Some(value.to_string());
+        } else if let Some(value) = trimmed.strip_prefix("status: ") {
+            status = Some(value.to_string());
+        } else if let Some(value) = trimmed.strip_prefix("review_at: ") {
+            review_at = Some(value.to_string());
+        } else if let Some(value) = trimmed.strip_prefix("reason: ") {
+            reason = Some(value.to_string());
+        } else if let Some(value) = trimmed.strip_prefix("source: ") {
+            source = Some(value.to_string());
+        }
+    }
+
+    flush(
+        &mut entries,
+        &mut item,
+        &mut status,
+        &mut review_at,
+        &mut reason,
+        &mut source,
+    );
+    entries
+}
+
 fn append_core_memory_points(existing: &str, points: &[String]) -> String {
     let marker = "## Core Memory";
     let mut entries = extract_section_bullets(existing, marker);
@@ -2810,6 +3378,43 @@ fn append_core_memory_points(existing: &str, points: &[String]) -> String {
         }
     }
     next.push('\n');
+    next
+}
+
+fn append_bullet_to_section(existing: &str, marker: &str, item: &str, max_items: usize) -> String {
+    let item = item.trim();
+    if item.is_empty() {
+        return existing.trim_end().to_string();
+    }
+
+    let mut entries = extract_section_bullets(existing, marker)
+        .into_iter()
+        .filter(|existing_item| {
+            !existing_item.contains("No confirmed model entry yet")
+                && !existing_item.contains("No key person recorded yet")
+                && !existing_item.contains("No team mapping recorded yet")
+                && !existing_item.contains("No emotional signal recorded yet")
+                && !existing_item
+                    .contains("Record unresolved identities or relationship ambiguities here")
+        })
+        .collect::<Vec<_>>();
+    if entries
+        .iter()
+        .any(|existing_item| existing_item.trim().eq_ignore_ascii_case(item))
+    {
+        return existing.trim_end().to_string();
+    }
+    entries.push(item.to_string());
+    if entries.len() > max_items {
+        entries = entries.split_off(entries.len() - max_items);
+    }
+
+    let cleaned = strip_markdown_section(existing, marker);
+    let mut next = cleaned.trim_end().to_string();
+    next.push_str(&format!("\n\n{marker}\n"));
+    for entry in entries {
+        next.push_str(&format!("\n- {}\n", entry));
+    }
     next
 }
 
@@ -2882,17 +3487,17 @@ fn append_daily_log_entry(
 
 fn fallback_template(file_name: &str) -> String {
     match file_name {
-        "IDENTITY.md" => "# IDENTITY.md\n\n- **Agent ID:** {{AGENT_ID}}\n- **Name:** {{AGENT_NAME}}\n- **Creature:** 智能体\n- **Vibe:** 高效、直接、少废话\n- **Accent Color:** {{AGENT_ACCENT_COLOR}}\n\n## Identity Notes\n\n- Summary: {{AGENT_SUMMARY}}\n".to_string(),
-        "ROLE.md" => "# ROLE.md\n\n## Mission\n\n{{AGENT_DESCRIPTION}}\n\n## Ownership\n\n- Define ownership here.\n\n## Do Not\n\n- Leak private memory.\n- Confuse tentative memory with confirmed facts.\n- Act externally without confirmation.\n".to_string(),
+        "IDENTITY.md" => "# IDENTITY.md\n\n- **Agent ID:** {{AGENT_ID}}\n- **Name:** {{AGENT_NAME}}\n- **Creature:** 智能体\n- **Vibe:** 高效、直接、少废话\n- **Accent Color:** {{AGENT_ACCENT_COLOR}}\n\n## Identity Notes\n\n- Summary: {{AGENT_SUMMARY}}\n- 这里只定义“我是谁”，不要堆做事流程、渠道规则或当前任务。\n".to_string(),
+        "ROLE.md" => "# ROLE.md\n\n## Mission\n\n{{AGENT_DESCRIPTION}}\n\n## Operating Rules\n\n- 只在当前 agent 的职责边界内行动。\n- 用户点名成员或明显适合分工的任务，先委派再汇总。\n- 委派失败时要明确告知阻塞，不要默默自己顶上。\n- 微信等 IM 场景默认用纯文本自然段，除非用户明确要求 markdown。\n- 不确定的内容直接说明，不要把推断说成事实。\n\n## Do Not\n\n- Leak private memory.\n- Confuse tentative memory with confirmed facts.\n- Take external actions without confirmation.\n".to_string(),
         "MEMORY.md" => "# MEMORY.md\n\n这是 `{{AGENT_NAME}}` 的最小启动记忆，只保留高频、稳定、开局就该知道的内容。\n\n## Identity Anchor\n\n- Agent name: {{AGENT_NAME}}\n- Summary: {{AGENT_SUMMARY}}\n\n## Core Principles\n\n- 保持直接、准确、可执行。\n- 推断和事实必须分层；不确定就直说。\n- 承诺要进入账本并持续跟进。\n\n## Stable Preferences\n\n- 在这里放高频、稳定、明确确认过的偏好。\n\n## Relationship Anchors\n\n- 在这里放最稳定、最高频的人物关系锚点。\n\n## Current Theme Anchors\n\n- 只放最近一段时间持续重要的主题，不放流水账。\n\n## Routing\n\n- 当前任务与未闭环：`WORKING.md`\n- 稳定规则与约定：`DECISIONS.md`\n- 用户长期模型：`USER_MODEL.md`\n- 关系图：`RELATIONSHIP_MAP.md`\n- 高风险坑点：`PITFALLS.md`\n- 外部知识：`wiki/INDEX.md`\n\n> 此文件不会在对话过程中被自动修改。如需调整，请手动编辑。\n".to_string(),
         "USER_MODEL.md" => "# USER_MODEL.md\n\n## Purpose\n\nCapture the user's long-term interaction model, not daily chatter.\n\n## Stable Preferences\n\n- No confirmed model entry yet.\n\n## Interaction Style\n\n- No confirmed style rule yet.\n\n## Implicit Signals\n\n- Record repeated hidden intent patterns here.\n\n## Test Patterns\n\n- Record recurring ways the user tests responsiveness or understanding.\n\n## Collaboration Modes\n\n- Note how the user wants the agent to behave in different contexts.\n".to_string(),
-        "RELATIONSHIP_MAP.md" => "# RELATIONSHIP_MAP.md\n\n## Purpose\n\nTrack the important people around the user and why they matter.\n\n## Key People\n\n- No key person recorded yet.\n\n## Teams And Groups\n\n- No team mapping recorded yet.\n\n## Open Questions\n\n- Record unresolved identities or relationship ambiguities here.\n".to_string(),
-        "PITFALLS.md" => "# PITFALLS.md\n\n## Purpose\n\nTrack recurring failure modes, explicit user corrections, and things this agent must stop doing.\n\n## Active Pitfalls\n\n- No active pitfall recorded yet.\n\n## Rules\n\n- Promote only concrete, reusable pitfalls.\n- Prefer actionable phrasing over vague blame.\n- Retire items when the behavior is truly fixed.\n".to_string(),
-        "TOOLS.md" => "# TOOLS.md\n\n## Tool Bias\n\n- Preferred tools:\n- Avoid when possible:\n".to_string(),
+        "RELATIONSHIP_MAP.md" => "# RELATIONSHIP_MAP.md\n\n## Purpose\n\nTrack the important people around the user and why they matter.\n\n## Key People\n\n- No key person recorded yet.\n\n## Teams And Groups\n\n- No team mapping recorded yet.\n\n## Emotional Signals\n\n- No emotional signal recorded yet.\n\n## Open Questions\n\n- Record unresolved identities or relationship ambiguities here.\n".to_string(),
+        "PITFALLS.md" => "# PITFALLS.md\n\n## Purpose\n\nTrack recurring failure modes, explicit user corrections, and things this agent must stop doing.\n\n## Active Pitfalls\n\n- No active pitfall recorded yet.\n\n## Rules\n\n- 只收可复用的行为纠正，不收具体任务流水账。\n- action 保持短句规则，不要贴执行日志。\n- 同类问题更新已有规则，不要无限重复追加。\n- Retire items when the behavior is truly fixed.\n".to_string(),
+        "TOOLS.md" => "# TOOLS.md\n\n## Tool Bias\n\n- Preferred tools:\n- Avoid when possible:\n- Escalate when:\n\n## Notes By Tool\n\n- 记录已验证过的工具偏好、坑点和使用边界。\n".to_string(),
         "HEARTBEAT.md" => "# HEARTBEAT.md\n\n# Keep empty if this agent owns no periodic checks.\n".to_string(),
-        "WORKING.md" => "# WORKING.md\n\n## Current Focus\n\n- No active task yet.\n\n## OPEN_LOOPS\n\n- No open loop yet.\n\n## Open Threads\n\n- No open thread yet.\n\n## IM Latest Context\n\n- No IM context ingested yet.\n".to_string(),
-        "DECISIONS.md" => "# DECISIONS.md\n\n## Decision Log\n\n- No decisions logged yet.\n\n## Sync Rules\n\n- Stable rules should be mirrored into `MEMORY.md` or category memory when relevant.\n".to_string(),
-        "PUBLIC_CONTEXT.md" => "# PUBLIC_CONTEXT.md\n\n## Safe Identity\n\n- Agent: {{AGENT_NAME}}\n- Summary: {{AGENT_SUMMARY}}\n\n## External Notes\n\n- Put channel-safe context here.\n".to_string(),
+        "WORKING.md" => "# WORKING.md\n\n## Current Focus\n\n- No active task yet.\n\n## OPEN_LOOPS\n\n- No open loop yet.\n\n## REVIEW_ITEMS\n\n- No review items yet.\n\n## Open Threads\n\n- No open thread yet.\n\n## IM Latest Context\n\n- No IM context ingested yet.\n".to_string(),
+        "DECISIONS.md" => "# DECISIONS.md\n\n## Decision Log\n\n- No decisions logged yet.\n\n## What Belongs Here\n\n- 稳定工作规则\n- 明确拍板过的架构/产品选择\n- 需要长期遵守的默认策略\n".to_string(),
+        "PUBLIC_CONTEXT.md" => "# PUBLIC_CONTEXT.md\n\n## Safe Identity\n\n- Agent: {{AGENT_NAME}}\n- Summary: {{AGENT_SUMMARY}}\n\n## Safe Operating Rules\n\n- Do not expose private memory.\n- 只放可在共享场景复用的身份与边界。\n- 不要写内部推断、私密关系或未确认事实。\n".to_string(),
         "memory/SOURCE_INDEX.md" => "# SOURCE_INDEX.md\n\nThis file registers immutable raw sources and uploaded artifacts. The LLM should never rewrite the underlying source files; it should only update the curated memory around them.\n\nEach entry includes an `Index:` line (`type=… ts=… cats=…`) for quick filtering.\n\n## Entries\n".to_string(),
         "memory/DAILY_INDEX.md" => "# DAILY_INDEX.md\n\n**Retrieval index** for `memory/YYYY-MM-DD.md` digest lines. Each machine line starts with `DAILY|` then `date|timestamp|user|cats|summary` (fields must not contain `|`).\n\n- Use `rg` / editor search on `cats` (e.g. `projects`) or keywords before opening a full daily file.\n- Full context stays in the dated markdown files.\n\n## Lines\n".to_string(),
         "wiki/INDEX.md" => "# INDEX.md\n\nThis wiki stores external knowledge, research notes, and reusable methodology. Do not store user identity, promises, or live project status here.\n\n## Boundaries\n\n- Put `who we are / what we promised / what the user prefers` into memory, not wiki.\n- Put external articles, GitHub project notes, technical summaries, and methods into wiki.\n\n## Routes\n\n- New research note: create a page under `wiki/` and link it here.\n- Memory question: go back to `memory/INDEX.md`.\n\n## Pages\n\n- No wiki pages yet.\n".to_string(),
@@ -2971,18 +3576,10 @@ fn display_workspace_root(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn workspace_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     fn lock_workspace_test() -> std::sync::MutexGuard<'static, ()> {
-        workspace_test_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+        crate::workspace_env_test_lock()
     }
 
     fn temp_root() -> PathBuf {
@@ -3098,6 +3695,45 @@ mod tests {
             .iter()
             .any(|file| file.relative_path == "agents/test-agent/wiki/INDEX.md"));
 
+        let _ = fs::remove_dir_all(&root);
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
+    fn preset_workspace_files_can_overwrite_agent_core_files() {
+        let _guard = lock_workspace_test();
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+
+        let seed = AgentWorkspaceSeed {
+            id: "preset-agent",
+            name: "预设智能体",
+            summary: "用于验证预设写入",
+            description: "负责验证默认预设工作区覆盖逻辑",
+            accent_color: Some("#445566"),
+            is_builtin: false,
+        };
+
+        let home = ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "IDENTITY.md".to_string(),
+            "# IDENTITY.md\n\npreset identity\n".to_string(),
+        );
+        files.insert(
+            "harness/default.json".to_string(),
+            "{\n  \"name\": \"preset\"\n}\n".to_string(),
+        );
+
+        write_agent_preset_workspace_files("preset-agent", &files, true)
+            .expect("write preset files");
+
+        assert_eq!(
+            read_string(home.join("IDENTITY.md")),
+            "# IDENTITY.md\n\npreset identity\n"
+        );
+        assert!(read_string(home.join("harness").join("default.json")).contains("\"preset\""));
+
         fs::remove_dir_all(&root).expect("cleanup");
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
     }
@@ -3182,6 +3818,37 @@ mod tests {
         )
         .expect("read saved wiki page");
         assert!(wiki_page.contains("wiki page"));
+
+        fs::remove_dir_all(&root).expect("cleanup");
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
+    fn read_agent_workspace_file_reads_private_memory_markdown() {
+        let _guard = lock_workspace_test();
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+
+        let seed = AgentWorkspaceSeed {
+            id: "reader",
+            name: "读者",
+            summary: "用于验证读取",
+            description: "负责验证 MEMORY.md 读取逻辑",
+            accent_color: Some("#556677"),
+            is_builtin: false,
+        };
+
+        ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        write_agent_workspace_file(
+            "reader",
+            "agents/reader/MEMORY.md",
+            "# MEMORY.md\n\nhello\n",
+        )
+        .expect("write memory file");
+
+        let file = read_agent_workspace_file("reader", "agents/reader/MEMORY.md")
+            .expect("read memory file");
+        assert_eq!(file.content, "# MEMORY.md\n\nhello\n");
 
         fs::remove_dir_all(&root).expect("cleanup");
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
@@ -3325,6 +3992,136 @@ mod tests {
         assert!(pitfalls.contains("别忽略时间线"));
         assert!(pitfalls.contains("risk: high"));
         assert!(pitfalls.contains("action:"));
+
+        fs::remove_dir_all(&root).expect("cleanup");
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
+    fn private_memory_gate_routes_profile_preference_relationship_and_pitfall() {
+        let summary = summarize_memory_entry(
+            "我是产品经理，你叫我老张就行，我喜欢你直接给结论。橘子是我们的合作方联系人。",
+            "收到。",
+        );
+        let categories = classify_memory_categories(
+            "我是产品经理，你叫我老张就行，我喜欢你直接给结论。橘子是我们的合作方联系人。",
+            "收到。",
+            &summary,
+        );
+
+        let gate = build_private_memory_gate(
+            "我是产品经理，你叫我老张就行，我喜欢你直接给结论。橘子是我们的合作方联系人。",
+            "收到。",
+            &summary,
+            &categories,
+        );
+
+        assert!(gate.user_profile);
+        assert!(gate.preference);
+        assert!(gate.relationship);
+        assert!(!gate.commitment);
+        assert!(!gate.pitfall);
+        assert!(!gate.emotional_event);
+        assert!(gate.should_write);
+    }
+
+    #[test]
+    fn private_memory_gate_detects_emotional_event() {
+        let summary =
+            summarize_memory_entry("你刚刚夸我可爱，还摸摸头，我有点害羞。", "我听到了。");
+        let categories = classify_memory_categories(
+            "你刚刚夸我可爱，还摸摸头，我有点害羞。",
+            "我听到了。",
+            &summary,
+        );
+
+        let gate = build_private_memory_gate(
+            "你刚刚夸我可爱，还摸摸头，我有点害羞。",
+            "我听到了。",
+            &summary,
+            &categories,
+        );
+
+        assert!(gate.emotional_event);
+        assert!(gate.should_write);
+    }
+
+    #[test]
+    fn append_agent_memory_entry_writes_user_model_and_relationship_map_via_gate() {
+        let _guard = lock_workspace_test();
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+
+        let seed = AgentWorkspaceSeed {
+            id: "profile-agent",
+            name: "画像助理",
+            summary: "用于验证长期画像写回",
+            description: "负责把用户画像和关系写入长期记忆",
+            accent_color: Some("#7799aa"),
+            is_builtin: false,
+        };
+
+        ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        append_agent_memory_entry(
+            "profile-agent",
+            "user-1",
+            "我是产品经理，你叫我老张就行，我喜欢你直接给结论。橘子是我们的合作方联系人。",
+            "收到，后续我会按这个方式配合。",
+        )
+        .expect("append profile memory");
+
+        let user_model = read_string(
+            root.join("agents")
+                .join("profile-agent")
+                .join("USER_MODEL.md"),
+        );
+        let relationship_map = read_string(
+            root.join("agents")
+                .join("profile-agent")
+                .join("RELATIONSHIP_MAP.md"),
+        );
+
+        assert!(user_model.contains("我是产品经理"));
+        assert!(user_model.contains("我喜欢你直接给结论"));
+        assert!(relationship_map.contains("橘子是我们的合作方联系人"));
+
+        fs::remove_dir_all(&root).expect("cleanup");
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
+    fn append_agent_memory_entry_writes_emotional_signal_section_via_gate() {
+        let _guard = lock_workspace_test();
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+
+        let seed = AgentWorkspaceSeed {
+            id: "emotion-agent",
+            name: "情绪助理",
+            summary: "用于验证情感事件写回",
+            description: "负责把高价值互动信号写入关系记忆",
+            accent_color: Some("#aa6677"),
+            is_builtin: false,
+        };
+
+        ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        append_agent_memory_entry(
+            "emotion-agent",
+            "user-1",
+            "你刚刚夸我可爱，还摸摸头，我有点害羞。",
+            "我知道你听见了。",
+        )
+        .expect("append emotion memory");
+
+        let relationship_map = read_string(
+            root.join("agents")
+                .join("emotion-agent")
+                .join("RELATIONSHIP_MAP.md"),
+        );
+
+        assert!(relationship_map.contains("## Emotional Signals"));
+        assert!(relationship_map.contains("你刚刚夸我可爱"));
+        assert!(relationship_map.contains("我知道你听见了"));
 
         fs::remove_dir_all(&root).expect("cleanup");
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
@@ -3826,6 +4623,84 @@ mod tests {
                 "bundle should not contain REVIEW_QUEUE.md"
             );
         }
+
+        fs::remove_dir_all(&root).expect("cleanup");
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
+    fn legacy_review_queue_is_migrated_and_stale_entries_are_dropped() {
+        let _guard = lock_workspace_test();
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+
+        let seed = AgentWorkspaceSeed {
+            id: "legacy-review-agent",
+            name: "迁移助理",
+            summary: "验证旧 REVIEW_QUEUE 迁移",
+            description: "负责把旧复查队列并入 WORKING",
+            accent_color: Some("#bb8844"),
+            is_builtin: false,
+        };
+
+        let home = ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        let review_path = home.join("memory").join("REVIEW_QUEUE.md");
+        fs::write(
+            &review_path,
+            "# REVIEW_QUEUE.md\n\n## Entries\n\n- item: 过期事项\n  status: pending\n  review_at: 2026-04-10\n  reason: 已经过期\n  source: memory/raw/old.md\n  updated: 2026-04-07\n- item: 有效事项；有效事项\n  status: pending\n  review_at: 2099-05-01\n  reason: 还需要跟进\n  source: memory/raw/new.md\n  updated: 2026-04-30\n",
+        )
+        .expect("write legacy review queue");
+
+        migrate_legacy_review_queue_into_working(&home).expect("migrate review queue");
+
+        let working = read_string(home.join("WORKING.md"));
+        assert!(working.contains("## REVIEW_ITEMS"));
+        assert!(working.contains("有效事项"));
+        assert!(!working.contains("过期事项"));
+        assert!(!working.contains("有效事项；有效事项"));
+        assert!(!review_path.exists(), "legacy file removed");
+
+        fs::remove_dir_all(&root).expect("cleanup");
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
+    fn ingest_dedupes_working_context_and_filters_task_like_pitfalls() {
+        let _guard = lock_workspace_test();
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+
+        let seed = AgentWorkspaceSeed {
+            id: "dedupe-agent",
+            name: "去重助理",
+            summary: "验证 WORKING 去重与 PITFALLS 过滤",
+            description: "负责验证记忆 ingest 清洗逻辑",
+            accent_color: Some("#cc7755"),
+            is_builtin: false,
+        };
+
+        let home = ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        append_agent_memory_entry(
+            "dedupe-agent",
+            "desktop-local",
+            "你帮我整理你觉得你还做的不够好的地方，我去让codex改一改；你帮我整理你觉得你还做的不够好的地方，我去让codex改一改",
+            "我先整理一下要改的点。",
+        )
+        .expect("append first memory");
+        append_agent_memory_entry(
+            "dedupe-agent",
+            "desktop-local",
+            "https://mp.weixin.qq.com/s/AA2NHww4jUBuAfi10EYICw 我想要给这篇文章写个总结的网页，不要使用 citycraft 的",
+            "我先读取文章内容。",
+        )
+        .expect("append second memory");
+
+        let working = read_string(home.join("WORKING.md"));
+        let pitfalls = read_string(home.join("PITFALLS.md"));
+
+        assert!(working.contains("Current note"));
+        assert!(!working.contains("改一改；你帮我整理你觉得你还做的不够好的地方"));
+        assert!(!pitfalls.contains("不要使用 citycraft"));
 
         fs::remove_dir_all(&root).expect("cleanup");
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);

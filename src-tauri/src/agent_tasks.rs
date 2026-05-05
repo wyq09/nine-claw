@@ -524,19 +524,14 @@ pub fn list_tasks(
                 };
             let source_session_id: String = row.get(3)?;
             let delivery_json: String = row.get(14)?;
-            let delivery =
-                parse_agent_task_delivery_json(&delivery_json, &source_session_id).map_err(
-                    |error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            14,
-                            rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                error,
-                            )),
-                        )
-                    },
-                )?;
+            let delivery = parse_agent_task_delivery_json(&delivery_json, &source_session_id)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        14,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                    )
+                })?;
             Ok(AgentTaskListItem {
                 id: row.get(0)?,
                 agent_id: row.get(1)?,
@@ -857,19 +852,14 @@ pub fn list_active_tasks_for_scheduler(
                 updated_at: row.get(14)?,
             };
             let delivery_json: String = row.get(11)?;
-            let delivery =
-                parse_agent_task_delivery_json(&delivery_json, &task.source_session_id).map_err(
-                    |error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            11,
-                            rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                error,
-                            )),
-                        )
-                    },
-                )?;
+            let delivery = parse_agent_task_delivery_json(&delivery_json, &task.source_session_id)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        11,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                    )
+                })?;
             Ok(SchedulerTaskDefinition { task, delivery })
         })
         .map_err(|error| format!("解析 agent tasks 失败: {error}"))?;

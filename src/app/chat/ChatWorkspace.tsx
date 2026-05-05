@@ -9,7 +9,7 @@ import type {
   RefObject,
   WheelEvent as ReactWheelEvent,
 } from 'react'
-import { Mic } from 'lucide-react'
+import { Keyboard, Mic } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { AppIcon, type IconName } from '../../components/AppIcon'
 import { useToast } from '../../hooks/useToast'
@@ -40,6 +40,10 @@ import { ImagePreviewModal } from './TurnAndTools'
 import { useChatTurnWindow } from './useChatTurnWindow'
 import { useSessionContextWindow } from '../../hooks/useSessionContextWindow'
 import { VirtualizedChatTurns, type VirtualizedChatTurnsHandle } from './VirtualizedChatTurns'
+import {
+  isMacTauriComposerDesktop,
+  openMacNativeDictationPanel,
+} from '../../lib/macosNativeDictationClient'
 
 function streamingTurnLayoutRevision(turn: ConversationTurn | undefined): number {
   if (!turn) {
@@ -293,6 +297,51 @@ export function ChatView({
   useEffect(() => {
     syncComposerTypedPresence()
   }, [sessionStreaming, syncComposerTypedPresence])
+
+  useEffect(() => {
+    if (!isMacTauriComposerDesktop()) {
+      return
+    }
+    let unlisten: (() => void) | undefined
+    let cancelled = false
+    void (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event')
+        unlisten = await listen<{ text: string }>('macos-native-composer-insert', (event) => {
+          const incoming = event.payload.text ?? ''
+          if (!incoming) {
+            return
+          }
+          const el = composerTextareaRef.current
+          if (!el) {
+            return
+          }
+          const cur = el.value
+          const next = cur.trim() ? `${cur.trimEnd()}\n${incoming}` : incoming
+          el.value = next
+          composerDraftBackupRef.current = next
+          setComposerHasTypedContent(next.trim().length > 0)
+          el.focus()
+          try {
+            const end = next.length
+            el.setSelectionRange(end, end)
+          } catch {
+            /* 部分环境下无效，忽略 */
+          }
+          onComposerInput?.(next)
+        })
+      } catch {
+        /* 非 Tauri 等 */
+      }
+      if (cancelled) {
+        unlisten?.()
+      }
+    })()
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [onComposerInput])
 
   useEffect(() => {
     const handlePointerMove = (event: PointerEvent) => {
@@ -572,6 +621,21 @@ export function ChatView({
               >
                 <Mic size={18} strokeWidth={1.75} aria-hidden />
               </button>
+              {isMacTauriComposerDesktop() ? (
+                <button
+                  type="button"
+                  className="ghost-icon-button"
+                  aria-label="系统原生语音输入"
+                  title="打开系统原生文本框，可在其中使用 Fn / 豆包听写，确认后插入到此处"
+                  onClick={() => {
+                    void openMacNativeDictationPanel().catch((err) =>
+                      toast.error(err instanceof Error ? err.message : String(err)),
+                    )
+                  }}
+                >
+                  <Keyboard size={18} strokeWidth={1.75} aria-hidden />
+                </button>
+              ) : null}
               <button type="button" className="ghost-icon-button" aria-label="技能">
                 <AppIcon name="spark" size={18} />
               </button>

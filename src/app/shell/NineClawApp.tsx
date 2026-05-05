@@ -1,4 +1,5 @@
 import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { listen } from '@tauri-apps/api/event'
 import { llmLogExportGet, llmLogExportSet } from '../../lib/llmLogExportClient'
 import type { MouseEvent } from 'react'
 import {
@@ -74,6 +75,7 @@ import {
   syncRuntimeParameters,
 } from '../../lib/piClient'
 import type { QrCodeEvent, BotStatusEvent } from '../../lib/piClient'
+import type { ApprovalRequest } from '../../lib/piClient'
 import { buildPromptWithAttachments } from '../../lib/composerAttachments'
 import { THEME_PRESETS, THEME_VARIABLE_KEYS } from '../../theme/themePresets'
 import {
@@ -142,6 +144,7 @@ import {
 } from '../lib'
 import { NineClawAppChrome } from './NineClawAppChrome'
 import { NineClawRouteOutlet } from './NineClawRouteOutlet'
+import { AgentApprovalDialog } from './AgentApprovalDialog'
 
 export function NineClawApp() {
   const toast = useToast()
@@ -159,8 +162,11 @@ export function NineClawApp() {
     activeHistoryItem,
     submitPrompt,
     submitPromptInNewSession,
+    submitWidgetResponse,
+    cancelWidgetResponse,
     abortPrompt,
     resetSessionDraft,
+    createEmptySession,
     selectHistoryItem,
     clearHistory,
     deleteHistoryItem,
@@ -246,6 +252,7 @@ export function NineClawApp() {
   const [qrDialogOpen, setQrDialogOpen] = useState(false)
   const [qrCodeUrl, setQrCodeUrl] = useState<string>('')
   const [qrStatus, setQrStatus] = useState<'waiting' | 'scanned' | 'confirmed' | 'error'>('waiting')
+  const [approvalRequest, setApprovalRequest] = useState<ApprovalRequest | null>(null)
   const [botLoading, setBotLoading] = useState(false)
   const [botStatusLog, setBotStatusLog] = useState<BotStatusEvent[]>([])
   /** 无选中会话时，输入区上方选择的模型（首条消息写入该会话） */
@@ -935,8 +942,10 @@ export function NineClawApp() {
 
   // ── Bot status log (diagnostics) ──
   useEffect(() => {
-    let unsub: (() => void) | undefined
-    void subscribeBotStatus((event) => {
+    let cancelled = false
+    let unlisten: (() => void) | undefined
+    subscribeBotStatus((event) => {
+      if (cancelled) return
       setBotStatusLog((prev) => [event, ...prev].slice(0, 20))
       if (!selectedManagedAgent) {
         return
@@ -964,11 +973,31 @@ export function NineClawApp() {
           },
         }
       })
-    }).then((unlisten) => {
-      unsub = unlisten
+    }).then((fn) => {
+      if (cancelled) {
+        fn()
+        return
+      }
+      unlisten = fn
     })
-    return () => unsub?.()
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
   }, [selectedManagedAgent])
+
+  // ── Agent Loop Guard Approval listener ──
+  useEffect(() => {
+    let cancelled = false
+    let unlisten: (() => void) | undefined
+    listen<ApprovalRequest>('agent-loop://approval/request', (event) => {
+      if (!cancelled) setApprovalRequest(event.payload)
+    }).then((fn) => {
+      if (cancelled) { fn(); return }
+      unlisten = fn
+    })
+    return () => { cancelled = true; unlisten?.() }
+  }, [])
 
   const refreshSkillLibrary = useCallback(async () => {
     setSkillsLoading(true)
@@ -1209,7 +1238,11 @@ export function NineClawApp() {
 
   const handleStartNewWorkspaceSession = () => {
     startTransition(() => {
-      resetSessionDraft()
+      createEmptySession({
+        agent: activeChatAgent,
+        sessionLlm: sessionLlmDisplay,
+        workspaceId: activeWorkspaceId,
+      })
     })
   }
 
@@ -1329,7 +1362,11 @@ export function NineClawApp() {
 
     if (parsed.command.id === 'new') {
       clearComposerAttachments()
-      resetSessionDraft()
+      createEmptySession({
+        agent: activeChatAgent,
+        sessionLlm: sessionLlmDisplay,
+        workspaceId: view === 'workspaces' ? activeWorkspaceId : null,
+      })
       handleViewChange('chat')
       toast.success('已开启一个新的会话。')
       return true
@@ -1953,8 +1990,13 @@ export function NineClawApp() {
         ? newSessionLlm
         : pickFallbackSessionLlm(mergedProviderDefinitions, providerConfigs, targetAgent.defaultProviderId)
     resetSessionDraft()
-    setComposerAgent(buildConversationAgentSnapshot(targetAgent))
+    const targetSnapshot = buildConversationAgentSnapshot(targetAgent)
+    setComposerAgent(targetSnapshot)
     setComposerSessionLlm(nextSessionLlm)
+    createEmptySession({
+      agent: targetSnapshot,
+      sessionLlm: nextSessionLlm,
+    })
     setNewSessionDialogOpen(false)
     handleViewChange('chat')
   }
@@ -1982,8 +2024,13 @@ export function NineClawApp() {
       : pickFallbackSessionLlm(mergedProviderDefinitions, providerConfigs, targetAgent.defaultProviderId)
 
     resetSessionDraft()
-    setComposerAgent(buildConversationAgentSnapshot(targetAgent))
+    const targetSnapshot = buildConversationAgentSnapshot(targetAgent)
+    setComposerAgent(targetSnapshot)
     setComposerSessionLlm(nextSessionLlm)
+    createEmptySession({
+      agent: targetSnapshot,
+      sessionLlm: nextSessionLlm,
+    })
     setNewSessionDialogOpen(false)
     setAgentEditorOpen(false)
     handleViewChange('chat')
@@ -2349,6 +2396,7 @@ export function NineClawApp() {
   }
 
   return (
+    <>
     <NineClawAppChrome
       chatProviderLabel={chatProviderLabel}
       onSessionLlmSelectChange={handleSessionLlmSelectChange}
@@ -2387,6 +2435,8 @@ export function NineClawApp() {
           sessionLlmSelectOptionsWithFallback={sessionLlmSelectOptionsWithFallback}
           runtimeReady={runtimeReady}
           runtimeBlockingReason={runtimeBlockingReason}
+          onSubmitWidgetResponse={submitWidgetResponse}
+          onCancelWidgetResponse={cancelWidgetResponse}
           sessionContextProviderConfig={
             (view === 'chat' ? standaloneActiveHistoryItem : activeHistoryItem)?.sessionLlmProviderId
               ? {
@@ -2565,8 +2615,17 @@ export function NineClawApp() {
       settingsTab={settingsTab}
       settingsSkillsLibrary={settingsSkillsLibrary}
       settingsResourcesLibrary={settingsResourcesLibrary}
+      settingsMemoryAgents={agentsDisplayOrder}
+      settingsMemoryDefaultAgentId={defaultAgentId}
       llmTraceSessionId={currentConversationHistoryId}
       llmTraceWorkspaceId={view === 'workspaces' && activeWorkspaceId ? activeWorkspaceId : null}
     />
+    {approvalRequest && (
+      <AgentApprovalDialog
+        request={approvalRequest}
+        onDone={() => setApprovalRequest(null)}
+      />
+    )}
+    </>
   )
 }

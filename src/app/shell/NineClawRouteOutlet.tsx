@@ -19,6 +19,10 @@ import type {
 } from '../../types'
 import type { BotStatusEvent } from '../../lib/piClient'
 import { ChatView } from '../chat/ChatWorkspace'
+import {
+  WidgetSegmentsContext,
+  type WidgetSegmentsContextValue,
+} from '../widgets/WidgetSegmentsContext'
 
 const AgentsView = lazy(async () => {
   const module = await import('../agents/AgentsView')
@@ -80,6 +84,8 @@ export type NineClawRouteOutletProps = {
   runtimeReady: boolean
   runtimeBlockingReason: string | null
   sessionContextProviderConfig: Pick<ProviderConfig, 'maxContextTokens'> | null
+  onSubmitWidgetResponse?: WidgetSegmentsContextValue['onSubmitWidget']
+  onCancelWidgetResponse?: WidgetSegmentsContextValue['onCancelWidget']
   installedSkills: InstalledSkillItem[]
   editableAgents: AgentRecord[]
   onOpenAgentEditor: (agentId: string) => void
@@ -205,6 +211,8 @@ export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
     runtimeReady,
     runtimeBlockingReason,
     sessionContextProviderConfig,
+    onSubmitWidgetResponse,
+    onCancelWidgetResponse,
     installedSkills,
     editableAgents,
     onOpenAgentEditor,
@@ -301,42 +309,49 @@ export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
 
   if (view === 'chat') {
     return (
-      <ChatView
-        agentBuilderActionBusyId={agentBuilderActionBusyId}
-        agentBuilderActionError={agentBuilderActionError}
-        agentBuilderActionNotice={agentBuilderActionNotice}
-        agentBuilderActionTargetId={agentBuilderActionTargetId}
-        composerClearRef={composerClearRef}
-        composerDraftBackupRef={composerDraftBackupRef}
-        error={chatGateError || piError}
-        showExecutionRail={appearanceSettings.showExecutionRail}
-        showThinkingProcess={appearanceSettings.showThinkingProcess}
-        globalBusy={loading}
-        runningHistoryIds={runningHistoryIds}
-        streamingHistoryIds={streamingHistoryIds}
-        activeHistoryId={activeHistoryId ?? ''}
-        onAbort={onAbort}
-        attachmentError={composerAttachmentError}
-        attachmentInputRef={composerAttachmentInputRef}
-        attachmentUploading={composerAttachmentUploading}
-        composerAttachments={composerAttachments}
-        onCreateAgentDraft={onChatAgentBuilderCreate}
-        onComposerAttachmentInputChange={onComposerAttachmentInputChange}
-        onComposerClearAttachments={onComposerClearAttachments}
-        onComposerPaste={onComposerPaste}
-        onComposerPickAttachment={onComposerPickAttachment}
-        onComposerRemoveAttachment={onComposerRemoveAttachment}
-        onComposerClearAttachmentError={onComposerClearAttachmentError}
-        onSubmit={(text) => {
-          void onChatSubmit(text)
+      <WidgetSegmentsContext.Provider
+        value={{
+          onSubmitWidget: onSubmitWidgetResponse,
+          onCancelWidget: onCancelWidgetResponse,
         }}
-        selectedAgent={activeChatAgent}
-        submitShortcut={submitShortcut}
-        activeHistoryItem={activeHistoryItem}
-        runtimeReady={runtimeReady}
-        runtimeBlockingReason={runtimeBlockingReason}
-        sessionContextProviderConfig={sessionContextProviderConfig}
-      />
+      >
+        <ChatView
+          agentBuilderActionBusyId={agentBuilderActionBusyId}
+          agentBuilderActionError={agentBuilderActionError}
+          agentBuilderActionNotice={agentBuilderActionNotice}
+          agentBuilderActionTargetId={agentBuilderActionTargetId}
+          composerClearRef={composerClearRef}
+          composerDraftBackupRef={composerDraftBackupRef}
+          error={chatGateError || piError}
+          showExecutionRail={appearanceSettings.showExecutionRail}
+          showThinkingProcess={appearanceSettings.showThinkingProcess}
+          globalBusy={loading}
+          runningHistoryIds={runningHistoryIds}
+          streamingHistoryIds={streamingHistoryIds}
+          activeHistoryId={activeHistoryId ?? ''}
+          onAbort={onAbort}
+          attachmentError={composerAttachmentError}
+          attachmentInputRef={composerAttachmentInputRef}
+          attachmentUploading={composerAttachmentUploading}
+          composerAttachments={composerAttachments}
+          onCreateAgentDraft={onChatAgentBuilderCreate}
+          onComposerAttachmentInputChange={onComposerAttachmentInputChange}
+          onComposerClearAttachments={onComposerClearAttachments}
+          onComposerPaste={onComposerPaste}
+          onComposerPickAttachment={onComposerPickAttachment}
+          onComposerRemoveAttachment={onComposerRemoveAttachment}
+          onComposerClearAttachmentError={onComposerClearAttachmentError}
+          onSubmit={(text) => {
+            void onChatSubmit(text)
+          }}
+          selectedAgent={activeChatAgent}
+          submitShortcut={submitShortcut}
+          activeHistoryItem={activeHistoryItem}
+          runtimeReady={runtimeReady}
+          runtimeBlockingReason={runtimeBlockingReason}
+          sessionContextProviderConfig={sessionContextProviderConfig}
+        />
+      </WidgetSegmentsContext.Provider>
     )
   }
 
@@ -387,6 +402,8 @@ export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
             onComposerClearAttachmentError={onComposerClearAttachmentError}
             onChatSubmit={onChatSubmit}
             onDispatchDelegatePlan={onDispatchDelegatePlan}
+            onSubmitWidgetResponse={onSubmitWidgetResponse}
+            onCancelWidgetResponse={onCancelWidgetResponse}
             selectedAgent={activeChatAgent}
             submitShortcut={submitShortcut}
             activeHistoryItem={activeHistoryItem}

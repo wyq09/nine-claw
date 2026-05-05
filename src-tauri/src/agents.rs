@@ -6,10 +6,28 @@ use crate::agent_workspace::{self, AgentWorkspaceSeed};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
 use tauri::AppHandle;
 use uuid::Uuid;
 
 const DEFAULT_AGENT_STATE_KEY: &str = "default_agent_id";
+const LEGACY_DEFAULT_ALLOWED_TOOL_IDS: &[&str] = &[
+    "bash",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "grep",
+    "list_dir",
+    "glob",
+    "web_search",
+    "web_fetch",
+    "image_generate",
+    "image_task_query",
+    "ask_user",
+    "agent_spawn",
+    "external_api",
+];
 const DEFAULT_ALLOWED_TOOL_IDS: &[&str] = &[
     "bash",
     "read_file",
@@ -22,8 +40,19 @@ const DEFAULT_ALLOWED_TOOL_IDS: &[&str] = &[
     "web_fetch",
     "image_generate",
     "image_task_query",
+    "ask_user",
     "agent_spawn",
     "external_api",
+    "memory_update",
+    "memory_search",
+    "memory_read",
+    "memory_delete",
+    "memory_store",
+    "memory_save",
+    "memory_get",
+    "memory_forget",
+    "memory_list",
+    "chat_search",
 ];
 
 /// 用户在「系统指令」中填写的内容会进入 `agent_system_prompt`；不应对其做过短截断，仅保留与模型侧类似的硬上限防误粘贴。
@@ -296,6 +325,13 @@ pub fn default_allowed_tool_ids() -> Vec<String> {
         .collect()
 }
 
+fn legacy_default_allowed_tool_ids() -> Vec<String> {
+    LEGACY_DEFAULT_ALLOWED_TOOL_IDS
+        .iter()
+        .map(|item| item.to_string())
+        .collect()
+}
+
 pub fn normalize_allowed_tool_ids(tool_ids: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut normalized = Vec::new();
@@ -322,6 +358,15 @@ pub fn runtime_tool_names_for_allowed_tool_ids(tool_ids: &[String]) -> Vec<Strin
             "glob" => "find",
             "agent_spawn" => "agent_delegate",
             "external_api" => "nineclaw_external_api",
+            "memory_update" => "memory_update",
+            "memory_search" => "memory_search",
+            "memory_read" => "memory_read",
+            "memory_delete" => "memory_delete",
+            "memory_store" => "memory_store",
+            "memory_get" => "memory_get",
+            "memory_forget" => "memory_forget",
+            "memory_list" => "memory_list",
+            "chat_search" => "chat_search",
             value => value,
         };
         let runtime_name = runtime_name.trim();
@@ -405,6 +450,107 @@ pub fn delete_agent(app: &AppHandle, agent_id: String) -> Result<(), String> {
 pub fn set_default_agent(app: &AppHandle, agent_id: String) -> Result<Option<AgentRecord>, String> {
     let connection = crate::open_history_db(app)?;
     set_default_agent_with_connection(&connection, &agent_id)
+}
+
+pub fn list_default_agent_presets(
+    _app: &AppHandle,
+) -> Result<Vec<crate::agent_presets::AgentPresetSummary>, String> {
+    Ok(crate::agent_presets::list_default_agent_preset_summaries())
+}
+
+pub fn reset_agent_to_default_preset(
+    app: &AppHandle,
+    agent_id: String,
+) -> Result<AgentRecord, String> {
+    let mut connection = crate::open_history_db(app)?;
+    ensure_agents_ready(&connection)?;
+    reset_agent_to_default_preset_with_connection(&mut connection, agent_id.trim())
+}
+
+fn reset_agent_to_default_preset_with_connection(
+    connection: &mut Connection,
+    agent_id: &str,
+) -> Result<AgentRecord, String> {
+    let preset = crate::agent_presets::find_default_agent_preset(agent_id)
+        .ok_or_else(|| "该智能体没有内置默认预设，无法恢复默认".to_string())?;
+    let Some(existing) = get_active_agent_by_id(connection, agent_id)? else {
+        return Err("要恢复默认的智能体不存在".to_string());
+    };
+    let now = crate::chrono_like_timestamp();
+    let collaboration_json = serialize_collaboration_config(preset.collaboration_config.as_ref())?;
+    let heartbeat_json = serialize_heartbeat_config(&preset.heartbeat_config)?;
+    let scenario_json = serialize_scenario_llm_config(&preset.scenario_llm_config)?;
+    let capability_policy_json = serialize_capability_policy(&preset.capability_policy)?;
+    let allowed_tool_ids_json = serialize_allowed_tool_ids(&preset.allowed_tool_ids)?;
+
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("恢复默认预设事务失败: {error}"))?;
+    transaction
+        .execute(
+            "UPDATE agents SET
+                name = ?2,
+                summary = ?3,
+                description = ?4,
+                system_prompt = ?5,
+                default_provider_id = ?6,
+                default_model = ?7,
+                execution_mode = ?8,
+                collaboration_config_json = ?9,
+                heartbeat_config_json = ?10,
+                capability_policy_json = ?11,
+                allowed_tool_ids_json = ?12,
+                accent_color = ?13,
+                avatar_uri = ?14,
+                scenario_llm_config_json = ?15,
+                updated_at = ?16
+            WHERE id = ?1",
+            params![
+                existing.id.as_str(),
+                preset.name.as_str(),
+                preset.summary.as_str(),
+                preset.description.as_str(),
+                preset.system_prompt.as_str(),
+                preset.default_provider_id.as_str(),
+                preset.default_model.as_str(),
+                preset.execution_mode.as_str(),
+                collaboration_json,
+                heartbeat_json,
+                capability_policy_json,
+                allowed_tool_ids_json,
+                preset.accent_color.as_deref(),
+                preset.avatar_uri.as_deref(),
+                scenario_json,
+                now,
+            ],
+        )
+        .map_err(|error| format!("恢复默认预设写回智能体失败: {error}"))?;
+    replace_agent_skills(&transaction, existing.id.as_str(), &preset.skill_ids, now)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("恢复默认预设提交失败: {error}"))?;
+
+    if agent_workspace::runtime_sync_enabled() {
+        let seed = AgentWorkspaceSeed {
+            id: existing.id.as_str(),
+            name: preset.name.as_str(),
+            summary: preset.summary.as_str(),
+            description: preset.description.as_str(),
+            accent_color: preset.accent_color.as_deref(),
+            is_builtin: existing.is_builtin,
+        };
+        agent_workspace::ensure_agent_workspace(seed, false)
+            .map_err(|error| format!("恢复默认预设时同步工作区失败: {error}"))?;
+        agent_workspace::write_agent_preset_workspace_files(
+            existing.id.as_str(),
+            &preset.workspace_files,
+            true,
+        )
+        .map_err(|error| format!("恢复默认预设工作区文件失败: {error}"))?;
+    }
+
+    get_active_agent_by_id(connection, existing.id.as_str())?
+        .ok_or_else(|| "恢复默认预设后读取智能体失败".to_string())
 }
 
 /// 读取智能体完整记录（含 `bot_configs`），供对等网关等按智能体解析密钥。
@@ -567,7 +713,7 @@ pub fn build_agent_system_prompt_for_prompt(
         } else {
             String::new()
         };
-            sections.push(format!("偏好技能：{}{}", listed, suffix));
+        sections.push(format!("偏好技能：{}{}", listed, suffix));
     }
 
     if !agent.allowed_tool_ids.is_empty() {
@@ -667,7 +813,11 @@ fn ensure_agents_schema(connection: &Connection) -> Result<(), String> {
     add_agents_column_if_missing(connection, "capability_policy_json", "TEXT")?;
     add_agents_column_if_missing(connection, "allowed_tool_ids_json", "TEXT")?;
     add_agents_column_if_missing(connection, "trigger_condition", "TEXT NOT NULL DEFAULT ''")?;
-    add_agents_column_if_missing(connection, "manual_trigger_only", "INTEGER NOT NULL DEFAULT 0")?;
+    add_agents_column_if_missing(
+        connection,
+        "manual_trigger_only",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_agents_column_if_missing(connection, "avatar_uri", "TEXT")?;
     crate::heartbeat::ensure_heartbeat_schema(connection)?;
 
@@ -706,7 +856,9 @@ fn add_agents_column_if_missing(
 fn ensure_agents_ready(connection: &Connection) -> Result<(), String> {
     crate::ensure_app_state_schema(connection)?;
     ensure_agents_schema(connection)?;
+    upgrade_legacy_default_allowed_tools(connection)?;
     seed_builtin_agents(connection)?;
+    seed_default_preset_agents(connection)?;
     try_sync_active_agent_workspaces(connection, "初始化智能体工作区");
     Ok(())
 }
@@ -737,6 +889,105 @@ fn seed_builtin_agents(connection: &Connection) -> Result<(), String> {
                 ],
             )
             .map_err(|error| format!("写入内置智能体失败: {error}"))?;
+    }
+
+    Ok(())
+}
+
+fn seed_default_preset_agents(connection: &Connection) -> Result<(), String> {
+    let now = 1_746_288_000_000_i64;
+    for preset in crate::agent_presets::load_default_agent_presets() {
+        let collaboration_json =
+            serialize_collaboration_config(preset.collaboration_config.as_ref())?;
+        let heartbeat_json = serialize_heartbeat_config(&preset.heartbeat_config)?;
+        let scenario_json = serialize_scenario_llm_config(&preset.scenario_llm_config)?;
+        let capability_policy_json = serialize_capability_policy(&preset.capability_policy)?;
+        let allowed_tool_ids_json = serialize_allowed_tool_ids(&preset.allowed_tool_ids)?;
+        let inserted = connection
+            .execute(
+                "INSERT OR IGNORE INTO agents (
+                    id, name, summary, description, trigger_condition, manual_trigger_only, system_prompt, default_provider_id,
+                    default_model, is_builtin, is_archived, execution_mode,
+                    collaboration_config_json, heartbeat_config_json, capability_policy_json, allowed_tool_ids_json, accent_color, avatar_uri, scenario_llm_config_json, agent_loop_config_json, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, '', 0, ?5, ?6, ?7, 0, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, NULL, ?16, ?16)",
+                params![
+                    preset.id.as_str(),
+                    preset.name.as_str(),
+                    preset.summary.as_str(),
+                    preset.description.as_str(),
+                    preset.system_prompt.as_str(),
+                    preset.default_provider_id.as_str(),
+                    preset.default_model.as_str(),
+                    preset.execution_mode.as_str(),
+                    collaboration_json,
+                    heartbeat_json,
+                    capability_policy_json,
+                    allowed_tool_ids_json,
+                    preset.accent_color.as_deref(),
+                    preset.avatar_uri.as_deref(),
+                    scenario_json,
+                    now,
+                ],
+            )
+            .map_err(|error| format!("写入默认智能体预设失败: {error}"))?;
+        if inserted > 0 {
+            replace_agent_skills(connection, preset.id.as_str(), &preset.skill_ids, now)?;
+        }
+
+        if agent_workspace::runtime_sync_enabled() {
+            let seed = AgentWorkspaceSeed {
+                id: preset.id.as_str(),
+                name: preset.name.as_str(),
+                summary: preset.summary.as_str(),
+                description: preset.description.as_str(),
+                accent_color: preset.accent_color.as_deref(),
+                is_builtin: false,
+            };
+            agent_workspace::ensure_agent_workspace(seed, false)
+                .map_err(|error| format!("创建默认智能体预设工作区失败: {error}"))?;
+            agent_workspace::write_agent_preset_workspace_files(
+                preset.id.as_str(),
+                &preset.workspace_files,
+                false,
+            )
+            .map_err(|error| format!("写入默认智能体预设工作区失败: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn upgrade_legacy_default_allowed_tools(connection: &Connection) -> Result<(), String> {
+    let legacy_default = legacy_default_allowed_tool_ids();
+    let current_default_json = serialize_allowed_tool_ids(&default_allowed_tool_ids())?;
+    let mut stmt = connection
+        .prepare("SELECT id, allowed_tool_ids_json FROM agents")
+        .map_err(|error| format!("准备扫描智能体工具白名单失败: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|error| format!("扫描智能体工具白名单失败: {error}"))?;
+
+    let mut ids_to_upgrade = Vec::new();
+    for row in rows {
+        let (agent_id, raw_allowed_tool_ids) =
+            row.map_err(|error| format!("读取智能体工具白名单失败: {error}"))?;
+        let normalized = raw_allowed_tool_ids
+            .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+            .map(normalize_allowed_tool_ids)
+            .unwrap_or_else(default_allowed_tool_ids);
+        if normalized == legacy_default {
+            ids_to_upgrade.push(agent_id);
+        }
+    }
+
+    for agent_id in ids_to_upgrade {
+        connection
+            .execute(
+                "UPDATE agents SET allowed_tool_ids_json = ?2 WHERE id = ?1",
+                params![agent_id, current_default_json.clone()],
+            )
+            .map_err(|error| format!("升级智能体默认工具白名单失败: {error}"))?;
     }
 
     Ok(())
@@ -825,6 +1076,7 @@ fn builtin_agent_seeds() -> Vec<BuiltinAgentSeed> {
 
 fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecord>, String> {
     ensure_agents_ready(connection)?;
+    let primary_default_id = crate::agent_presets::DEFAULT_PRIMARY_AGENT_ID;
 
     let mut statement = connection
         .prepare(
@@ -853,7 +1105,7 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
             FROM agents
             WHERE is_archived = 0
             ORDER BY
-                CASE WHEN id = 'general-assistant' THEN 0 ELSE 1 END,
+                CASE WHEN id = ?1 THEN 0 WHEN id = 'general-assistant' THEN 1 ELSE 2 END,
                 is_builtin DESC,
                 lower(name) ASC,
                 updated_at DESC",
@@ -861,7 +1113,7 @@ fn list_agents_with_connection(connection: &Connection) -> Result<Vec<AgentRecor
         .map_err(|error| format!("读取智能体列表失败: {error}"))?;
 
     let rows = statement
-        .query_map([], |row| {
+        .query_map(params![primary_default_id], |row| {
             Ok(AgentRecord {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -940,6 +1192,12 @@ fn get_default_agent_with_connection(
 }
 
 fn find_fallback_default_agent(connection: &Connection) -> Result<Option<AgentRecord>, String> {
+    if let Some(agent) =
+        get_active_agent_by_id(connection, crate::agent_presets::DEFAULT_PRIMARY_AGENT_ID)?
+    {
+        return Ok(Some(agent));
+    }
+
     if let Some(agent) = get_active_agent_by_id(connection, "general-assistant")? {
         return Ok(Some(agent));
     }
@@ -1110,6 +1368,22 @@ fn create_agent_with_connection(
 ) -> Result<AgentRecord, String> {
     ensure_agents_ready(connection)?;
     let normalized = normalize_agent_input(payload)?;
+    {
+        let conflict = connection
+            .query_row(
+                "SELECT 1 FROM agents WHERE name = ?1 AND is_archived = 0 LIMIT 1",
+                params![normalized.name.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("检查智能体名称是否可用失败: {error}"))?;
+        if conflict.is_some() {
+            return Err(format!(
+                "智能体名称「{}」已存在，请换一个。",
+                normalized.name
+            ));
+        }
+    }
     let agent_id = normalized
         .id
         .clone()
@@ -1194,23 +1468,30 @@ fn update_agent_with_connection(
         .ok_or_else(|| "要更新的智能体不存在".to_string())?;
 
     let normalized = normalize_agent_input(payload)?;
+    {
+        let conflict = connection
+            .query_row(
+                "SELECT 1 FROM agents WHERE name = ?1 AND id != ?2 AND is_archived = 0 LIMIT 1",
+                params![normalized.name.as_str(), agent_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("检查智能体名称是否可用失败: {error}"))?;
+        if conflict.is_some() {
+            return Err(format!(
+                "智能体名称「{}」已存在，请换一个。",
+                normalized.name
+            ));
+        }
+    }
     let next_agent_id = normalized
         .id
         .clone()
         .unwrap_or_else(|| agent_id.to_string());
     if next_agent_id.as_str() != agent_id {
-        let conflict = connection
-            .query_row(
-                "SELECT 1 FROM agents WHERE id = ?1",
-                params![next_agent_id.as_str()],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|error| format!("检查 Agent_ID 是否可用失败: {error}"))?;
-        if conflict.is_some() {
-            return Err("Agent_ID 已存在，请换一个。".to_string());
-        }
+        return Err("Agent_ID 创建后不可修改".to_string());
     }
+    let mut workspace_rename = prepare_agent_workspace_rename(agent_id, &next_agent_id)?;
     let now = crate::chrono_like_timestamp();
     let collaboration_json =
         serialize_collaboration_config(normalized.collaboration_config.as_ref())?;
@@ -1260,7 +1541,11 @@ fn update_agent_with_connection(
                 normalized.summary,
                 normalized.description,
                 normalized.trigger_condition,
-                if normalized.manual_trigger_only { 1_i64 } else { 0_i64 },
+                if normalized.manual_trigger_only {
+                    1_i64
+                } else {
+                    0_i64
+                },
                 normalized.system_prompt,
                 normalized.default_provider_id,
                 normalized.default_model,
@@ -1285,15 +1570,96 @@ fn update_agent_with_connection(
     let mut bot_configs = normalized.bot_configs;
     apply_peer_inbound_defaults(&mut bot_configs, existing.bot_configs.get("peer"));
     replace_agent_bot_bindings(&transaction, &next_agent_id, &bot_configs, now)?;
-    transaction
-        .commit()
-        .map_err(|error| format!("提交智能体更新失败: {error}"))?;
+    if let Some(plan) = workspace_rename.as_mut() {
+        plan.execute()?;
+    }
+    if let Err(error) = transaction.commit() {
+        if let Some(plan) = workspace_rename.as_mut() {
+            let _ = plan.revert();
+        }
+        return Err(format!("提交智能体更新失败: {error}"));
+    }
 
     let record = get_active_agent_by_id(connection, &next_agent_id)?
         .ok_or_else(|| "更新智能体后读取结果失败".to_string())?;
     try_ensure_workspace_for_record(&record, false, "更新智能体工作区");
     try_sync_active_agent_workspaces(connection, "更新后同步智能体工作区");
     Ok(record)
+}
+
+struct AgentWorkspaceRenamePlan {
+    old_path: PathBuf,
+    new_path: PathBuf,
+    applied: bool,
+}
+
+impl AgentWorkspaceRenamePlan {
+    fn execute(&mut self) -> Result<(), String> {
+        if self.applied || !self.old_path.exists() {
+            return Ok(());
+        }
+        if self.new_path.exists() {
+            return Err(format!(
+                "智能体工作区目录已存在，无法迁移到新 Agent_ID：{}",
+                self.new_path.display()
+            ));
+        }
+        fs::rename(&self.old_path, &self.new_path).map_err(|error| {
+            format!(
+                "重命名智能体工作区失败 {} -> {}: {error}",
+                self.old_path.display(),
+                self.new_path.display()
+            )
+        })?;
+        self.applied = true;
+        Ok(())
+    }
+
+    fn revert(&mut self) -> Result<(), String> {
+        if !self.applied || !self.new_path.exists() {
+            return Ok(());
+        }
+        fs::rename(&self.new_path, &self.old_path).map_err(|error| {
+            format!(
+                "回滚智能体工作区重命名失败 {} -> {}: {error}",
+                self.new_path.display(),
+                self.old_path.display()
+            )
+        })?;
+        self.applied = false;
+        Ok(())
+    }
+}
+
+fn prepare_agent_workspace_rename(
+    old_agent_id: &str,
+    new_agent_id: &str,
+) -> Result<Option<AgentWorkspaceRenamePlan>, String> {
+    if old_agent_id == new_agent_id {
+        return Ok(None);
+    }
+
+    let root = agent_workspace::resolve_workspace_root()?;
+    agent_workspace::ensure_root_scaffold(&root)?;
+
+    let old_path = root.join("agents").join(old_agent_id);
+    if !old_path.exists() {
+        return Ok(None);
+    }
+
+    let new_path = root.join("agents").join(new_agent_id);
+    if new_path.exists() {
+        return Err(format!(
+            "智能体工作区目录已存在，无法迁移到新 Agent_ID：{}",
+            new_path.display()
+        ));
+    }
+
+    Ok(Some(AgentWorkspaceRenamePlan {
+        old_path,
+        new_path,
+        applied: false,
+    }))
 }
 
 fn archive_agent_with_connection(
@@ -1345,6 +1711,7 @@ fn delete_agent_with_connection(connection: &mut Connection, agent_id: &str) -> 
         return Err("内置智能体不允许删除".to_string());
     }
 
+    let now = crate::chrono_like_timestamp();
     let transaction = connection
         .transaction()
         .map_err(|error| format!("删除智能体事务失败: {error}"))?;
@@ -1368,8 +1735,11 @@ fn delete_agent_with_connection(connection: &mut Connection, agent_id: &str) -> 
         )
         .map_err(|error| format!("删除智能体技能绑定失败: {error}"))?;
     transaction
-        .execute("DELETE FROM agents WHERE id = ?1", params![agent_id])
-        .map_err(|error| format!("删除智能体失败: {error}"))?;
+        .execute(
+            "UPDATE agents SET is_archived = 1, updated_at = ?2 WHERE id = ?1",
+            params![agent_id, now],
+        )
+        .map_err(|error| format!("归档智能体失败: {error}"))?;
 
     let current_default = transaction
         .query_row(
@@ -1505,6 +1875,176 @@ fn table_exists(connection: &Connection, table_name: &str) -> Result<bool, Strin
         .optional()
         .map(|value| value.unwrap_or(false))
         .map_err(|error| format!("检查数据表是否存在失败: {error}"))
+}
+
+/// 将旧 agent_id 的全部数据（数据库记录 + 向量命名空间 + 工作区目录）合并到新 agent_id。
+/// 用于一次性迁移，迁移完成后旧记录被归档。
+pub fn migrate_agent_id(
+    app: &AppHandle,
+    old_agent_id: String,
+    new_agent_id: String,
+) -> Result<String, String> {
+    let mut connection = crate::open_history_db(app)?;
+    migrate_agent_id_with_connection(&mut connection, &old_agent_id, &new_agent_id)
+}
+
+fn migrate_agent_id_with_connection(
+    connection: &mut Connection,
+    old_agent_id: &str,
+    new_agent_id: &str,
+) -> Result<String, String> {
+    let old = old_agent_id.trim();
+    let new_id = new_agent_id.trim();
+    if old.is_empty() || new_id.is_empty() || old == new_id {
+        return Err("旧 Agent_ID 和新 Agent_ID 不能相同且不能为空".to_string());
+    }
+
+    // 确认旧 agent 存在
+    let _old_agent = get_active_agent_by_id(connection, old)?
+        .ok_or_else(|| format!("旧智能体「{old}」不存在或已归档"))?;
+
+    // 检查新 ID 是否已存在
+    let new_exists = get_active_agent_by_id(connection, new_id)?.is_some();
+    if new_exists {
+        return Err(format!(
+            "新 Agent_ID「{new_id}」已存在，请先删除或归档该智能体"
+        ));
+    }
+
+    let now = crate::chrono_like_timestamp();
+
+    // 1) agents 表：更新 id + name（保持其他字段不变）
+    let rows = connection
+        .execute(
+            "UPDATE agents SET id = ?2, updated_at = ?3 WHERE id = ?1 AND is_archived = 0",
+            params![old, new_id, now],
+        )
+        .map_err(|error| format!("更新 agents 表 ID 失败: {error}"))?;
+    if rows == 0 {
+        return Err("未找到活跃的旧智能体记录".to_string());
+    }
+
+    // 2) 级联更新所有直接引用 agent_id 的表
+    let direct_updates: &[(&str, &str, bool)] = &[
+        ("agent_skills", "UPDATE agent_skills SET agent_id = ?2 WHERE agent_id = ?1", false),
+        ("agent_bot_bindings", "UPDATE agent_bot_bindings SET agent_id = ?2, updated_at = ?3 WHERE agent_id = ?1", true),
+        ("agent_heartbeat_runs", "UPDATE agent_heartbeat_runs SET agent_id = ?2 WHERE agent_id = ?1", false),
+        ("chat_sessions", "UPDATE chat_sessions SET agent_id = ?2 WHERE agent_id = ?1", false),
+        ("workspace_members", "UPDATE workspace_members SET agent_id = ?2 WHERE agent_id = ?1", false),
+        ("workspaces", "UPDATE workspaces SET supervisor_agent_id = ?2, updated_at = ?3 WHERE supervisor_agent_id = ?1", true),
+        ("workspace_resources", "UPDATE workspace_resources SET uploader_agent_id = ?2 WHERE uploader_agent_id = ?1", false),
+        ("workspace_memories", "UPDATE workspace_memories SET author_agent_id = ?2, updated_at = ?3 WHERE author_agent_id = ?1", true),
+        ("workspace_memories", "UPDATE workspace_memories SET scope_agent_id = ?2, updated_at = ?3 WHERE scope_agent_id = ?1", true),
+        ("core_memory_documents", "UPDATE core_memory_documents SET agent_id = ?2, updated_at = ?3 WHERE agent_id = ?1", true),
+        ("core_memory_events", "UPDATE core_memory_events SET agent_id = ?2 WHERE agent_id = ?1", false),
+        ("runtime_session_events", "UPDATE runtime_session_events SET agent_id = ?2 WHERE agent_id = ?1", false),
+        ("token_usage_records", "UPDATE token_usage_records SET agent_id = ?2 WHERE agent_id = ?1", false),
+    ];
+    let mut direct_count = 0u64;
+    for (table, stmt, uses_now) in direct_updates {
+        if !table_exists(connection, table)? {
+            continue;
+        }
+        let affected = if *uses_now {
+            connection.execute(stmt, params![old, new_id, now])
+        } else {
+            connection.execute(stmt, params![old, new_id])
+        }
+        .map_err(|error| format!("更新 {table} 失败: {error}"))?;
+        direct_count += affected as u64;
+    }
+
+    // 3) user_memories: owner_scope='agent' AND owner_id=old
+    let mut user_mem_count = 0u64;
+    if table_exists(connection, "user_memories")? {
+        user_mem_count = connection
+            .execute(
+                "UPDATE user_memories SET owner_id = ?2 WHERE owner_scope = 'agent' AND owner_id = ?1",
+                params![old, new_id],
+            )
+            .map_err(|error| format!("更新 user_memories 失败: {error}"))? as u64;
+    }
+
+    // 4) memory_vectors 命名空间更新
+    let mut vector_count = 0u64;
+    if table_exists(connection, "memory_vectors")? {
+        // agent::old -> agent::new
+        vector_count += connection
+            .execute(
+                "UPDATE memory_vectors SET workspace_id = REPLACE(workspace_id, ?2, ?3) WHERE workspace_id LIKE ?1",
+                params![format!("agent::{old}"), format!("agent::{old}"), format!("agent::{new_id}")],
+            )
+            .map_err(|error| format!("更新 memory_vectors agent 命名空间失败: {error}"))? as u64;
+        // user-memory::agent::old -> user-memory::agent::new
+        vector_count += connection
+            .execute(
+                "UPDATE memory_vectors SET workspace_id = REPLACE(workspace_id, ?2, ?3) WHERE workspace_id LIKE ?1",
+                params![format!("user-memory::agent::{old}"), format!("user-memory::agent::{old}"), format!("user-memory::agent::{new_id}")],
+            )
+            .map_err(|error| format!("更新 memory_vectors user-memory 命名空间失败: {error}"))? as u64;
+        // memory_id 前缀 chat-turn:: 的 metadata_json 里 agentId
+        // 以及 workspace_id = build_agent_memory_workspace_id(old) 的情况
+        let agent_ws_old = format!("agent-ws-{old}");
+        let agent_ws_new = format!("agent-ws-{new_id}");
+        vector_count += connection
+            .execute(
+                "UPDATE memory_vectors SET workspace_id = ?2 WHERE workspace_id = ?1",
+                params![agent_ws_old, agent_ws_new],
+            )
+            .map_err(|error| format!("更新 memory_vectors agent-ws 命名空间失败: {error}"))?
+            as u64;
+    }
+
+    // 5) workspace_kv_memories 的 workspace_id
+    let mut kv_count = 0u64;
+    if table_exists(connection, "workspace_kv_memories")? {
+        let agent_ws_old = format!("agent-ws-{old}");
+        let agent_ws_new = format!("agent-ws-{new_id}");
+        kv_count = connection
+            .execute(
+                "UPDATE workspace_kv_memories SET workspace_id = ?2 WHERE workspace_id = ?1",
+                params![agent_ws_old, agent_ws_new],
+            )
+            .map_err(|error| format!("更新 workspace_kv_memories 失败: {error}"))?
+            as u64;
+    }
+
+    // 6) app_state 默认智能体
+    connection
+        .execute(
+            "UPDATE app_state SET value = ?2, updated_at = ?3 WHERE key = ?4 AND value = ?1",
+            params![old, new_id, now, DEFAULT_AGENT_STATE_KEY],
+        )
+        .map_err(|error| format!("更新默认智能体引用失败: {error}"))?;
+
+    // 7) 文件系统：工作区目录重命名
+    let mut workspace_renamed = false;
+    if let Ok(root) = agent_workspace::resolve_workspace_root() {
+        let old_path = root.join("agents").join(old);
+        let new_path = root.join("agents").join(new_id);
+        if old_path.exists() && !new_path.exists() {
+            if let Err(error) = std::fs::rename(&old_path, &new_path) {
+                eprintln!("NineClaw: 迁移工作区目录失败: {error}");
+            } else {
+                workspace_renamed = true;
+            }
+        }
+    }
+
+    try_sync_active_agent_workspaces(connection, "迁移后同步智能体工作区");
+
+    Ok(format!(
+        "迁移完成: 直接引用 {} 条, 用户记忆 {} 条, 向量 {} 条, KV {} 条, 工作区目录{}",
+        direct_count,
+        user_mem_count,
+        vector_count,
+        kv_count,
+        if workspace_renamed {
+            "已重命名"
+        } else {
+            "无需迁移"
+        },
+    ))
 }
 
 fn replace_agent_skills(
@@ -2459,6 +2999,12 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::MutexGuard;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TEST_WORKSPACE_ROOT_ENV: &str = "NINECLAW_WORKSPACE_ROOT";
 
     fn connection() -> Connection {
         let connection = Connection::open_in_memory().expect("in-memory db");
@@ -2472,6 +3018,18 @@ mod tests {
             )
             .expect("app_state schema");
         connection
+    }
+
+    fn workspace_test_lock() -> MutexGuard<'static, ()> {
+        crate::workspace_env_test_lock()
+    }
+
+    fn temp_workspace_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("nineclaw-agent-id-rename-{nonce}"))
     }
 
     #[test]
@@ -2529,6 +3087,8 @@ mod tests {
                     required_skill_ids: vec!["required".to_string()],
                     forbidden_skill_ids: vec!["blocked".to_string()],
                     max_dynamic_skills: 3,
+                    forbidden_paths: vec![],
+                    high_risk_actions: vec![],
                 }),
                 skill_ids: vec!["gamma".to_string()],
                 allowed_tool_ids: vec!["read_file".to_string(), "web_fetch".to_string()],
@@ -2634,6 +3194,64 @@ mod tests {
                 "agent_delegate".to_string(),
                 "nineclaw_external_api".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn upgrades_legacy_default_allowed_tool_ids_without_touching_custom_lists() {
+        let connection = connection();
+        ensure_agents_schema(&connection).expect("ensure schema");
+        connection
+            .execute(
+                "INSERT INTO agents (
+                    id, name, summary, description, trigger_condition, manual_trigger_only, system_prompt,
+                    default_provider_id, default_model, is_builtin, is_archived, execution_mode,
+                    collaboration_config_json, heartbeat_config_json, capability_policy_json,
+                    allowed_tool_ids_json, accent_color, avatar_uri, scenario_llm_config_json,
+                    agent_loop_config_json, created_at, updated_at
+                ) VALUES (
+                    'legacy-default', 'Legacy Default', '', '', '', 0, '',
+                    'openai', 'gpt-4.1', 0, 0, 'single',
+                    NULL, NULL, NULL, ?1, NULL, NULL, NULL, NULL, 1, 1
+                )",
+                params![serialize_allowed_tool_ids(&legacy_default_allowed_tool_ids())
+                    .expect("legacy tools")],
+            )
+            .expect("insert legacy default");
+        connection
+            .execute(
+                "INSERT INTO agents (
+                    id, name, summary, description, trigger_condition, manual_trigger_only, system_prompt,
+                    default_provider_id, default_model, is_builtin, is_archived, execution_mode,
+                    collaboration_config_json, heartbeat_config_json, capability_policy_json,
+                    allowed_tool_ids_json, accent_color, avatar_uri, scenario_llm_config_json,
+                    agent_loop_config_json, created_at, updated_at
+                ) VALUES (
+                    'custom-tools', 'Custom Tools', '', '', '', 0, '',
+                    'openai', 'gpt-4.1', 0, 0, 'single',
+                    NULL, NULL, NULL, ?1, NULL, NULL, NULL, NULL, 1, 1
+                )",
+                params![serialize_allowed_tool_ids(&vec![
+                    "read_file".to_string(),
+                    "web_fetch".to_string(),
+                ])
+                .expect("custom tools")],
+            )
+            .expect("insert custom tools");
+
+        upgrade_legacy_default_allowed_tools(&connection).expect("upgrade defaults");
+
+        let upgraded =
+            get_active_agent_by_id(&connection, "legacy-default").expect("get legacy default");
+        let custom = get_active_agent_by_id(&connection, "custom-tools").expect("get custom");
+
+        assert_eq!(
+            upgraded.expect("legacy default agent").allowed_tool_ids,
+            default_allowed_tool_ids()
+        );
+        assert_eq!(
+            custom.expect("custom agent").allowed_tool_ids,
+            vec!["read_file".to_string(), "web_fetch".to_string()]
         );
     }
 
@@ -2754,6 +3372,85 @@ mod tests {
     }
 
     #[test]
+    fn updating_agent_id_renames_workspace_directory() {
+        let _guard = workspace_test_lock();
+        let root = temp_workspace_root();
+        std::env::set_var(TEST_WORKSPACE_ROOT_ENV, &root);
+
+        let mut connection = connection();
+        let created = create_agent_with_connection(
+            &mut connection,
+            AgentInput {
+                id: Some("writer".to_string()),
+                name: "写手".to_string(),
+                summary: "负责写内容".to_string(),
+                description: "负责验证 ID 变更时迁移工作区".to_string(),
+                trigger_condition: String::new(),
+                manual_trigger_only: false,
+                system_prompt: "".to_string(),
+                capability_policy: None,
+                skill_ids: vec![],
+                allowed_tool_ids: default_allowed_tool_ids(),
+                default_provider_id: "openai".to_string(),
+                default_model: "gpt-4.1".to_string(),
+                execution_mode: Some("single".to_string()),
+                collaboration_config: None,
+                accent_color: None,
+                avatar_uri: None,
+                bot_configs: HashMap::new(),
+                heartbeat_config: AgentHeartbeatConfig::default(),
+                scenario_llm_config: None,
+                agent_loop_config: None,
+            },
+        )
+        .expect("create agent");
+
+        agent_workspace::ensure_agent_workspace(record_workspace_seed(&created), true)
+            .expect("scaffold workspace");
+        let old_home = root.join("agents").join(&created.id);
+        fs::write(old_home.join("MEMORY.md"), "# MEMORY.md\n\nold-data\n").expect("seed memory");
+
+        let updated = update_agent_with_connection(
+            &mut connection,
+            &created.id,
+            AgentInput {
+                id: Some("writer_v2".to_string()),
+                name: "写手".to_string(),
+                summary: "负责写内容".to_string(),
+                description: "负责验证 ID 变更时迁移工作区".to_string(),
+                trigger_condition: String::new(),
+                manual_trigger_only: false,
+                system_prompt: "".to_string(),
+                capability_policy: None,
+                skill_ids: vec![],
+                allowed_tool_ids: default_allowed_tool_ids(),
+                default_provider_id: "openai".to_string(),
+                default_model: "gpt-4.1".to_string(),
+                execution_mode: Some("single".to_string()),
+                collaboration_config: None,
+                accent_color: None,
+                avatar_uri: None,
+                bot_configs: HashMap::new(),
+                heartbeat_config: AgentHeartbeatConfig::default(),
+                scenario_llm_config: None,
+                agent_loop_config: None,
+            },
+        )
+        .expect("update agent id");
+
+        let new_home = root.join("agents").join(&updated.id);
+        assert!(!old_home.exists());
+        assert!(new_home.exists());
+        assert_eq!(
+            fs::read_to_string(new_home.join("MEMORY.md")).expect("read migrated memory"),
+            "# MEMORY.md\n\nold-data\n"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        std::env::remove_var(TEST_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
     fn default_agent_falls_back_and_reassigns_after_archive() {
         let mut connection = connection();
 
@@ -2761,7 +3458,7 @@ mod tests {
             get_default_agent_with_connection(&connection).expect("initial default");
         assert_eq!(
             initial_default.as_ref().map(|item| item.id.as_str()),
-            Some("general-assistant")
+            Some(crate::agent_presets::DEFAULT_PRIMARY_AGENT_ID)
         );
 
         let custom = create_agent_with_connection(
@@ -2806,8 +3503,62 @@ mod tests {
                 .expect("fallback default")
                 .as_ref()
                 .map(|item| item.id.as_str()),
-            Some("general-assistant")
+            Some(crate::agent_presets::DEFAULT_PRIMARY_AGENT_ID)
         );
+    }
+
+    #[test]
+    fn ensure_agents_ready_seeds_default_agent_presets() {
+        let connection = connection();
+        ensure_agents_ready(&connection).expect("seed presets");
+
+        let list = list_agents_with_connection(&connection).expect("list agents");
+        assert!(list.iter().any(|agent| agent.id == "jiujiexia"));
+        assert!(list.iter().any(|agent| agent.id == "color-master"));
+        assert!(list.iter().any(|agent| agent.id == "xiao8-frontend"));
+    }
+
+    #[test]
+    fn reset_agent_to_default_preset_restores_core_fields() {
+        let mut connection = connection();
+        ensure_agents_ready(&connection).expect("seed presets");
+
+        update_agent_with_connection(
+            &mut connection,
+            "jiujiexia",
+            AgentInput {
+                id: Some("jiujiexia".to_string()),
+                name: "九节虾".to_string(),
+                summary: "被改坏的摘要".to_string(),
+                description: "被改坏的描述".to_string(),
+                trigger_condition: String::new(),
+                manual_trigger_only: false,
+                system_prompt: "被改坏的提示词".to_string(),
+                capability_policy: None,
+                skill_ids: vec!["pdf".to_string()],
+                allowed_tool_ids: vec!["read_file".to_string()],
+                default_provider_id: "openai".to_string(),
+                default_model: "gpt-4o-mini".to_string(),
+                execution_mode: Some("single".to_string()),
+                collaboration_config: None,
+                accent_color: Some("#000000".to_string()),
+                avatar_uri: None,
+                bot_configs: HashMap::new(),
+                heartbeat_config: AgentHeartbeatConfig::default(),
+                scenario_llm_config: None,
+                agent_loop_config: None,
+            },
+        )
+        .expect("mutate preset agent");
+
+        let reset = reset_agent_to_default_preset_with_connection(&mut connection, "jiujiexia")
+            .expect("reset to preset");
+
+        assert!(reset.summary.contains("群哥的专属私人助理"));
+        assert!(reset.system_prompt.contains("你是九节虾"));
+        assert_eq!(reset.default_model, "gpt-4.1");
+        assert!(reset.skill_ids.iter().any(|skill| skill == "agent-builder"));
+        assert!(reset.allowed_tool_ids.iter().any(|tool| tool == "ask_user"));
     }
 
     #[test]
@@ -2825,6 +3576,8 @@ mod tests {
                 required_skill_ids: vec![],
                 forbidden_skill_ids: vec![],
                 max_dynamic_skills: 4,
+                forbidden_paths: vec![],
+                high_risk_actions: vec![],
             },
             skill_ids: vec!["alpha".to_string(), "beta".to_string()],
             allowed_tool_ids: vec!["read_file".to_string(), "web_fetch".to_string()],

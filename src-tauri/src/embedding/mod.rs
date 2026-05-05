@@ -43,9 +43,7 @@ impl ProviderRegistry {
 }
 
 pub fn new_registry() -> Arc<RwLock<ProviderRegistry>> {
-    Arc::new(RwLock::new(ProviderRegistry::new(
-        "bge-small-zh-local",
-    )))
+    Arc::new(RwLock::new(ProviderRegistry::new("bge-small-zh-local")))
 }
 
 #[cfg(test)]
@@ -137,16 +135,10 @@ mod tests {
         let mut registry = ProviderRegistry::new("mock");
 
         registry.register(Arc::new(MockProvider::new("mock", 64)));
-        assert_eq!(
-            registry.get("mock").unwrap().dimension(),
-            64
-        );
+        assert_eq!(registry.get("mock").unwrap().dimension(), 64);
 
         // Re-register with different dimension
         registry.register(Arc::new(MockProvider::new("mock", 256)));
-        assert_eq!(
-            registry.get("mock").unwrap().dimension(),
-            256
-        );
+        assert_eq!(registry.get("mock").unwrap().dimension(), 256);
     }
 }

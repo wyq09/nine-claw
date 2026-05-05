@@ -735,11 +735,9 @@ pub fn build_session_context_snapshot(
     if let Some(app) = injected_app_handle() {
         if let Ok(conn) = crate::storage_conn(&app) {
             if let Some(agent_id) = agent_home.file_name().and_then(|name| name.to_str()) {
-                if let Ok(events) =
-                    crate::storage::core_memory::list_recent_runtime_session_events(
-                        &conn, agent_id, limit,
-                    )
-                {
+                if let Ok(events) = crate::storage::core_memory::list_recent_runtime_session_events(
+                    &conn, agent_id, limit,
+                ) {
                     if !events.is_empty() {
                         let mut lines = vec!["Recent Session Events:".to_string()];
                         for event in events {
@@ -1148,6 +1146,7 @@ fn credential_proxy_server() -> Result<&'static CredentialProxyServer, String> {
         .route("/memory/:token/read", post(memory_read_handler))
         .route("/memory/:token/delete", post(memory_delete_handler))
         .route("/memory/:token/store", post(memory_store_handler))
+        .route("/memory/:token/save", post(memory_save_handler))
         .route("/memory/:token/get", post(memory_get_handler))
         .route("/memory/:token/forget", post(memory_forget_handler))
         .route("/memory/:token/list", post(memory_list_handler))
@@ -1443,8 +1442,16 @@ async fn delegate_proxy_handler(
     AxumPath(token): AxumPath<String>,
     Json(body): Json<DelegateRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    log::info!(
+        "delegate_proxy: 收到委派请求 token={} role={} task_len={}",
+        token.len(),
+        body.role.len(),
+        body.task.len(),
+    );
+
     // Resolve AppHandle lazily — may not be available on very first call
     let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        log::error!("delegate_proxy: AppHandle 尚未注入");
         (
             StatusCode::SERVICE_UNAVAILABLE,
             "AppHandle 尚未注入，委派功能暂不可用".to_string(),
@@ -1454,6 +1461,7 @@ async fn delegate_proxy_handler(
     // Look up session config to get provider info + caller context
     let (llm_binding, session_id, workspace_id, caller_agent_id, caller_agent_name) = {
         let guard = state.sessions.lock().map_err(|_| {
+            log::error!("delegate_proxy: session lock poisoned");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "session lock poisoned".to_string(),
@@ -1473,6 +1481,7 @@ async fn delegate_proxy_handler(
             .unwrap_or((None, None, None, None, None))
     };
     let Some(llm) = llm_binding else {
+        log::warn!("delegate_proxy: 未找到 session 或 LLM 配置 token={}", token.len());
         return Err((
             StatusCode::UNAUTHORIZED,
             "unknown session or no LLM config".to_string(),
@@ -1571,9 +1580,18 @@ async fn delegate_proxy_handler(
         &format!("[委派任务] {}\n\n{}", body.task, body.context),
     );
 
+    log::info!(
+        "delegate_proxy: 已解析目标智能体 id={} name={} provider={}/{} 开始执行委派",
+        agent.id,
+        agent.name,
+        provider_config.provider_id,
+        provider_config.model,
+    );
+
     // Execute delegation (blocking call with PiBridge)
     let app = app_handle.clone();
     let agent_id = agent.id.clone();
+    let agent_name = agent.name.clone();
     let task = body.task.clone();
     let context = if body.context.is_empty() {
         None
@@ -1583,17 +1601,32 @@ async fn delegate_proxy_handler(
     let trace_id_for_delegate = trace_id.clone();
 
     let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::agent_loop::delegate_to_agent_with_trace(
+        log::info!(
+            "delegate_proxy: spawn_blocking 开始 agent_id={} agent_name={}",
+            agent_id,
+            agent_name,
+        );
+        let result = crate::agent_loop::delegate_to_agent_with_trace(
             &app,
             &agent_id,
             &task,
             context.as_deref(),
             &provider_config,
             Some(trace_id_for_delegate.as_str()),
-        )
+        );
+        log::info!(
+            "delegate_proxy: spawn_blocking 完成 agent_id={} status={} output_len={}",
+            agent_id,
+            result.status,
+            result.output.len(),
+        );
+        result
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|e| {
+        log::error!("delegate_proxy: spawn_blocking JoinError: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     // Finalize trace
     let final_status = if result.status == "success" {
@@ -1949,7 +1982,8 @@ async fn memory_update_handler(
     // memory_search can find this content.
     if let Some(app_handle) = APP_HANDLE.get().cloned() {
         if let Ok(conn) = crate::storage_conn(&app_handle) {
-            let ws_id = resolve_memory_workspace(&state, &token, None).unwrap_or_else(|_| build_agent_memory_workspace_id(&agent_id));
+            let ws_id = resolve_memory_workspace(&state, &token, None)
+                .unwrap_or_else(|_| build_agent_memory_workspace_id(&agent_id));
             let _ = ensure_memory_workspace_namespace(&conn, &ws_id, Some(&agent_id));
 
             let record_id = memory_md_record_id(&agent_id);
@@ -2148,9 +2182,15 @@ async fn memory_search_handler(
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
             if let Some(agent_id) = caller_agent_id {
+                let mut namespaces = vec![crate::storage::core_memory::agent_vector_namespace(
+                    agent_id,
+                )];
+                namespaces.extend(crate::storage::user_memory::vector_namespaces_for_agent(
+                    Some(agent_id),
+                ));
                 let mut core_hits = crate::memory_vector::search_vectors_across_workspaces(
                     &conn,
-                    &[crate::storage::core_memory::agent_vector_namespace(agent_id)],
+                    &namespaces,
                     &query_embedding,
                     body.limit,
                     threshold,
@@ -2173,11 +2213,15 @@ async fn memory_search_handler(
                     if let Ok(Some(record)) =
                         crate::storage::workspaces::get_workspace_memory(&conn, &hit.memory_id)
                     {
-                        let tags =
-                            serde_json::from_str::<Vec<String>>(&record.tags_json).unwrap_or_default();
+                        let tags = serde_json::from_str::<Vec<String>>(&record.tags_json)
+                            .unwrap_or_default();
                         body.tags.iter().all(|t| tags.contains(t))
                     } else {
-                        false
+                        crate::storage::user_memory::fetch_search_text(&conn, &hit.memory_id)
+                            .ok()
+                            .flatten()
+                            .map(|(_, _, _, _, tags)| body.tags.iter().all(|t| tags.contains(t)))
+                            .unwrap_or(false)
                     }
                 });
             }
@@ -2231,6 +2275,45 @@ async fn memory_search_handler(
                         "title": title,
                         "content": content,
                         "score": hit.score,
+                    }));
+                    continue;
+                }
+                if let Ok(Some((source_kind, bucket, text, origin_kind, tags))) =
+                    crate::storage::user_memory::fetch_search_text(&conn, &hit.memory_id)
+                {
+                    results.push(json!({
+                        "memoryType": source_kind,
+                        "searchMode": "semantic",
+                        "memoryId": hit.memory_id,
+                        "bucket": bucket,
+                        "content": text,
+                        "originKind": origin_kind,
+                        "tags": tags,
+                        "score": hit.score,
+                    }));
+                }
+                // Check for saved:: memory entries (from memory_save tool)
+                if hit.memory_id.starts_with("saved::") {
+                    let meta = hit
+                        .metadata_json
+                        .as_deref()
+                        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                        .unwrap_or(serde_json::json!({}));
+                    let saved_tags: Vec<String> = meta
+                        .get("tags")
+                        .and_then(|t| {
+                            serde_json::from_str(&serde_json::to_string(t).unwrap_or_default()).ok()
+                        })
+                        .unwrap_or_default();
+                    results.push(json!({
+                        "memoryType": "saved",
+                        "searchMode": "semantic",
+                        "memoryId": hit.memory_id,
+                        "content": hit.content_text.as_deref().unwrap_or(""),
+                        "tags": saved_tags,
+                        "metadata": meta,
+                        "score": hit.score,
+                        "updatedAt": hit.updated_at,
                     }));
                 }
             }
@@ -2344,6 +2427,116 @@ async fn memory_store_handler(
         "key": record.memory_key,
         "value": body.value,
         "updatedAt": record.updated_at,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct MemorySaveRequest {
+    text: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    metadata: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+async fn memory_save_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<MemorySaveRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入".to_string(),
+        )
+    })?;
+    let session = resolve_proxy_session(&state, &token)?;
+    let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
+    let conn =
+        crate::storage_conn(&app_handle).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let memory_id = format!("saved::{}", uuid::Uuid::new_v4().simple());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default();
+
+    // Build metadata
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "timestamp".to_string(),
+        serde_json::Value::Number(now.into()),
+    );
+    meta.insert(
+        "workspaceId".to_string(),
+        serde_json::Value::String(workspace_id.clone()),
+    );
+    if let Some(agent_id) = session.caller_agent_id.as_deref() {
+        meta.insert(
+            "agentId".to_string(),
+            serde_json::Value::String(agent_id.to_string()),
+        );
+    }
+    for (k, v) in &body.metadata {
+        meta.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    if !body.tags.is_empty() {
+        meta.insert("tags".to_string(), serde_json::json!(body.tags));
+    }
+    let metadata_json = serde_json::Value::Object(meta).to_string();
+    let tags_json = serde_json::json!(body.tags).to_string();
+
+    if let Some(registry) = EMBEDDING_REGISTRY.get() {
+        let registry = registry.clone();
+        let ws_id = workspace_id.clone();
+        let mid = memory_id.clone();
+        let text = body.text.clone();
+        let meta_str = metadata_json.clone();
+        let tags_str = tags_json.clone();
+        tauri::async_runtime::spawn(async move {
+            let provider = {
+                let guard = registry.read().await;
+                guard.default_provider()
+            };
+            if let Some(provider) = provider {
+                match provider.embed(vec![text.clone()]).await {
+                    Ok(embeddings) => {
+                        if let Some(embedding) = embeddings.into_iter().next() {
+                            if let Some(app_handle) = APP_HANDLE.get() {
+                                if let Ok(conn) = crate::storage_conn(app_handle) {
+                                    let vector_id =
+                                        format!("vec_{}", uuid::Uuid::new_v4().simple());
+                                    let _ = crate::memory_vector::upsert_vector_with_meta(
+                                        &conn,
+                                        &vector_id,
+                                        &mid,
+                                        &ws_id,
+                                        &embedding,
+                                        provider.id(),
+                                        Some(&meta_str),
+                                        Some(&text),
+                                        Some(&tags_str),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => log::warn!("memory_save 嵌入失败: {error}"),
+                }
+            }
+        });
+    }
+
+    Ok(Json(json!({
+        "ok": true,
+        "memoryId": memory_id,
+        "workspaceId": workspace_id,
+        "text": body.text,
+        "tags": body.tags,
+        "timestamp": now,
     })))
 }
 
@@ -2498,13 +2691,31 @@ async fn memory_delete_handler(
     let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
     let conn =
         crate::storage_conn(&app_handle).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let _ = crate::memory_vector::delete_vector_by_memory_id(&conn, &body.memory_id);
+
+    // Always delete the vector first (works for all memory types)
+    let vector_deleted = crate::memory_vector::delete_vector_by_memory_id(&conn, &body.memory_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // For standalone vector entries (saved::, chat-turn::, kv::), vector deletion is sufficient
+    if body.memory_id.starts_with("saved::")
+        || body.memory_id.starts_with("chat-turn::")
+        || body.memory_id.starts_with("kv::")
+    {
+        return Ok(Json(json!({
+            "ok": true,
+            "memoryId": body.memory_id,
+            "vectorDeleted": vector_deleted,
+        })));
+    }
+
+    // For workspace memories, also delete the workspace_memories record
     crate::storage::workspaces::delete_workspace_memory(&conn, &workspace_id, &body.memory_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(json!({
         "ok": true,
         "memoryId": body.memory_id,
+        "vectorDeleted": vector_deleted,
     })))
 }
 
@@ -2516,6 +2727,10 @@ struct ChatSearchRequest {
     limit: i64,
     #[serde(default)]
     workspace_id: Option<String>,
+    #[serde(default)]
+    time_range_start: Option<i64>,
+    #[serde(default)]
+    time_range_end: Option<i64>,
 }
 
 fn default_chat_search_limit() -> i64 {
@@ -2540,36 +2755,150 @@ async fn chat_search_handler(
         .workspace_id
         .as_deref()
         .or(session.workspace_id.as_deref());
-    let hits = crate::storage::chat_history::search_chat_turns(
-        &conn,
-        &body.query,
-        body.limit,
-        workspace_id,
-    )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let results = hits
-        .into_iter()
-        .map(|hit| {
-            json!({
-                "sessionId": hit.session_id,
-                "sessionTitle": hit.session_title,
-                "turnId": hit.turn_id,
-                "turnIndex": hit.turn_index,
-                "excerpt": build_chat_search_excerpt(&hit.prompt, &hit.answer, &body.query),
-                "prompt": hit.prompt,
-                "answer": hit.answer,
-                "createdAt": hit.created_at,
-                "workspaceId": hit.workspace_id,
-                "speakerAgentId": hit.speaker_agent_id,
-            })
-        })
-        .collect::<Vec<_>>();
-    let total = results.len();
 
+    // Try semantic vector search first
+    let mut semantic_results: Vec<Value> = Vec::new();
+    let mut search_mode = "keyword";
+
+    if let Some(registry) = get_embedding_registry() {
+        let provider = {
+            let guard = registry.read().await;
+            guard.default_provider()
+        };
+        if let Some(provider) = provider {
+            let embed_result = provider.embed(vec![body.query.clone()]).await;
+            match embed_result {
+                Ok(embeddings) => {
+                    if let Some(query_embedding) = embeddings.into_iter().next() {
+                        // Search chat turn vectors across all relevant workspaces
+                        let ws_ids: Vec<String> = if let Some(ws) = workspace_id {
+                            vec![ws.to_string()]
+                        } else {
+                            // Search across all workspaces that have chat vectors
+                            let mut stmt = conn
+                                .prepare("SELECT DISTINCT workspace_id FROM memory_vectors WHERE memory_id LIKE 'chat-turn::%'")
+                                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("查询 workspace 列表失败: {e}")))?;
+                            let rows =
+                                stmt.query_map([], |row| row.get::<_, String>(0))
+                                    .map_err(|e| {
+                                        (
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                            format!("读取 workspace 列表失败: {e}"),
+                                        )
+                                    })?;
+                            rows.filter_map(|r| r.ok()).collect()
+                        };
+
+                        if ws_ids.is_empty() {
+                            log::debug!("chat_search: 无 chat-turn 向量，跳过语义搜索");
+                        }
+
+                        for ws in &ws_ids {
+                            if let Ok(hits) =
+                                crate::memory_vector::vector_search::standalone_vector_search(
+                                    &conn,
+                                    ws,
+                                    &query_embedding,
+                                    body.limit as usize,
+                                    0.3,
+                                    "chat-turn::",
+                                    body.time_range_start,
+                                    body.time_range_end,
+                                    None,
+                                )
+                            {
+                                for hit in hits {
+                                    let meta = hit
+                                        .metadata_json
+                                        .as_deref()
+                                        .and_then(|m| {
+                                            serde_json::from_str::<serde_json::Value>(m).ok()
+                                        })
+                                        .unwrap_or(serde_json::json!({}));
+                                    let content = hit.content_text.as_deref().unwrap_or("");
+                                    let parts: Vec<&str> = content.splitn(2, '\n').collect();
+                                    let prompt = parts.first().unwrap_or(&"").to_string();
+                                    let answer = parts.get(1).unwrap_or(&"").to_string();
+
+                                    semantic_results.push(json!({
+                                        "sessionId": meta.get("sessionId").and_then(|v| v.as_str()).unwrap_or(""),
+                                        "sessionTitle": meta.get("sessionTitle").and_then(|v| v.as_str()).unwrap_or(""),
+                                        "turnId": meta.get("turnId").and_then(|v| v.as_str()).unwrap_or(""),
+                                        "turnIndex": meta.get("turnIndex").and_then(|v| v.as_i64()).unwrap_or(0),
+                                        "prompt": prompt,
+                                        "answer": answer,
+                                        "excerpt": build_chat_search_excerpt(&prompt, &answer, &body.query),
+                                        "createdAt": meta.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(hit.updated_at),
+                                        "completedAt": meta.get("completedAt").and_then(|v| v.as_i64()),
+                                        "workspaceId": meta.get("workspaceId").and_then(|v| v.as_str()).unwrap_or(ws),
+                                        "speakerAgentId": meta.get("agentId").and_then(|v| v.as_str()).unwrap_or(""),
+                                        "score": hit.score,
+                                        "searchMode": "semantic",
+                                    }));
+                                }
+                            }
+                        }
+
+                        if !semantic_results.is_empty() {
+                            search_mode = "semantic";
+                            semantic_results.sort_by(|a, b| {
+                                b.get("score")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0)
+                                    .partial_cmp(
+                                        &a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                                    )
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            semantic_results.truncate(body.limit as usize);
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::warn!("chat_search 嵌入查询失败: {error}，降级到关键词搜索");
+                }
+            }
+        } else {
+            log::debug!("chat_search: embedding provider 未初始化，使用关键词搜索");
+        }
+    }
+
+    // Fallback to keyword search if no semantic results
+    let results = if semantic_results.is_empty() {
+        let hits = crate::storage::chat_history::search_chat_turns(
+            &conn,
+            &body.query,
+            body.limit,
+            workspace_id,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        hits.into_iter()
+            .map(|hit| {
+                json!({
+                    "sessionId": hit.session_id,
+                    "sessionTitle": hit.session_title,
+                    "turnId": hit.turn_id,
+                    "turnIndex": hit.turn_index,
+                    "excerpt": build_chat_search_excerpt(&hit.prompt, &hit.answer, &body.query),
+                    "prompt": hit.prompt,
+                    "answer": hit.answer,
+                    "createdAt": hit.created_at,
+                    "workspaceId": hit.workspace_id,
+                    "speakerAgentId": hit.speaker_agent_id,
+                    "searchMode": "keyword",
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        semantic_results
+    };
+
+    let total = results.len();
     Ok(Json(json!({
         "ok": true,
         "results": results,
         "total": total,
+        "searchMode": search_mode,
     })))
 }
 
