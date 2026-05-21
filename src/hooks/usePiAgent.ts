@@ -24,6 +24,7 @@ import { generateSessionConversationTitle } from '../lib/sessionTitleClient'
 import { isToolLoopGuardBlockResult } from '../lib/toolLoopGuard'
 import {
   listenTaskDeliveryNotificationActions,
+  showAgentReplyNotification,
   showTaskDeliveryDesktopNotification,
 } from '../lib/taskDeliveryNotification'
 import { useToast } from './useToast'
@@ -81,7 +82,7 @@ function yieldToNextPaint(): Promise<void> {
   })
 }
 
-export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | null>) {
+export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | null>, options?: { notificationEnabled?: boolean }) {
   const toast = useToast()
   const [error, setError] = useState('')
   const [runningHistoryIds, setRunningHistoryIds] = useState<string[]>([])
@@ -303,11 +304,16 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
         if (!asyncTitleJob) {
           return
         }
+        const titleJob = asyncTitleJob as {
+          agentId: string
+          userMsg: string
+          heuristicTitle: string
+        }
         requestLlmSessionTitle({
           historyId,
-          agentId: asyncTitleJob.agentId,
-          userMsg: asyncTitleJob.userMsg,
-          heuristicTitle: asyncTitleJob.heuristicTitle,
+          agentId: titleJob.agentId,
+          userMsg: titleJob.userMsg,
+          heuristicTitle: titleJob.heuristicTitle,
         })
       })
     })
@@ -414,7 +420,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     const timer = window.setTimeout(() => {
       const serialized = JSON.stringify(history)
       latestHistorySerializedRef.current = serialized
-      void saveHistoryState(serialized)
+      saveHistoryState(serialized).catch((e) => console.error('[NineClaw] auto-save failed:', e))
     }, delay)
     return () => {
       window.clearTimeout(timer)
@@ -432,7 +438,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       const payload =
         latestHistorySerializedRef.current || JSON.stringify(latestHistoryRef.current)
       if (payload) {
-        void saveHistoryState(payload)
+        saveHistoryState(payload).catch((e) => console.error('[NineClaw] unmount-save failed:', e))
       }
     }
   }, [])
@@ -662,6 +668,16 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       updateSessionStatus(currentHistoryId, 'done')
       finalizeHistoryTitleAfterTurn(currentHistoryId)
       markSessionSettled(currentHistoryId)
+
+      // 当用户不在该会话窗口时推送系统通知
+      const notificationOn = options?.notificationEnabled !== false
+      const notViewingThisSession = document.visibilityState !== 'visible' || activeHistoryId !== currentHistoryId
+      if (notificationOn && notViewingThisSession) {
+        const item = latestHistoryRef.current.find((h) => h.id === currentHistoryId)
+        const title = item?.title ?? ''
+        void showAgentReplyNotification(currentHistoryId, title)
+      }
+
       return
     }
 
@@ -1004,6 +1020,18 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     }
   }, [])
 
+  // Web Notification 点击跳转（通过自定义事件桥接）
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const sessionId = (e as CustomEvent<{ sessionId: string }>).detail?.sessionId
+      if (sessionId) {
+        openTaskSessionRef.current(sessionId)
+      }
+    }
+    window.addEventListener('nineclaw-navigate-session', handler)
+    return () => window.removeEventListener('nineclaw-navigate-session', handler)
+  }, [])
+
   useEffect(() => {
     let unlisten: (() => void) | undefined
     void listen<{ kind?: string; message?: string }>('nineclaw-runtime-notification', (event) => {
@@ -1175,7 +1203,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     desktopStreamHoldRef.current.add(nextHistoryId)
     let streamFly: Promise<void> | undefined
     try {
-      if (prevFly) {
+      if (prevFly && supersededTurnId) {
         try {
           await abortPiStream(nextHistoryId)
         } catch {
@@ -1189,6 +1217,12 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
           finalizeSupersededTurn(nextHistoryId, supersededTurnId)
         }
         setError('')
+      } else if (prevFly) {
+        // 旧主回复已通过 done/error/abort 收尾，只剩 Rust 侧后台清理 promise；
+        // 继续等待会把标题生成、记忆提取、压缩等后台任务误算成输入框 busy。
+        if (desktopStreamFlyRef.current.get(nextHistoryId) === prevFly) {
+          desktopStreamFlyRef.current.delete(nextHistoryId)
+        }
       }
 
       currentTurnIdsRef.current.set(nextHistoryId, turn.id)
@@ -1246,6 +1280,10 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
 
         return true
       } catch (invokeError) {
+        const latestTurnIdAfterError = currentTurnIdsRef.current.get(nextHistoryId)
+        if (latestTurnIdAfterError !== turn.id) {
+          return true
+        }
         const message = invokeError instanceof Error ? invokeError.message : String(invokeError)
         setError(message)
         appendActivity(nextHistoryId, turn.id, '启动失败', message, 'error')

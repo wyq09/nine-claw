@@ -1,6 +1,10 @@
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+const piStreamHarness = vi.hoisted(() => ({
+  listeners: [] as Array<(payload: Record<string, unknown>) => void>,
+}))
+
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn().mockResolvedValue(() => {}),
 }))
@@ -22,7 +26,15 @@ vi.mock('../../lib/piClient', () => ({
   subscribeAgentLoopCompleted: vi.fn().mockResolvedValue(() => {}),
   subscribeAgentLoopStarted: vi.fn().mockResolvedValue(() => {}),
   subscribeBotMessage: vi.fn().mockResolvedValue(() => {}),
-  subscribePiStream: vi.fn().mockResolvedValue(() => {}),
+  subscribePiStream: vi.fn((listener: (payload: Record<string, unknown>) => void) => {
+    piStreamHarness.listeners.push(listener)
+    return Promise.resolve(() => {
+      const index = piStreamHarness.listeners.indexOf(listener)
+      if (index >= 0) {
+        piStreamHarness.listeners.splice(index, 1)
+      }
+    })
+  }),
   widgetCancelResponse: vi.fn().mockResolvedValue(undefined),
   widgetSubmitResponse: vi.fn().mockResolvedValue(undefined),
 }))
@@ -72,7 +84,9 @@ const sampleAgent = {
 describe('usePiAgent', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    piStreamHarness.listeners.length = 0
     mockStreamPiPrompt.mockResolvedValue(undefined)
+    mockGenerateSessionConversationTitle.mockResolvedValue('咖啡店开业海报')
     vi.stubGlobal('localStorage', {
       getItem: vi.fn().mockReturnValue(null),
       setItem: vi.fn(),
@@ -188,5 +202,59 @@ describe('usePiAgent', () => {
         '空会话首条：咖啡店海报',
       )
     })
+  })
+
+  it('allows the next prompt after done while title generation and old invoke are still pending', async () => {
+    const streamSettlers: Array<{ resolve: () => void; reject: (error: Error) => void }> = []
+    mockStreamPiPrompt.mockImplementation(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          streamSettlers.push({ resolve, reject })
+        }),
+    )
+    mockGenerateSessionConversationTitle.mockImplementation(() => new Promise<string>(() => {}))
+
+    const { result } = renderHook(() => usePiAgent())
+
+    await waitFor(() => expect(result.current.runtimeReady).toBe(true))
+    await waitFor(() => expect(piStreamHarness.listeners.length).toBeGreaterThan(0))
+
+    act(() => {
+      void result.current.submitPrompt('第一条：整理用户画像', {
+        agent: sampleAgent,
+        sessionLlm: { providerId: 'openai', model: 'gpt-4o-mini' },
+      })
+    })
+
+    await waitFor(() => expect(mockStreamPiPrompt).toHaveBeenCalledTimes(1))
+    const firstSessionId = mockStreamPiPrompt.mock.calls[0]?.[1]?.sessionId
+    expect(firstSessionId).toEqual(expect.any(String))
+
+    act(() => {
+      for (const listener of piStreamHarness.listeners) {
+        listener({ event: 'done', sessionId: firstSessionId })
+      }
+    })
+
+    await waitFor(() => expect(result.current.loading).toBe(false))
+
+    act(() => {
+      void result.current.submitPrompt('第二条：继续生成标题', {
+        agent: sampleAgent,
+        sessionLlm: { providerId: 'openai', model: 'gpt-4o-mini' },
+      })
+    })
+
+    await waitFor(() => expect(mockStreamPiPrompt).toHaveBeenCalledTimes(2))
+    expect(mockStreamPiPrompt.mock.calls[1]?.[0]).toBe('第二条：继续生成标题')
+    expect(streamSettlers).toHaveLength(2)
+
+    act(() => {
+      streamSettlers[0]?.reject(new Error('late background cleanup failed'))
+      streamSettlers[1]?.resolve()
+    })
+
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.error).toBe('')
   })
 })

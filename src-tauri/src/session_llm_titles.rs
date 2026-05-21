@@ -427,18 +427,22 @@ fn generate_conversation_session_title_llm(
 }
 
 #[tauri::command]
-pub(crate) fn generate_session_conversation_title(
+pub(crate) async fn generate_session_conversation_title(
     app: AppHandle,
     agent_id: String,
     session_id: Option<String>,
     user_message: String,
     assistant_message: Option<String>,
 ) -> Result<String, String> {
-    generate_conversation_session_title_llm(
-        &app,
-        &agent_id,
-        session_id.as_deref(),
-        &user_message,
-        assistant_message.as_deref().unwrap_or_default(),
-    )
+    tauri::async_runtime::spawn_blocking(move || {
+        generate_conversation_session_title_llm(
+            &app,
+            &agent_id,
+            session_id.as_deref(),
+            &user_message,
+            assistant_message.as_deref().unwrap_or_default(),
+        )
+    })
+    .await
+    .map_err(|error| format!("生成会话标题任务失败: {error}"))?
 }

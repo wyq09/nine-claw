@@ -46,6 +46,7 @@ mod commands_chat_workspace;
 mod commands_llm_log_export;
 mod commands_llm_trace;
 mod commands_memory;
+mod commands_session_llm_log;
 mod commands_workspace_kv_memory;
 mod history_app_state;
 mod pi_usage;
@@ -53,6 +54,8 @@ mod prompts;
 mod provider_runtime;
 mod provider_stream_noise;
 mod runtime_agent_config;
+mod session_compression;
+mod session_llm_log;
 mod session_llm_titles;
 mod skill_broker;
 mod time_util;
@@ -78,11 +81,12 @@ pub(crate) use pi_usage::{
     PiUsageMetadataPayload,
 };
 pub(crate) use provider_runtime::{
-    anthropic_messages_url, load_provider_preferences, normalize_anthropic_base_url,
-    normalize_provider_api_format, normalize_provider_base_url,
+    anthropic_messages_url, forced_pi_thinking_level, load_provider_preferences,
+    normalize_anthropic_base_url, normalize_provider_api_format, normalize_provider_base_url,
     normalized_provider_runtime_base_url, openai_pi_compat_requires_explicit_thinking_disable,
-    openai_pi_compat_supports_reasoning_effort, pi_runtime_dir, resolve_im_llm_runtime,
-    save_provider_preferences, should_force_pi_thinking_off, ProviderRuntimeConfig,
+    openai_pi_compat_requires_reasoning_content_replay, openai_pi_compat_supports_reasoning_effort,
+    pi_runtime_dir, resolve_im_llm_runtime, save_provider_preferences,
+    should_force_pi_thinking_off, ProviderRuntimeConfig,
 };
 pub(crate) use proxy_settings::build_http_client;
 pub(crate) use session_llm_titles::refine_agent_task_metadata;
@@ -94,6 +98,7 @@ use commands_chat_workspace::*;
 use commands_llm_log_export::*;
 use commands_llm_trace::*;
 use commands_memory::*;
+use commands_session_llm_log::*;
 use commands_workspace_kv_memory::*;
 use history_app_state::{
     clear_history_state, list_token_usage_records, load_history_state, save_history_state,
@@ -124,6 +129,7 @@ use channels::manager::ChannelManager;
 use channels::types::{MediaPayload, MediaType};
 use channels::wechat::WeChatChannel;
 use chat_attachments::{ChatAttachmentUpload, PersistedChatAttachment};
+use chrono::Utc;
 use dev_trace::{dev_trace, dev_trace_block};
 use pi_runtime::RuntimeDependencyStatus;
 #[derive(Clone)]
@@ -135,6 +141,7 @@ struct PiRuntimeHandle {
 
 static PI_RUNTIME_HANDLES: OnceLock<Mutex<HashMap<String, PiRuntimeHandle>>> = OnceLock::new();
 static DESKTOP_POOLED_PI: OnceLock<Mutex<HashMap<String, DesktopPooledPi>>> = OnceLock::new();
+static DESKTOP_IDLE_COMPRESSION_EPOCHS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 /// 同一桌面 session 串行化 `stream_pi_prompt`，避免并发时池替换/双进程互相 kill 导致 SIGKILL、stdout 空读。
 static DESKTOP_STREAM_SESSION_MUTEXES: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     OnceLock::new();
@@ -161,6 +168,16 @@ struct DesktopPooledPi {
     stdout_rx: mpsc::Receiver<Result<String, String>>,
     stderr_buffer: Arc<Mutex<String>>,
     fingerprint: String,
+    workspace_id: Option<String>,
+    session_path: PathBuf,
+    last_usage: Option<PiTokenUsagePayload>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopCompressionCommandResult {
+    compressed: bool,
+    reason: String,
 }
 
 fn pi_reuse_desktop_enabled() -> bool {
@@ -994,7 +1011,7 @@ mod lib_tests {
         build_desktop_anthropic_compat_extension_source, build_desktop_outbound_display_text,
         build_provider_models_config_with_input, build_turn_prompt_with_multimodal_summary,
         desktop_incomplete_reply_error, desktop_media_reply_prompt, desktop_pi_fingerprint,
-        infer_media_mime_type, is_provider_image_block_rejection_error,
+        forced_pi_thinking_level, infer_media_mime_type, is_provider_image_block_rejection_error,
         is_provider_reasoning_history_rejection_error, parse_context_stats_from_rpc_response,
         prepend_multimodal_summary_context, quarantine_pi_session_file, record_multimodal_summary,
         render_multimodal_summary_context, resolve_context_window_from_sources,
@@ -1308,6 +1325,106 @@ mod lib_tests {
         assert_eq!(provider_json["compat"]["thinkingFormat"], json!("qwen"));
         assert_eq!(provider_json["models"][0]["reasoning"], json!(true));
         assert!(should_force_pi_thinking_off(&provider, false));
+        assert_eq!(forced_pi_thinking_level(&provider, false), Some("off"));
+    }
+
+    #[test]
+    fn provider_models_config_for_mimo_replays_reasoning_content() {
+        let provider = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://api.xiaomimimo.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "MiMo-V2.5-Pro".to_string(),
+        };
+
+        let config =
+            build_provider_models_config_with_input(&provider, false, false).expect("mimo config");
+        let provider_json = &config["providers"]["nineclaw-runtime-8b9035807842"];
+        assert_eq!(
+            provider_json["compat"]["requiresReasoningContentOnAssistantMessages"],
+            json!(true)
+        );
+        assert_eq!(provider_json["compat"]["thinkingFormat"], json!("deepseek"));
+        assert_eq!(provider_json["models"][0]["reasoning"], json!(true));
+        assert!(!should_force_pi_thinking_off(&provider, false));
+        assert!(!should_force_pi_thinking_off(&provider, true));
+        assert_eq!(forced_pi_thinking_level(&provider, false), Some("medium"));
+        assert_eq!(forced_pi_thinking_level(&provider, true), Some("medium"));
+    }
+
+    #[test]
+    fn provider_models_config_does_not_apply_mimo_replay_to_other_models() {
+        let provider = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://api.xiaomimimo.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "mimo-v2-tts".to_string(),
+        };
+
+        let config =
+            build_provider_models_config_with_input(&provider, false, false).expect("tts config");
+        let provider_json = &config["providers"]["nineclaw-runtime-8b9035807842"];
+        assert!(provider_json["compat"]
+            .get("requiresReasoningContentOnAssistantMessages")
+            .is_none());
+        assert!(provider_json["compat"].get("thinkingFormat").is_none());
+    }
+
+    #[test]
+    fn provider_models_config_keeps_mimo_replay_compat_when_retry_disables_reasoning_effort() {
+        let provider = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://api.xiaomimimo.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "mimo-v2.5".to_string(),
+        };
+
+        let config =
+            build_provider_models_config_with_input(&provider, false, true).expect("mimo config");
+        let provider_json = &config["providers"]["nineclaw-runtime-8b9035807842"];
+        assert_eq!(
+            provider_json["compat"]["requiresReasoningContentOnAssistantMessages"],
+            json!(true)
+        );
+        assert_eq!(provider_json["compat"]["thinkingFormat"], json!("deepseek"));
+        assert_eq!(provider_json["models"][0]["reasoning"], json!(true));
+        assert!(!should_force_pi_thinking_off(&provider, true));
+        assert_eq!(forced_pi_thinking_level(&provider, true), Some("medium"));
+    }
+
+    #[test]
+    fn provider_models_config_marks_anthropic_mimo_as_reasoning_capable() {
+        let provider = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "anthropic".to_string(),
+            base_url: "https://token-plan-cn.xiaomimimo.com/anthropic".to_string(),
+            api_key: "secret".to_string(),
+            model: "mimo-v2.5-pro".to_string(),
+        };
+
+        let config =
+            build_provider_models_config_with_input(&provider, false, false).expect("mimo config");
+        let provider_json = &config["providers"]["nineclaw-runtime-8b9035807842"];
+        assert_eq!(provider_json["api"], json!("anthropic-messages"));
+        assert_eq!(provider_json["models"][0]["reasoning"], json!(true));
+        assert_eq!(forced_pi_thinking_level(&provider, false), Some("medium"));
+    }
+
+    #[test]
+    fn forced_pi_thinking_level_preserves_non_mimo_fallbacks() {
+        let provider = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "glm-4.6".to_string(),
+        };
+
+        assert_eq!(forced_pi_thinking_level(&provider, false), None);
+        assert_eq!(forced_pi_thinking_level(&provider, true), Some("off"));
     }
 
     #[test]
@@ -1384,6 +1501,7 @@ mod lib_tests {
             "https://example.com",
             "model",
             true,
+            false,
         )
         .expect("extension source");
 
@@ -1402,6 +1520,7 @@ mod lib_tests {
             "https://example.com/base/",
             "model-name",
             false,
+            false,
         )
         .expect("extension source");
 
@@ -1410,6 +1529,27 @@ mod lib_tests {
         assert!(source.contains("provider-id"));
         assert!(source.contains("https://example.com/base/"));
         assert!(source.contains("model-name"));
+    }
+
+    #[test]
+    fn anthropic_compat_extension_marks_mimo_models_as_reasoning_capable() {
+        let source = build_desktop_anthropic_compat_extension_source(
+            Path::new("/tmp/pi-ai/index.js"),
+            "provider",
+            "API_KEY",
+            "https://example.com/base/",
+            "mimo-v2.5-pro",
+            false,
+            true,
+        )
+        .expect("extension source");
+
+        assert!(source.contains("reasoning: true"));
+        assert!(source.contains("REQUIRES_REASONING_CONTENT_REPLAY = true"));
+        assert!(source.contains("assistantMessage.reasoning_content"));
+        assert!(source.contains("type: 'thinking', thinking: sanitizedReasoningContent"));
+        assert!(source.contains("payload.thinking"));
+        assert!(source.contains("thinkingSignature: 'reasoning_content'"));
     }
 
     #[test]
@@ -1652,6 +1792,26 @@ fn desktop_pi_pool() -> &'static Mutex<HashMap<String, DesktopPooledPi>> {
     DESKTOP_POOLED_PI.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn desktop_idle_compression_epochs() -> &'static Mutex<HashMap<String, u64>> {
+    DESKTOP_IDLE_COMPRESSION_EPOCHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn bump_desktop_idle_compression_epoch(session_id: &str) -> u64 {
+    let mut guard = desktop_idle_compression_epochs()
+        .lock()
+        .expect("DESKTOP_IDLE_COMPRESSION_EPOCHS poisoned");
+    let entry = guard.entry(session_id.to_string()).or_insert(0);
+    *entry = entry.saturating_add(1);
+    *entry
+}
+
+fn current_desktop_idle_compression_epoch(session_id: &str) -> u64 {
+    let guard = desktop_idle_compression_epochs()
+        .lock()
+        .expect("DESKTOP_IDLE_COMPRESSION_EPOCHS poisoned");
+    guard.get(session_id).copied().unwrap_or(0)
+}
+
 fn insert_runtime_handle(session_id: &str, handle: PiRuntimeHandle) -> Result<(), String> {
     let mut guard = runtime_handle_store()
         .lock()
@@ -1707,6 +1867,274 @@ fn send_pi_prompt_command(
         .flush()
         .map_err(|error| format!("刷新 stdin 失败: {error}"))?;
     Ok(())
+}
+
+fn send_pi_rpc_command(
+    stdin: &Arc<Mutex<Option<ChildStdin>>>,
+    command: serde_json::Value,
+) -> Result<(), String> {
+    let mut stdin_guard = stdin
+        .lock()
+        .map_err(|error| format!("无法锁定 rpc stdin: {error}"))?;
+    let stdin = stdin_guard
+        .as_mut()
+        .ok_or_else(|| "pi stdin 已关闭，无法写入 rpc 命令".to_string())?;
+    writeln!(stdin, "{command}").map_err(|error| format!("写入 rpc 命令失败: {error}"))?;
+    stdin
+        .flush()
+        .map_err(|error| format!("刷新 rpc stdin 失败: {error}"))?;
+    Ok(())
+}
+
+fn wait_for_pi_rpc_response(
+    stdout_rx: &mpsc::Receiver<Result<String, String>>,
+    command_id: &str,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let started = Instant::now();
+    loop {
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .ok_or_else(|| format!("等待 pi rpc 响应超时: {command_id}"))?;
+        let line = match stdout_rx.recv_timeout(remaining.min(Duration::from_secs(5))) {
+            Ok(Ok(line)) => line,
+            Ok(Err(error)) => return Err(format!("读取 pi rpc 响应失败: {error}")),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err("等待 pi rpc 响应时 stdout 已断开".to_string())
+            }
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(|item| item.as_str()) != Some("response") {
+            continue;
+        }
+        if value.get("id").and_then(|item| item.as_str()) != Some(command_id) {
+            continue;
+        }
+        if value.get("success").and_then(|item| item.as_bool()) == Some(false) {
+            let message = value
+                .get("error")
+                .and_then(|item| item.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("pi rpc 命令失败 {command_id}: {message}"));
+        }
+        return Ok(value);
+    }
+}
+
+fn desktop_compression_archive_root(workspace_id: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(wid) = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(workspace_fs::team_root(wid)?
+            .join(".debug")
+            .join("session-compression"));
+    }
+    Ok(agent_workspace::resolve_workspace_root()?
+        .join(".debug")
+        .join("standalone")
+        .join("session-compression"))
+}
+
+fn compression_config_from_env() -> session_compression::CompressionConfig {
+    let mut config = session_compression::CompressionConfig::default();
+    if let Some(value) = env_u64("NINECLAW_COMPRESSION_TOKEN_THRESHOLD") {
+        config.token_threshold = value.max(1);
+    }
+    if let Some(value) = env_usize("NINECLAW_COMPRESSION_MESSAGE_THRESHOLD") {
+        config.message_count_threshold = value.max(1);
+    }
+    if let Some(value) = env_u64("NINECLAW_COMPRESSION_TARGET_TOKENS") {
+        config.target_compressed_tokens = value.max(1);
+    }
+    if let Some(value) = env_usize("NINECLAW_COMPRESSION_MAX_RECENT_MESSAGES") {
+        config.max_recent_messages = value.max(1);
+    }
+    if let Some(value) = env_bool("NINECLAW_IDLE_COMPRESSION_ENABLED") {
+        config.idle_compression_enabled = value;
+    }
+    if let Some(value) = env_u64("NINECLAW_IDLE_COMPRESSION_DELAY_MS") {
+        config.idle_compression_delay_ms = value.max(1);
+    }
+    if let Some(value) = env_u64("NINECLAW_IDLE_COMPRESSION_TOKEN_THRESHOLD") {
+        config.idle_token_threshold = value.max(1);
+    }
+    config
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.trim().parse::<u64>().ok()
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.trim().parse::<usize>().ok()
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    let raw = std::env::var(name).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn maybe_compact_desktop_session_after_turn(
+    app: &tauri::AppHandle,
+    workspace_id: Option<&str>,
+    session_id: &str,
+    session_path: &Path,
+    stdin: &Arc<Mutex<Option<ChildStdin>>>,
+    stdout_rx: &mpsc::Receiver<Result<String, String>>,
+    usage: Option<&PiTokenUsagePayload>,
+    force_idle: bool,
+) -> Result<bool, String> {
+    let Some(usage) = usage else {
+        return Ok(false);
+    };
+    let used_tokens = usage_row_total_tokens(usage);
+    let config = compression_config_from_env();
+    let entries = session_compression::load_session_entries(session_path)?;
+    let Some(plan) =
+        session_compression::plan_compression(&entries, used_tokens, &config, force_idle)
+    else {
+        return Ok(false);
+    };
+
+    maybe_compact_desktop_session_with_plan(
+        app,
+        workspace_id,
+        session_id,
+        stdin,
+        stdout_rx,
+        plan,
+        &config,
+    )
+}
+
+fn maybe_compact_desktop_session_with_plan(
+    app: &tauri::AppHandle,
+    workspace_id: Option<&str>,
+    session_id: &str,
+    stdin: &Arc<Mutex<Option<ChildStdin>>>,
+    stdout_rx: &mpsc::Receiver<Result<String, String>>,
+    plan: session_compression::CompressionPlan,
+    config: &session_compression::CompressionConfig,
+) -> Result<bool, String> {
+    let archive_root = desktop_compression_archive_root(workspace_id)?;
+    let command_id = format!("compact-{session_id}-{}", Utc::now().timestamp_millis());
+    let custom_instructions = format!(
+        "{}\n\n{}",
+        "NineClaw compression policy: produce a concise structured summary with <topics> and <summary> tags. Do not continue the user task.",
+        session_compression::build_compression_instruction(plan.compression_level, config)
+            .get("content")
+            .and_then(|item| item.as_str())
+            .unwrap_or_default()
+    );
+    let command = json!({
+        "id": command_id,
+        "type": "compact",
+        "customInstructions": custom_instructions,
+    });
+    send_pi_rpc_command(stdin, command)?;
+    let response = wait_for_pi_rpc_response(stdout_rx, &command_id, Duration::from_secs(180))?;
+    let summary = response
+        .get("data")
+        .and_then(|data| data.get("summary"))
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    let topics = session_compression::parse_topics(summary);
+    let archive = session_compression::write_chunk_archive(
+        &archive_root,
+        session_id,
+        plan.compression_level,
+        &plan,
+        topics.as_deref(),
+    )?;
+    dev_trace(
+        "desktop.stream",
+        format!(
+            "insert_then_compress completed: session={} reason={:?} tokens_before={} messages_before={} archive={}",
+            session_id,
+            plan.reason,
+            plan.original_token_count,
+            plan.original_message_count,
+            archive.path
+        ),
+    );
+    let _ = app.emit(
+        "nineclaw-runtime-notification",
+        serde_json::json!({
+            "kind": "session_compressed",
+            "sessionId": session_id,
+            "archivePath": archive.path,
+            "topics": topics,
+        }),
+    );
+    Ok(true)
+}
+
+fn schedule_desktop_idle_compression(app: &tauri::AppHandle, session_id: &str) {
+    let config = compression_config_from_env();
+    if !config.idle_compression_enabled {
+        return;
+    }
+    let epoch = bump_desktop_idle_compression_epoch(session_id);
+    let app = app.clone();
+    let session_id = session_id.to_string();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(config.idle_compression_delay_ms));
+        if current_desktop_idle_compression_epoch(&session_id) != epoch {
+            dev_trace(
+                "desktop.stream",
+                format!("idle compression cancelled by newer prompt: session={session_id}"),
+            );
+            return;
+        }
+        if get_runtime_handle(&session_id).ok().flatten().is_some() {
+            dev_trace(
+                "desktop.stream",
+                format!("idle compression skipped while stream active: session={session_id}"),
+            );
+            return;
+        }
+        let Some(pooled) = take_pooled_desktop_pi(&session_id).ok().flatten() else {
+            return;
+        };
+        let result = maybe_compact_desktop_session_after_turn(
+            &app,
+            pooled.workspace_id.as_deref(),
+            &session_id,
+            &pooled.session_path,
+            &pooled.stdin,
+            &pooled.stdout_rx,
+            pooled.last_usage.as_ref(),
+            true,
+        );
+        match result {
+            Ok(true) => dev_trace(
+                "desktop.stream",
+                format!("idle compression applied: session={session_id}"),
+            ),
+            Ok(false) => dev_trace(
+                "desktop.stream",
+                format!("idle compression skipped below threshold: session={session_id}"),
+            ),
+            Err(error) => dev_trace(
+                "desktop.stream",
+                format!("idle compression failed and rolled back by PI: session={session_id} error={error}"),
+            ),
+        }
+        if let Err(error) = store_pooled_desktop_pi(&session_id, pooled) {
+            dev_trace(
+                "desktop.stream",
+                format!("idle compression pool restore failed: session={session_id} error={error}"),
+            );
+        }
+    });
 }
 
 fn maybe_repair_pi_runtime_from_command(command: &mut Command) -> bool {
@@ -2494,6 +2922,7 @@ fn build_desktop_anthropic_compat_extension_source(
     base_url: &str,
     model: &str,
     text_only_input: bool,
+    requires_reasoning_content_replay: bool,
 ) -> Result<String, String> {
     let import_path = js_string_literal(&pi_ai_import_path.to_string_lossy())?;
     let provider_id = js_string_literal(provider_id)?;
@@ -2504,6 +2933,11 @@ fn build_desktop_anthropic_compat_extension_source(
         "['text']"
     } else {
         "['text', 'image']"
+    };
+    let model_reasoning = if requires_reasoning_content_replay {
+        "true"
+    } else {
+        "false"
     };
 
     Ok(format!(
@@ -2521,6 +2955,8 @@ function anthropicMessagesUrl(baseUrl) {{
   const trimmed = String(baseUrl ?? '').trim().replace(/\/+$/, '');
   return trimmed.endsWith('/v1') ? trimmed + '/messages' : trimmed + '/v1/messages';
 }}
+
+const REQUIRES_REASONING_CONTENT_REPLAY = {model_reasoning};
 
 function convertContentBlocks(content) {{
   const items = Array.isArray(content) ? content : [];
@@ -2604,11 +3040,16 @@ function convertMessages(messages) {{
 
     if (message.role === 'assistant') {{
       const blocks = [];
+      const reasoningBlocks = [];
       for (const block of message.content) {{
         if (block.type === 'text' && block.text.trim()) {{
           blocks.push({{ type: 'text', text: sanitizeSurrogates(block.text) }});
         }} else if (block.type === 'thinking' && block.thinking.trim()) {{
-          blocks.push({{ type: 'text', text: sanitizeSurrogates(block.thinking) }});
+          if (REQUIRES_REASONING_CONTENT_REPLAY) {{
+            reasoningBlocks.push(block.thinking);
+          }} else {{
+            blocks.push({{ type: 'text', text: sanitizeSurrogates(block.thinking) }});
+          }}
         }} else if (block.type === 'toolCall') {{
           blocks.push({{
             type: 'tool_use',
@@ -2619,7 +3060,17 @@ function convertMessages(messages) {{
         }}
       }}
       if (blocks.length > 0) {{
-        params.push({{ role: 'assistant', content: blocks }});
+        const assistantMessage = {{ role: 'assistant', content: blocks }};
+        const reasoningContent = reasoningBlocks.join('\n').trim();
+        if (REQUIRES_REASONING_CONTENT_REPLAY && reasoningContent) {{
+          const sanitizedReasoningContent = sanitizeSurrogates(reasoningContent);
+          assistantMessage.content = [
+            {{ type: 'thinking', thinking: sanitizedReasoningContent }},
+            ...blocks,
+          ];
+          assistantMessage.reasoning_content = sanitizedReasoningContent;
+        }}
+        params.push(assistantMessage);
       }}
       continue;
     }}
@@ -2700,6 +3151,18 @@ function mapStopReason(reason) {{
       }}
       return 'error';
   }}
+}}
+
+function thinkingBudgetTokens(level, maxTokens) {{
+  const budgets = {{
+    minimal: 1024,
+    low: 2048,
+    medium: 4096,
+    high: 8192,
+    xhigh: 12000,
+  }};
+  const requested = budgets[level] || budgets.medium;
+  return Math.max(1024, Math.min(requested, Math.max(1024, maxTokens - 1024)));
 }}
 
 async function* parseSSE(response) {{
@@ -2807,6 +3270,13 @@ function streamNineclawAnthropicCompat(model, context, options) {{
         stream: true,
       }};
 
+      if (model.reasoning && options?.reasoning && options.reasoning !== 'off') {{
+        payload.thinking = {{
+          type: 'enabled',
+          budget_tokens: thinkingBudgetTokens(options.reasoning, payload.max_tokens),
+        }};
+      }}
+
       if (context.systemPrompt) {{
         payload.system = [{{
           type: 'text',
@@ -2848,6 +3318,13 @@ function streamNineclawAnthropicCompat(model, context, options) {{
           if (event.content_block?.type === 'text') {{
             output.content.push({{ type: 'text', text: '', index: event.index }});
             stream.push({{ type: 'text_start', contentIndex: output.content.length - 1, partial: output }});
+          }} else if (
+            event.content_block?.type === 'thinking' ||
+            event.content_block?.type === 'reasoning' ||
+            event.content_block?.type === 'reasoning_content'
+          ) {{
+            output.content.push({{ type: 'thinking', thinking: '', thinkingSignature: 'reasoning_content', index: event.index }});
+            stream.push({{ type: 'thinking_start', contentIndex: output.content.length - 1, partial: output }});
           }} else if (event.content_block?.type === 'tool_use') {{
             output.content.push({{
               type: 'toolCall',
@@ -2869,6 +3346,22 @@ function streamNineclawAnthropicCompat(model, context, options) {{
           if (event.delta?.type === 'text_delta' && block.type === 'text') {{
             block.text += event.delta.text;
             stream.push({{ type: 'text_delta', contentIndex, delta: event.delta.text, partial: output }});
+          }} else if (
+            block.type === 'thinking' &&
+            (
+              event.delta?.type === 'thinking_delta' ||
+              event.delta?.type === 'reasoning_delta' ||
+              event.delta?.type === 'reasoning_content_delta' ||
+              event.delta?.reasoning_content != null ||
+              event.delta?.thinking != null ||
+              event.delta?.text != null
+            )
+          ) {{
+            const thinkingDelta = event.delta?.text ?? event.delta?.reasoning_content ?? event.delta?.thinking ?? '';
+            if (thinkingDelta) {{
+              block.thinking += thinkingDelta;
+              stream.push({{ type: 'thinking_delta', contentIndex, delta: thinkingDelta, partial: output }});
+            }}
           }} else if (event.delta?.type === 'input_json_delta' && block.type === 'toolCall') {{
             block.partialJson += event.delta.partial_json;
             block.arguments = parseStreamingJson(block.partialJson);
@@ -2889,6 +3382,8 @@ function streamNineclawAnthropicCompat(model, context, options) {{
           delete block.index;
           if (block.type === 'text') {{
             stream.push({{ type: 'text_end', contentIndex, content: block.text, partial: output }});
+          }} else if (block.type === 'thinking') {{
+            stream.push({{ type: 'thinking_end', contentIndex, content: block.thinking, partial: output }});
           }} else if (block.type === 'toolCall') {{
             block.arguments = parseStreamingJson(block.partialJson);
             delete block.partialJson;
@@ -2962,7 +3457,7 @@ export default function(pi) {{
     models: [{{
       id: {model},
       name: {model},
-      reasoning: false,
+      reasoning: {model_reasoning},
       input: {model_input},
       cost: {{ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }},
       contextWindow: 200000,
@@ -2978,6 +3473,7 @@ export default function(pi) {{
         base_url = base_url,
         model = model,
         model_input = model_input,
+        model_reasoning = model_reasoning,
     ))
 }
 
@@ -3007,6 +3503,7 @@ fn prepare_desktop_anthropic_compat_extension(
         &compat_base_url,
         provider_config.model.trim(),
         text_only_input,
+        openai_pi_compat_requires_reasoning_content_replay(provider_config.model.trim()),
     )?;
     let extension_path = runtime_dir.join(format!("{}.mjs", compat_provider_id));
     fs::write(&extension_path, extension_source)
@@ -3047,9 +3544,14 @@ fn custom_provider_object(
     );
     let requires_explicit_thinking_disable =
         openai_pi_compat_requires_explicit_thinking_disable(model);
-    let model_reasoning = !disable_reasoning_effort
+    let requires_reasoning_content_replay =
+        openai_pi_compat_requires_reasoning_content_replay(model);
+    let effective_disable_reasoning_effort =
+        disable_reasoning_effort && !requires_reasoning_content_replay;
+    let model_reasoning = !effective_disable_reasoning_effort
         && (openai_pi_compat_supports_reasoning_effort(model)
-            || requires_explicit_thinking_disable);
+            || requires_explicit_thinking_disable
+            || requires_reasoning_content_replay);
     let mut provider = serde_json::Map::new();
     let model_input = if text_only_input {
         json!(["text"])
@@ -3077,7 +3579,8 @@ fn custom_provider_object(
                   {
                     "id": model,
                     "api": "anthropic-messages",
-                    "input": model_input
+                    "input": model_input,
+                    "reasoning": requires_reasoning_content_replay
                   }
                 ]),
             );
@@ -3092,6 +3595,13 @@ fn custom_provider_object(
             );
             if requires_explicit_thinking_disable {
                 compat.insert("thinkingFormat".to_string(), json!("qwen"));
+            }
+            if requires_reasoning_content_replay {
+                compat.insert(
+                    "requiresReasoningContentOnAssistantMessages".to_string(),
+                    json!(true),
+                );
+                compat.insert("thinkingFormat".to_string(), json!("deepseek"));
             }
             provider.insert("compat".to_string(), serde_json::Value::Object(compat));
             provider.insert(
@@ -3523,6 +4033,88 @@ async fn abort_pi_stream(session_id: Option<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn compact_desktop_session_before_model_switch(
+    app: tauri::AppHandle,
+    session_id: String,
+    workspace_id: Option<String>,
+    current_model: String,
+    next_model: String,
+) -> Result<DesktopCompressionCommandResult, String> {
+    let session_id = session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Ok(DesktopCompressionCommandResult {
+            compressed: false,
+            reason: "empty_session_id".to_string(),
+        });
+    }
+    if current_model.trim() == next_model.trim() {
+        return Ok(DesktopCompressionCommandResult {
+            compressed: false,
+            reason: "same_model".to_string(),
+        });
+    }
+    if get_runtime_handle(&session_id)?.is_some() {
+        return Ok(DesktopCompressionCommandResult {
+            compressed: false,
+            reason: "session_running".to_string(),
+        });
+    }
+
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(pooled) = take_pooled_desktop_pi(&session_id)? else {
+            return Ok(DesktopCompressionCommandResult {
+                compressed: false,
+                reason: "no_pooled_runtime".to_string(),
+            });
+        };
+
+        let config = compression_config_from_env();
+        let entries = session_compression::load_session_entries(&pooled.session_path)?;
+        let used_tokens = pooled
+            .last_usage
+            .as_ref()
+            .map(usage_row_total_tokens)
+            .unwrap_or_default();
+        let plan = session_compression::plan_model_switch_compression(&entries, used_tokens, &config);
+        let result = match plan {
+            Some(plan) => maybe_compact_desktop_session_with_plan(
+                &app_for_task,
+                workspace_id.as_deref().or(pooled.workspace_id.as_deref()),
+                &session_id,
+                &pooled.stdin,
+                &pooled.stdout_rx,
+                plan,
+                &config,
+            )
+            .map(|compressed| DesktopCompressionCommandResult {
+                compressed,
+                reason: if compressed {
+                    "model_switch_compressed".to_string()
+                } else {
+                    "compression_skipped".to_string()
+                },
+            }),
+            None => Ok(DesktopCompressionCommandResult {
+                compressed: false,
+                reason: "below_model_switch_threshold".to_string(),
+            }),
+        };
+
+        if let Err(error) = store_pooled_desktop_pi(&session_id, pooled) {
+            dev_trace(
+                "desktop.stream",
+                format!("model-switch compression pool restore failed: session={session_id} error={error}"),
+            );
+        }
+
+        result
+    })
+    .await
+    .map_err(|error| format!("模型切换前压缩任务失败: {error}"))?
+}
+
+#[tauri::command]
 async fn clear_pi_session() -> Result<(), String> {
     dev_trace("desktop.stream", "clear_pi_session invoked".to_string());
     for pooled in drain_pooled_desktop_pi()? {
@@ -3623,6 +4215,83 @@ async fn open_external_url(url: String) -> Result<(), String> {
         .map_err(|error| format!("打开外部链接失败: {error}"))?
 }
 
+/// 打开 macOS 系统设置 → 通知面板
+#[tauri::command]
+async fn open_system_notification_settings() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("open")
+                .arg("x-apple.systempreferences:com.apple.Notifications-Settings.extension")
+                .spawn()
+                .map_err(|e| format!("打开系统通知设置失败: {e}"))?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Windows / Linux fallback — 暂不实现
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("打开系统通知设置失败: {error}"))?
+}
+
+/// 通过 osascript 发送 macOS 系统通知（绕过 notify-rust，兼容 macOS 15+）
+#[tauri::command]
+async fn send_native_notification(
+    title: String,
+    body: String,
+    subtitle: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let escaped_title = title.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped_body = body.replace('\\', "\\\\").replace('"', "\\\"");
+        let escaped_subtitle = subtitle
+            .as_deref()
+            .map(|s| s.replace('\\', "\\\\").replace('"', "\\\""));
+
+        let script = if let Some(st) = escaped_subtitle {
+            format!(
+                "display notification \"{}\" with title \"{}\" subtitle \"{}\"",
+                escaped_body, escaped_title, st
+            )
+        } else {
+            format!(
+                "display notification \"{}\" with title \"{}\"",
+                escaped_body, escaped_title
+            )
+        };
+
+        let output = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .map_err(|e| format!("执行 osascript 失败: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("osascript 报错: {stderr}"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("发送通知失败: {error}"))?
+}
+
+/// 调试用：通过 Rust 端直接发一条系统通知，用于排查前端通知不弹窗问题
+#[tauri::command]
+async fn debug_send_test_notification() -> Result<String, String> {
+    let output = std::process::Command::new("osascript")
+        .args(["-e", "display notification \"如果你看到这条通知，说明通知功能正常！\" with title \"NineClaw 测试\""])
+        .output()
+        .map_err(|e| format!("执行 osascript 失败: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("osascript 报错: {stderr}"));
+    }
+    Ok("通知已发送".to_string())
+}
+
 #[tauri::command]
 async fn load_local_media_preview(
     file_path: String,
@@ -3710,6 +4379,7 @@ async fn stream_pi_prompt(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "default".to_string());
+    bump_desktop_idle_compression_epoch(&normalized_session_id);
     let summary_key = session_summary_key(&normalized_session_id);
 
     let workspace_id_for_stream = workspace_id
@@ -3792,6 +4462,10 @@ async fn stream_pi_prompt(
         let normalized_session_id = session_id_for_attempt.clone();
         let runtime_session_id = session_id_for_attempt.clone();
         let provider_config = provider_config.clone();
+        let attempt_model_requires_reasoning_replay = provider_config
+            .as_ref()
+            .map(|config| openai_pi_compat_requires_reasoning_content_replay(&config.model))
+            .unwrap_or(false);
         let text_only_provider_input = text_only_provider_input_retry;
         let disable_reasoning_effort = disable_reasoning_provider_retry;
         let agent_config = agent_config.clone();
@@ -3973,8 +4647,10 @@ async fn stream_pi_prompt(
                 command.args(["--model", runtime_provider_config.model.trim()]);
             }
 
-            if should_force_pi_thinking_off(&runtime_provider_config, disable_reasoning_effort) {
-                command.args(["--thinking", "off"]);
+            if let Some(thinking_level) =
+                forced_pi_thinking_level(&runtime_provider_config, disable_reasoning_effort)
+            {
+                command.args(["--thinking", thinking_level]);
             }
 
             if !runtime_provider_config.api_key.trim().is_empty() {
@@ -4086,15 +4762,37 @@ async fn stream_pi_prompt(
             let skill_decision =
                 crate::skill_broker::select_skills_for_turn(agent_config, trimmed_prompt.as_str(), &[])?;
             selected_skill_ids = skill_decision.mounted_skill_ids.clone();
+            if !selected_skill_ids.is_empty() {
+                match skills::resolve_skill_source_info(&selected_skill_ids)
+                    .and_then(|info| serde_json::to_string(&info).map_err(|error| error.to_string()))
+                {
+                    Ok(skill_sources_json) => {
+                        command.env("NINECLAW_ACTIVE_SKILL_SOURCES_JSON", skill_sources_json);
+                    }
+                    Err(error) => {
+                        dev_trace(
+                            "desktop.stream",
+                            format!(
+                                "runtime skill source snapshot skipped: session={} error={}",
+                                normalized_session_id, error
+                            ),
+                        );
+                    }
+                }
+            }
             let _ = emit_pi_stream_skill_selection_event(
                 &app,
                 Some(normalized_session_id.clone()),
                 &skill_decision,
             );
             if let Some(skill_prompt) = crate::skill_broker::runtime_skill_prompt(&skill_decision) {
-                system_prompt_chars += skill_prompt.chars().count();
-                system_prompt_sections.push(("runtime_skills".to_string(), skill_prompt.clone()));
-                command.args(["--append-system-prompt", &skill_prompt]);
+                dev_trace(
+                    "desktop.stream",
+                    format!(
+                        "runtime_skill_selection: session={} {}",
+                        normalized_session_id, skill_prompt
+                    ),
+                );
             }
 
             for skill_path in skills::resolve_skill_directories(&selected_skill_ids)? {
@@ -4171,6 +4869,34 @@ async fn stream_pi_prompt(
                 content,
             );
         }
+
+        let mut session_text_log_guard = {
+            let _ = session_llm_log::record_start(
+                Some(&app),
+                session_llm_log::StartLog {
+                    workspace_id: workspace_id_for_stream.clone(),
+                    session_id: normalized_session_id.clone(),
+                    source: "desktop".to_string(),
+                    channel_id: None,
+                    user_id: None,
+                    agent_id: agent_config.as_ref().map(|item| item.id.clone()),
+                    agent_name: agent_config.as_ref().map(|item| item.name.clone()),
+                    provider: provider_config.as_ref().map(|item| item.provider_id.clone()),
+                    model: provider_config.as_ref().map(|item| item.model.clone()),
+                    prompt: trimmed_prompt.clone(),
+                    system_prompts: system_prompt_sections.clone(),
+                    attachments_count: attachments.len(),
+                    images_count: prepared_input.images.len(),
+                    reused_process: None,
+                    runtime_session_path: Some(session_path_string.clone()),
+                },
+            );
+            session_llm_log::SessionLlmLogGuard::new(
+                Some(&app),
+                workspace_id_for_stream.clone(),
+                normalized_session_id.clone(),
+            )
+        };
 
         // 调试模式：团队空间遵循 `llm_trace_enabled`；单独 session 则默认记录结构化 trace。
         // 系统提示词、用户输入、响应、用量最终会写入 scope 对应的 `.debug/YYYY-MM-DD.jsonl`。
@@ -4366,6 +5092,7 @@ async fn stream_pi_prompt(
                     None,
                     None,
                 )?;
+                session_text_log_guard.finish_error("error", timeout_error.clone(), None);
                 return Err(timeout_error);
             }
 
@@ -4418,8 +5145,18 @@ async fn stream_pi_prompt(
                             None,
                             None,
                         )?;
+                        session_text_log_guard.finish_error(
+                            "aborted",
+                            "用户中止后读取 pi 输出失败".to_string(),
+                            Some(emitted_assistant_text.clone()),
+                        );
                         return Ok(());
                     }
+                    session_text_log_guard.finish_error(
+                        "error",
+                        format!("读取 pi 输出失败: {error}"),
+                        Some(emitted_assistant_text.clone()),
+                    );
                     return Err(format!("读取 pi 输出失败: {error}"));
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -4485,6 +5222,11 @@ async fn stream_pi_prompt(
                         None,
                         None,
                     )?;
+                    session_text_log_guard.finish_error(
+                        "error",
+                        timeout_error.clone(),
+                        Some(emitted_assistant_text.clone()),
+                    );
                     return Err(timeout_error);
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -4519,8 +5261,18 @@ async fn stream_pi_prompt(
                             None,
                             None,
                         )?;
+                        session_text_log_guard.finish_error(
+                            "aborted",
+                            "用户中止后解析 pi 输出失败".to_string(),
+                            Some(emitted_assistant_text.clone()),
+                        );
                         return Ok(());
                     }
+                    session_text_log_guard.finish_error(
+                        "error",
+                        format!("解析 pi 输出失败: {error}"),
+                        Some(emitted_assistant_text.clone()),
+                    );
                     return Err(format!("解析 pi 输出失败: {error}"));
                 }
             };
@@ -4572,6 +5324,29 @@ async fn stream_pi_prompt(
                 }
             }
 
+            if line_type == "nineclaw_skill_evolution_usage" {
+                let step_usage = extract_usage_payload(value.get("usage"));
+                if step_usage.is_some() {
+                    accumulate_pi_token_usage(&mut final_usage, step_usage);
+                    dev_trace(
+                        "desktop.stream",
+                        format!(
+                            "skill_evolution usage aggregated: session={} route={} cost={}",
+                            normalized_session_id,
+                            value
+                                .get("route")
+                                .and_then(|item| item.as_str())
+                                .unwrap_or_default(),
+                            value
+                                .get("cost")
+                                .and_then(|item| item.as_f64())
+                                .unwrap_or_default()
+                        ),
+                    );
+                }
+                continue;
+            }
+
             if line_type == "response" {
                 let command = value
                     .get("command")
@@ -4608,6 +5383,11 @@ async fn stream_pi_prompt(
                         None,
                         None,
                     )?;
+                    session_text_log_guard.finish_error(
+                        "error",
+                        error_text.clone(),
+                        Some(emitted_assistant_text.clone()),
+                    );
                     return Err(error_text);
                 }
             }
@@ -4849,6 +5629,18 @@ async fn stream_pi_prompt(
                         None,
                     );
                 }
+                let _ = session_llm_log::record_tool_start(
+                    Some(&app),
+                    session_llm_log::ToolLog {
+                        workspace_id: workspace_id_for_stream.clone(),
+                        session_id: normalized_session_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        args: args_text.clone(),
+                        result: None,
+                        is_error: None,
+                    },
+                );
 
                 managed_runtime::append_session_event_quiet(
                     desktop_agent_home.as_deref(),
@@ -4938,6 +5730,18 @@ async fn stream_pi_prompt(
                         is_error,
                     );
                 }
+                let _ = session_llm_log::record_tool_end(
+                    Some(&app),
+                    session_llm_log::ToolLog {
+                        workspace_id: workspace_id_for_stream.clone(),
+                        session_id: normalized_session_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        args: args_text.clone(),
+                        result: result_text.clone(),
+                        is_error,
+                    },
+                );
 
                 managed_runtime::append_session_event_quiet(
                     desktop_agent_home.as_deref(),
@@ -5023,34 +5827,6 @@ async fn stream_pi_prompt(
                 }
 
                 saw_agent_end = true;
-                if assistant_terminal_error.is_none() {
-                    emit_stream_event_with_meta(
-                        &app,
-                        "done",
-                        Some(normalized_session_id.clone()),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        final_usage.clone(),
-                        final_usage_meta.clone(),
-                    )?;
-                    if let Some(guard) = pi_trace_guard.as_mut() {
-                        guard.finalize_done(
-                            Some(emitted_assistant_text.clone()),
-                            final_usage.clone(),
-                            final_usage_meta.as_ref().and_then(|m| m.provider.clone()),
-                            final_usage_meta.as_ref().and_then(|m| m.model.clone()),
-                            final_usage_meta.as_ref().and_then(|m| m.response_id.clone()),
-                        );
-                    }
-                    done_emitted = true;
-                }
                 break;
             }
         }
@@ -5126,6 +5902,41 @@ async fn stream_pi_prompt(
                 }
             }
 
+            if !done_emitted {
+                emit_stream_event_with_meta(
+                    &app,
+                    "done",
+                    Some(normalized_session_id.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    final_usage.clone(),
+                    final_usage_meta.clone(),
+                )?;
+            }
+            if let Some(guard) = pi_trace_guard.as_mut() {
+                guard.finalize_done(
+                    Some(emitted_assistant_text.clone()),
+                    final_usage.clone(),
+                    final_usage_meta.as_ref().and_then(|m| m.provider.clone()),
+                    final_usage_meta.as_ref().and_then(|m| m.model.clone()),
+                    final_usage_meta.as_ref().and_then(|m| m.response_id.clone()),
+                );
+            }
+            session_text_log_guard.finish_done(
+                Some(emitted_assistant_text.clone()),
+                final_usage.clone(),
+                final_usage_meta.as_ref().and_then(|m| m.provider.clone()),
+                final_usage_meta.as_ref().and_then(|m| m.model.clone()),
+                final_usage_meta.as_ref().and_then(|m| m.response_id.clone()),
+            );
+
             if let Some(agent_config) = agent_config.as_ref() {
                 if !emitted_assistant_text.trim().is_empty() {
                     if let Err(error) = agent_workspace::append_agent_memory_entry(
@@ -5165,34 +5976,6 @@ async fn stream_pi_prompt(
                 &emitted_assistant_text,
             );
 
-            if !done_emitted {
-                emit_stream_event_with_meta(
-                    &app,
-                    "done",
-                    Some(normalized_session_id.clone()),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    final_usage.clone(),
-                    final_usage_meta.clone(),
-                )?;
-            }
-            if let Some(guard) = pi_trace_guard.as_mut() {
-                guard.finalize_done(
-                    Some(emitted_assistant_text.clone()),
-                    final_usage.clone(),
-                    final_usage_meta.as_ref().and_then(|m| m.provider.clone()),
-                    final_usage_meta.as_ref().and_then(|m| m.model.clone()),
-                    final_usage_meta.as_ref().and_then(|m| m.response_id.clone()),
-                );
-            }
-
             store_pooled_desktop_pi(
                 &normalized_session_id,
                 DesktopPooledPi {
@@ -5201,8 +5984,13 @@ async fn stream_pi_prompt(
                     stdout_rx,
                     stderr_buffer,
                     fingerprint: desktop_fingerprint,
+                    workspace_id: workspace_id_for_stream.clone(),
+                    session_path: session_path.clone(),
+                    last_usage: final_usage.clone(),
                 },
             )?;
+            // 压缩可能再次调用模型；只在 idle 后台执行，避免主回复 done 后继续占用同会话输入通道。
+            schedule_desktop_idle_compression(&app, &normalized_session_id);
             dev_trace(
                 "desktop.stream",
                 format!(
@@ -5273,6 +6061,11 @@ async fn stream_pi_prompt(
                 None,
                 None,
             )?;
+            session_text_log_guard.finish_error(
+                "aborted",
+                "用户中止".to_string(),
+                Some(emitted_assistant_text.clone()),
+            );
             return Ok(());
         }
 
@@ -5292,6 +6085,11 @@ async fn stream_pi_prompt(
                 Some("aborted".to_string()),
                 None,
             )?;
+            session_text_log_guard.finish_error(
+                "aborted",
+                "模型返回 aborted".to_string(),
+                Some(emitted_assistant_text.clone()),
+            );
             return Ok(());
         }
 
@@ -5332,6 +6130,11 @@ async fn stream_pi_prompt(
                 None,
                 final_usage,
             )?;
+            session_text_log_guard.finish_error(
+                "error",
+                error_text.clone(),
+                Some(emitted_assistant_text.clone()),
+            );
             return Err(error_text);
         }
 
@@ -5388,6 +6191,42 @@ async fn stream_pi_prompt(
                     }
                 }
             }
+        }
+
+        if saw_terminal_completion && !done_emitted {
+            emit_stream_event_with_meta(
+                &app,
+                "done",
+                Some(normalized_session_id.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                final_usage.clone(),
+                final_usage_meta.clone(),
+            )?;
+            done_emitted = true;
+            if let Some(guard) = pi_trace_guard.as_mut() {
+                guard.finalize_done(
+                    Some(emitted_assistant_text.clone()),
+                    final_usage.clone(),
+                    final_usage_meta.as_ref().and_then(|m| m.provider.clone()),
+                    final_usage_meta.as_ref().and_then(|m| m.model.clone()),
+                    final_usage_meta.as_ref().and_then(|m| m.response_id.clone()),
+                );
+            }
+            session_text_log_guard.finish_done(
+                Some(emitted_assistant_text.clone()),
+                final_usage.clone(),
+                final_usage_meta.as_ref().and_then(|m| m.provider.clone()),
+                final_usage_meta.as_ref().and_then(|m| m.model.clone()),
+                final_usage_meta.as_ref().and_then(|m| m.response_id.clone()),
+            );
         }
 
         if let Some(agent_config) = agent_config.as_ref() {
@@ -5499,11 +6338,23 @@ async fn stream_pi_prompt(
                 None,
                 None,
             )?;
+            session_text_log_guard.finish_error(
+                "error",
+                fallback_error.clone(),
+                Some(emitted_assistant_text.clone()),
+            );
             return Err(fallback_error);
         }
 
         if status.map(|value| !value.success()).unwrap_or(true) {
             if done_emitted && saw_terminal_completion {
+                session_text_log_guard.finish_done(
+                    Some(emitted_assistant_text.clone()),
+                    final_usage.clone(),
+                    final_usage_meta.as_ref().and_then(|m| m.provider.clone()),
+                    final_usage_meta.as_ref().and_then(|m| m.model.clone()),
+                    final_usage_meta.as_ref().and_then(|m| m.response_id.clone()),
+                );
                 return Ok(());
             }
 
@@ -5525,10 +6376,17 @@ async fn stream_pi_prompt(
                         None,
                         None,
                         None,
-                        final_usage,
+                        final_usage.clone(),
                         final_usage_meta.clone(),
                     )?;
                 }
+                session_text_log_guard.finish_done(
+                    Some(emitted_assistant_text.clone()),
+                    final_usage.clone(),
+                    final_usage_meta.as_ref().and_then(|m| m.provider.clone()),
+                    final_usage_meta.as_ref().and_then(|m| m.model.clone()),
+                    final_usage_meta.as_ref().and_then(|m| m.response_id.clone()),
+                );
                 return Ok(());
             }
 
@@ -5563,6 +6421,11 @@ async fn stream_pi_prompt(
                 None,
                 None,
             )?;
+            session_text_log_guard.finish_error(
+                "error",
+                fallback_error.clone(),
+                Some(emitted_assistant_text.clone()),
+            );
             return Err(fallback_error);
         }
 
@@ -5593,6 +6456,13 @@ async fn stream_pi_prompt(
                 final_usage_meta.as_ref().and_then(|m| m.response_id.clone()),
             );
         }
+        session_text_log_guard.finish_done(
+            Some(emitted_assistant_text.clone()),
+            final_usage.clone(),
+            final_usage_meta.as_ref().and_then(|m| m.provider.clone()),
+            final_usage_meta.as_ref().and_then(|m| m.model.clone()),
+            final_usage_meta.as_ref().and_then(|m| m.response_id.clone()),
+        );
         dev_trace(
             "desktop.stream",
             format!(
@@ -5649,71 +6519,95 @@ async fn stream_pi_prompt(
                     return Err(clarified);
                 }
                 if attempt < 2 && is_provider_reasoning_history_rejection_error(&error) {
+                    let current_model_requires_reasoning_replay =
+                        attempt_model_requires_reasoning_replay;
                     let session_path = session_file_path(Some(session_id_for_attempt.as_str()));
-                    match sanitize_pi_session_replay_state(&session_path) {
-                        Ok(true) => dev_trace(
-                            "desktop.stream",
-                            format!(
-                                "sanitized reasoning replay state before retry: session={} path={}",
-                                session_id_for_attempt,
-                                session_path.display()
+                    if !current_model_requires_reasoning_replay {
+                        match sanitize_pi_session_replay_state(&session_path) {
+                            Ok(true) => dev_trace(
+                                "desktop.stream",
+                                format!(
+                                    "sanitized reasoning replay state before retry: session={} path={}",
+                                    session_id_for_attempt,
+                                    session_path.display()
+                                ),
                             ),
-                        ),
-                        Ok(false) => {
-                            if session_path.exists() {
-                                match quarantine_pi_session_file(&session_path, "reasoning-history")
-                                {
-                                    Ok(true) => dev_trace(
+                            Ok(false) => {
+                                if session_path.exists() {
+                                    match quarantine_pi_session_file(
+                                        &session_path,
+                                        "reasoning-history",
+                                    ) {
+                                        Ok(true) => dev_trace(
+                                            "desktop.stream",
+                                            format!(
+                                                "quarantined pi session for fresh reasoning retry: session={} path={}",
+                                                session_id_for_attempt,
+                                                session_path.display()
+                                            ),
+                                        ),
+                                        Ok(false) => {}
+                                        Err(quarantine_error) => dev_trace(
+                                            "desktop.stream",
+                                            format!(
+                                                "failed to quarantine pi session for reasoning retry: session={} path={} error={}",
+                                                session_id_for_attempt,
+                                                session_path.display(),
+                                                quarantine_error
+                                            ),
+                                        ),
+                                    }
+                                    dev_trace(
                                         "desktop.stream",
                                         format!(
-                                            "quarantined pi session for fresh reasoning retry: session={} path={}",
+                                            "reasoning replay retry requested but session needed no sanitize: session={} path={}",
                                             session_id_for_attempt,
                                             session_path.display()
                                         ),
-                                    ),
-                                    Ok(false) => {}
-                                    Err(quarantine_error) => dev_trace(
-                                        "desktop.stream",
-                                        format!(
-                                            "failed to quarantine pi session for reasoning retry: session={} path={} error={}",
-                                            session_id_for_attempt,
-                                            session_path.display(),
-                                            quarantine_error
-                                        ),
-                                    ),
+                                    );
                                 }
-                                dev_trace(
-                                    "desktop.stream",
-                                    format!(
-                                        "reasoning replay retry requested but session needed no sanitize: session={} path={}",
-                                        session_id_for_attempt,
-                                        session_path.display()
-                                    ),
-                                );
                             }
+                            Err(sanitize_error) => dev_trace(
+                                "desktop.stream",
+                                format!(
+                                    "failed to sanitize reasoning replay state: session={} path={} error={}",
+                                    session_id_for_attempt,
+                                    session_path.display(),
+                                    sanitize_error
+                                ),
+                            ),
                         }
-                        Err(sanitize_error) => dev_trace(
+                    } else {
+                        dev_trace(
                             "desktop.stream",
                             format!(
-                                "failed to sanitize reasoning replay state: session={} path={} error={}",
+                                "mimo reasoning replay retry keeps session state intact: session={} path={}",
                                 session_id_for_attempt,
-                                session_path.display(),
-                                sanitize_error
+                                session_path.display()
                             ),
-                        ),
+                        );
                     }
+                    let retry_note = if current_model_requires_reasoning_replay {
+                        "provider rejected MiMo reasoning replay; retrying with MiMo replay compatibility preserved"
+                    } else {
+                        "provider rejected replayed reasoning history; retrying once with reasoning effort disabled"
+                    };
                     managed_runtime::append_session_event_quiet(
                         desktop_agent_home_for_runtime.as_deref(),
                         &session_id_for_attempt,
                         managed_runtime::SessionEventKind::RuntimeRetry,
-                        "provider rejected replayed reasoning history; retrying once with reasoning effort disabled",
+                        retry_note,
                         Some(serde_json::json!({ "attempt": attempt + 1, "error": error })),
                     );
-                    disable_reasoning_provider_retry = true;
-                    attempt_prompt = format!(
-                        "{}\n\n[system note] 上一次请求因为旧 PI session 中的 reasoning/thinking 历史无法被当前 Provider 回放而失败。NineClaw 已修复或隔离污染的 session 历史。请基于当前可见上下文和持久记忆继续处理用户请求；如果关键上下文缺失，只问一个最必要的问题。",
-                        prompt.trim()
-                    );
+                    disable_reasoning_provider_retry = !current_model_requires_reasoning_replay;
+                    attempt_prompt = if current_model_requires_reasoning_replay {
+                        prompt.trim().to_string()
+                    } else {
+                        format!(
+                            "{}\n\n[system note] 上一次请求因为旧 PI session 中的 reasoning/thinking 历史无法被当前 Provider 回放而失败。NineClaw 已修复或隔离污染的 session 历史。请基于当前可见上下文和持久记忆继续处理用户请求；如果关键上下文缺失，只问一个最必要的问题。",
+                            prompt.trim()
+                        )
+                    };
                     continue;
                 }
                 if managed_runtime::should_auto_retry_runtime(
@@ -6591,6 +7485,9 @@ pub fn run() {
             workspace_llm_trace_set_enabled,
             llm_trace_list,
             llm_trace_clear,
+            session_llm_log_get,
+            session_llm_log_list,
+            session_llm_log_clear,
             llm_log_export_get,
             llm_log_export_set,
             llm_log_export_preview,
@@ -6628,9 +7525,13 @@ pub fn run() {
             workspace_abort_delegate,
             workspace_augment_delegate,
             abort_pi_stream,
+            compact_desktop_session_before_model_switch,
             persist_chat_attachments,
             open_local_file,
             open_external_url,
+            open_system_notification_settings,
+            send_native_notification,
+            debug_send_test_notification,
             load_local_media_preview,
             clear_pi_session,
             clear_pi_session_for_id,
