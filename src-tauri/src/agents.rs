@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use tauri::AppHandle;
 use uuid::Uuid;
 
@@ -53,10 +54,31 @@ const DEFAULT_ALLOWED_TOOL_IDS: &[&str] = &[
     "memory_forget",
     "memory_list",
     "chat_search",
+    "create_scheduled_task",
+    "query_scheduled_task",
+    "query_scheduled_task_info",
 ];
 
 /// 用户在「系统指令」中填写的内容会进入 `agent_system_prompt`；不应对其做过短截断，仅保留与模型侧类似的硬上限防误粘贴。
 const MAX_USER_SYSTEM_INSTRUCTION_CHARS: usize = 32_000;
+
+type SessionAgentPromptCache = HashMap<(String, String), String>;
+
+fn session_agent_prompt_cache() -> &'static Mutex<SessionAgentPromptCache> {
+    static CACHE: OnceLock<Mutex<SessionAgentPromptCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn clear_session_agent_system_prompt_cache(agent_id: &str, session_id: &str) {
+    let agent_id = agent_id.trim();
+    let session_id = session_id.trim();
+    if agent_id.is_empty() || session_id.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = session_agent_prompt_cache().lock() {
+        guard.remove(&(agent_id.to_string(), session_id.to_string()));
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -367,6 +389,9 @@ pub fn runtime_tool_names_for_allowed_tool_ids(tool_ids: &[String]) -> Vec<Strin
             "memory_forget" => "memory_forget",
             "memory_list" => "memory_list",
             "chat_search" => "chat_search",
+            "create_scheduled_task" => "create_scheduled_task",
+            "query_scheduled_task" => "query_scheduled_task",
+            "query_scheduled_task_info" => "query_scheduled_task_info",
             value => value,
         };
         let runtime_name = runtime_name.trim();
@@ -663,6 +688,42 @@ pub fn build_agent_system_prompt_for_prompt(
     agent: &ConversationAgentConfig,
     current_prompt: Option<&str>,
 ) -> Option<String> {
+    build_agent_system_prompt_for_session_prompt(agent, None, current_prompt)
+}
+
+pub fn build_agent_system_prompt_for_session_prompt(
+    agent: &ConversationAgentConfig,
+    session_id: Option<&str>,
+    current_prompt: Option<&str>,
+) -> Option<String> {
+    let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return build_agent_system_prompt_for_prompt_inner(agent, None, current_prompt);
+    };
+    let agent_id = agent.id.trim();
+    if agent_id.is_empty() {
+        return build_agent_system_prompt_for_prompt_inner(agent, None, current_prompt);
+    }
+
+    let cache_key = (agent_id.to_string(), session_id.to_string());
+    if let Ok(guard) = session_agent_prompt_cache().lock() {
+        if let Some(snapshot) = guard.get(&cache_key) {
+            return Some(snapshot.clone());
+        }
+    }
+
+    let snapshot =
+        build_agent_system_prompt_for_prompt_inner(agent, Some(session_id), current_prompt)?;
+    if let Ok(mut guard) = session_agent_prompt_cache().lock() {
+        guard.entry(cache_key).or_insert_with(|| snapshot.clone());
+    }
+    Some(snapshot)
+}
+
+fn build_agent_system_prompt_for_prompt_inner(
+    agent: &ConversationAgentConfig,
+    session_id: Option<&str>,
+    current_prompt: Option<&str>,
+) -> Option<String> {
     let mut sections = Vec::new();
 
     let name = agent.name.trim();
@@ -717,10 +778,18 @@ pub fn build_agent_system_prompt_for_prompt(
     }
 
     if !agent.allowed_tool_ids.is_empty() {
-        sections.push(format!(
-            "允许工具：{}。严禁调用未列入允许工具的工具。",
-            agent.allowed_tool_ids.join("、")
-        ));
+        let inline_tools = agent.allowed_tool_ids.join("、");
+        if agent.allowed_tool_ids.len() <= 12 && inline_tools.chars().count() <= 180 {
+            sections.push(format!(
+                "允许工具：{}。严禁调用未列入允许工具的工具。",
+                inline_tools
+            ));
+        } else {
+            sections.push(format!(
+                "允许工具：运行时白名单共 {} 个；只调用当前可用且已授权的工具，严禁越权。",
+                agent.allowed_tool_ids.len()
+            ));
+        }
     }
 
     let system_prompt = agent.system_prompt.trim();
@@ -744,9 +813,15 @@ pub fn build_agent_system_prompt_for_prompt(
 
     if agent_workspace::runtime_sync_enabled() {
         if let Ok(workspace_prompt) =
-            agent_workspace::build_workspace_system_prompt_for_query(&agent.id, current_prompt)
+            agent_workspace::build_session_workspace_system_prompt_for_query(
+                &agent.id,
+                session_id,
+                current_prompt,
+            )
         {
-            sections.push(workspace_prompt);
+            if !workspace_prompt.trim().is_empty() {
+                sections.push(workspace_prompt);
+            }
         }
     }
 
@@ -1912,9 +1987,15 @@ fn migrate_agent_id_with_connection(
     }
 
     let now = crate::chrono_like_timestamp();
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("迁移 Agent_ID 事务失败: {error}"))?;
+    transaction
+        .execute_batch("PRAGMA defer_foreign_keys = ON;")
+        .map_err(|error| format!("启用 Agent_ID 迁移事务约束延迟失败: {error}"))?;
 
     // 1) agents 表：更新 id + name（保持其他字段不变）
-    let rows = connection
+    let rows = transaction
         .execute(
             "UPDATE agents SET id = ?2, updated_at = ?3 WHERE id = ?1 AND is_archived = 0",
             params![old, new_id, now],
@@ -1942,13 +2023,13 @@ fn migrate_agent_id_with_connection(
     ];
     let mut direct_count = 0u64;
     for (table, stmt, uses_now) in direct_updates {
-        if !table_exists(connection, table)? {
+        if !table_exists(&transaction, table)? {
             continue;
         }
         let affected = if *uses_now {
-            connection.execute(stmt, params![old, new_id, now])
+            transaction.execute(stmt, params![old, new_id, now])
         } else {
-            connection.execute(stmt, params![old, new_id])
+            transaction.execute(stmt, params![old, new_id])
         }
         .map_err(|error| format!("更新 {table} 失败: {error}"))?;
         direct_count += affected as u64;
@@ -1956,8 +2037,8 @@ fn migrate_agent_id_with_connection(
 
     // 3) user_memories: owner_scope='agent' AND owner_id=old
     let mut user_mem_count = 0u64;
-    if table_exists(connection, "user_memories")? {
-        user_mem_count = connection
+    if table_exists(&transaction, "user_memories")? {
+        user_mem_count = transaction
             .execute(
                 "UPDATE user_memories SET owner_id = ?2 WHERE owner_scope = 'agent' AND owner_id = ?1",
                 params![old, new_id],
@@ -1967,16 +2048,16 @@ fn migrate_agent_id_with_connection(
 
     // 4) memory_vectors 命名空间更新
     let mut vector_count = 0u64;
-    if table_exists(connection, "memory_vectors")? {
+    if table_exists(&transaction, "memory_vectors")? {
         // agent::old -> agent::new
-        vector_count += connection
+        vector_count += transaction
             .execute(
                 "UPDATE memory_vectors SET workspace_id = REPLACE(workspace_id, ?2, ?3) WHERE workspace_id LIKE ?1",
                 params![format!("agent::{old}"), format!("agent::{old}"), format!("agent::{new_id}")],
             )
             .map_err(|error| format!("更新 memory_vectors agent 命名空间失败: {error}"))? as u64;
         // user-memory::agent::old -> user-memory::agent::new
-        vector_count += connection
+        vector_count += transaction
             .execute(
                 "UPDATE memory_vectors SET workspace_id = REPLACE(workspace_id, ?2, ?3) WHERE workspace_id LIKE ?1",
                 params![format!("user-memory::agent::{old}"), format!("user-memory::agent::{old}"), format!("user-memory::agent::{new_id}")],
@@ -1986,7 +2067,7 @@ fn migrate_agent_id_with_connection(
         // 以及 workspace_id = build_agent_memory_workspace_id(old) 的情况
         let agent_ws_old = format!("agent-ws-{old}");
         let agent_ws_new = format!("agent-ws-{new_id}");
-        vector_count += connection
+        vector_count += transaction
             .execute(
                 "UPDATE memory_vectors SET workspace_id = ?2 WHERE workspace_id = ?1",
                 params![agent_ws_old, agent_ws_new],
@@ -1997,10 +2078,10 @@ fn migrate_agent_id_with_connection(
 
     // 5) workspace_kv_memories 的 workspace_id
     let mut kv_count = 0u64;
-    if table_exists(connection, "workspace_kv_memories")? {
+    if table_exists(&transaction, "workspace_kv_memories")? {
         let agent_ws_old = format!("agent-ws-{old}");
         let agent_ws_new = format!("agent-ws-{new_id}");
-        kv_count = connection
+        kv_count = transaction
             .execute(
                 "UPDATE workspace_kv_memories SET workspace_id = ?2 WHERE workspace_id = ?1",
                 params![agent_ws_old, agent_ws_new],
@@ -2010,12 +2091,15 @@ fn migrate_agent_id_with_connection(
     }
 
     // 6) app_state 默认智能体
-    connection
+    transaction
         .execute(
             "UPDATE app_state SET value = ?2, updated_at = ?3 WHERE key = ?4 AND value = ?1",
             params![old, new_id, now, DEFAULT_AGENT_STATE_KEY],
         )
         .map_err(|error| format!("更新默认智能体引用失败: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交 Agent_ID 迁移失败: {error}"))?;
 
     // 7) 文件系统：工作区目录重命名
     let mut workspace_renamed = false;
@@ -3297,7 +3381,7 @@ mod tests {
     }
 
     #[test]
-    fn create_and_update_agent_supports_editable_agent_id_and_trigger_fields() {
+    fn create_and_update_agent_rejects_id_change_and_updates_trigger_fields() {
         let mut connection = connection();
 
         let created = create_agent_with_connection(
@@ -3331,7 +3415,7 @@ mod tests {
         assert_eq!(created.trigger_condition, "用户请求审查时");
         assert!(created.manual_trigger_only);
 
-        let updated = update_agent_with_connection(
+        let id_change = update_agent_with_connection(
             &mut connection,
             &created.id,
             AgentInput {
@@ -3356,10 +3440,42 @@ mod tests {
                 scenario_llm_config: None,
                 agent_loop_config: None,
             },
-        )
-        .expect("update id");
+        );
 
-        assert_eq!(updated.id, "review_agent_v2");
+        assert_eq!(
+            id_change.expect_err("agent id update should be rejected"),
+            "Agent_ID 创建后不可修改"
+        );
+
+        let updated = update_agent_with_connection(
+            &mut connection,
+            &created.id,
+            AgentInput {
+                id: Some(created.id.clone()),
+                name: "审查智能体".to_string(),
+                summary: "".to_string(),
+                description: "负责审查用户提交的内容".to_string(),
+                trigger_condition: "用户请求复核时".to_string(),
+                manual_trigger_only: false,
+                system_prompt: "围绕 ${ARG} 复核".to_string(),
+                capability_policy: None,
+                skill_ids: vec!["pdf".to_string()],
+                allowed_tool_ids: vec!["read".to_string(), "find".to_string()],
+                default_provider_id: "openai".to_string(),
+                default_model: "gpt-4.1".to_string(),
+                execution_mode: Some("single".to_string()),
+                collaboration_config: None,
+                accent_color: None,
+                avatar_uri: None,
+                bot_configs: HashMap::new(),
+                heartbeat_config: AgentHeartbeatConfig::default(),
+                scenario_llm_config: None,
+                agent_loop_config: None,
+            },
+        )
+        .expect("update editable fields");
+
+        assert_eq!(updated.id, "review_agent");
         assert_eq!(updated.trigger_condition, "用户请求复核时");
         assert_eq!(
             updated.allowed_tool_ids,
@@ -3367,8 +3483,8 @@ mod tests {
         );
         assert!(!updated.manual_trigger_only);
         assert!(get_active_agent_by_id(&connection, "review_agent")
-            .expect("old id lookup")
-            .is_none());
+            .expect("agent lookup")
+            .is_some());
     }
 
     #[test]
@@ -3410,37 +3526,14 @@ mod tests {
         let old_home = root.join("agents").join(&created.id);
         fs::write(old_home.join("MEMORY.md"), "# MEMORY.md\n\nold-data\n").expect("seed memory");
 
-        let updated = update_agent_with_connection(
-            &mut connection,
-            &created.id,
-            AgentInput {
-                id: Some("writer_v2".to_string()),
-                name: "写手".to_string(),
-                summary: "负责写内容".to_string(),
-                description: "负责验证 ID 变更时迁移工作区".to_string(),
-                trigger_condition: String::new(),
-                manual_trigger_only: false,
-                system_prompt: "".to_string(),
-                capability_policy: None,
-                skill_ids: vec![],
-                allowed_tool_ids: default_allowed_tool_ids(),
-                default_provider_id: "openai".to_string(),
-                default_model: "gpt-4.1".to_string(),
-                execution_mode: Some("single".to_string()),
-                collaboration_config: None,
-                accent_color: None,
-                avatar_uri: None,
-                bot_configs: HashMap::new(),
-                heartbeat_config: AgentHeartbeatConfig::default(),
-                scenario_llm_config: None,
-                agent_loop_config: None,
-            },
-        )
-        .expect("update agent id");
+        let migration_summary =
+            migrate_agent_id_with_connection(&mut connection, &created.id, "writer_v2")
+                .expect("update agent id");
 
-        let new_home = root.join("agents").join(&updated.id);
+        let new_home = root.join("agents").join("writer_v2");
         assert!(!old_home.exists());
         assert!(new_home.exists());
+        assert!(migration_summary.contains("迁移完成"));
         assert_eq!(
             fs::read_to_string(new_home.join("MEMORY.md")).expect("read migrated memory"),
             "# MEMORY.md\n\nold-data\n"
@@ -3603,6 +3696,34 @@ mod tests {
     }
 
     #[test]
+    fn build_agent_system_prompt_summarizes_large_tool_allowlist() {
+        let prompt = build_agent_system_prompt(&ConversationAgentConfig {
+            id: "agent".to_string(),
+            name: "工具助理".to_string(),
+            summary: "验证长工具白名单压缩".to_string(),
+            description: String::new(),
+            trigger_condition: String::new(),
+            manual_trigger_only: false,
+            system_prompt: String::new(),
+            capability_policy: AgentCapabilityPolicy::default(),
+            skill_ids: vec![],
+            allowed_tool_ids: (0..20).map(|idx| format!("tool_{idx}")).collect(),
+            default_provider_id: "openai".to_string(),
+            default_model: "gpt-4.1".to_string(),
+            execution_mode: "single".to_string(),
+            collaboration_config: None,
+            accent_color: None,
+            avatar_uri: None,
+            scenario_llm_config: None,
+            agent_loop_config: None,
+        })
+        .expect("prompt");
+
+        assert!(prompt.contains("运行时白名单共 20 个"));
+        assert!(!prompt.contains("tool_0、tool_1、tool_2"));
+    }
+
+    #[test]
     fn build_agent_system_prompt_expands_arg_placeholder() {
         let prompt = build_agent_system_prompt_for_prompt(
             &ConversationAgentConfig {
@@ -3633,6 +3754,56 @@ mod tests {
         assert!(prompt.contains("禁止模型自动调用"));
         assert!(prompt.contains("请审查：合同条款"));
         assert!(!prompt.contains("${ARG}"));
+    }
+
+    #[test]
+    fn build_agent_system_prompt_freezes_per_session() {
+        let _guard = workspace_test_lock();
+        let root = temp_workspace_root();
+        std::env::set_var(TEST_WORKSPACE_ROOT_ENV, &root);
+
+        let agent = ConversationAgentConfig {
+            id: "frozen-agent-prompt".to_string(),
+            name: "冻结测试".to_string(),
+            summary: "用于验证系统提示词缓存".to_string(),
+            description: "验证同一会话后续轮次不再重建 prompt".to_string(),
+            trigger_condition: String::new(),
+            manual_trigger_only: false,
+            system_prompt: "处理当前请求：${ARG}".to_string(),
+            capability_policy: AgentCapabilityPolicy::default(),
+            skill_ids: vec![],
+            allowed_tool_ids: default_allowed_tool_ids(),
+            default_provider_id: "openai".to_string(),
+            default_model: "gpt-4.1".to_string(),
+            execution_mode: "single".to_string(),
+            collaboration_config: None,
+            accent_color: None,
+            avatar_uri: None,
+            scenario_llm_config: None,
+            agent_loop_config: None,
+        };
+
+        clear_session_agent_system_prompt_cache(&agent.id, "session-a");
+        clear_session_agent_system_prompt_cache(&agent.id, "session-b");
+
+        let first =
+            build_agent_system_prompt_for_session_prompt(&agent, Some("session-a"), Some("第一轮"))
+                .expect("first prompt");
+        assert!(first.contains("处理当前请求：第一轮"));
+
+        let second =
+            build_agent_system_prompt_for_session_prompt(&agent, Some("session-a"), Some("第二轮"))
+                .expect("second prompt");
+        assert_eq!(second, first);
+        assert!(!second.contains("第二轮"));
+
+        let other_session =
+            build_agent_system_prompt_for_session_prompt(&agent, Some("session-b"), Some("第二轮"))
+                .expect("other session prompt");
+        assert!(other_session.contains("处理当前请求：第二轮"));
+
+        let _ = fs::remove_dir_all(root);
+        std::env::remove_var(TEST_WORKSPACE_ROOT_ENV);
     }
 
     #[test]

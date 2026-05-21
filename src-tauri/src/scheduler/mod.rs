@@ -1488,13 +1488,7 @@ fn push_scheduler_result_to_auxiliary_im_channels(
     let primary_rt = runtime_channel_id(&agent.id, &primary_delivery.channel_id);
     let primary_uid = primary_delivery.target_user_id.trim();
 
-    let manager = match crate::channel_manager().lock() {
-        Ok(guard) => guard,
-        Err(error) => {
-            log::warn!("scheduler IM 广播：无法锁定通道管理器: {error}");
-            return;
-        }
-    };
+    let manager = crate::lock_channel_manager();
 
     for schedule in &agent.heartbeat_config.schedules {
         if !schedule.enabled {
@@ -2183,9 +2177,7 @@ fn send_task_message(
         return Ok(());
     }
 
-    let manager = crate::channel_manager()
-        .lock()
-        .map_err(|error| format!("锁定 IM 通道管理器失败: {error}"))?;
+    let manager = crate::lock_channel_manager();
     if !text_content.is_empty() {
         manager.send_message(&runtime_channel_id, &delivery.target_user_id, &text_content)?;
     }

@@ -118,7 +118,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, PhysicalSize, Size};
@@ -1010,9 +1010,10 @@ mod lib_tests {
         aggregate_token_usage_from_history_turns, aggregate_usage_from_agent_messages,
         build_desktop_anthropic_compat_extension_source, build_desktop_outbound_display_text,
         build_provider_models_config_with_input, build_turn_prompt_with_multimodal_summary,
-        desktop_incomplete_reply_error, desktop_media_reply_prompt, desktop_pi_fingerprint,
-        forced_pi_thinking_level, infer_media_mime_type, is_provider_image_block_rejection_error,
-        is_provider_reasoning_history_rejection_error, parse_context_stats_from_rpc_response,
+        channel_manager, desktop_incomplete_reply_error, desktop_media_reply_prompt,
+        desktop_pi_fingerprint, forced_pi_thinking_level, infer_media_mime_type,
+        is_provider_image_block_rejection_error, is_provider_reasoning_history_rejection_error,
+        lock_channel_manager, parse_context_stats_from_rpc_response,
         prepend_multimodal_summary_context, quarantine_pi_session_file, record_multimodal_summary,
         render_multimodal_summary_context, resolve_context_window_from_sources,
         resolve_pi_ai_import_path, sanitize_pi_session_replay_state, should_force_pi_thinking_off,
@@ -1034,6 +1035,25 @@ mod lib_tests {
         ));
         fs::write(&path, bytes).expect("write temp media file");
         path
+    }
+
+    #[test]
+    fn lock_channel_manager_recovers_from_poisoned_mutex() {
+        let _test_guard = crate::workspace_env_test_lock();
+        let manager = channel_manager();
+        manager.clear_poison();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = manager
+                .lock()
+                .expect("channel manager lock should start clean");
+            panic!("poison channel manager for test");
+        }));
+
+        assert!(poisoned.is_err());
+        assert!(manager.lock().is_err());
+        drop(lock_channel_manager());
+        assert!(manager.lock().is_ok());
     }
 
     #[test]
@@ -4690,8 +4710,9 @@ async fn stream_pi_prompt(
                 team_artifacts_root_for_media.as_deref(),
             );
 
-            let base_agent_prompt = agents::build_agent_system_prompt_for_prompt(
+            let base_agent_prompt = agents::build_agent_system_prompt_for_session_prompt(
                 agent_config,
+                Some(normalized_session_id.as_str()),
                 Some(trimmed_prompt.as_str()),
             );
             let speaker_id = agent_config.id.trim();
@@ -6641,6 +6662,19 @@ pub(crate) fn channel_manager() -> &'static Mutex<ChannelManager> {
     CHANNEL_MANAGER.get_or_init(|| Mutex::new(ChannelManager::new()))
 }
 
+pub(crate) fn lock_channel_manager() -> MutexGuard<'static, ChannelManager> {
+    let manager = channel_manager();
+    match manager.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("channel manager lock was poisoned; recovering shared IM channel state");
+            let guard = poisoned.into_inner();
+            manager.clear_poison();
+            guard
+        }
+    }
+}
+
 #[tauri::command]
 async fn sync_runtime_parameters(
     payload: runtime_parameters::RuntimeParametersPayload,
@@ -6753,9 +6787,7 @@ fn start_wechat_channel(
         &runtime.provider_id,
     );
 
-    let mut mgr = channel_manager()
-        .lock()
-        .map_err(|e| format!("锁失败: {e}"))?;
+    let mut mgr = lock_channel_manager();
 
     // Register WeChat channel via factory
     let old = mgr.register_channel(ChannelConfig::WeChat {
@@ -6774,9 +6806,7 @@ fn start_wechat_channel(
     if let Some(mut channel) = old {
         let _ = channel.stop();
     }
-    let mut mgr = channel_manager()
-        .lock()
-        .map_err(|e| format!("锁失败: {e}"))?;
+    let mut mgr = lock_channel_manager();
     mgr.start_channel(&channel_id, app)?;
 
     Ok(())
@@ -6808,9 +6838,7 @@ fn start_lark_channel(
         &runtime.provider_id,
     );
 
-    let mut mgr = channel_manager()
-        .lock()
-        .map_err(|e| format!("锁失败: {e}"))?;
+    let mut mgr = lock_channel_manager();
 
     let old = mgr.register_channel(ChannelConfig::Lark {
         channel_id: channel_id.clone(),
@@ -6827,9 +6855,7 @@ fn start_lark_channel(
     if let Some(mut channel) = old {
         let _ = channel.stop();
     }
-    let mut mgr = channel_manager()
-        .lock()
-        .map_err(|e| format!("锁失败: {e}"))?;
+    let mut mgr = lock_channel_manager();
     mgr.start_channel(&channel_id, app)?;
 
     Ok(())
@@ -6837,9 +6863,7 @@ fn start_lark_channel(
 
 #[tauri::command]
 async fn bot_stop_wechat(channel_id: String) -> Result<(), String> {
-    let mut mgr = channel_manager()
-        .lock()
-        .map_err(|e| format!("锁失败: {e}"))?;
+    let mut mgr = lock_channel_manager();
     mgr.stop_channel(&channel_id)
 }
 
@@ -6901,9 +6925,7 @@ fn save_peer_gateway_settings(
 
 #[tauri::command]
 async fn bot_stop_lark(channel_id: String) -> Result<(), String> {
-    let mut mgr = channel_manager()
-        .lock()
-        .map_err(|e| format!("锁失败: {e}"))?;
+    let mut mgr = lock_channel_manager();
     mgr.stop_channel(&channel_id)
 }
 
@@ -7010,9 +7032,7 @@ pub(crate) fn auto_start_bound_im_services(app: &AppHandle) -> Result<(), String
 
 #[tauri::command]
 async fn bot_get_status(channel_id: String) -> Result<String, String> {
-    let mgr = channel_manager()
-        .lock()
-        .map_err(|e| format!("锁失败: {e}"))?;
+    let mgr = lock_channel_manager();
     let status = mgr.get_status(&channel_id)?;
     serde_json::to_string(&status).map_err(|e| format!("序列化状态失败: {e}"))
 }
@@ -7023,9 +7043,7 @@ async fn bot_send_message(
     user_id: String,
     content: String,
 ) -> Result<(), String> {
-    let mgr = channel_manager()
-        .lock()
-        .map_err(|e| format!("锁失败: {e}"))?;
+    let mgr = lock_channel_manager();
     mgr.send_message(&channel_id, &user_id, &content)
 }
 
@@ -7164,9 +7182,7 @@ async fn bot_send_media(
         data,
     };
 
-    let mgr = channel_manager()
-        .lock()
-        .map_err(|e| format!("锁失败: {e}"))?;
+    let mgr = lock_channel_manager();
     mgr.send_media(&channel_id, &user_id, &payload)
 }
 

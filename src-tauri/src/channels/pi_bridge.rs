@@ -291,6 +291,146 @@ mod tests {
         assert_eq!(provider["compat"]["supportsReasoningEffort"], json!(false));
         assert_eq!(provider["compat"]["thinkingFormat"], json!("qwen"));
         assert_eq!(provider["models"][0]["reasoning"], json!(true));
+        assert_eq!(crate::forced_pi_thinking_level(&config, false), Some("off"));
+    }
+
+    #[test]
+    fn bot_provider_models_config_handles_mimo_reasoning_replay() {
+        let config = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://api.xiaomimimo.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "xiaomi/mimo-v2-flash".to_string(),
+        };
+
+        let models = PiBridge::build_provider_models_config_from_config(&config, false, false)
+            .expect("config");
+        let provider = &models["providers"]["nineclaw-runtime-8b9035807842"];
+        assert_eq!(
+            provider["compat"]["requiresReasoningContentOnAssistantMessages"],
+            json!(true)
+        );
+        assert_eq!(provider["compat"]["thinkingFormat"], json!("deepseek"));
+        assert_eq!(provider["models"][0]["reasoning"], json!(true));
+        assert_eq!(
+            crate::forced_pi_thinking_level(&config, false),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn bot_provider_models_config_keeps_mimo_reasoning_on_when_history_retry_disables_reasoning() {
+        let config = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://api.xiaomimimo.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model: "mimo-v2.5".to_string(),
+        };
+
+        let models = PiBridge::build_provider_models_config_from_config(&config, false, true)
+            .expect("config");
+        let provider = &models["providers"]["nineclaw-runtime-8b9035807842"];
+        assert_eq!(
+            provider["compat"]["requiresReasoningContentOnAssistantMessages"],
+            json!(true)
+        );
+        assert_eq!(provider["compat"]["thinkingFormat"], json!("deepseek"));
+        assert_eq!(provider["models"][0]["reasoning"], json!(true));
+        assert_eq!(
+            crate::forced_pi_thinking_level(&config, true),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn bot_provider_models_config_marks_anthropic_mimo_as_reasoning_capable() {
+        let config = ProviderRuntimeConfig {
+            provider_id: "custom".to_string(),
+            api_format: "anthropic".to_string(),
+            base_url: "https://token-plan-cn.xiaomimimo.com/anthropic".to_string(),
+            api_key: "secret".to_string(),
+            model: "mimo-v2.5-pro".to_string(),
+        };
+
+        let models = PiBridge::build_provider_models_config_from_config(&config, false, false)
+            .expect("config");
+        let provider = &models["providers"]["nineclaw-runtime-8b9035807842"];
+        assert_eq!(provider["api"], json!("anthropic-messages"));
+        assert_eq!(provider["models"][0]["reasoning"], json!(true));
+        assert_eq!(
+            crate::forced_pi_thinking_level(&config, false),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn bot_runtime_dir_is_scoped_by_session_and_provider() {
+        let pi_runtime = PiRuntimeLocation {
+            executable: PathBuf::from("/tmp/pi"),
+            source: PiRuntimeSource::SystemPath,
+            resource_root: None,
+        };
+        let first = PiBridge::new(
+            pi_runtime.clone(),
+            "custom-a",
+            "openai",
+            "https://example-a.com/v1",
+            "secret-a",
+            "model-a",
+            None,
+        );
+        let same = PiBridge::new(
+            pi_runtime.clone(),
+            "custom-a",
+            "openai",
+            "https://example-a.com/v1",
+            "secret-b",
+            "model-a",
+            None,
+        );
+        let different_provider = PiBridge::new(
+            pi_runtime.clone(),
+            "custom-b",
+            "openai",
+            "https://example-b.com/v1",
+            "secret-b",
+            "model-b",
+            None,
+        );
+        let overridden = PiBridge::new(
+            pi_runtime,
+            "custom-b",
+            "openai",
+            "https://example-b.com/v1",
+            "secret-b",
+            "model-b",
+            None,
+        )
+        .with_runtime_dir(PathBuf::from("/tmp/nineclaw-explicit-runtime"));
+
+        assert_eq!(
+            first.prepare_runtime_dir("session-a").expect("first dir"),
+            same.prepare_runtime_dir("session-a").expect("same dir"),
+            "api key changes must not force a new on-disk runtime path"
+        );
+        assert_ne!(
+            first.prepare_runtime_dir("session-a").expect("first dir"),
+            first.prepare_runtime_dir("session-b").expect("session dir"),
+        );
+        assert_ne!(
+            first.prepare_runtime_dir("session-a").expect("first dir"),
+            different_provider
+                .prepare_runtime_dir("session-a")
+                .expect("provider dir"),
+        );
+        assert_eq!(
+            overridden
+                .prepare_runtime_dir("session-a")
+                .expect("override dir"),
+            PathBuf::from("/tmp/nineclaw-explicit-runtime"),
+        );
     }
 
     #[test]
@@ -567,6 +707,8 @@ impl PiBridge {
             if let Ok(workspace_root) = crate::agent_workspace::resolve_workspace_root() {
                 let agent_home = workspace_root.join("agents").join(&agent_config.id);
                 managed_runtime::clear_session_events(&agent_home, key)?;
+                crate::agent_workspace::clear_session_workspace_prompt_cache(&agent_config.id, key);
+                agents::clear_session_agent_system_prompt_cache(&agent_config.id, key);
             }
         }
 
@@ -796,16 +938,21 @@ impl PiBridge {
                 provider.insert("authHeader".to_string(), json!(true));
                 provider.insert(
                     "models".to_string(),
-                    json!([{ "id": model, "api": "anthropic-messages", "input": model_input }]),
+                    json!([{ "id": model, "api": "anthropic-messages", "input": model_input, "reasoning": crate::openai_pi_compat_requires_reasoning_content_replay(model) }]),
                 );
             }
             _ => {
                 provider.insert("api".to_string(), json!("openai-completions"));
                 let requires_explicit_thinking_disable =
                     crate::openai_pi_compat_requires_explicit_thinking_disable(model);
-                let reasoning = !disable_reasoning_effort
+                let requires_reasoning_content_replay =
+                    crate::openai_pi_compat_requires_reasoning_content_replay(model);
+                let effective_disable_reasoning_effort =
+                    disable_reasoning_effort && !requires_reasoning_content_replay;
+                let reasoning = !effective_disable_reasoning_effort
                     && (crate::openai_pi_compat_supports_reasoning_effort(model)
-                        || requires_explicit_thinking_disable);
+                        || requires_explicit_thinking_disable
+                        || requires_reasoning_content_replay);
                 let mut compat = serde_json::Map::new();
                 compat.insert("supportsDeveloperRole".to_string(), json!(false));
                 compat.insert(
@@ -814,6 +961,13 @@ impl PiBridge {
                 );
                 if requires_explicit_thinking_disable {
                     compat.insert("thinkingFormat".to_string(), json!("qwen"));
+                }
+                if requires_reasoning_content_replay {
+                    compat.insert(
+                        "requiresReasoningContentOnAssistantMessages".to_string(),
+                        json!(true),
+                    );
+                    compat.insert("thinkingFormat".to_string(), json!("deepseek"));
                 }
                 provider.insert("compat".to_string(), serde_json::Value::Object(compat));
                 provider.insert(
@@ -835,8 +989,26 @@ impl PiBridge {
         Some(json!({ "providers": providers }))
     }
 
-    fn prepare_runtime_dir(&self) -> Result<PathBuf, String> {
-        let dir = self.runtime_dir_override.clone().unwrap_or_else(Self::pi_runtime_dir);
+    fn scoped_runtime_dir(&self, session_key: &str) -> PathBuf {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(session_key.as_bytes());
+        blob.push(0);
+        blob.extend_from_slice(self.provider_id.trim().as_bytes());
+        blob.push(0);
+        blob.extend_from_slice(self.api_format.trim().as_bytes());
+        blob.push(0);
+        blob.extend_from_slice(self.base_url.trim().as_bytes());
+        blob.push(0);
+        blob.extend_from_slice(self.model.trim().as_bytes());
+        let digest = format!("{:x}", Md5::digest(&blob));
+        Self::pi_runtime_dir().join(&digest[..16])
+    }
+
+    fn prepare_runtime_dir(&self, session_key: &str) -> Result<PathBuf, String> {
+        let dir = self
+            .runtime_dir_override
+            .clone()
+            .unwrap_or_else(|| self.scoped_runtime_dir(session_key));
         fs::create_dir_all(&dir).map_err(|e| format!("创建 pi runtime 目录失败: {e}"))?;
 
         fs::write(dir.join("auth.json"), "{}").map_err(|e| format!("写入 auth.json 失败: {e}"))?;
@@ -1158,7 +1330,9 @@ impl PiBridge {
         } else {
             Self::session_file_path(&key)
         };
-        if !fresh_multimodal_session {
+        if !fresh_multimodal_session
+            && !crate::openai_pi_compat_requires_reasoning_content_replay(&self.model)
+        {
             match crate::sanitize_pi_session_replay_state(&session_path) {
                 Ok(true) => dev_trace(
                     "bot.pi",
@@ -1182,7 +1356,7 @@ impl PiBridge {
                 ),
             }
         }
-        let runtime_dir = self.prepare_runtime_dir()?;
+        let runtime_dir = self.prepare_runtime_dir(&key)?;
         let prompt_with_summary =
             crate::build_turn_prompt_with_multimodal_summary(prompt, &key, attachments)?;
         let prepared_input =
@@ -1304,8 +1478,10 @@ impl PiBridge {
             if !config.model.is_empty() {
                 cmd.args(["--model", &config.model]);
             }
-            if crate::should_force_pi_thinking_off(config, disable_reasoning_history) {
-                cmd.args(["--thinking", "off"]);
+            if let Some(thinking_level) =
+                crate::forced_pi_thinking_level(config, disable_reasoning_history)
+            {
+                cmd.args(["--thinking", thinking_level]);
             }
             if !config.api_key.is_empty() {
                 cmd.args(["--api-key", &config.api_key]);
@@ -1345,8 +1521,9 @@ impl PiBridge {
                     .env("NINECLAW_AGENT_HOME", agent_home.as_os_str());
             }
 
-            if let Some(system_prompt) = agents::build_agent_system_prompt_for_prompt(
+            if let Some(system_prompt) = agents::build_agent_system_prompt_for_session_prompt(
                 agent_config,
+                Some(key.as_str()),
                 Some(prepared_input.message.as_str()),
             )
             .map(|prompt| format!("{prompt}\n\n# NineClaw 媒体输出\n\n{media_prompt}"))
@@ -1378,9 +1555,12 @@ impl PiBridge {
                 &[],
             )?;
             if let Some(skill_prompt) = crate::skill_broker::runtime_skill_prompt(&skill_decision) {
-                system_prompt_chars += skill_prompt.chars().count();
-                system_prompt_sections.push(("runtime_skills".to_string(), skill_prompt.clone()));
-                cmd.args(["--append-system-prompt", &skill_prompt]);
+                log::info!(
+                    "runtime_skill_selection: channel={} session={} {}",
+                    channel_id,
+                    key,
+                    skill_prompt
+                );
             }
 
             for skill_path in skills::resolve_skill_directories(&skill_decision.mounted_skill_ids)?
@@ -1391,6 +1571,37 @@ impl PiBridge {
         }
 
         let session_path_str = session_path.to_string_lossy().to_string();
+        let workspace_id_for_log = crate::session_llm_log::infer_workspace_id_from_session(&key);
+        let app_for_log = crate::managed_runtime::injected_app_handle();
+        let _ = crate::session_llm_log::record_start(
+            app_for_log.as_ref(),
+            crate::session_llm_log::StartLog {
+                workspace_id: workspace_id_for_log.clone(),
+                session_id: key.clone(),
+                source: "pi_bridge".to_string(),
+                channel_id: Some(channel_id.to_string()),
+                user_id: Some(user_id.to_string()),
+                agent_id: agent_config.as_ref().map(|item| item.id.clone()),
+                agent_name: agent_config.as_ref().map(|item| item.name.clone()),
+                provider: runtime_provider_config
+                    .as_ref()
+                    .map(|item| item.provider_id.clone()),
+                model: runtime_provider_config
+                    .as_ref()
+                    .map(|item| item.model.clone()),
+                prompt: prompt.trim().to_string(),
+                system_prompts: system_prompt_sections.clone(),
+                attachments_count: attachments.len(),
+                images_count: prepared_input.images.len(),
+                reused_process: None,
+                runtime_session_path: Some(session_path_str.clone()),
+            },
+        );
+        let mut session_text_log_guard = crate::session_llm_log::SessionLlmLogGuard::new(
+            app_for_log.as_ref(),
+            workspace_id_for_log.clone(),
+            key.clone(),
+        );
         let fingerprint = fingerprint_im_pi_turn(
             self.provider_id.trim(),
             self.api_format.trim(),
@@ -1571,6 +1782,7 @@ impl PiBridge {
                         channel_id, user_id, error
                     ),
                 );
+                session_text_log_guard.finish_error("error", error.clone(), None);
                 return Err(error);
             }
 
@@ -1636,6 +1848,11 @@ impl PiBridge {
                     if let Ok(mut stdin_guard) = stdin.lock() {
                         let _ = stdin_guard.take();
                     }
+                    session_text_log_guard.finish_error(
+                        "error",
+                        timeout_reason.clone(),
+                        Some(full_text.clone()),
+                    );
                     return Err(timeout_reason);
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -1680,6 +1897,11 @@ impl PiBridge {
                             "assistant error: channel={} user={} error={}",
                             channel_id, user_id, err
                         ),
+                    );
+                    session_text_log_guard.finish_error(
+                        "error",
+                        format!("pi assistant 错误: {err}"),
+                        Some(full_text.clone()),
                     );
                     return Err(format!("pi assistant 错误: {err}"));
                 }
@@ -1780,6 +2002,11 @@ impl PiBridge {
                             channel_id, user_id, reason
                         ),
                     );
+                    session_text_log_guard.finish_error(
+                        "error",
+                        format!("pi 流错误: {reason}"),
+                        Some(full_text.clone()),
+                    );
                     return Err(format!("pi 流错误: {reason}"));
                 }
             }
@@ -1817,6 +2044,18 @@ impl PiBridge {
                     .get("args")
                     .map(|item| item.to_string())
                     .unwrap_or_default();
+                let _ = crate::session_llm_log::record_tool_start(
+                    app_for_log.as_ref(),
+                    crate::session_llm_log::ToolLog {
+                        workspace_id: workspace_id_for_log.clone(),
+                        session_id: key.clone(),
+                        tool_call_id: Some(tool_call_id.clone()),
+                        tool_name: Some(tool_name.clone()),
+                        args: Some(args_text.clone()),
+                        result: None,
+                        is_error: None,
+                    },
+                );
                 managed_runtime::append_session_event_quiet(
                     agent_home.as_deref(),
                     &key,
@@ -1850,6 +2089,18 @@ impl PiBridge {
                     .and_then(|result| Self::extract_text_content_from_message(Some(result)))
                     .unwrap_or_default();
                 let is_error = value.get("isError").and_then(|item| item.as_bool());
+                let _ = crate::session_llm_log::record_tool_end(
+                    app_for_log.as_ref(),
+                    crate::session_llm_log::ToolLog {
+                        workspace_id: workspace_id_for_log.clone(),
+                        session_id: key.clone(),
+                        tool_call_id: Some(tool_call_id.clone()),
+                        tool_name: Some(tool_name.clone()),
+                        args: Some(args_text.clone()),
+                        result: Some(result_text.clone()),
+                        is_error,
+                    },
+                );
                 managed_runtime::append_session_event_quiet(
                     agent_home.as_deref(),
                     &key,
@@ -1901,6 +2152,11 @@ impl PiBridge {
                             channel_id, user_id, err
                         ),
                     );
+                    session_text_log_guard.finish_error(
+                        "error",
+                        format!("pi RPC 错误: {err}"),
+                        Some(full_text.clone()),
+                    );
                     return Err(format!("pi RPC 错误: {err}"));
                 }
             }
@@ -1929,6 +2185,11 @@ impl PiBridge {
             dev_trace(
                 "bot.pi",
                 format!("已中止: channel={} user={}", channel_id, user_id),
+            );
+            session_text_log_guard.finish_error(
+                "aborted",
+                "请求已中止".to_string(),
+                Some(full_text.clone()),
             );
             return Ok(PiProcessOutcome::Aborted);
         }
@@ -1984,6 +2245,7 @@ impl PiBridge {
                     channel_id, user_id, reason
                 ),
             );
+            session_text_log_guard.finish_error("error", reason.clone(), None);
             return Err(reason);
         }
 
@@ -2011,6 +2273,19 @@ impl PiBridge {
                 agent_home.as_deref(),
                 &key,
                 &full_text,
+            );
+            session_text_log_guard.finish_done(
+                Some(full_text.clone()),
+                final_usage.clone(),
+                final_usage_meta
+                    .as_ref()
+                    .and_then(|item| item.provider.clone()),
+                final_usage_meta
+                    .as_ref()
+                    .and_then(|item| item.model.clone()),
+                final_usage_meta
+                    .as_ref()
+                    .and_then(|item| item.response_id.clone()),
             );
             return Ok(PiProcessOutcome::Completed(PiProcessResult {
                 full_text,
@@ -2049,6 +2324,7 @@ impl PiBridge {
                 reason.clone(),
                 None,
             );
+            session_text_log_guard.finish_error("error", reason.clone(), Some(full_text.clone()));
             return Err(reason);
         }
 
@@ -2065,6 +2341,19 @@ impl PiBridge {
             let _ = crate::record_multimodal_summary(&key, prompt, &full_text);
         }
         managed_runtime::append_assistant_output_events(agent_home.as_deref(), &key, &full_text);
+        session_text_log_guard.finish_done(
+            Some(full_text.clone()),
+            final_usage.clone(),
+            final_usage_meta
+                .as_ref()
+                .and_then(|item| item.provider.clone()),
+            final_usage_meta
+                .as_ref()
+                .and_then(|item| item.model.clone()),
+            final_usage_meta
+                .as_ref()
+                .and_then(|item| item.response_id.clone()),
+        );
         Ok(PiProcessOutcome::Completed(PiProcessResult {
             full_text,
             usage: final_usage,

@@ -5,9 +5,11 @@ mod memory_wiki;
 
 use crate::memory_gate::MemoryGate;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 const DEFAULT_WORKSPACE_RELATIVE_PATH: &str = ".nineclaw/workspace";
 const LEGACY_WORKSPACE_RELATIVE_PATH: &str = ".openclaw/workspace";
@@ -16,7 +18,7 @@ const LEGACY_WORKSPACE_ROOT_ENVS: &[&str] = &["NINECLAW_AGENT_WORKSPACE_ROOT"];
 const TEMPLATE_DIR: &str = "agents/_template";
 const LEGACY_TEMPLATE_DIR: &str = "agents/_templates";
 const LEGACY_REVIEW_QUEUE_RELATIVE_PATH: &str = "memory/REVIEW_QUEUE.md";
-const WORKSPACE_SYSTEM_PROMPT_CHAR_LIMIT: usize = 1600;
+const WORKSPACE_SYSTEM_PROMPT_CHAR_LIMIT: usize = 900;
 const ROOT_FILES: &[&str] = &[
     "AGENTS.md",
     "SOUL.md",
@@ -80,6 +82,24 @@ const AGENT_VIEW_FILES: &[&str] = &[
     "PUBLIC_CONTEXT.md",
     "HEARTBEAT.md",
 ];
+
+type SessionPromptCache = HashMap<(String, String), String>;
+
+fn session_workspace_prompt_cache() -> &'static Mutex<SessionPromptCache> {
+    static CACHE: OnceLock<Mutex<SessionPromptCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn clear_session_workspace_prompt_cache(agent_id: &str, session_id: &str) {
+    let agent_id = agent_id.trim();
+    let session_id = session_id.trim();
+    if agent_id.is_empty() || session_id.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = session_workspace_prompt_cache().lock() {
+        guard.remove(&(agent_id.to_string(), session_id.to_string()));
+    }
+}
 
 #[derive(Clone, Copy)]
 struct MemoryCategoryDefinition {
@@ -534,30 +554,60 @@ pub fn build_workspace_system_prompt_for_query(
     agent_id: &str,
     current_prompt: Option<&str>,
 ) -> Result<String, String> {
+    build_workspace_system_prompt_for_query_inner(agent_id, current_prompt, false)
+}
+
+pub fn build_session_workspace_system_prompt_for_query(
+    agent_id: &str,
+    session_id: Option<&str>,
+    current_prompt: Option<&str>,
+) -> Result<String, String> {
+    let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return build_workspace_system_prompt_for_query_inner(agent_id, current_prompt, false);
+    };
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        return build_workspace_system_prompt_for_query_inner(agent_id, current_prompt, false);
+    }
+
+    let cache_key = (agent_id.to_string(), session_id.to_string());
+    if let Ok(guard) = session_workspace_prompt_cache().lock() {
+        if let Some(snapshot) = guard.get(&cache_key) {
+            return Ok(snapshot.clone());
+        }
+    }
+
+    let snapshot = build_workspace_system_prompt_for_query_inner(agent_id, current_prompt, true)?;
+    if let Ok(mut guard) = session_workspace_prompt_cache().lock() {
+        guard.entry(cache_key).or_insert_with(|| snapshot.clone());
+    }
+    Ok(snapshot)
+}
+
+fn build_workspace_system_prompt_for_query_inner(
+    agent_id: &str,
+    current_prompt: Option<&str>,
+    force_session_snapshot: bool,
+) -> Result<String, String> {
     let root = resolve_workspace_root()?;
     let agent_home = root.join("agents").join(agent_id);
+    let should_load_memory = should_load_workspace_memory_for_query(current_prompt);
+    if current_prompt.is_some() && !should_load_memory && !force_session_snapshot {
+        return Ok(String::new());
+    }
 
     let mut sections = Vec::new();
     sections.push(
-        "记忆规则：只使用当前 agent 私有记忆；命中不到就直说；禁止引用其他 agents/<id>/ 内容。"
+        "记忆规则：只用当前 agent 私有记忆；按需查 WORKING/DECISIONS/PITFALLS/MEMORY/USER_MODEL/RELATIONSHIP_MAP/DAILY_INDEX；命中不到直说。"
             .to_string(),
     );
-    sections.push(
-        "写回：短期写 WORKING.md（含 OPEN_LOOPS 和复查项）；长期整理 DECISIONS.md、PITFALLS.md、PUBLIC_CONTEXT.md、wiki/*.md。MEMORY.md 只保留启动最小记忆；对话 ingest 默认写 raw、daily、SOURCE_INDEX 与 WORKING，不自动写 MEMORY.md。"
-            .to_string(),
-    );
-    sections.push(
-        "检索顺序：先判断是否真的需要查记忆；任务与未闭环优先看 WORKING.md 的 `Current Focus` / `OPEN_LOOPS`；规则优先看 DECISIONS.md 与 PITFALLS.md；用户风格优先看 MEMORY.md 与 USER_MODEL.md；人物关系优先看 RELATIONSHIP_MAP.md；没有证据就不要装记得。"
-            .to_string(),
-    );
-    sections.push(
-        "历史日记：除非用户明确要求追溯，不要用工具通读全部 memory/YYYY-MM-DD.md；先用 memory/DAILY_INDEX.md（或 NineClaw 注入的「日记检索」摘要）按分类/关键词筛选，再打开对应 memory/YYYY-MM-DD.md 段落；今昨两天可直接读日记。"
-            .to_string(),
-    );
-    if let Some(session_snapshot) =
-        crate::managed_runtime::build_session_context_snapshot(&agent_home, 12, 520)?
-    {
-        sections.push(session_snapshot);
+    let prompt = current_prompt.unwrap_or_default();
+    if force_session_snapshot || contains_memory_recall_signal(prompt) {
+        if let Some(session_snapshot) =
+            crate::managed_runtime::build_session_context_snapshot(&agent_home, 8, 360)?
+        {
+            sections.push(session_snapshot);
+        }
     }
 
     if let Some(wiki_snapshot) =
@@ -584,6 +634,49 @@ pub fn build_workspace_system_prompt_for_query(
         &sections.join("\n\n"),
         WORKSPACE_SYSTEM_PROMPT_CHAR_LIMIT,
     ))
+}
+
+fn should_load_workspace_memory_for_query(current_prompt: Option<&str>) -> bool {
+    let prompt = normalize_memory_match_text(current_prompt.unwrap_or_default());
+    if prompt.is_empty() {
+        return true;
+    }
+    contains_memory_recall_signal(&prompt)
+        || contains_any_keyword(
+            &prompt,
+            &[
+                "记住",
+                "记一下",
+                "待办",
+                "承诺",
+                "阻塞",
+                "复查",
+                "提醒",
+                "附件",
+                "文件",
+                "来源",
+                "路径",
+                "偏好",
+                "风格",
+                "喜欢",
+                "习惯",
+                "别再",
+                "坑",
+                "规则",
+                "决定",
+                "谁",
+                "关系",
+                "联系人",
+                "source",
+                "attachment",
+                "preference",
+                "style",
+                "todo",
+                "blocker",
+                "decision",
+                "contact",
+            ],
+        )
 }
 
 pub fn read_agent_heartbeat_instructions(agent_id: &str) -> Result<Option<String>, String> {
@@ -3768,6 +3861,107 @@ mod tests {
                 .expect("workspace prompt");
         assert!(prompt.contains("Recent Session Events:"));
         assert!(prompt.contains("调用 bash 运行 cargo test"));
+
+        let _ = fs::remove_dir_all(root);
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
+    fn session_workspace_prompt_freezes_recent_events_per_session() {
+        let _guard = lock_workspace_test();
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+
+        let seed = AgentWorkspaceSeed {
+            id: "frozen-session-agent",
+            name: "Frozen Session Agent",
+            summary: "用于验证 session prompt 冻结",
+            description: "验证 Recent Session Events 只注入一次",
+            accent_color: None,
+            is_builtin: false,
+        };
+
+        let home = ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        clear_session_workspace_prompt_cache("frozen-session-agent", "session-1");
+        clear_session_workspace_prompt_cache("frozen-session-agent", "session-2");
+        crate::managed_runtime::append_session_event(
+            &home,
+            "session-1",
+            crate::managed_runtime::SessionEventKind::ToolCall,
+            "第一次事件",
+            None,
+        )
+        .expect("append first session event");
+
+        let first = build_session_workspace_system_prompt_for_query(
+            "frozen-session-agent",
+            Some("session-1"),
+            Some("继续刚才的任务"),
+        )
+        .expect("first prompt");
+        assert!(first.contains("Recent Session Events:"));
+        assert!(first.contains("第一次事件"));
+
+        crate::managed_runtime::append_session_event(
+            &home,
+            "session-1",
+            crate::managed_runtime::SessionEventKind::ToolResult,
+            "第二次事件，不应该进入已冻结 prompt",
+            None,
+        )
+        .expect("append second session event");
+
+        let second = build_session_workspace_system_prompt_for_query(
+            "frozen-session-agent",
+            Some("session-1"),
+            Some("继续刚才的任务"),
+        )
+        .expect("second prompt");
+        assert_eq!(second, first);
+        assert!(!second.contains("第二次事件"));
+
+        let other_session = build_session_workspace_system_prompt_for_query(
+            "frozen-session-agent",
+            Some("session-2"),
+            Some("继续刚才的任务"),
+        )
+        .expect("other session prompt");
+        assert!(other_session.contains("第二次事件"));
+
+        let _ = fs::remove_dir_all(root);
+        std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
+    }
+
+    #[test]
+    fn workspace_prompt_skips_memory_for_lightweight_turns() {
+        let _guard = lock_workspace_test();
+        let root = temp_root();
+        std::env::set_var(PRIMARY_WORKSPACE_ROOT_ENV, &root);
+
+        let seed = AgentWorkspaceSeed {
+            id: "light-agent",
+            name: "Light Agent",
+            summary: "用于验证普通请求不注入记忆",
+            description: "验证轻量 prompt",
+            accent_color: None,
+            is_builtin: false,
+        };
+
+        let home = ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        crate::managed_runtime::append_session_event(
+            &home,
+            "session-1",
+            crate::managed_runtime::SessionEventKind::Prompt,
+            "上一轮很长的用户输入",
+            None,
+        )
+        .expect("append session event");
+
+        let prompt =
+            build_workspace_system_prompt_for_query("light-agent", Some("马云")).expect("prompt");
+        assert!(prompt.trim().is_empty());
+        assert!(!prompt.contains("Recent Session Events:"));
+        assert!(!prompt.contains("DAILY_INDEX"));
 
         let _ = fs::remove_dir_all(root);
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
