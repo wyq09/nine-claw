@@ -34,7 +34,7 @@ where
     F: Future<Output = T>,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => Ok(handle.block_on(future)),
+        Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
         Err(_) => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

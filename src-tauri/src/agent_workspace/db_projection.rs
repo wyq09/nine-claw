@@ -241,12 +241,14 @@ fn build_vector_hint_block(
     }
     let registry = crate::managed_runtime::get_embedding_registry()?;
     let embeddings = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle.block_on(async {
-            let guard = registry.read().await;
-            let provider = guard
-                .default_provider()
-                .ok_or_else(|| "no provider".to_string())?;
-            provider.embed(vec![prompt_norm.to_string()]).await
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let guard = registry.read().await;
+                let provider = guard
+                    .default_provider()
+                    .ok_or_else(|| "no provider".to_string())?;
+                provider.embed(vec![prompt_norm.to_string()]).await
+            })
         }),
         Err(_) => {
             let rt = tokio::runtime::Builder::new_current_thread()

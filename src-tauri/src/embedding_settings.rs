@@ -511,7 +511,12 @@ pub fn maybe_start_local_model_download(
     }
     tauri::async_runtime::spawn_blocking(move || match ensure_local_model_downloaded(&app) {
         Ok(_) => {
-            let rt = tokio::runtime::Handle::current();
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
             let _ = rt.block_on(configure_embedding_runtime(&app, &registry));
         }
         Err(error) => {

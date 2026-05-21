@@ -365,27 +365,29 @@ fn run_user_memory_auto_extraction(
             let app_clone = app.clone();
             let namespaces = user_memory::vector_namespaces_for_agent(Some(&request.agent_id));
             let result = match tokio::runtime::Handle::try_current() {
-                Ok(handle) => handle.block_on(async {
-                    let provider = {
-                        let guard = registry.read().await;
-                        guard.default_provider()
-                    };
-                    let Some(provider) = provider else {
-                        return Ok::<bool, String>(false);
-                    };
-                    let embeddings = provider.embed(vec![candidate_text.clone()]).await?;
-                    let Some(embedding) = embeddings.into_iter().next() else {
-                        return Ok(false);
-                    };
-                    let conn = crate::storage_conn(&app_clone)?;
-                    let hits = crate::memory_vector::search_vectors_across_workspaces(
-                        &conn,
-                        &namespaces,
-                        &embedding,
-                        1,
-                        VECTOR_DEDUP_THRESHOLD,
-                    )?;
-                    Ok(!hits.is_empty())
+                Ok(handle) => tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let provider = {
+                            let guard = registry.read().await;
+                            guard.default_provider()
+                        };
+                        let Some(provider) = provider else {
+                            return Ok::<bool, String>(false);
+                        };
+                        let embeddings = provider.embed(vec![candidate_text.clone()]).await?;
+                        let Some(embedding) = embeddings.into_iter().next() else {
+                            return Ok(false);
+                        };
+                        let conn = crate::storage_conn(&app_clone)?;
+                        let hits = crate::memory_vector::search_vectors_across_workspaces(
+                            &conn,
+                            &namespaces,
+                            &embedding,
+                            1,
+                            VECTOR_DEDUP_THRESHOLD,
+                        )?;
+                        Ok(!hits.is_empty())
+                    })
                 }),
                 Err(_) => {
                     let rt = tokio::runtime::Builder::new_current_thread()

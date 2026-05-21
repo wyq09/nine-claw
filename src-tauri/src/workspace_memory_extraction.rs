@@ -21,7 +21,7 @@ where
     F: std::future::Future<Output = T>,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => Ok(handle.block_on(future)),
+        Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
         Err(_) => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -702,6 +702,12 @@ pub(crate) fn spawn_workspace_memory_extraction(
 mod tests {
     use super::*;
     use crate::agent_capabilities::AgentCapabilityPolicy;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_async_can_block_inside_tokio_runtime() {
+        let value = run_async(async { 42 }).expect("run async inside runtime");
+        assert_eq!(value, 42);
+    }
 
     fn memory_row(title: &str, content: &str) -> WorkspaceMemoryRecord {
         WorkspaceMemoryRecord {

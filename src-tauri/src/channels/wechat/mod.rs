@@ -1956,8 +1956,14 @@ fn block_on_async<F, T>(fut: F) -> Result<T, String>
 where
     F: std::future::Future<Output = Result<T, String>>,
 {
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("创建 tokio runtime 失败: {e}"))?;
-    rt.block_on(fut)
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+        Err(_) => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| format!("创建 tokio runtime 失败: {e}"))?;
+            rt.block_on(fut)
+        }
+    }
 }
 
 fn generate_qr_data_uri(content: &str) -> Result<String, String> {

@@ -7344,10 +7344,16 @@ pub fn run() {
                 scheduler::start_embedded_scheduler(app_handle);
 
                 // --- Embedding provider init + background index rebuild ---
-                let init_result = tauri::async_runtime::block_on(configure_embedding_runtime(
-                    &post_scheduler_handle,
-                    &setup_embedding_registry,
-                ));
+                let init_result = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(configure_embedding_runtime(
+                        &post_scheduler_handle,
+                        &setup_embedding_registry,
+                    )),
+                    Err(error) => Err(format!("创建 embedding runtime 失败: {error}")),
+                };
                 match init_result {
                     Ok(status) => {
                         if let Some(provider_id) = status.active_provider_id {
@@ -7396,7 +7402,12 @@ pub fn run() {
                             .map(|(_, title, content)| format!("{title}\n{content}"))
                             .collect();
 
-                        let rt = tokio::runtime::Handle::current();
+                        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        else {
+                            continue;
+                        };
                         let Ok(embeddings) = rt.block_on(async {
                             let guard = rebuild_registry.read().await;
                             if let Some(provider) = guard.default_provider() {
