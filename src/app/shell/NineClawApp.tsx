@@ -1390,9 +1390,8 @@ export function NineClawApp() {
     }
 
     const botTarget = currentConversationHistoryItem?.botTarget ?? null
-    const hasDirectBotAttachments = Boolean(botTarget && composerAttachments.length > 0)
 
-    if (hasDirectBotAttachments && botTarget) {
+    if (botTarget) {
       if (chatGateError) {
         setChatGateError('')
       }
