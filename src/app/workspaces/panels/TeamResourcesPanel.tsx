@@ -17,6 +17,12 @@ function formatKb(size: number): string {
   return `${(size / 1024 / 1024).toFixed(1)} MB`
 }
 
+function isHtmlResource(mime: string, fileName: string): boolean {
+  if (mime.toLowerCase().trim() === 'text/html') return true
+  const ext = fileName.split('.').pop()?.toLowerCase()
+  return ext === 'html' || ext === 'htm'
+}
+
 /** 应用内用 UTF-8 文本读取；勿把 Office OpenXML（含 *ml* 片段）误判为 XML 文本。 */
 function isTextLikeResource(mime: string, fileName: string): boolean {
   const m = mime.toLowerCase().trim()
@@ -164,6 +170,11 @@ export function TeamResourcesPanel({
         } catch {
           await openLocalFile(path)
         }
+        return
+      }
+      if (isHtmlResource(r.mime, r.fileName)) {
+        const path = await workspaceResourceAbsolutePath(workspaceId, r.relPath)
+        await openLocalFile(path)
         return
       }
       if (isTextLikeResource(r.mime, r.fileName)) {

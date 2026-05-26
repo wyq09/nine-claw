@@ -15,7 +15,10 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
             agent_snapshot_json TEXT,
             bot_target_json TEXT,
             session_llm_provider_id TEXT,
-            session_llm_model TEXT
+            session_llm_model TEXT,
+            workspace_id TEXT,
+            topic_workspace_dir TEXT,
+            current_workspace_dir TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated_at
             ON chat_sessions(updated_at DESC);
@@ -36,6 +39,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), String> {
             response_segments_json TEXT,
             tool_calls_json TEXT,
             activity_json TEXT,
+            speaker_agent_id TEXT,
             FOREIGN KEY(session_id) REFERENCES chat_sessions(id),
             UNIQUE(session_id, turn_index)
         );
@@ -64,6 +68,10 @@ pub struct ChatSession {
     pub session_llm_model: Option<String>,
     #[serde(default)]
     pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub topic_workspace_dir: Option<String>,
+    #[serde(default)]
+    pub current_workspace_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +162,8 @@ fn row_to_chat_session(row: &rusqlite::Row) -> rusqlite::Result<ChatSession> {
         session_llm_provider_id: row.get("session_llm_provider_id")?,
         session_llm_model: row.get("session_llm_model")?,
         workspace_id: row.get::<_, Option<String>>("workspace_id")?,
+        topic_workspace_dir: row.get::<_, Option<String>>("topic_workspace_dir")?,
+        current_workspace_dir: row.get::<_, Option<String>>("current_workspace_dir")?,
     })
 }
 
@@ -208,7 +218,7 @@ pub fn create_chat_session(
 pub fn list_chat_sessions(conn: &Connection) -> Result<Vec<ChatSession>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, status, created_at, updated_at, agent_id, agent_snapshot_json, bot_target_json, session_llm_provider_id, session_llm_model, workspace_id
+            "SELECT id, title, status, created_at, updated_at, agent_id, agent_snapshot_json, bot_target_json, session_llm_provider_id, session_llm_model, workspace_id, topic_workspace_dir, current_workspace_dir
              FROM chat_sessions ORDER BY updated_at DESC",
         )
         .map_err(|e| format!("准备查询失败: {e}"))?;
@@ -227,7 +237,7 @@ pub fn list_chat_sessions(conn: &Connection) -> Result<Vec<ChatSession>, String>
 /// Get a single chat session by ID.
 pub fn get_chat_session(conn: &Connection, id: &str) -> Result<Option<ChatSession>, String> {
     conn.query_row(
-        "SELECT id, title, status, created_at, updated_at, agent_id, agent_snapshot_json, bot_target_json, session_llm_provider_id, session_llm_model, workspace_id
+        "SELECT id, title, status, created_at, updated_at, agent_id, agent_snapshot_json, bot_target_json, session_llm_provider_id, session_llm_model, workspace_id, topic_workspace_dir, current_workspace_dir
          FROM chat_sessions WHERE id = ?1",
         params![id],
         row_to_chat_session,
@@ -266,6 +276,80 @@ pub fn append_chat_turn(
     .map_err(|e| format!("追加聊天轮次失败: {e}"))?;
 
     // Bump session updated_at.
+    conn.execute(
+        "UPDATE chat_sessions SET updated_at = ?1 WHERE id = ?2",
+        params![now, input.session_id],
+    )
+    .map_err(|e| format!("更新会话时间戳失败: {e}"))?;
+
+    get_chat_turn(conn, &input.id)?.ok_or_else(|| "刚创建的轮次查询不到".to_string())
+}
+
+/// Append a new turn while letting SQLite allocate the next session-local turn_index.
+/// If the same turn id was already persisted for this session, return it instead of failing.
+pub fn append_chat_turn_allocating_index(
+    conn: &Connection,
+    input: &AppendChatTurnInput,
+) -> Result<ChatTurn, String> {
+    if let Some(existing) = get_chat_turn(conn, &input.id)? {
+        if existing.session_id == input.session_id {
+            return Ok(existing);
+        }
+        return Err(format!(
+            "轮次 {} 已存在于其他会话 {}",
+            input.id, existing.session_id
+        ));
+    }
+
+    let now = now_ms();
+    let insert_result = conn.execute(
+        "INSERT INTO chat_turns (
+            id, session_id, turn_index, prompt, answer, thinking, status, created_at,
+            completed_at, usage_json, response_segments_json, tool_calls_json, activity_json, speaker_agent_id
+        )
+        SELECT
+            ?1,
+            ?2,
+            COALESCE(MAX(turn_index) + 1, 0),
+            ?3,
+            ?4,
+            ?5,
+            ?6,
+            ?7,
+            ?8,
+            ?9,
+            ?10,
+            ?11,
+            ?12,
+            ?13
+        FROM chat_turns
+        WHERE session_id = ?2",
+        params![
+            input.id,
+            input.session_id,
+            input.prompt,
+            input.answer,
+            input.thinking,
+            input.status,
+            now,
+            Option::<i64>::None,
+            input.usage_json,
+            input.response_segments_json,
+            input.tool_calls_json,
+            input.activity_json,
+            input.speaker_agent_id,
+        ],
+    );
+
+    if let Err(error) = insert_result {
+        if let Some(existing) = get_chat_turn(conn, &input.id)? {
+            if existing.session_id == input.session_id {
+                return Ok(existing);
+            }
+        }
+        return Err(format!("追加聊天轮次失败: {error}"));
+    }
+
     conn.execute(
         "UPDATE chat_sessions SET updated_at = ?1 WHERE id = ?2",
         params![now, input.session_id],
@@ -747,6 +831,36 @@ mod tests {
     }
 
     #[test]
+    fn test_append_chat_turn_allocating_index_appends_after_existing_turns() {
+        let conn = open_in_memory().unwrap();
+        create_chat_session(&conn, &make_session_input("s1")).unwrap();
+        append_chat_turn(&conn, &make_turn_input("s1", 0, "t1")).unwrap();
+
+        let next = append_chat_turn_allocating_index(&conn, &make_turn_input("s1", 0, "t2")).unwrap();
+
+        assert_eq!(next.turn_index, 1);
+        let turns = list_chat_turns(&conn, "s1").unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1].id, "t2");
+        assert_eq!(turns[1].turn_index, 1);
+    }
+
+    #[test]
+    fn test_append_chat_turn_allocating_index_is_idempotent_for_same_turn_id() {
+        let conn = open_in_memory().unwrap();
+        create_chat_session(&conn, &make_session_input("s1")).unwrap();
+
+        let first = append_chat_turn_allocating_index(&conn, &make_turn_input("s1", 0, "t1")).unwrap();
+        let second = append_chat_turn_allocating_index(&conn, &make_turn_input("s1", 0, "t1")).unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.turn_index, 0);
+        assert_eq!(second.turn_index, 0);
+        let turns = list_chat_turns(&conn, "s1").unwrap();
+        assert_eq!(turns.len(), 1);
+    }
+
+    #[test]
     fn test_session_with_agent_and_llm_fields() {
         let conn = open_in_memory().unwrap();
         let input = CreateChatSessionInput {
@@ -785,7 +899,7 @@ mod tests {
     #[test]
     fn test_update_turn_bumps_session_timestamp() {
         let conn = open_in_memory().unwrap();
-        let session = create_chat_session(&conn, &make_session_input("s1")).unwrap();
+        let _session = create_chat_session(&conn, &make_session_input("s1")).unwrap();
         append_chat_turn(&conn, &make_turn_input("s1", 0, "t1")).unwrap();
 
         let after_append = get_chat_session(&conn, "s1").unwrap().unwrap().updated_at;

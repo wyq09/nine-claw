@@ -6,6 +6,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 
 import { invoke } from '@tauri-apps/api/core'
 import {
+  compactDesktopSessionBeforeModelSwitch,
   getSessionContextStats,
   listDefaultAgentPresets,
   resetAgentToDefaultPreset,
@@ -86,6 +87,25 @@ describe('streamPiPrompt / syncRuntimeParameters', () => {
 
     expect(invoke).toHaveBeenCalledWith('sync_runtime_parameters', { payload: rp })
     expect(result).toEqual(returned)
+  })
+
+  it('calls model-switch compression command before changing session model', async () => {
+    vi.mocked(invoke).mockResolvedValue({ compressed: true, reason: 'model_switch_compressed' })
+
+    const result = await compactDesktopSessionBeforeModelSwitch({
+      sessionId: 's1',
+      workspaceId: 'w1',
+      currentModel: 'old-model',
+      nextModel: 'new-model',
+    })
+
+    expect(invoke).toHaveBeenCalledWith('compact_desktop_session_before_model_switch', {
+      sessionId: 's1',
+      workspaceId: 'w1',
+      currentModel: 'old-model',
+      nextModel: 'new-model',
+    })
+    expect(result.compressed).toBe(true)
   })
 })
 

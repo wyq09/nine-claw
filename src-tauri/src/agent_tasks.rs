@@ -71,6 +71,35 @@ pub struct AgentTaskListItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentTaskCreateInput {
+    pub goal: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default = "default_task_type")]
+    pub task_type: String,
+    pub schedule_type: String,
+    #[serde(default)]
+    pub timezone: String,
+    #[serde(default)]
+    pub interval_minutes: Option<i64>,
+    #[serde(default)]
+    pub daily_times: Vec<String>,
+    #[serde(default)]
+    pub weekly_days: Vec<u32>,
+    #[serde(default)]
+    pub monthly_days: Vec<u32>,
+    #[serde(default)]
+    pub run_at_ms: Option<i64>,
+    #[serde(default)]
+    pub result_in_new_session: bool,
+}
+
+fn default_task_type() -> String {
+    TASK_TYPE_AGENT_PROMPT.to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentTaskUpdateInput {
     pub title: String,
     pub goal: String,
@@ -997,4 +1026,230 @@ pub fn default_daily_time_for_now() -> String {
 
 pub fn is_desktop_delivery_kind(kind: &str) -> bool {
     kind == DELIVERY_KIND_DESKTOP
+}
+
+pub fn get_task_detail(
+    app: &tauri::AppHandle,
+    task_id: &str,
+) -> Result<Option<AgentTaskListItem>, String> {
+    let all = list_tasks(app, None)?;
+    Ok(all.into_iter().find(|item| item.id == task_id))
+}
+
+pub fn list_tasks_filtered(
+    app: &tauri::AppHandle,
+    agent_id: Option<&str>,
+    status_filter: Option<&str>,
+    schedule_type_filter: Option<&str>,
+) -> Result<Vec<AgentTaskListItem>, String> {
+    let mut tasks = list_tasks(app, agent_id)?;
+    if let Some(status) = status_filter {
+        if !status.is_empty() {
+            tasks.retain(|item| item.status == status);
+        }
+    }
+    if let Some(schedule_type) = schedule_type_filter {
+        if !schedule_type.is_empty() {
+            tasks.retain(|item| item.schedule_type == schedule_type);
+        }
+    }
+    Ok(tasks)
+}
+
+pub fn create_task(
+    app: &tauri::AppHandle,
+    agent_id: &str,
+    source_session_id: &str,
+    input: &AgentTaskCreateInput,
+) -> Result<AgentTaskListItem, String> {
+    let connection = crate::open_history_db(app)?;
+    ensure_agent_task_schema(&connection)?;
+    crate::scheduler::ensure_scheduler_schema(&connection)?;
+
+    let goal = input.goal.trim();
+    if goal.is_empty() {
+        return Err("任务内容不能为空".to_string());
+    }
+
+    let task_type = if input.task_type.trim().is_empty() {
+        TASK_TYPE_AGENT_PROMPT.to_string()
+    } else {
+        input.task_type.trim().to_string()
+    };
+    if task_type != TASK_TYPE_REMINDER && task_type != TASK_TYPE_AGENT_PROMPT {
+        return Err(format!("不支持的任务类型: {task_type}"));
+    }
+
+    let schedule_type = input.schedule_type.trim().to_string();
+    if schedule_type != SCHEDULE_TYPE_INTERVAL
+        && schedule_type != SCHEDULE_TYPE_DAILY_TIME
+        && schedule_type != SCHEDULE_TYPE_WEEKLY_TIME
+        && schedule_type != SCHEDULE_TYPE_MONTHLY_TIME
+        && schedule_type != SCHEDULE_TYPE_ONCE_AT
+    {
+        return Err(format!("不支持的调度类型: {schedule_type}"));
+    }
+
+    let timezone = if input.timezone.trim().is_empty() {
+        "Asia/Shanghai".to_string()
+    } else {
+        input.timezone.trim().to_string()
+    };
+
+    let now = crate::chrono_like_timestamp();
+
+    let schedule_json = if schedule_type == SCHEDULE_TYPE_INTERVAL {
+        let every_minutes = input.interval_minutes.unwrap_or(0);
+        if every_minutes <= 0 {
+            return Err("间隔任务至少需要大于 0 的分钟数".to_string());
+        }
+        serde_json::to_string(&IntervalSchedule {
+            every_minutes: every_minutes.clamp(1, 24 * 60),
+            start_at: Some(now),
+            end_at: None,
+        })
+        .map_err(|error| format!("序列化 interval schedule 失败: {error}"))?
+    } else if schedule_type == SCHEDULE_TYPE_ONCE_AT {
+        let run_at = input
+            .run_at_ms
+            .ok_or_else(|| "请指定一次性任务的执行时间".to_string())?;
+        if run_at <= now {
+            return Err("一次性任务的执行时间须晚于当前时间".to_string());
+        }
+        serde_json::to_string(&OnceAtSchedule { run_at_ms: run_at })
+            .map_err(|error| format!("序列化 once_at schedule 失败: {error}"))?
+    } else if schedule_type == SCHEDULE_TYPE_WEEKLY_TIME {
+        let times = normalize_time_values(&input.daily_times);
+        let days = normalize_weekly_days(&input.weekly_days);
+        if days.is_empty() {
+            return Err("每周任务至少需要一个星期几".to_string());
+        }
+        if times.is_empty() {
+            return Err("每周任务至少需要一个触发时间".to_string());
+        }
+        serde_json::to_string(&WeeklyTimeSchedule {
+            times,
+            days_of_week: days,
+        })
+        .map_err(|error| format!("序列化 weekly schedule 失败: {error}"))?
+    } else if schedule_type == SCHEDULE_TYPE_MONTHLY_TIME {
+        let times = normalize_time_values(&input.daily_times);
+        let days = normalize_monthly_days(&input.monthly_days);
+        if days.is_empty() {
+            return Err("每月任务至少需要一个日期".to_string());
+        }
+        if times.is_empty() {
+            return Err("每月任务至少需要一个触发时间".to_string());
+        }
+        serde_json::to_string(&MonthlyTimeSchedule {
+            times,
+            days_of_month: days,
+        })
+        .map_err(|error| format!("序列化 monthly schedule 失败: {error}"))?
+    } else {
+        let times = normalize_time_values(&input.daily_times);
+        if times.is_empty() {
+            return Err("每天定时任务至少需要一个触发时间".to_string());
+        }
+        serde_json::to_string(&DailyTimeSchedule {
+            times,
+            days_of_week: vec![1, 2, 3, 4, 5, 6, 7],
+        })
+        .map_err(|error| format!("序列化 daily schedule 失败: {error}"))?
+    };
+
+    let schedule_hint = build_schedule_hint(
+        &schedule_type,
+        input.interval_minutes,
+        &input.daily_times,
+        &input.weekly_days,
+        &input.monthly_days,
+        input.run_at_ms,
+    );
+
+    let (title, intent_summary, payload_goal) =
+        match crate::refine_agent_task_metadata(app, agent_id, goal, &task_type, &schedule_hint) {
+            Some((t, s, g)) => {
+                let title = if input.title.trim().is_empty() {
+                    t
+                } else {
+                    input.title.trim().to_string()
+                };
+                (title, s, g)
+            }
+            None => {
+                let title = if input.title.trim().is_empty() {
+                    build_title(goal, &task_type)
+                } else {
+                    input.title.trim().to_string()
+                };
+                (title, summarize_goal_fallback(goal), goal.to_string())
+            }
+        };
+
+    let payload_json = serde_json::to_string(&AgentTaskPayload {
+        goal: payload_goal.clone(),
+        reminder_text: if task_type == TASK_TYPE_REMINDER {
+            payload_goal.clone()
+        } else {
+            String::new()
+        },
+        prompt_template: if task_type == TASK_TYPE_AGENT_PROMPT {
+            payload_goal
+        } else {
+            String::new()
+        },
+    })
+    .map_err(|error| format!("序列化 task payload 失败: {error}"))?;
+
+    let session_id_for_delivery = if input.result_in_new_session {
+        format!("task_sess_{}", uuid::Uuid::new_v4().simple())
+    } else {
+        source_session_id.to_string()
+    };
+    let delivery = AgentTaskDeliveryTarget {
+        kind: DELIVERY_KIND_DESKTOP.to_string(),
+        session_id: session_id_for_delivery,
+        result_in_new_session: input.result_in_new_session,
+    };
+    let delivery_json = serde_json::to_string(&delivery)
+        .map_err(|error| format!("序列化任务投递配置失败: {error}"))?;
+
+    let id = format!("task_{}", uuid::Uuid::new_v4().simple());
+    let creator_user_id = "agent_tool".to_string();
+
+    connection
+        .execute(
+            "INSERT INTO agent_tasks (
+                id, agent_id, source_session_id, creator_user_id,
+                title, intent_summary, task_type, schedule_type, timezone,
+                payload_json, schedule_json, delivery_json, status,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                id,
+                agent_id,
+                source_session_id,
+                creator_user_id,
+                title,
+                intent_summary,
+                task_type,
+                schedule_type,
+                timezone,
+                payload_json,
+                schedule_json,
+                delivery_json,
+                STATUS_ACTIVE,
+                now,
+                now,
+            ],
+        )
+        .map_err(|error| format!("创建定时任务失败: {error}"))?;
+
+    let _ = crate::scheduler::sync_materialized_jobs(app);
+
+    list_tasks(app, None)?
+        .into_iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| "创建成功但读取失败".to_string())
 }

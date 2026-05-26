@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, act } from '@testing-library/react'
 import { SettingsModal } from '../SettingsModal'
 import type {
   AppearanceSettings,
@@ -12,6 +12,12 @@ import type {
   ImageProviderConfig,
   ImageProviderDefinition,
 } from '../../types/imageGeneration'
+import {
+  getNotificationPermissionState,
+  openSystemNotificationSettings,
+  requestNotificationPermission,
+  sendTestNotification,
+} from '../../lib/taskDeliveryNotification'
 
 vi.mock('../../lib/piClient', () => ({
   getPeerGatewayInfo: vi.fn().mockResolvedValue({
@@ -83,6 +89,13 @@ vi.mock('../../lib/appLogClient', () => ({
   appLogExportAll: vi.fn().mockResolvedValue(0),
 }))
 
+vi.mock('../../lib/taskDeliveryNotification', () => ({
+  getNotificationPermissionState: vi.fn().mockResolvedValue('not_determined'),
+  openSystemNotificationSettings: vi.fn().mockResolvedValue(undefined),
+  requestNotificationPermission: vi.fn().mockResolvedValue('granted'),
+  sendTestNotification: vi.fn().mockResolvedValue(undefined),
+}))
+
 const generalSettings: GeneralSettings = {
   language: '中文',
   launchOnStartup: false,
@@ -90,6 +103,7 @@ const generalSettings: GeneralSettings = {
   customProxyUrl: '',
   submitShortcut: 'enter',
   llmCallLogDir: '',
+  notificationEnabled: true,
   runtimeParameters: {
     maxAgentToolRoundsPerDialogue: 80,
     streamDisconnectMaxRetries: 3,
@@ -407,5 +421,78 @@ describe('SettingsModal provider tabs', () => {
     expect(screen.getByLabelText('最大迭代次数')).toHaveDisplayValue('80')
     expect(screen.getByLabelText('流式中断重试')).toHaveDisplayValue('3')
     expect(screen.getByLabelText('LLM 外层最大重试次数')).toHaveDisplayValue('8')
+  })
+
+  it('requests system notification permission when the user enables notifications', async () => {
+    const setGeneralSettings = vi.fn()
+    vi.mocked(getNotificationPermissionState).mockResolvedValue('not_determined')
+    vi.mocked(requestNotificationPermission).mockResolvedValue('granted')
+
+    render(
+      <SettingsModal
+        {...baseModalProps}
+        generalSettings={{ ...generalSettings, notificationEnabled: false }}
+        setGeneralSettings={setGeneralSettings}
+        tab="general"
+      />,
+    )
+
+    const notificationLabel = screen.getByText('回复完成通知')
+    const notificationRow = notificationLabel.closest('.settings-row.switch')
+    const toggle = notificationRow?.querySelector('.toggle')
+    expect(toggle).not.toBeNull()
+
+    await act(async () => {
+      fireEvent.click(toggle as HTMLButtonElement)
+    })
+
+    expect(getNotificationPermissionState).toHaveBeenCalled()
+    expect(requestNotificationPermission).toHaveBeenCalledTimes(1)
+    expect(openSystemNotificationSettings).not.toHaveBeenCalled()
+    expect(setGeneralSettings).toHaveBeenCalledWith(expect.any(Function))
+  })
+
+  it('requests permission when the app setting is enabled but system permission is missing', async () => {
+    const setGeneralSettings = vi.fn()
+    vi.mocked(getNotificationPermissionState).mockResolvedValue('not_determined')
+    vi.mocked(requestNotificationPermission).mockResolvedValue('granted')
+
+    render(
+      <SettingsModal
+        {...baseModalProps}
+        generalSettings={{ ...generalSettings, notificationEnabled: true }}
+        setGeneralSettings={setGeneralSettings}
+        tab="general"
+      />,
+    )
+
+    const notificationLabel = screen.getByText('回复完成通知')
+    const notificationRow = notificationLabel.closest('.settings-row.switch')
+    const toggle = notificationRow?.querySelector('.toggle')
+    expect(toggle).not.toBeNull()
+
+    await act(async () => {
+      fireEvent.click(toggle as HTMLButtonElement)
+    })
+
+    expect(requestNotificationPermission).toHaveBeenCalledTimes(1)
+    expect(openSystemNotificationSettings).not.toHaveBeenCalled()
+    expect(setGeneralSettings).toHaveBeenCalledWith(expect.any(Function))
+  })
+
+  it('can send a test notification from settings', async () => {
+    render(
+      <SettingsModal
+        {...baseModalProps}
+        generalSettings={{ ...generalSettings, notificationEnabled: true }}
+        tab="general"
+      />,
+    )
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '发送测试通知' }))
+    })
+
+    expect(sendTestNotification).toHaveBeenCalledTimes(1)
   })
 })

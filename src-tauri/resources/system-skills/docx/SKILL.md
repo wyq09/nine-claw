@@ -15,7 +15,7 @@ A .docx file is a ZIP archive containing XML files.
 | Task | Approach |
 |------|----------|
 | Read/analyze content | `pandoc` or unpack for raw XML |
-| Create new document | Use `docx-js` - see Creating New Documents below |
+| Create new document | Prefer existing `.docx` template + unpack/edit/repack; only use `docx-js` if the package is already available locally |
 | Edit existing document | Unpack → edit XML → repack - see Editing Existing Documents below |
 
 ### Converting .doc to .docx
@@ -55,7 +55,39 @@ python scripts/accept_changes.py input.docx output.docx
 
 ## Creating New Documents
 
-Generate .docx files with JavaScript, then validate. Install: `npm install -g docx`
+Prefer one of these stable paths, in order:
+
+1. Duplicate an existing `.docx` template, then `unpack -> edit XML -> pack`
+2. If no template exists, create a minimal `.docx` via LibreOffice and then edit/repack it
+3. Use `docx-js` only when `docx` is already available in the current environment
+
+Do not rely on ad hoc global installs such as `npm install -g docx` during a task. If `docx` is unavailable, fall back to the XML/template workflow instead of trying to install packages globally.
+
+### Minimal blank document bootstrap
+
+When there is no suitable template, create a minimal starter document first:
+
+```bash
+mkdir -p tmp-docx-bootstrap
+cat > tmp-docx-bootstrap/body.html <<'EOF'
+<!doctype html>
+<html>
+  <body>
+    <p>Draft</p>
+  </body>
+</html>
+EOF
+python scripts/office/soffice.py --headless --convert-to docx tmp-docx-bootstrap/body.html --outdir tmp-docx-bootstrap
+python scripts/office/unpack.py tmp-docx-bootstrap/body.docx unpacked/
+```
+
+Then edit `unpacked/word/*.xml` and repack with:
+
+```bash
+python scripts/office/pack.py unpacked/ output.docx
+```
+
+### JavaScript path when `docx` is already present
 
 ### Setup
 ```javascript
@@ -585,6 +617,6 @@ After running `comment.py` (see Step 2), add markers to document.xml. For replie
 ## Dependencies
 
 - **pandoc**: Text extraction
-- **docx**: `npm install -g docx` (new documents)
+- **docx-js**: optional, only when the `docx` package is already available locally
 - **LibreOffice**: PDF conversion (auto-configured for sandboxed environments via `scripts/office/soffice.py`)
 - **Poppler**: `pdftoppm` for images

@@ -93,6 +93,7 @@ pub(crate) fn openai_pi_compat_supports_reasoning_effort(model: &str) -> bool {
         || m.contains("deepseek-reasoner")
         || m.contains("kimi")
         || m.contains("moonshot")
+        || openai_pi_compat_requires_reasoning_content_replay(model)
 }
 
 pub(crate) fn openai_pi_compat_requires_explicit_thinking_disable(model: &str) -> bool {
@@ -104,12 +105,41 @@ pub(crate) fn openai_pi_compat_requires_explicit_thinking_disable(model: &str) -
         || m.contains("deepseek_v4_pro")
 }
 
+pub(crate) fn openai_pi_compat_requires_reasoning_content_replay(model: &str) -> bool {
+    let normalized = model
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .replace(' ', "-");
+    let model_id = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    matches!(
+        model_id,
+        "mimo-v2.5-pro" | "mimo-v2.5" | "mimo-v2-pro" | "mimo-v2-omni" | "mimo-v2-flash"
+    )
+}
+
 pub(crate) fn should_force_pi_thinking_off(
     provider_config: &ProviderRuntimeConfig,
     disable_reasoning_effort: bool,
 ) -> bool {
+    if openai_pi_compat_requires_reasoning_content_replay(&provider_config.model) {
+        return false;
+    }
     disable_reasoning_effort
         || openai_pi_compat_requires_explicit_thinking_disable(&provider_config.model)
+}
+
+pub(crate) fn forced_pi_thinking_level(
+    provider_config: &ProviderRuntimeConfig,
+    disable_reasoning_effort: bool,
+) -> Option<&'static str> {
+    if openai_pi_compat_requires_reasoning_content_replay(&provider_config.model) {
+        return Some("medium");
+    }
+    if should_force_pi_thinking_off(provider_config, disable_reasoning_effort) {
+        return Some("off");
+    }
+    None
 }
 
 /// 微信/飞书 IM 必须使用绑定智能体的默认模型；Base URL / API Key 从应用全局 Provider 配置读取。

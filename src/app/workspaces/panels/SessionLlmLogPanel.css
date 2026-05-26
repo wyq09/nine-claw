@@ -1,0 +1,237 @@
+/* Session LLM text log viewer */
+.session-log-panel {
+  position: fixed;
+  inset: 64px 64px 48px;
+  z-index: 1410;
+  min-width: 680px;
+  min-height: 420px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--chrome-border-subtle, #2a2a30);
+  border-radius: 12px;
+  background: var(--chrome-surface-elevated, #141417);
+  color: var(--chrome-text-strong, #e7e7eb);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+}
+.session-log-panel.standalone {
+  inset: 0;
+  min-width: 0;
+  min-height: 0;
+  border-radius: 0;
+  border: 0;
+  box-shadow: none;
+}
+.session-log-head {
+  min-height: 48px;
+  padding: 10px 12px;
+  background: var(--chrome-surface-raised, #1a1a1f);
+  border-bottom: 1px solid var(--chrome-border-subtle, #2a2a30);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.session-log-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 650;
+}
+.session-log-title code {
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--chrome-text-muted);
+  font-size: 11px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-weight: 500;
+}
+.session-log-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.session-log-actions button {
+  width: 28px;
+  height: 26px;
+  border-radius: 6px;
+  border: 1px solid var(--chrome-border-subtle, #2a2a30);
+  background: transparent;
+  color: var(--chrome-text-muted, #9a9aa5);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.session-log-actions button:hover {
+  color: var(--chrome-text-strong);
+  border-color: rgba(122, 183, 255, 0.35);
+}
+.session-log-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+}
+.session-log-sidebar {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--chrome-border-subtle, #2a2a30);
+  background: rgba(255, 255, 255, 0.02);
+}
+.session-log-search {
+  margin: 10px;
+  min-height: 34px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--chrome-border-subtle, #2a2a30);
+  background: #0f0f13;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--chrome-text-muted);
+}
+.session-log-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--chrome-text-strong);
+  font: inherit;
+  font-size: 12px;
+}
+.session-log-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 8px 10px;
+}
+.session-log-item {
+  width: 100%;
+  min-height: 86px;
+  margin-bottom: 8px;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  display: grid;
+  gap: 5px;
+  cursor: pointer;
+}
+.session-log-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.session-log-item.active {
+  background: rgba(122, 183, 255, 0.12);
+  border-color: rgba(122, 183, 255, 0.28);
+}
+.session-log-item span {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--chrome-text-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-log-item small {
+  color: var(--chrome-text-muted);
+  font-size: 11px;
+}
+.session-log-item p {
+  margin: 0;
+  color: var(--chrome-text-muted);
+  font-size: 11px;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.session-log-detail {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+.session-log-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+  color: var(--chrome-text-muted);
+  font-size: 11px;
+}
+.session-log-meta code {
+  max-width: 100%;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+.session-log-sections {
+  display: grid;
+  gap: 10px;
+}
+.session-log-section {
+  border: 1px solid var(--chrome-border-subtle, #2a2a30);
+  border-radius: 8px;
+  background: #0f0f13;
+  overflow: hidden;
+}
+.session-log-section h3 {
+  margin: 0;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--chrome-border-subtle, #2a2a30);
+  font-size: 12px;
+  color: var(--chrome-text-strong);
+}
+.session-log-section.tone-start h3 { color: #9ccaff; }
+.session-log-section.tone-finish h3 { color: #a7ecc0; }
+.session-log-section.tone-tool h3 { color: #ffc866; }
+.session-log-section pre {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--chrome-text-strong);
+  font-size: 12px;
+  line-height: 1.55;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+.session-log-empty,
+.session-log-error {
+  color: var(--chrome-text-muted);
+  font-size: 13px;
+  padding: 34px 16px;
+  text-align: center;
+}
+.session-log-error {
+  color: #ff9b9b;
+}
+
+@media (max-width: 760px) {
+  .session-log-panel {
+    inset: 0;
+    min-width: 0;
+    border-radius: 0;
+  }
+  .session-log-body {
+    grid-template-columns: 1fr;
+  }
+  .session-log-sidebar {
+    max-height: 220px;
+    border-right: 0;
+    border-bottom: 1px solid var(--chrome-border-subtle, #2a2a30);
+  }
+}

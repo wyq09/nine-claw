@@ -1377,7 +1377,7 @@ impl Channel for WeChatChannel {
                             }
                             if let Some(errcode) = resp.errcode {
                                 if errcode == -14 {
-                                    log::warn!("WeChat session expired (errcode -14)");
+                                    log::info!("WeChat session expired (errcode -14)");
                                     running.store(false, Ordering::SeqCst);
                                     *status.lock().unwrap() =
                                         ChannelStatus::Error("会话已过期".to_string());

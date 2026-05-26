@@ -34,6 +34,15 @@ export function buildPromptWithAttachments(
   return `${trimmedPrompt}\n\n${attachmentLines.join('\n')}`.trim()
 }
 
+export function stripAttachmentDirectivesFromPrompt(prompt: string): string {
+  return prompt
+    .split('\n')
+    .map((line) => line.replace(/::nc-media\{[^}]*\}/g, ' ').trimEnd())
+    .filter((line) => !line.trim().startsWith('::nc-media{'))
+    .join('\n')
+    .trim()
+}
+
 export function inferAttachmentKindFromReference(reference: string, mimeType = ''): ChatAttachmentKind {
   const normalized = `${reference.toLowerCase()} ${mimeType.toLowerCase()}`
   if (normalized.includes('image/') || /\.(png|jpe?g|gif|webp|bmp|svg)(?:[?#].*)?$/.test(normalized)) {

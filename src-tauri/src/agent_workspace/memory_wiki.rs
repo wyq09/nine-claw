@@ -61,7 +61,7 @@ pub(super) fn build_memory_wiki_snapshot(
 
     let mut sections = Vec::new();
     sections.push(format!(
-        "查来源看 `memory/{}`；**日记检索**看 `memory/{}`（`DAILY|` 行含 date/cats/summary，再下钻 `memory/YYYY-MM-DD.md`）；查外部知识看 `wiki/{}`。",
+        "查来源看 `memory/{}`；查每日索引看 `memory/{}`（`DAILY|` 行含 date/cats/summary，再下钻 `memory/YYYY-MM-DD.md`）；查外部知识看 `wiki/{}`。",
         SOURCE_INDEX_FILE, DAILY_INDEX_FILE, WIKI_INDEX_FILE
     ));
 

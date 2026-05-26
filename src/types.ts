@@ -155,9 +155,9 @@ export type DelegationRunSegment = {
   elapsedMs?: number
   /** 错误信息 */
   error?: string | null
-  /** 实时思考轮（turn_end / agent_end），按 `workspace.delegate.turn` 事件聚合 */
+  /** 实时思考轮（turn_end / agent_end），按 `workspace:delegate:turn` 事件聚合 */
   turns?: DelegationTurnEntry[]
-  /** 实时工具调用列表（tool_execution_start/end），按 `workspace.delegate.tool` 事件聚合 */
+  /** 实时工具调用列表（tool_execution_start/end），按 `workspace:delegate:tool` 事件聚合 */
   toolCalls?: DelegationToolCallEntry[]
 }
 
@@ -278,6 +278,9 @@ export type AgentToolId =
   | 'memory_forget'
   | 'memory_list'
   | 'chat_search'
+  | 'create_scheduled_task'
+  | 'query_scheduled_task'
+  | 'query_scheduled_task_info'
 
 export type AgentCapabilityPolicy = {
   strategy: AgentSkillStrategy
@@ -400,6 +403,10 @@ export type HistoryItem = {
   sessionLlmModel?: string
   /** 非空表示本会话属于某团队工作空间（群聊 / 多智能体） */
   workspaceId?: string
+  /** 会话创建时自动生成的话题工作区目录。 */
+  topicWorkspaceDir?: string
+  /** 当前产物写入目录，可切换到外部文件夹。 */
+  currentWorkspaceDir?: string
 }
 
 /** Session list item returned from the structured chat API (no turns). */
@@ -415,6 +422,8 @@ export type ChatSessionListItem = {
   session_llm_provider_id: string | null
   session_llm_model: string | null
   workspace_id: string | null
+  topic_workspace_dir?: string | null
+  current_workspace_dir?: string | null
   turn_count: number
 }
 
@@ -431,6 +440,8 @@ export type ChatSessionDetail = {
   session_llm_provider_id: string | null
   session_llm_model: string | null
   workspace_id: string | null
+  topic_workspace_dir?: string | null
+  current_workspace_dir?: string | null
   turns: ChatTurnRow[]
 }
 
@@ -454,66 +465,13 @@ export type ChatTurnRow = {
 
 export type ViewKey = 'chat' | 'agents' | 'tasks' | 'workspaces'
 
-export type WorkspaceRecord = {
-  id: string
-  name: string
-  description: string
-  supervisorAgentId: string
-  /** 空字符串：默认 `teams/<id>/artifacts`；非空：自定义绝对路径 */
-  artifactsRoot: string
-  /**
-   * 团队会话注入的「主智能体角色」Markdown。空 = 使用应用内置默认（随可委派成员数变化）；
-   * 非空则整段写入团队前言（建议以 `## 主智能体角色（MUST）` 开头）。
-   */
-  supervisorOrchestrationPrompt?: string
-  /** 1 = 启用 LLM 调用链调试模式（本工作空间内会把主 Agent↔Pi / 主 Agent↔子 Agent 的完整调用写入 `.debug/*.jsonl`） */
-  llmTraceEnabled?: number
-  createdAt: number
-  updatedAt: number
-  archived: number
-}
-
-export type ArtifactsTreeEntry = {
-  name: string
-  relPath: string
-  isDir: boolean
-  size: number | null
-  modifiedMs: number | null
-}
-
-export type WorkspaceMemberView = {
-  agentId: string
-  name: string
-  summary: string
-  description: string
-  role: string
-  skillIds: string[]
-  avatarUri?: string
-}
-
-export type WorkspaceResourceRecord = {
-  id: string
-  workspaceId: string
-  fileName: string
-  relPath: string
-  mime: string
-  size: number
-  uploaderAgentId: string | null
-  createdAt: number
-}
-
-export type WorkspaceMemoryRecord = {
-  id: string
-  workspaceId: string
-  title: string
-  content: string
-  authorAgentId: string | null
-  tagsJson: string
-  scope: string
-  scopeAgentId: string | null
-  createdAt: number
-  updatedAt: number
-}
+export type {
+  ArtifactsTreeEntry,
+  WorkspaceMemoryRecord,
+  WorkspaceMemberView,
+  WorkspaceRecord,
+  WorkspaceResourceRecord,
+} from './workspaceTypes'
 
 /** 全局 runtime 参数（「设置 → 参数」）与 `stream_pi_prompt` / 委派 Agent Loop 共享 */
 export type RuntimeParameters = {
@@ -860,9 +818,11 @@ export type GeneralSettings = {
   llmCallLogDir: string
   /** Agent 循环 / 流式 / LLM 外层重试等全局运行时参数 */
   runtimeParameters: RuntimeParameters
+  /** 是否开启 Agent 回复完成的系统推送通知 */
+  notificationEnabled: boolean
 }
 
-export type ThemeMode = 'dark' | 'light' | 'claude' | 'shrimp_tide'
+export type ThemeMode = 'dark' | 'light' | 'claude' | 'shrimp_tide' | 'paper_ink'
 
 export type AppearanceSettings = {
   themeMode: ThemeMode

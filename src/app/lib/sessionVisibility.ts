@@ -5,16 +5,16 @@ export function isWorkspaceHistoryItem(item: Pick<HistoryItem, 'workspaceId'> | 
 }
 
 export function filterStandaloneHistory(items: HistoryItem[]): HistoryItem[] {
-  return items.filter((item) => !isWorkspaceHistoryItem(item))
+  return items
 }
 
 export function resolveStandaloneActiveHistoryItem(activeItem: HistoryItem | null): HistoryItem | null {
-  return isWorkspaceHistoryItem(activeItem) ? null : activeItem
+  return activeItem
 }
 
-export function resolveStandaloneActiveHistoryId(activeItem: HistoryItem | null, activeId: string | null): string {
+export function resolveStandaloneActiveHistoryId(_activeItem: HistoryItem | null, activeId: string | null): string {
   const trimmedId = activeId?.trim() ?? ''
-  if (!trimmedId || isWorkspaceHistoryItem(activeItem)) {
+  if (!trimmedId) {
     return ''
   }
   return trimmedId

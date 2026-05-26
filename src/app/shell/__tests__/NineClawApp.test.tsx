@@ -201,7 +201,7 @@ describe('NineClawApp', () => {
     )
   })
 
-  it('routes bot conversation text through the bot channel instead of desktop Pi', async () => {
+  it('keeps bot conversation text on the desktop Pi path', async () => {
     const submitPrompt = vi.fn()
     mockUsePiAgent.mockReturnValue({
       ...buildUsePiAgentReturn(),
@@ -217,9 +217,14 @@ describe('NineClawApp', () => {
     fireEvent.click(screen.getByRole('button', { name: 'submit chat' }))
 
     await waitFor(() => {
-      expect(botSendMessage).toHaveBeenCalledWith('wechat', 'user-1', 'hello from chat')
+      expect(submitPrompt).toHaveBeenCalledWith(
+        ' hello from chat ',
+        expect.objectContaining({
+          attachments: [],
+        }),
+      )
     })
-    expect(submitPrompt).not.toHaveBeenCalled()
+    expect(botSendMessage).not.toHaveBeenCalled()
     expect(botSendMedia).not.toHaveBeenCalled()
   })
 

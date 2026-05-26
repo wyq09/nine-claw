@@ -57,7 +57,7 @@ describe('memory and chat tools', () => {
     vi.stubGlobal('fetch', fetchMock)
     const tool = createMemoryReadTool({ Type: createTypeStub() } as never)
 
-    const result = await tool.execute('call-2', {})
+    const result = await tool.execute()
 
     expect(fetchMock).toHaveBeenCalledWith(
       'http://127.0.0.1:8123/memory/token-1/read',
@@ -80,7 +80,7 @@ describe('memory and chat tools', () => {
     const getTool = createMemoryGetTool({ Type } as never)
     const listTool = createMemoryListTool({ Type } as never)
     const forgetTool = createMemoryForgetTool({ Type } as never)
-    const chatSearchTool = createChatSearchTool({ Type } as never)
+    const chatSearchTool = createChatSearchTool({ Type, fetchImpl: fetchMock } as never)
 
     await storeTool.execute('call-3', { key: 'user.profile', value: { name: 'Ada' } })
     await getTool.execute('call-4', { key: 'user.profile' })

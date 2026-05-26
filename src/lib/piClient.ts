@@ -112,6 +112,25 @@ export async function abortPiStream(sessionId?: string | null): Promise<void> {
   await invoke('abort_pi_stream', { sessionId: sessionId ?? null })
 }
 
+export type DesktopCompressionCommandResult = {
+  compressed: boolean
+  reason: string
+}
+
+export async function compactDesktopSessionBeforeModelSwitch(payload: {
+  sessionId: string
+  workspaceId?: string | null
+  currentModel: string
+  nextModel: string
+}): Promise<DesktopCompressionCommandResult> {
+  return invoke<DesktopCompressionCommandResult>('compact_desktop_session_before_model_switch', {
+    sessionId: payload.sessionId,
+    workspaceId: payload.workspaceId ?? null,
+    currentModel: payload.currentModel,
+    nextModel: payload.nextModel,
+  })
+}
+
 export async function clearPiSession(): Promise<void> {
   await invoke('clear_pi_session')
 }
@@ -325,6 +344,10 @@ export async function chatUpdateTurn(payload: {
     toolCallsJson: payload.toolCallsJson ?? null,
     activityJson: payload.activityJson ?? null,
   })
+}
+
+export async function syncHistoryBackupFromStructured(): Promise<void> {
+  await invoke('sync_history_backup_from_structured')
 }
 
 export async function chatDeleteSession(sessionId: string): Promise<void> {
@@ -567,7 +590,7 @@ export async function workspaceDelegate(payload: {
   return invoke<string>('workspace_delegate', payload)
 }
 
-/** 从委派计划卡「下发一项」——后端会发 workspace.delegate.* 事件并返回最终结果。 */
+/** 从委派计划卡「下发一项」——后端会发 workspace:delegate:* 事件并返回最终结果。 */
 export async function workspaceRunDelegateTask(payload: {
   workspaceId: string
   sessionId?: string | null
@@ -590,12 +613,12 @@ export async function workspaceAbortDelegate(runId: string): Promise<void> {
 
 // ── Workspace delegate live events ──
 // 后端在 `run_delegate_with_provider_events` 中按 runId 发射下列事件：
-//   - workspace.delegate.progress  (派发开始) { runId, workspaceId, sessionId?, assignee, task }
-//   - workspace.delegate.turn      { runId, workspaceId, turnIndex, kind }
-//   - workspace.delegate.tool      { runId, workspaceId, toolIndex, toolCallId, toolName, argsDigest, status, isError? }
-//   - workspace.delegate.chunk     { runId, workspaceId, deltaText }
-//   - workspace.delegate.done      { runId, workspaceId, assignee, output, elapsedMs, status: 'done' }
-//   - workspace.delegate.error     { runId, workspaceId, assignee, error, status: 'error' }
+//   - workspace:delegate:progress  (派发开始) { runId, workspaceId, sessionId?, assignee, task }
+//   - workspace:delegate:turn      { runId, workspaceId, turnIndex, kind }
+//   - workspace:delegate:tool      { runId, workspaceId, toolIndex, toolCallId, toolName, argsDigest, status, isError? }
+//   - workspace:delegate:chunk     { runId, workspaceId, deltaText }
+//   - workspace:delegate:done      { runId, workspaceId, assignee, output, elapsedMs, status: 'done' }
+//   - workspace:delegate:error     { runId, workspaceId, assignee, error, status: 'error' }
 
 export type WorkspaceDelegateTurnEvent = {
   runId: string
@@ -635,7 +658,7 @@ export type WorkspaceDelegateTerminalEvent = {
 export async function subscribeWorkspaceDelegateTurn(
   onEvent: (payload: WorkspaceDelegateTurnEvent) => void,
 ): Promise<PiStreamUnsubscribe> {
-  return listen<WorkspaceDelegateTurnEvent>('workspace.delegate.turn', (event) => {
+  return listen<WorkspaceDelegateTurnEvent>('workspace:delegate:turn', (event) => {
     onEvent(event.payload)
   })
 }
@@ -643,7 +666,7 @@ export async function subscribeWorkspaceDelegateTurn(
 export async function subscribeWorkspaceDelegateTool(
   onEvent: (payload: WorkspaceDelegateToolEvent) => void,
 ): Promise<PiStreamUnsubscribe> {
-  return listen<WorkspaceDelegateToolEvent>('workspace.delegate.tool', (event) => {
+  return listen<WorkspaceDelegateToolEvent>('workspace:delegate:tool', (event) => {
     onEvent(event.payload)
   })
 }
@@ -651,7 +674,7 @@ export async function subscribeWorkspaceDelegateTool(
 export async function subscribeWorkspaceDelegateChunk(
   onEvent: (payload: WorkspaceDelegateChunkEvent) => void,
 ): Promise<PiStreamUnsubscribe> {
-  return listen<WorkspaceDelegateChunkEvent>('workspace.delegate.chunk', (event) => {
+  return listen<WorkspaceDelegateChunkEvent>('workspace:delegate:chunk', (event) => {
     onEvent(event.payload)
   })
 }
@@ -661,12 +684,12 @@ export async function subscribeWorkspaceDelegateTerminal(
 ): Promise<PiStreamUnsubscribe> {
   const unsubs: PiStreamUnsubscribe[] = []
   unsubs.push(
-    await listen<WorkspaceDelegateTerminalEvent>('workspace.delegate.done', (event) => {
+    await listen<WorkspaceDelegateTerminalEvent>('workspace:delegate:done', (event) => {
       onEvent({ ...event.payload, status: 'done' })
     }),
   )
   unsubs.push(
-    await listen<WorkspaceDelegateTerminalEvent>('workspace.delegate.error', (event) => {
+    await listen<WorkspaceDelegateTerminalEvent>('workspace:delegate:error', (event) => {
       onEvent({ ...event.payload, status: 'error' })
     }),
   )

@@ -74,6 +74,10 @@ function isWidgetOption(value: unknown): value is WidgetOption {
   )
 }
 
+function isChoiceQuestion(question: AskUserQuestion): question is AskUserChoiceQuestion {
+  return question.type === 'single_select' || question.type === 'multi_select'
+}
+
 function parseAskUserQuestion(value: unknown): AskUserQuestion | null {
   if (!isRecord(value) || typeof value.id !== 'string' || typeof value.label !== 'string') {
     return null
@@ -183,7 +187,7 @@ export function validateAskUserToolPolicy(widget: AskUserWidget): string[] {
   }
 
   for (const question of widget.questions) {
-    if (question.type === 'text' || question.type === 'textarea') {
+    if (!isChoiceQuestion(question)) {
       continue
     }
 

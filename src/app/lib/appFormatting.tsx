@@ -55,6 +55,9 @@ export const AGENT_TOOL_OPTIONS: { id: AgentToolId; label: string; description: 
   { id: 'memory_forget', label: 'memory_forget', description: '按 key 删除 K/V 记忆' },
   { id: 'memory_list', label: 'memory_list', description: '列出 K/V 记忆条目' },
   { id: 'chat_search', label: 'chat_search', description: '跨会话关键词搜索历史消息' },
+  { id: 'create_scheduled_task', label: 'create_scheduled_task', description: '创建定时任务到任务中心' },
+  { id: 'query_scheduled_task', label: 'query_scheduled_task', description: '查询当前智能体的定时任务列表' },
+  { id: 'query_scheduled_task_info', label: 'query_scheduled_task_info', description: '查询单个定时任务的详情' },
 ]
 
 const AGENT_TOOL_ID_SET = new Set<AgentToolId>(AGENT_TOOL_OPTIONS.map((tool) => tool.id))

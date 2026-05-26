@@ -1,9 +1,12 @@
 import type { Dispatch, MouseEvent, ReactNode, SetStateAction } from 'react'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { AppIcon } from '../../components/AppIcon'
 import { SettingsModal } from '../../components/SettingsModal'
 import { llmTraceList, onLlmTraceEvent } from '../../lib/llmTraceClient'
+import { sessionLlmLogGet, onSessionLlmLogEvent } from '../../lib/sessionLlmLogClient'
+import { groupHistoryIntoSidebarBuckets } from '../../lib/historySidebarBuckets'
+import { useHistorySidebarBucketsExpanded } from '../../hooks/useHistorySidebarBucketsExpanded'
 import type {
   AgentInput,
   AppearanceSettings,
@@ -24,17 +27,18 @@ import type {
 import type { ResourcesViewProps, SkillsViewProps } from '../pages/LibraryAndTasks'
 import {
   SIDEBAR_FOOTER_SHORTCUTS_ENABLED,
-  formatHistoryAgeLabel,
-  getStatusTone,
   sessionLlmDecode,
   sessionLlmEncode,
   summarizePrompt,
 } from '../lib'
+import { getHistorySidebarCardMeta } from '../lib/historySidebarCardMeta'
 import { SidebarButton } from '../chat/ChatWorkspace'
 import { NewSessionDialog, SkillInstallDialog } from '../pages/SessionDialogs'
 import { AgentSkillPickerDialog } from '../agents/AgentDialogsBundle'
 import { openLlmTracePopout } from '../lib/llmTracePopout'
+import { openSessionLlmLogPopout } from '../lib/sessionLlmLogPopout'
 import { matchesTraceScope } from '../workspaces/panels/llmTraceModel'
+import { matchesSessionLogScope } from '../workspaces/panels/sessionLlmLogModel'
 import type { SessionLlmSelectOption } from './NineClawRouteOutlet'
 
 export type NineClawAppChromeProps = {
@@ -230,7 +234,11 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
     llmTraceSessionId: llmTraceSessionIdProp,
     llmTraceWorkspaceId,
   } = props
+  const historyBuckets = useMemo(() => groupHistoryIntoSidebarBuckets(visibleHistory), [visibleHistory])
+  const { mergedBucketOpen, toggleBucket } = useHistorySidebarBucketsExpanded(historyBuckets, activeHistoryId)
+
   const [standaloneTraceCount, setStandaloneTraceCount] = useState(0)
+  const [sessionLogAvailable, setSessionLogAvailable] = useState(false)
   const traceSessionId = llmTraceSessionIdProp.trim()
 
   useEffect(() => {
@@ -275,6 +283,38 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
       if (payload.phase === 'started' && mounted) {
         setStandaloneTraceCount((count) => count + 1)
       }
+    }).then((unlisten) => {
+      unsubscribe = unlisten
+    })
+
+    return () => {
+      mounted = false
+      unsubscribe?.()
+    }
+  }, [llmTraceWorkspaceId, traceSessionId])
+
+  useEffect(() => {
+    if (!traceSessionId) {
+      setSessionLogAvailable(false)
+      return
+    }
+
+    let mounted = true
+    let unsubscribe: (() => void) | null = null
+    void sessionLlmLogGet({
+      workspaceId: llmTraceWorkspaceId,
+      sessionId: traceSessionId,
+    })
+      .then(() => {
+        if (mounted) setSessionLogAvailable(true)
+      })
+      .catch(() => {
+        if (mounted) setSessionLogAvailable(false)
+      })
+
+    void onSessionLlmLogEvent((payload) => {
+      if (!matchesSessionLogScope(payload, { workspaceId: llmTraceWorkspaceId, sessionId: traceSessionId })) return
+      if (mounted) setSessionLogAvailable(true)
     }).then((unlisten) => {
       unsubscribe = unlisten
     })
@@ -362,6 +402,18 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
             {/* Tauri drag.js 只看 event.target，不向上找；此处必须自带属性，否则点中间空白不触发拖动 */}
             <div className="app-window-titlebar-drag-spacer" data-tauri-drag-region aria-hidden="true" />
             <div className="app-window-titlebar-end" data-tauri-drag-region="false" data-titlebar-no-drag="true">
+              {traceSessionId ? (
+                <button
+                  type="button"
+                  className={`titlebar-trace-button${sessionLogAvailable ? ' active' : ''}`}
+                  data-titlebar-no-drag="true"
+                  onClick={() => void openSessionLlmLogPopout(llmTraceWorkspaceId, traceSessionId)}
+                  title="在独立窗口查看当前 session 的文本日志"
+                >
+                  <AppIcon name="folder" size={13} />
+                  <span>日志</span>
+                </button>
+              ) : null}
               {traceSessionId ? (
                 <button
                   type="button"
@@ -463,23 +515,54 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
 
               <div className="history-list">
                 {visibleHistory.length > 0 ? (
-                  visibleHistory.map((item) => (
-                    <button
-                      key={item.id}
-                      type="button"
-                      className={`history-card ${item.id === activeHistoryId ? 'active' : ''}`}
-                      onClick={() => onHistorySelect(item.id)}
-                      onContextMenu={(event) => onHistoryContextMenu(event, item)}
-                      title={item.title}
-                    >
-                      <span className="history-card-copy">
-                        <span className="history-card-title">{summarizePrompt(item.title, 20)}</span>
-                        {item.agent ? <span className="history-card-agent">{item.agent.name}</span> : null}
-                      </span>
-                      <span className={`history-card-time ${getStatusTone(item.status)}`}>
-                        {formatHistoryAgeLabel(item.status, item.updatedAt)}
-                      </span>
-                    </button>
+                  historyBuckets.map((bucket) => (
+                    <section key={bucket.key} className="history-bucket">
+                      <button
+                        type="button"
+                        className="history-bucket-head"
+                        aria-expanded={mergedBucketOpen[bucket.key]}
+                        onClick={() => toggleBucket(bucket.key)}
+                      >
+                        <span
+                          className={`history-bucket-chevron-wrap${mergedBucketOpen[bucket.key] ? ' is-open' : ''}`}
+                        >
+                          <AppIcon name="chevron-down" size={14} />
+                        </span>
+                        <span className="history-bucket-label">{bucket.label}</span>
+                        <span className="history-bucket-count">{bucket.items.length}</span>
+                      </button>
+                      {mergedBucketOpen[bucket.key] ? (
+                        <div className="history-bucket-items" role="list">
+                          {bucket.items.map((item) => {
+                            const meta = getHistorySidebarCardMeta(item.status, item.updatedAt || item.createdAt)
+                            return (
+                              <button
+                                key={item.id}
+                                type="button"
+                                role="listitem"
+                                className={`history-card ${item.id === activeHistoryId ? 'active' : ''}`}
+                                onClick={() => onHistorySelect(item.id)}
+                                onContextMenu={(event) => onHistoryContextMenu(event, item)}
+                                title={item.title}
+                              >
+                                <span className="history-card-body">
+                                  <span className="history-card-title">{item.title?.trim() || '未命名会话'}</span>
+                                  {item.agent ? (
+                                    <span className="history-card-agent">{item.agent.name}</span>
+                                  ) : null}
+                                  <span className="history-card-meta-row">
+                                    <span className={`history-card-meta-icon ${meta.tone}`}>
+                                      <AppIcon name={meta.icon} size={12} />
+                                    </span>
+                                    <span className={`history-card-time ${meta.tone}`}>{meta.label}</span>
+                                  </span>
+                                </span>
+                              </button>
+                            )
+                          })}
+                        </div>
+                      ) : null}
+                    </section>
                   ))
                 ) : (
                   <div className="empty-history-card compact">

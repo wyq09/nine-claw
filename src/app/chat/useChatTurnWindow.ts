@@ -26,8 +26,10 @@ export function useChatTurnWindow(
       cancelAnimationFrame(warmupRafRef.current)
       warmupRafRef.current = null
     }
+    // Session switches must reset the virtualization window before the first paint.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoadedCount(Math.min(INITIAL_VISIBLE, fullTurns.length))
-  }, [activeHistoryId])
+  }, [activeHistoryId, fullTurns.length])
 
   useEffect(() => {
     if (fullTurns.length <= INITIAL_VISIBLE) {
@@ -47,6 +49,8 @@ export function useChatTurnWindow(
 
   useEffect(() => {
     const t = fullTurns.length
+    // Keep the window from staying at 0 while turns stream into the same session.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoadedCount((c) => {
       if (t === 0) {
         return 0
@@ -93,7 +97,7 @@ export function useChatTurnWindow(
     }
     pendingScrollRestoreRef.current = null
     pagingRef.current = false
-  }, [visibleTurns.length, loadedCount])
+  }, [visibleTurns.length, loadedCount, scrollParentRef])
 
   return { visibleTurns, visibleRangeStart, hasMoreAbove, loadMoreAbove }
 }

@@ -53,6 +53,7 @@ import {
   botStartWechat,
   botStopLark,
   botStopWechat,
+  compactDesktopSessionBeforeModelSwitch,
   createAgent,
   getDefaultAgent,
   installSystemSkill,
@@ -76,7 +77,6 @@ import {
 } from '../../lib/piClient'
 import type { QrCodeEvent, BotStatusEvent } from '../../lib/piClient'
 import type { ApprovalRequest } from '../../lib/piClient'
-import { buildPromptWithAttachments } from '../../lib/composerAttachments'
 import { THEME_PRESETS, THEME_VARIABLE_KEYS } from '../../theme/themePresets'
 import {
   APPEARANCE_SETTINGS_STORAGE_KEY,
@@ -150,6 +150,18 @@ export function NineClawApp() {
   const toast = useToast()
   const composerClearRef = useRef<(() => void) | null>(null)
   const composerDraftBackupRef = useRef('')
+  const [generalSettings, setGeneralSettings] = useState<GeneralSettings>(createInitialGeneralSettings)
+  const [appearanceSettings, setAppearanceSettings] = useState<AppearanceSettings>(createInitialAppearanceState)
+  const [selectedProviderId, setSelectedProviderId] = useState<ProviderId>('openai')
+  const [selectedBotId, setSelectedBotId] = useState<BotChannelId>('dingtalk')
+  const [providerConfigs, setProviderConfigs] = useState<Record<string, ProviderConfig>>(createInitialProviderState)
+  const [imageProviderConfigs, setImageProviderConfigs] = useState<Record<string, ImageProviderConfig>>(
+    createInitialImageProviderState,
+  )
+  const [imageGenerationSystem, setImageGenerationSystem] = useState<ImageGenerationSystemConfig>(
+    createInitialImageGenerationSystemState,
+  )
+  const [customProviderMeta, setCustomProviderMeta] = useState<CustomProviderMeta[]>(() => loadCustomProviderMeta())
   const {
     error,
     loading,
@@ -172,7 +184,7 @@ export function NineClawApp() {
     deleteHistoryItem,
     updateSessionLlm,
     sanitizeSessionLlmReferences,
-  } = usePiAgent(composerClearRef)
+  } = usePiAgent(composerClearRef, { notificationEnabled: generalSettings.notificationEnabled })
 
   const [view, setView] = useState<ViewKey>('chat')
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null)
@@ -237,18 +249,6 @@ export function NineClawApp() {
   } | null>(null)
   const [historyDeleteTarget, setHistoryDeleteTarget] = useState<{ sessionId: string; title: string } | null>(null)
   const [historyDeleteBusy, setHistoryDeleteBusy] = useState(false)
-  const [generalSettings, setGeneralSettings] = useState<GeneralSettings>(createInitialGeneralSettings)
-  const [appearanceSettings, setAppearanceSettings] = useState<AppearanceSettings>(createInitialAppearanceState)
-  const [selectedProviderId, setSelectedProviderId] = useState<ProviderId>('openai')
-  const [selectedBotId, setSelectedBotId] = useState<BotChannelId>('dingtalk')
-  const [providerConfigs, setProviderConfigs] = useState<Record<string, ProviderConfig>>(createInitialProviderState)
-  const [imageProviderConfigs, setImageProviderConfigs] = useState<Record<string, ImageProviderConfig>>(
-    createInitialImageProviderState,
-  )
-  const [imageGenerationSystem, setImageGenerationSystem] = useState<ImageGenerationSystemConfig>(
-    createInitialImageGenerationSystemState,
-  )
-  const [customProviderMeta, setCustomProviderMeta] = useState<CustomProviderMeta[]>(() => loadCustomProviderMeta())
   const [qrDialogOpen, setQrDialogOpen] = useState(false)
   const [qrCodeUrl, setQrCodeUrl] = useState<string>('')
   const [qrStatus, setQrStatus] = useState<'waiting' | 'scanned' | 'confirmed' | 'error'>('waiting')
@@ -784,11 +784,7 @@ export function NineClawApp() {
 
   useEffect(() => {
     void syncRuntimeParameters(generalSettings.runtimeParameters).catch(() => {})
-  }, [
-    generalSettings.runtimeParameters.maxAgentToolRoundsPerDialogue,
-    generalSettings.runtimeParameters.streamDisconnectMaxRetries,
-    generalSettings.runtimeParameters.llmOuterMaxAttempts,
-  ])
+  }, [generalSettings.runtimeParameters])
 
   useEffect(() => {
     persistStoredStorageValue(
@@ -803,7 +799,9 @@ export function NineClawApp() {
     const preset = THEME_PRESETS[appearanceSettings.themeMode] ?? THEME_PRESETS.dark
 
     root.dataset.uiTheme = appearanceSettings.themeMode
+    root.dataset.colorScheme = preset.colorScheme
     document.body.dataset.uiTheme = appearanceSettings.themeMode
+    document.body.dataset.colorScheme = preset.colorScheme
     root.style.setProperty('color-scheme', preset.colorScheme)
 
     for (const variableName of THEME_VARIABLE_KEYS) {
@@ -1322,11 +1320,22 @@ export function NineClawApp() {
     openNewSessionDialog()
   }
 
-  const handleSessionLlmChange = (nextProviderId: ProviderId, nextModel: string) => {
+  const handleSessionLlmChange = async (nextProviderId: ProviderId, nextModel: string) => {
     if (chatGateError) {
       setChatGateError('')
     }
     if (currentConversationHistoryId) {
+      const currentModel = sessionLlmDisplay.model.trim()
+      try {
+        await compactDesktopSessionBeforeModelSwitch({
+          sessionId: currentConversationHistoryId,
+          workspaceId: currentConversationHistoryItem?.workspaceId ?? null,
+          currentModel,
+          nextModel,
+        })
+      } catch (error) {
+        console.warn('model-switch compression skipped', error)
+      }
       updateSessionLlm(currentConversationHistoryId, nextProviderId, nextModel)
     } else {
       setComposerSessionLlm({ providerId: nextProviderId, model: nextModel })
@@ -1338,7 +1347,7 @@ export function NineClawApp() {
     if (!parsed) {
       return
     }
-    handleSessionLlmChange(parsed.providerId, parsed.model)
+    void handleSessionLlmChange(parsed.providerId, parsed.model)
   }
 
   const executeSlashCommand = (composerText: string): boolean => {
@@ -1390,8 +1399,10 @@ export function NineClawApp() {
     }
 
     const botTarget = currentConversationHistoryItem?.botTarget ?? null
+    const botSessionId = currentConversationHistoryItem?.id.trim() ?? ''
+    const hasDirectBotAttachments = Boolean(botTarget && composerAttachments.length > 0)
 
-    if (botTarget) {
+    if (hasDirectBotAttachments && botTarget) {
       if (chatGateError) {
         setChatGateError('')
       }
@@ -1399,6 +1410,9 @@ export function NineClawApp() {
       try {
         const trimmedDraft = composerText.trim()
         if (trimmedDraft) {
+          if (!botSessionId) {
+            throw new Error('缺少可复用的 bot session id')
+          }
           await botSendMessage(botTarget.channelId, botTarget.userId, trimmedDraft)
         }
 
@@ -1427,7 +1441,6 @@ export function NineClawApp() {
     if (chatGateError) {
       setChatGateError('')
     }
-    const promptWithAttachments = buildPromptWithAttachments(composerText, composerAttachments)
     clearComposerAttachments()
     const effectiveWorkspaceId =
       currentConversationHistoryItem?.workspaceId ??
@@ -1461,7 +1474,7 @@ export function NineClawApp() {
       : currentConversationHistoryItem
         ? currentConversationHistoryItem.agent ?? null
         : preferredComposerAgent
-    void submitPrompt(promptWithAttachments, {
+    void submitPrompt(composerText, {
       providerConfig: effectiveChatRuntime,
       agent: effectiveAgent,
       sessionLlm: sessionLlmDisplay,

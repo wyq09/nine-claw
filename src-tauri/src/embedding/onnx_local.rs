@@ -3,13 +3,15 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ndarray::{Array1, Array2, ArrayD};
-use ort::session::Session;
+use ort::logging::LogLevel;
 use ort::value::Tensor;
+use ort::{environment::Environment, session::Session};
 use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
 
 use super::EmbeddingProvider;
 
 const PROVIDER_ID: &str = "bge-small-zh-local";
+#[allow(dead_code)]
 const DIMENSION: usize = 512;
 const MAX_SEQ_LENGTH: usize = 512;
 
@@ -43,14 +45,20 @@ impl OnnxLocalProvider {
             ));
         }
 
+        if let Ok(environment) = Environment::current() {
+            environment.set_log_level(LogLevel::Warning);
+        }
+
         let session = Session::builder()
             .map_err(|e| format!("Failed to create session builder: {}", e))?
+            .with_log_level(LogLevel::Warning)
+            .map_err(|e| format!("Failed to set ONNX log level: {}", e))?
             .commit_from_file(&model_path)
             .map_err(|e| format!("Failed to load ONNX model: {}", e))?;
 
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| format!("Failed to load tokenizer: {}", e))?;
-        tokenizer.with_truncation(Some(TruncationParams {
+        let _ = tokenizer.with_truncation(Some(TruncationParams {
             max_length: MAX_SEQ_LENGTH,
             strategy: TruncationStrategy::LongestFirst,
             stride: 0,

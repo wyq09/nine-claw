@@ -10,6 +10,8 @@
 //! 3. **Execute** — delegated execution with 3-layer pre-guards
 //! 4. **Verify** — LLM self-evaluation with score + evidence
 
+#![allow(dead_code)]
+
 use crate::agent_loop_types::{
     AgentLoopBatchMarker, AgentLoopBatchResult, AgentLoopCallMarker, AgentLoopConfig,
     AgentLoopExtendMarker, AgentLoopResult, EnvironmentSnapshot, FailedAction, GuardDecision,
@@ -504,7 +506,32 @@ pub(crate) fn delegate_to_agent(
     context: Option<&str>,
     provider: &crate::provider_runtime::ProviderRuntimeConfig,
 ) -> AgentLoopResult {
-    delegate_to_agent_with_trace(app, agent_id, task, context, provider, None)
+    delegate_to_agent_with_trace(
+        app,
+        agent_id,
+        task,
+        context,
+        provider,
+        None,
+        DelegateEventCallbacks::default(),
+    )
+}
+
+/// Optional callbacks for emitting real-time delegate events (tool calls, text chunks, turns).
+pub(crate) struct DelegateEventCallbacks {
+    pub on_chunk: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    pub on_tool: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>, // (tool_call_id, tool_name, status)
+    pub on_turn: Option<Arc<dyn Fn(u32) + Send + Sync>>,              // (turn_index)
+}
+
+impl Default for DelegateEventCallbacks {
+    fn default() -> Self {
+        Self {
+            on_chunk: None,
+            on_tool: None,
+            on_turn: None,
+        }
+    }
 }
 
 pub(crate) fn delegate_to_agent_with_trace(
@@ -514,6 +541,7 @@ pub(crate) fn delegate_to_agent_with_trace(
     context: Option<&str>,
     provider: &crate::provider_runtime::ProviderRuntimeConfig,
     trace_id: Option<&str>,
+    event_cbs: DelegateEventCallbacks,
 ) -> AgentLoopResult {
     let mut prompt = task.to_string();
     if let Some(ctx) = context {
@@ -541,6 +569,7 @@ pub(crate) fn delegate_to_agent_with_trace(
         provider,
         &abort_flag,
         trace_id,
+        event_cbs,
     )
 }
 
@@ -560,7 +589,16 @@ pub(crate) fn execute_single_delegate(
     provider: &crate::provider_runtime::ProviderRuntimeConfig,
     abort_flag: &Arc<AtomicBool>,
 ) -> AgentLoopResult {
-    execute_single_delegate_internal(app, call, loop_id, iteration, provider, abort_flag, None)
+    execute_single_delegate_internal(
+        app,
+        call,
+        loop_id,
+        iteration,
+        provider,
+        abort_flag,
+        None,
+        DelegateEventCallbacks::default(),
+    )
 }
 
 fn execute_single_delegate_internal(
@@ -571,6 +609,7 @@ fn execute_single_delegate_internal(
     provider: &crate::provider_runtime::ProviderRuntimeConfig,
     abort_flag: &Arc<AtomicBool>,
     trace_id: Option<&str>,
+    event_cbs: DelegateEventCallbacks,
 ) -> AgentLoopResult {
     let start = Instant::now();
 
@@ -648,36 +687,25 @@ fn execute_single_delegate_internal(
         }
     };
 
-    // Resolve the sub-agent's own provider config instead of using the parent's.
-    let sub_provider = match crate::provider_runtime::resolve_im_llm_runtime(
-        app,
+    let delegate_provider = select_delegate_runtime_provider(
+        provider,
         &agent_record.default_provider_id,
         &agent_record.default_model,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            log::warn!(
-                "AgentLoop [{loop_id}] sub-agent '{}' provider '{}' resolution failed: {e}, falling back to parent provider",
-                call.agent_id,
-                agent_record.default_provider_id,
-            );
-            provider.clone()
-        }
-    };
+    );
 
     log::info!(
         "AgentLoop [{loop_id}] delegate to '{}' using provider: id={}, format={}, url={}, model={}",
         call.agent_id,
-        sub_provider.provider_id,
-        sub_provider.api_format,
-        sub_provider.base_url,
-        sub_provider.model,
+        delegate_provider.provider_id,
+        delegate_provider.api_format,
+        delegate_provider.base_url,
+        delegate_provider.model,
     );
 
     let base_normalized = crate::normalized_provider_runtime_base_url(
-        &sub_provider.base_url,
-        &sub_provider.api_format,
-        &sub_provider.provider_id,
+        &delegate_provider.base_url,
+        &delegate_provider.api_format,
+        &delegate_provider.provider_id,
     );
 
     let pi_rt = match crate::pi_runtime::require_pi_runtime_location(app) {
@@ -697,17 +725,13 @@ fn execute_single_delegate_internal(
 
     let bridge = crate::channels::pi_bridge::PiBridge::new(
         pi_rt,
-        &sub_provider.provider_id,
-        &sub_provider.api_format,
+        &delegate_provider.provider_id,
+        &delegate_provider.api_format,
         &base_normalized,
-        &sub_provider.api_key,
-        &sub_provider.model,
+        &delegate_provider.api_key,
+        &delegate_provider.model,
         Some(agent_cfg),
-    )
-    .with_runtime_dir(std::env::temp_dir().join(format!(
-        "nineclaw-pi-delegate-{}",
-        call.agent_id.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
-    )));
+    );
 
     let _run_id = format!("nc-al:{}:{}:{}", loop_id, iteration, call.agent_id);
     let channel_id = format!("nc:agent-loop:{}", Uuid::new_v4());
@@ -721,15 +745,22 @@ fn execute_single_delegate_internal(
 
     let app_for_chunk = app.clone();
     let trace_id_for_chunk = trace_id.map(str::to_string);
+    let chunk_cb = event_cbs.on_chunk.clone();
     let on_chunk = move |chunk: &str| {
         if let Some(tid) = trace_id_for_chunk.as_deref() {
             crate::llm_trace::append_response(&app_for_chunk, tid, chunk);
+        }
+        if let Some(cb) = &chunk_cb {
+            cb(chunk);
         }
     };
 
     let app_for_event = app.clone();
     let trace_id_for_event = trace_id.map(str::to_string);
     let tool_calls_count_for_event = tool_calls_count.clone();
+    let tool_cb = event_cbs.on_tool.clone();
+    let turn_cb = event_cbs.on_turn.clone();
+    let turn_counter = Arc::new(AtomicUsize::new(0));
     let on_event = move |value: &serde_json::Value| {
         let Some(tid) = trace_id_for_event.as_deref() else {
             return;
@@ -769,6 +800,15 @@ fn execute_single_delegate_internal(
                     status,
                     is_error,
                 );
+                if let Some(cb) = &tool_cb {
+                    cb(tool_call_id, tool_name, status);
+                }
+            }
+            "turn_end" | "agent_end" => {
+                if let Some(cb) = &turn_cb {
+                    let idx = turn_counter.fetch_add(1, Ordering::SeqCst) as u32;
+                    cb(idx);
+                }
             }
             _ => {}
         }
@@ -825,6 +865,14 @@ fn execute_single_delegate_internal(
             duration_ms,
         },
     }
+}
+
+fn select_delegate_runtime_provider<'a>(
+    session_provider: &'a crate::provider_runtime::ProviderRuntimeConfig,
+    _target_default_provider_id: &str,
+    _target_default_model: &str,
+) -> &'a crate::provider_runtime::ProviderRuntimeConfig {
+    session_provider
 }
 
 // ---------------------------------------------------------------------------
@@ -2904,6 +2952,25 @@ mod tests {
         };
         let budget = RetryBudget::default();
         assert!(!should_retry(&action, &result, &budget, None));
+    }
+
+    #[test]
+    fn test_delegate_provider_inherits_session_binding() {
+        let session_provider = crate::provider_runtime::ProviderRuntimeConfig {
+            provider_id: "custom_session".to_string(),
+            api_format: "openai".to_string(),
+            base_url: "https://session.example/v1".to_string(),
+            api_key: "session-key".to_string(),
+            model: "session-model".to_string(),
+        };
+
+        let selected =
+            select_delegate_runtime_provider(&session_provider, "stale_target", "stale-model");
+
+        assert_eq!(selected.provider_id, "custom_session");
+        assert_eq!(selected.base_url, "https://session.example/v1");
+        assert_eq!(selected.api_key, "session-key");
+        assert_eq!(selected.model, "session-model");
     }
 
     #[test]

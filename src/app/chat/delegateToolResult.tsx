@@ -126,10 +126,12 @@ export function DelegateToolResultCard({
         </button>
       </header>
       {open ? (
-        <div className="delegate-tool-result-body" onClick={handleClick}>
-          <Suspense fallback={<div className="markdown-fallback">{normalizedBody || ' '}</div>}>
-            <MarkdownRenderer content={normalizedBody || ' '} isStreaming={false} />
-          </Suspense>
+        <div className="delegate-tool-result-body theme-markdown-surface" onClick={handleClick}>
+          <div className="markdown-content">
+            <Suspense fallback={<div className="markdown-content-fallback">{normalizedBody || ' '}</div>}>
+              <MarkdownRenderer content={normalizedBody || ' '} isStreaming={false} />
+            </Suspense>
+          </div>
         </div>
       ) : null}
     </article>

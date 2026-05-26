@@ -2,6 +2,9 @@ import { useMemo, useState, type MouseEvent } from 'react'
 import type { HistoryItem } from '../../types'
 import { AppIcon } from '../../components/AppIcon'
 import { AgentAvatar } from '../../components/AgentAvatar'
+import { groupHistoryIntoSidebarBuckets } from '../../lib/historySidebarBuckets'
+import { useHistorySidebarBucketsExpanded } from '../../hooks/useHistorySidebarBucketsExpanded'
+import { getHistorySidebarCardMeta } from '../lib/historySidebarCardMeta'
 
 export type WorkspaceSessionsSidebarProps = {
   workspaceId: string
@@ -14,8 +17,6 @@ export type WorkspaceSessionsSidebarProps = {
   onToggleCollapsed: () => void
 }
 
-type SessionGroup = { key: string; label: string; items: HistoryItem[] }
-
 function sessionMatchesQuery(item: HistoryItem, q: string): boolean {
   if (!q) return true
   const hay = [
@@ -25,33 +26,6 @@ function sessionMatchesQuery(item: HistoryItem, q: string): boolean {
     .join('\n')
     .toLowerCase()
   return hay.includes(q)
-}
-
-function groupByTime(items: HistoryItem[]): SessionGroup[] {
-  const now = new Date()
-  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
-  const startOfYesterday = startOfDay - 24 * 3600 * 1000
-  const startOfWeek = startOfDay - 7 * 24 * 3600 * 1000
-
-  const today: HistoryItem[] = []
-  const yesterday: HistoryItem[] = []
-  const week: HistoryItem[] = []
-  const earlier: HistoryItem[] = []
-
-  for (const item of items) {
-    const ts = item.updatedAt || item.createdAt
-    if (ts >= startOfDay) today.push(item)
-    else if (ts >= startOfYesterday) yesterday.push(item)
-    else if (ts >= startOfWeek) week.push(item)
-    else earlier.push(item)
-  }
-
-  const groups: SessionGroup[] = []
-  if (today.length) groups.push({ key: 'today', label: '今天', items: today })
-  if (yesterday.length) groups.push({ key: 'yesterday', label: '昨天', items: yesterday })
-  if (week.length) groups.push({ key: 'week', label: '最近七天', items: week })
-  if (earlier.length) groups.push({ key: 'earlier', label: '更早', items: earlier })
-  return groups
 }
 
 export function WorkspaceSessionsSidebar({
@@ -77,7 +51,8 @@ export function WorkspaceSessionsSidebar({
     return teamSessions.filter((item) => sessionMatchesQuery(item, q))
   }, [teamSessions, query])
 
-  const groups = useMemo(() => groupByTime(filteredSessions), [filteredSessions])
+  const groups = useMemo(() => groupHistoryIntoSidebarBuckets(filteredSessions), [filteredSessions])
+  const { mergedBucketOpen, toggleBucket } = useHistorySidebarBucketsExpanded(groups, activeHistoryId)
 
   if (collapsed) {
     return (
@@ -164,21 +139,35 @@ export function WorkspaceSessionsSidebar({
             </button>
           </div>
         ) : null}
-        {groups.map((group) => (
-          <section key={group.key} className="workspace-sessions-group">
-            <header className="workspace-sessions-group-head">{group.label}</header>
-            <ul>
-	              {group.items.map((item) => {
-	                const isActive = item.id === activeHistoryId
-	                const lastPrompt = item.turns[item.turns.length - 1]?.prompt ?? ''
+
+        {groups.map((bucket) => (
+          <section key={bucket.key} className="history-bucket workspace-sessions-history-bucket">
+            <button
+              type="button"
+              className="history-bucket-head"
+              aria-expanded={mergedBucketOpen[bucket.key]}
+              onClick={() => toggleBucket(bucket.key)}
+            >
+              <span className={`history-bucket-chevron-wrap${mergedBucketOpen[bucket.key] ? ' is-open' : ''}`}>
+                <AppIcon name="chevron-down" size={14} />
+              </span>
+              <span className="history-bucket-label">{bucket.label}</span>
+              <span className="history-bucket-count">{bucket.items.length}</span>
+            </button>
+            {mergedBucketOpen[bucket.key] ? (
+              <ul className="history-bucket-items workspace-sessions-bucket-ul">
+                {bucket.items.map((item) => {
+                  const isActive = item.id === activeHistoryId
+                  const meta = getHistorySidebarCardMeta(item.status, item.updatedAt || item.createdAt)
                   const agent = item.agent
-	                return (
-	                  <li key={item.id}>
-                    <button
-                      type="button"
-                      className={`workspace-sessions-item${isActive ? ' active' : ''}`}
-                      onClick={() => onSelectSession(item.id)}
-	                    >
+
+                  return (
+                    <li key={item.id}>
+                      <button
+                        type="button"
+                        className={`workspace-sessions-item${isActive ? ' active' : ''}`}
+                        onClick={() => onSelectSession(item.id)}
+                      >
                         <div className="workspace-sessions-item-main">
                           <AgentAvatar
                             name={agent?.name || item.title || '会话'}
@@ -189,43 +178,40 @@ export function WorkspaceSessionsSidebar({
                             fallbackToIcon={!agent}
                           />
                           <div className="workspace-sessions-item-copy">
-	                          <div className="workspace-sessions-item-title">
-	                            {item.title || '未命名会话'}
-	                          </div>
-                              {agent?.name ? (
-                                <div className="workspace-sessions-item-agent">{agent.name}</div>
-                              ) : null}
-	                          {lastPrompt ? (
-	                            <div className="workspace-sessions-item-sub">
-	                              {lastPrompt.length > 48 ? `${lastPrompt.slice(0, 48)}…` : lastPrompt}
-	                            </div>
-	                          ) : null}
+                            <div className="workspace-sessions-item-title">
+                              {item.title || '未命名会话'}
+                            </div>
+                            {agent?.name ? (
+                              <div className="workspace-sessions-item-agent">{agent.name}</div>
+                            ) : null}
+                            <div className="workspace-sessions-item-meta-row">
+                              <span className={`workspace-sessions-item-meta-icon ${meta.tone}`}>
+                                <AppIcon name={meta.icon} size={12} />
+                              </span>
+                              <span className={`workspace-sessions-item-meta-label ${meta.tone}`}>{meta.label}</span>
+                            </div>
                           </div>
                         </div>
-	                      <div className="workspace-sessions-item-meta">
-	                        <span>{new Date(item.updatedAt || item.createdAt).toLocaleString()}</span>
-	                        <span>·</span>
-	                        <span>{item.turns.length} 轮</span>
-	                      </div>
-                      {onDeleteSession ? (
-                        <span
-                          className="workspace-sessions-item-delete"
-                          role="button"
-                          tabIndex={0}
-                          title="删除会话"
-                          onClick={(event: MouseEvent<HTMLSpanElement>) => {
-                            event.stopPropagation()
-                            onDeleteSession(item.id)
-                          }}
-                        >
-                          <AppIcon name="trash" size={12} />
-                        </span>
-                      ) : null}
-                    </button>
-                  </li>
-                )
-              })}
-            </ul>
+                        {onDeleteSession ? (
+                          <span
+                            className="workspace-sessions-item-delete"
+                            role="button"
+                            tabIndex={0}
+                            title="删除会话"
+                            onClick={(event: MouseEvent<HTMLSpanElement>) => {
+                              event.stopPropagation()
+                              onDeleteSession(item.id)
+                            }}
+                          >
+                            <AppIcon name="trash" size={12} />
+                          </span>
+                        ) : null}
+                      </button>
+                    </li>
+                  )
+                })}
+              </ul>
+            ) : null}
           </section>
         ))}
       </div>

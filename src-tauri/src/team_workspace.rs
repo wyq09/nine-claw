@@ -495,13 +495,13 @@ pub fn run_delegate_with_provider(
 
 /// 与 `run_delegate_with_provider` 相同，但当 `run_id` 提供时会在整个子会话过程中
 /// emit 细粒度事件：
-/// - `workspace.delegate.turn`  { runId, turnIndex, kind }
-/// - `workspace.delegate.tool`  { runId, toolIndex, toolCallId, toolName, argsDigest, status, isError? }
-/// - `workspace.delegate.chunk` { runId, deltaText }
+/// - `workspace:delegate:turn`  { runId, turnIndex, kind }
+/// - `workspace:delegate:tool`  { runId, toolIndex, toolCallId, toolName, argsDigest, status, isError? }
+/// - `workspace:delegate:chunk` { runId, deltaText }
 ///
 /// 这些事件仅用于前端 `DelegationCard` 的实时"工具调用/思考轮次"折叠视图，
 /// 不改变主会话 history（主 Agent 仍只拿到最终文本串，通过 `maybe_expand_team_delegates`
-/// 或 `workspace.delegate.done` 事件回注）。
+/// 或 `workspace:delegate:done` 事件回注）。
 pub fn run_delegate_with_provider_events(
     app: &AppHandle,
     workspace_id: &str,
@@ -599,7 +599,7 @@ pub fn run_delegate_with_provider_events(
         if let Some(rid) = run_id_for_chunk.as_ref() {
             if !chunk.is_empty() {
                 let _ = app_for_chunk.emit(
-                    "workspace.delegate.chunk",
+                    "workspace:delegate:chunk",
                     serde_json::json!({
                         "runId": rid,
                         "workspaceId": workspace_id_for_chunk,
@@ -677,7 +677,7 @@ pub fn run_delegate_with_provider_events(
                     "thinking"
                 };
                 let _ = app_for_event.emit(
-                    "workspace.delegate.turn",
+                    "workspace:delegate:turn",
                     serde_json::json!({
                         "runId": rid,
                         "workspaceId": workspace_id_for_event,
@@ -745,7 +745,7 @@ pub fn run_delegate_with_provider_events(
                         payload["status"] = serde_json::Value::String("error".to_string());
                     }
                 }
-                let _ = app_for_event.emit("workspace.delegate.tool", payload);
+                let _ = app_for_event.emit("workspace:delegate:tool", payload);
             }
             _ => {}
         }

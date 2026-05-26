@@ -35,6 +35,7 @@ pub fn ensure_all_schemas(conn: &Connection) -> Result<(), String> {
     super::core_memory::ensure_schema(conn)?;
     super::user_memory::ensure_schema(conn)?;
     super::workspaces::ensure_schema(conn)?;
+    super::session_workspace::ensure_schema(conn)?;
     crate::memory_vector::migration::ensure_schema(conn)?;
     Ok(())
 }

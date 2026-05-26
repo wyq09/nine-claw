@@ -336,6 +336,7 @@ export const defaultGeneralSettings: GeneralSettings = {
   submitShortcut: 'mod_enter',
   llmCallLogDir: '',
   runtimeParameters: defaultRuntimeParameters,
+  notificationEnabled: true,
 }
 
 export const defaultAppearanceSettings: AppearanceSettings = {

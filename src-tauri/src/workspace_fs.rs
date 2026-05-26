@@ -106,6 +106,7 @@ pub fn remove_team_resource_file(workspace_id: &str, rel_path: &str) -> Result<(
     }
 }
 
+#[allow(dead_code)]
 pub fn write_team_brief(
     workspace_id: &str,
     agent_id: &str,

@@ -1,4 +1,4 @@
-import { lazy, Suspense, type RefObject, type ChangeEvent, type ClipboardEvent } from 'react'
+import { lazy, Suspense, useRef, type RefObject, type ChangeEvent, type ClipboardEvent } from 'react'
 import type {
   AgentBuilderDraft,
   AgentInput,
@@ -19,6 +19,7 @@ import type {
 } from '../../types'
 import type { BotStatusEvent } from '../../lib/piClient'
 import { ChatView } from '../chat/ChatWorkspace'
+import { SessionWorkspacePanel } from '../workspaces/panels/SessionWorkspacePanel'
 import {
   WidgetSegmentsContext,
   type WidgetSegmentsContextValue,
@@ -295,6 +296,7 @@ export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
     agents,
     onDispatchDelegatePlan,
   } = props
+  const standaloneComposerSetTextRef = useRef<((text: string) => void) | null>(null)
 
   const routeFallback = (
     <div className="page-shell task-center-page task-linear-page">
@@ -315,42 +317,50 @@ export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
           onCancelWidget: onCancelWidgetResponse,
         }}
       >
-        <ChatView
-          agentBuilderActionBusyId={agentBuilderActionBusyId}
-          agentBuilderActionError={agentBuilderActionError}
-          agentBuilderActionNotice={agentBuilderActionNotice}
-          agentBuilderActionTargetId={agentBuilderActionTargetId}
-          composerClearRef={composerClearRef}
-          composerDraftBackupRef={composerDraftBackupRef}
-          error={chatGateError || piError}
-          showExecutionRail={appearanceSettings.showExecutionRail}
-          showThinkingProcess={appearanceSettings.showThinkingProcess}
-          globalBusy={loading}
-          runningHistoryIds={runningHistoryIds}
-          streamingHistoryIds={streamingHistoryIds}
-          activeHistoryId={activeHistoryId ?? ''}
-          onAbort={onAbort}
-          attachmentError={composerAttachmentError}
-          attachmentInputRef={composerAttachmentInputRef}
-          attachmentUploading={composerAttachmentUploading}
-          composerAttachments={composerAttachments}
-          onCreateAgentDraft={onChatAgentBuilderCreate}
-          onComposerAttachmentInputChange={onComposerAttachmentInputChange}
-          onComposerClearAttachments={onComposerClearAttachments}
-          onComposerPaste={onComposerPaste}
-          onComposerPickAttachment={onComposerPickAttachment}
-          onComposerRemoveAttachment={onComposerRemoveAttachment}
-          onComposerClearAttachmentError={onComposerClearAttachmentError}
-          onSubmit={(text) => {
-            void onChatSubmit(text)
-          }}
-          selectedAgent={activeChatAgent}
-          submitShortcut={submitShortcut}
-          activeHistoryItem={activeHistoryItem}
-          runtimeReady={runtimeReady}
-          runtimeBlockingReason={runtimeBlockingReason}
-          sessionContextProviderConfig={sessionContextProviderConfig}
-        />
+        <div className="chat-session-workspace-layout">
+          <ChatView
+            agentBuilderActionBusyId={agentBuilderActionBusyId}
+            agentBuilderActionError={agentBuilderActionError}
+            agentBuilderActionNotice={agentBuilderActionNotice}
+            agentBuilderActionTargetId={agentBuilderActionTargetId}
+            composerClearRef={composerClearRef}
+            composerDraftBackupRef={composerDraftBackupRef}
+            error={chatGateError || piError}
+            showExecutionRail={appearanceSettings.showExecutionRail}
+            showThinkingProcess={appearanceSettings.showThinkingProcess}
+            globalBusy={loading}
+            runningHistoryIds={runningHistoryIds}
+            streamingHistoryIds={streamingHistoryIds}
+            activeHistoryId={activeHistoryId ?? ''}
+            onAbort={onAbort}
+            attachmentError={composerAttachmentError}
+            attachmentInputRef={composerAttachmentInputRef}
+            attachmentUploading={composerAttachmentUploading}
+            composerAttachments={composerAttachments}
+            onCreateAgentDraft={onChatAgentBuilderCreate}
+            onComposerAttachmentInputChange={onComposerAttachmentInputChange}
+            onComposerClearAttachments={onComposerClearAttachments}
+            onComposerPaste={onComposerPaste}
+            onComposerPickAttachment={onComposerPickAttachment}
+            onComposerRemoveAttachment={onComposerRemoveAttachment}
+            onComposerClearAttachmentError={onComposerClearAttachmentError}
+            onSubmit={(text) => {
+              void onChatSubmit(text)
+            }}
+            selectedAgent={activeChatAgent}
+            submitShortcut={submitShortcut}
+            activeHistoryItem={activeHistoryItem}
+            runtimeReady={runtimeReady}
+            runtimeBlockingReason={runtimeBlockingReason}
+            sessionContextProviderConfig={sessionContextProviderConfig}
+            composerSetTextRef={standaloneComposerSetTextRef}
+          />
+          <SessionWorkspacePanel
+            sessionId={activeHistoryId || null}
+            modelLabel={activeHistoryItem?.sessionLlmModel ?? null}
+            onAddToComposer={(text) => standaloneComposerSetTextRef.current?.(text)}
+          />
+        </div>
       </WidgetSegmentsContext.Provider>
     )
   }

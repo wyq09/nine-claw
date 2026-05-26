@@ -25,6 +25,7 @@ pub struct SkillDefinition {
     pub id: String,
     pub name: String,
     pub description: String,
+    #[allow(dead_code)]
     pub path: PathBuf,
     pub triggers: Vec<String>,
     pub examples: Vec<String>,
@@ -32,6 +33,14 @@ pub struct SkillDefinition {
     pub requires_auth: bool,
     pub side_effect_level: String,
     pub modes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRuntimeSourceInfo {
+    pub id: String,
+    pub source: String,
+    pub source_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -429,6 +438,53 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+pub fn resolve_skill_source_info(
+    skill_ids: &[String],
+) -> Result<HashMap<String, SkillRuntimeSourceInfo>, String> {
+    if skill_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let installed = list_installed_skills()?;
+    let installed_by_id = installed
+        .into_iter()
+        .map(|skill| (skill.id.clone(), skill))
+        .collect::<HashMap<_, _>>();
+    let runtime_system_ids = list_runtime_system_skill_directories()?
+        .into_iter()
+        .map(|(skill_id, _)| skill_id)
+        .collect::<HashSet<_>>();
+
+    let mut out = HashMap::new();
+    for skill_id in skill_ids {
+        let source = if runtime_system_ids.contains(skill_id) {
+            "default".to_string()
+        } else {
+            installed_by_id
+                .get(skill_id)
+                .and_then(|skill| {
+                    skill
+                        .source_type
+                        .clone()
+                        .or_else(|| skill.source.clone())
+                        .or_else(|| Some(skill.scope.clone()))
+                })
+                .unwrap_or_else(|| "user".to_string())
+        };
+        out.insert(
+            skill_id.clone(),
+            SkillRuntimeSourceInfo {
+                id: skill_id.clone(),
+                source,
+                source_type: installed_by_id
+                    .get(skill_id)
+                    .and_then(|skill| skill.source_type.clone()),
+            },
+        );
+    }
+    Ok(out)
 }
 
 fn scan_skill_roots(roots: &[SkillRoot]) -> Result<Vec<InstalledSkill>, String> {

@@ -23,6 +23,13 @@ const MANAGED_RUNTIME_MEMORY_FORGET_FILE: &str = "memory_forget_tool.mjs";
 const MANAGED_RUNTIME_MEMORY_LIST_FILE: &str = "memory_list_tool.mjs";
 const MANAGED_RUNTIME_CHAT_SEARCH_FILE: &str = "chat_search_tool.mjs";
 const MANAGED_RUNTIME_MEMORY_TOOL_TRANSPORT_FILE: &str = "memory_tool_transport.mjs";
+const MANAGED_RUNTIME_CREATE_TASK_FILE: &str = "create_scheduled_task.mjs";
+const MANAGED_RUNTIME_QUERY_TASK_FILE: &str = "query_scheduled_task.mjs";
+const MANAGED_RUNTIME_QUERY_TASK_INFO_FILE: &str = "query_scheduled_task_info.mjs";
+const MANAGED_RUNTIME_SKILL_CREATOR_FILE: &str = "skill_creator_tool.mjs";
+const MANAGED_RUNTIME_SKILL_EVOLUTION_FILE: &str = "skill_evolution_runtime.mjs";
+const MANAGED_RUNTIME_SKILL_AUTO_CREATION_PROMPT_FILE: &str = "skill_auto_creation.md";
+const MANAGED_RUNTIME_SKILL_REFLECTION_PROMPT_FILE: &str = "skill_reflection.md";
 const WEB_SEARCH_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/web_search_tool.mjs");
 const WEB_FETCH_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/web_fetch_tool.mjs");
 const IMAGE_GENERATION_TOOL_SOURCE: &str =
@@ -55,6 +62,20 @@ const MEMORY_LIST_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/memo
 const CHAT_SEARCH_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/chat_search_tool.mjs");
 const MEMORY_TOOL_TRANSPORT_SOURCE: &str =
     include_str!("../../src/runtime-tools/memory_tool_transport.mjs");
+const CREATE_SCHEDULED_TASK_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/create_scheduled_task.mjs");
+const QUERY_SCHEDULED_TASK_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/query_scheduled_task.mjs");
+const QUERY_SCHEDULED_TASK_INFO_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/query_scheduled_task_info.mjs");
+const SKILL_CREATOR_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/skill_creator_tool.mjs");
+const SKILL_EVOLUTION_RUNTIME_SOURCE: &str =
+    include_str!("../../src/runtime-tools/skill_evolution_runtime.mjs");
+const SKILL_AUTO_CREATION_PROMPT_SOURCE: &str =
+    include_str!("../../src/runtime-tools/prompts/skill_auto_creation.md");
+const SKILL_REFLECTION_PROMPT_SOURCE: &str =
+    include_str!("../../src/runtime-tools/prompts/skill_reflection.md");
 
 pub(crate) fn write_managed_runtime_extension_files(
     runtime_dir: &Path,
@@ -235,6 +256,67 @@ pub(crate) fn write_managed_runtime_extension_files(
         )
     })?;
 
+    let create_task_path = runtime_dir.join(MANAGED_RUNTIME_CREATE_TASK_FILE);
+    fs::write(&create_task_path, CREATE_SCHEDULED_TASK_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 create_scheduled_task 运行时模块失败 {}: {error}",
+            create_task_path.display()
+        )
+    })?;
+
+    let query_task_path = runtime_dir.join(MANAGED_RUNTIME_QUERY_TASK_FILE);
+    fs::write(&query_task_path, QUERY_SCHEDULED_TASK_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 query_scheduled_task 运行时模块失败 {}: {error}",
+            query_task_path.display()
+        )
+    })?;
+
+    let query_task_info_path = runtime_dir.join(MANAGED_RUNTIME_QUERY_TASK_INFO_FILE);
+    fs::write(&query_task_info_path, QUERY_SCHEDULED_TASK_INFO_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 query_scheduled_task_info 运行时模块失败 {}: {error}",
+            query_task_info_path.display()
+        )
+    })?;
+
+    let skill_creator_path = runtime_dir.join(MANAGED_RUNTIME_SKILL_CREATOR_FILE);
+    fs::write(&skill_creator_path, SKILL_CREATOR_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 skill_creator 运行时模块失败 {}: {error}",
+            skill_creator_path.display()
+        )
+    })?;
+
+    let skill_evolution_path = runtime_dir.join(MANAGED_RUNTIME_SKILL_EVOLUTION_FILE);
+    fs::write(&skill_evolution_path, SKILL_EVOLUTION_RUNTIME_SOURCE).map_err(|error| {
+        format!(
+            "写入 skill_evolution 运行时模块失败 {}: {error}",
+            skill_evolution_path.display()
+        )
+    })?;
+
+    let skill_auto_prompt_path = runtime_dir.join(MANAGED_RUNTIME_SKILL_AUTO_CREATION_PROMPT_FILE);
+    fs::write(&skill_auto_prompt_path, SKILL_AUTO_CREATION_PROMPT_SOURCE).map_err(|error| {
+        format!(
+            "写入 skill auto-creation prompt 失败 {}: {error}",
+            skill_auto_prompt_path.display()
+        )
+    })?;
+
+    let skill_reflection_prompt_path =
+        runtime_dir.join(MANAGED_RUNTIME_SKILL_REFLECTION_PROMPT_FILE);
+    fs::write(
+        &skill_reflection_prompt_path,
+        SKILL_REFLECTION_PROMPT_SOURCE,
+    )
+    .map_err(|error| {
+        format!(
+            "写入 skill reflection prompt 失败 {}: {error}",
+            skill_reflection_prompt_path.display()
+        )
+    })?;
+
     let extension_source = build_managed_runtime_extension_source(typebox_import_path)?;
     let extension_path = runtime_dir.join(MANAGED_RUNTIME_EXTENSION_FILE);
     fs::write(&extension_path, extension_source).map_err(|error| {
@@ -259,6 +341,7 @@ import * as crypto from "node:crypto";
 import http from "node:http";
 import {{ execFile as execFileCallback }} from "node:child_process";
 import {{ promisify }} from "node:util";
+import {{ fileURLToPath }} from "node:url";
 import {{ Type }} from {import_path};
 import {{
   formatSize,
@@ -281,6 +364,11 @@ import {{ createMemoryGetTool }} from "./{MANAGED_RUNTIME_MEMORY_GET_FILE}";
 import {{ createMemoryForgetTool }} from "./{MANAGED_RUNTIME_MEMORY_FORGET_FILE}";
 import {{ createMemoryListTool }} from "./{MANAGED_RUNTIME_MEMORY_LIST_FILE}";
 import {{ createChatSearchTool }} from "./{MANAGED_RUNTIME_CHAT_SEARCH_FILE}";
+import {{ createCreateScheduledTaskTool }} from "./{MANAGED_RUNTIME_CREATE_TASK_FILE}";
+import {{ createQueryScheduledTaskTool }} from "./{MANAGED_RUNTIME_QUERY_TASK_FILE}";
+import {{ createQueryScheduledTaskInfoTool }} from "./{MANAGED_RUNTIME_QUERY_TASK_INFO_FILE}";
+import {{ createSkillCreatorTool }} from "./{MANAGED_RUNTIME_SKILL_CREATOR_FILE}";
+import {{ createSkillEvolutionRuntime }} from "./{MANAGED_RUNTIME_SKILL_EVOLUTION_FILE}";
 
 const execFile = promisify(execFileCallback);
 
@@ -415,8 +503,25 @@ export default function(pi) {{
   let memoryForgetToolRegistered = false;
   let memoryListToolRegistered = false;
   let chatSearchToolRegistered = false;
+  let createScheduledTaskToolRegistered = false;
+  let queryScheduledTaskToolRegistered = false;
+  let queryScheduledTaskInfoToolRegistered = false;
+  let skillCreatorToolRegistered = false;
   let lastToolSignature = "";
   let repeatedToolSignatureCount = 0;
+  const extensionPath = fileURLToPath(import.meta.url);
+  const extensionDir = path.dirname(extensionPath);
+  const skillEvolution = createSkillEvolutionRuntime({{
+    fsSync: fs,
+    fsPromises,
+    pathApi: path,
+    processApi: process,
+    consoleApi: console,
+    pi,
+    extensionPath,
+    autoCreationPromptPath: path.join(extensionDir, "{MANAGED_RUNTIME_SKILL_AUTO_CREATION_PROMPT_FILE}"),
+    reflectionPromptPath: path.join(extensionDir, "{MANAGED_RUNTIME_SKILL_REFLECTION_PROMPT_FILE}"),
+  }});
 
   function ensureWebSearchTool() {{
     if (webSearchToolRegistered) return;
@@ -574,7 +679,37 @@ export default function(pi) {{
   function ensureChatSearchTool() {{
     if (chatSearchToolRegistered) return;
     chatSearchToolRegistered = true;
-    pi.registerTool(createChatSearchTool({{ Type }}));
+    pi.registerTool(createChatSearchTool({{ Type, fetchImpl: localHttpPost, processApi: process }}));
+  }}
+
+  function ensureCreateScheduledTaskTool() {{
+    if (createScheduledTaskToolRegistered) return;
+    createScheduledTaskToolRegistered = true;
+    pi.registerTool(createCreateScheduledTaskTool({{ Type, fetchImpl: localHttpPost, processApi: process }}));
+  }}
+
+  function ensureQueryScheduledTaskTool() {{
+    if (queryScheduledTaskToolRegistered) return;
+    queryScheduledTaskToolRegistered = true;
+    pi.registerTool(createQueryScheduledTaskTool({{ Type, fetchImpl: localHttpPost, processApi: process }}));
+  }}
+
+  function ensureQueryScheduledTaskInfoTool() {{
+    if (queryScheduledTaskInfoToolRegistered) return;
+    queryScheduledTaskInfoToolRegistered = true;
+    pi.registerTool(createQueryScheduledTaskInfoTool({{ Type, fetchImpl: localHttpPost, processApi: process }}));
+  }}
+
+  function ensureSkillCreatorTool() {{
+    if (skillCreatorToolRegistered) return;
+    skillCreatorToolRegistered = true;
+    pi.registerTool(createSkillCreatorTool({{
+      Type,
+      fsSync: fs,
+      fsPromises,
+      pathApi: path,
+      processApi: process,
+    }}));
   }}
 
   function ensureExternalTool() {{
@@ -632,6 +767,10 @@ export default function(pi) {{
     ensureMemoryForgetTool();
     ensureMemoryListTool();
     ensureChatSearchTool();
+    ensureCreateScheduledTaskTool();
+    ensureQueryScheduledTaskTool();
+    ensureQueryScheduledTaskInfoTool();
+    ensureSkillCreatorTool();
     if (harness.enableExternalApiProxy) {{
       ensureExternalTool();
     }}
@@ -656,17 +795,27 @@ export default function(pi) {{
     ensureMemoryForgetTool();
     ensureMemoryListTool();
     ensureChatSearchTool();
+    ensureCreateScheduledTaskTool();
+    ensureQueryScheduledTaskTool();
+    ensureQueryScheduledTaskInfoTool();
+    ensureSkillCreatorTool();
     if (harness.enableExternalApiProxy) {{
       ensureExternalTool();
     }}
     applyHarness(pi, harness);
     const promptAppend = buildSystemPromptAppend(harness);
+    skillEvolution.reset(event.prompt);
     return {{
       systemPrompt: `${{event.systemPrompt}}\n\n${{promptAppend}}`
     }};
   }});
 
+  pi.on("turn_end", async () => {{
+    skillEvolution.noteTurnEnd();
+  }});
+
   pi.on("tool_call", async (event) => {{
+    skillEvolution.noteToolCall(event);
     const signature = stableToolSignature(event.toolName, event.input);
     if (signature === lastToolSignature) {{
       repeatedToolSignatureCount += 1;
@@ -696,6 +845,10 @@ export default function(pi) {{
     }}
     return undefined;
   }});
+
+  pi.on("agent_end", async (event, ctx) => {{
+    await skillEvolution.maybeRunAfterAgent(event, ctx);
+  }});
 }}
 "#
     ))
@@ -704,6 +857,16 @@ export default function(pi) {{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read(path: &Path) -> String {
+        fs::read_to_string(path).expect("read generated file")
+    }
+
+    fn assert_contains_all(source: &str, needles: &[&str]) {
+        for needle in needles {
+            assert!(source.contains(needle), "missing {needle}");
+        }
+    }
 
     #[test]
     fn extension_source_registers_web_tools_and_support_files() {
@@ -720,72 +883,133 @@ mod tests {
         let image_downloader_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_DOWNLOADER_FILE);
         let image_task_query_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE);
         let image_generation_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_GENERATION_FILE);
-        let extension_source = fs::read_to_string(&extension_path).expect("read extension");
-        let helper_source = fs::read_to_string(&helper_path).expect("read helper");
-        let fetch_helper_source =
-            fs::read_to_string(&fetch_helper_path).expect("read fetch helper");
-        let storage_helper_source =
-            fs::read_to_string(&storage_helper_path).expect("read storage helper");
-        let curl_http_source = fs::read_to_string(&curl_http_path).expect("read curl http helper");
-        let web_search_transport_source =
-            fs::read_to_string(&web_search_transport_path).expect("read search transport helper");
-        let image_downloader_source =
-            fs::read_to_string(&image_downloader_path).expect("read image downloader helper");
-        let image_generation_source =
-            fs::read_to_string(&image_generation_path).expect("read image generation helper");
-        let image_task_query_source =
-            fs::read_to_string(&image_task_query_path).expect("read image task query helper");
+        let skill_creator_path = runtime_dir.join(MANAGED_RUNTIME_SKILL_CREATOR_FILE);
+        let skill_evolution_path = runtime_dir.join(MANAGED_RUNTIME_SKILL_EVOLUTION_FILE);
+        let skill_auto_prompt_path =
+            runtime_dir.join(MANAGED_RUNTIME_SKILL_AUTO_CREATION_PROMPT_FILE);
+        let skill_reflection_prompt_path =
+            runtime_dir.join(MANAGED_RUNTIME_SKILL_REFLECTION_PROMPT_FILE);
+        let extension_source = read(&extension_path);
+        assert_contains_all(
+            &extension_source,
+            &[
+                "ensureWebSearchTool",
+                "ensureWebFetchTool",
+                "ensureImageGenerationTool",
+                "ensureImageTaskQueryTool",
+                "ensureAskUserTool",
+                "NINECLAW_SYSTEM_PROMPT_APPEND",
+                "After a successful ask_user result, continue the task immediately and answer the user using the submitted information.",
+                "buildSystemPromptAppend",
+                "const hasExplicitActiveTools = active.length > 0",
+                "if (hasExplicitActiveTools)",
+                "const TOOL_REPEAT_LIMIT = 3",
+                "stableToolSignature(event.toolName, event.input)",
+                "[NineClaw loop guard]",
+                "import { Type } from \"/tmp/typebox/index.mjs\";",
+                "from \"@mariozechner/pi-coding-agent\";",
+                "createAgentDelegateTool",
+                "createAskUserTool",
+                "createSkillCreatorTool",
+                "createSkillEvolutionRuntime",
+                "skillEvolution.reset(event.prompt)",
+                "skillEvolution.maybeRunAfterAgent",
+            ],
+        );
+        assert!(read(&helper_path).contains("name: \"web_search\""));
+        assert_contains_all(
+            &read(&fetch_helper_path),
+            &[
+                "name: \"web_fetch\"",
+                "tool_result_storage.mjs",
+                "curl_http.mjs",
+                "image_downloader.mjs",
+            ],
+        );
+        assert_contains_all(
+            &read(&helper_path),
+            &[
+                "tool_result_storage.mjs",
+                "web_search_transport.mjs",
+                "image_downloader.mjs",
+            ],
+        );
+        assert!(read(&image_generation_path).contains("name: \"image_generate\""));
+        assert!(read(&image_task_query_path).contains("name: \"image_task_query\""));
+        assert_contains_all(
+            &read(&skill_creator_path),
+            &["name: 'skill-creator'", ".agents"],
+        );
+        assert_contains_all(
+            &read(&skill_evolution_path),
+            &["NINECLAW_SKILL_EVOLUTION_ENABLED", "--mode', 'json'"],
+        );
+        assert!(read(&skill_auto_prompt_path).contains("SKILL AUTO-CREATION MODE"));
+        assert!(read(&skill_reflection_prompt_path).contains("SKILL REFLECTION MODE"));
+        assert_contains_all(
+            &read(&image_downloader_path),
+            &["fetchUrlWithCurl", "downloadImagesToWorkdir"],
+        );
+        assert_contains_all(
+            &read(&storage_helper_path),
+            &["Result exceeded", "Use the file reading tool"],
+        );
+        assert!(read(&curl_http_path).contains("execFileImpl(\"curl\""));
+        assert_contains_all(
+            &read(&web_search_transport_path),
+            &["anti-bot / enablejs", "curl_http.mjs"],
+        );
 
-        assert!(extension_source.contains("ensureWebSearchTool"));
-        assert!(extension_source.contains("ensureWebFetchTool"));
-        assert!(extension_source.contains("ensureImageGenerationTool"));
-        assert!(extension_source.contains("ensureImageTaskQueryTool"));
-        assert!(extension_source.contains("ensureAskUserTool"));
-        assert!(extension_source.contains("NINECLAW_SYSTEM_PROMPT_APPEND"));
-        assert!(extension_source.contains(
-            "After a successful ask_user result, continue the task immediately and answer the user using the submitted information."
-        ));
-        assert!(extension_source.contains("buildSystemPromptAppend"));
-        assert!(extension_source.contains("createImageGenerationTool"));
-        assert!(extension_source.contains("createImageTaskQueryTool"));
-        assert!(extension_source.contains("createWebSearchTool"));
-        assert!(extension_source.contains("createWebFetchTool"));
-        assert!(extension_source.contains("const hasExplicitActiveTools = active.length > 0"));
-        assert!(extension_source.contains("if (hasExplicitActiveTools)"));
-        assert!(extension_source.contains("const TOOL_REPEAT_LIMIT = 3"));
-        assert!(extension_source.contains("stableToolSignature(event.toolName, event.input)"));
-        assert!(extension_source.contains("[NineClaw loop guard]"));
-        assert!(extension_source.contains("import { Type } from \"/tmp/typebox/index.mjs\";"));
-        assert!(extension_source.contains("from \"@mariozechner/pi-coding-agent\";"));
-        assert!(extension_source.contains("createAgentDelegateTool"));
-        assert!(extension_source.contains("createAskUserTool"));
-        assert!(helper_source.contains("name: \"web_search\""));
-        assert!(fetch_helper_source.contains("name: \"web_fetch\""));
-        assert!(image_generation_source.contains("name: \"image_generate\""));
-        assert!(image_task_query_source.contains("name: \"image_task_query\""));
-        assert!(helper_source.contains("tool_result_storage.mjs"));
-        assert!(fetch_helper_source.contains("tool_result_storage.mjs"));
-        assert!(fetch_helper_source.contains("curl_http.mjs"));
-        assert!(helper_source.contains("web_search_transport.mjs"));
-        assert!(helper_source.contains("image_downloader.mjs"));
-        assert!(fetch_helper_source.contains("image_downloader.mjs"));
-        assert!(image_downloader_source.contains("fetchUrlWithCurl"));
-        assert!(image_downloader_source.contains("downloadImagesToWorkdir"));
-        assert!(storage_helper_source.contains("Result exceeded"));
-        assert!(storage_helper_source.contains("Use the file reading tool"));
-        assert!(curl_http_source.contains("execFileImpl(\"curl\""));
-        assert!(web_search_transport_source.contains("anti-bot / enablejs"));
-        assert!(web_search_transport_source.contains("curl_http.mjs"));
+        let _ = fs::remove_dir_all(runtime_dir);
+    }
+
+    #[test]
+    fn extension_source_registers_create_scheduled_task_tool() {
+        let runtime_dir = std::env::temp_dir().join("nineclaw-create-task-ext-test");
+        let typebox_path = PathBuf::from("/tmp/typebox/index.mjs");
+        let extension_path = write_managed_runtime_extension_files(&runtime_dir, &typebox_path)
+            .expect("write files");
+
+        let tool_path = runtime_dir.join(MANAGED_RUNTIME_CREATE_TASK_FILE);
+        let tool_source = fs::read_to_string(&tool_path).expect("read create_scheduled_task");
+        let extension_source = fs::read_to_string(&extension_path).expect("read extension");
+
+        assert!(tool_source.contains("create_scheduled_task"));
+        assert!(tool_source.contains("createCreateScheduledTaskTool"));
+        assert!(extension_source.contains("ensureCreateScheduledTaskTool"));
+        assert!(extension_source.contains("createCreateScheduledTaskTool"));
 
         let _ = fs::remove_file(extension_path);
-        let _ = fs::remove_file(helper_path);
-        let _ = fs::remove_file(fetch_helper_path);
-        let _ = fs::remove_file(storage_helper_path);
-        let _ = fs::remove_file(curl_http_path);
-        let _ = fs::remove_file(web_search_transport_path);
-        let _ = fs::remove_file(image_downloader_path);
-        let _ = fs::remove_file(image_generation_path);
-        let _ = fs::remove_file(image_task_query_path);
+        let _ = fs::remove_file(tool_path);
+        let _ = fs::remove_dir_all(runtime_dir);
+    }
+
+    #[test]
+    fn extension_source_registers_query_task_tools() {
+        let runtime_dir = std::env::temp_dir().join("nineclaw-query-task-ext-test");
+        let typebox_path = PathBuf::from("/tmp/typebox/index.mjs");
+        let extension_path = write_managed_runtime_extension_files(&runtime_dir, &typebox_path)
+            .expect("write files");
+
+        let query_path = runtime_dir.join(MANAGED_RUNTIME_QUERY_TASK_FILE);
+        let query_info_path = runtime_dir.join(MANAGED_RUNTIME_QUERY_TASK_INFO_FILE);
+        let query_source = fs::read_to_string(&query_path).expect("read query_scheduled_task");
+        let query_info_source =
+            fs::read_to_string(&query_info_path).expect("read query_scheduled_task_info");
+        let extension_source = fs::read_to_string(&extension_path).expect("read extension");
+
+        assert!(query_source.contains("query_scheduled_task"));
+        assert!(query_source.contains("createQueryScheduledTaskTool"));
+        assert!(query_info_source.contains("query_scheduled_task_info"));
+        assert!(query_info_source.contains("createQueryScheduledTaskInfoTool"));
+        assert!(extension_source.contains("ensureQueryScheduledTaskTool"));
+        assert!(extension_source.contains("ensureQueryScheduledTaskInfoTool"));
+        assert!(extension_source.contains("createQueryScheduledTaskTool"));
+        assert!(extension_source.contains("createQueryScheduledTaskInfoTool"));
+
+        let _ = fs::remove_file(extension_path);
+        let _ = fs::remove_file(query_path);
+        let _ = fs::remove_file(query_info_path);
         let _ = fs::remove_dir_all(runtime_dir);
     }
 }

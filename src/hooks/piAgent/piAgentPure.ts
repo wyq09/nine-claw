@@ -26,7 +26,6 @@ import { parseWidgetSegment } from '../../widgetTypes'
 
 export const HISTORY_STORAGE_KEY = 'nineclaw.history.v4'
 const LEGACY_HISTORY_STORAGE_KEYS = ['yqagent.history.v4']
-export const MAX_HISTORY_ITEMS = 30
 const TITLE_MIN_LENGTH = 10
 const TITLE_MAX_LENGTH = 20
 
@@ -884,8 +883,8 @@ export function parseHistorySnapshot(raw: string | null): HistoryItem[] {
         } satisfies HistoryItem
       })
       .filter((item): item is HistoryItem => item !== null)
-      .slice(0, MAX_HISTORY_ITEMS)
-  } catch {
+  } catch (err) {
+    console.error('[NineClaw] parseHistorySnapshot failed:', err)
     return []
   }
 }

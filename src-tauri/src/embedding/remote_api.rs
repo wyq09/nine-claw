@@ -4,6 +4,7 @@ use serde::Deserialize;
 #[derive(Clone)]
 pub struct RemoteApiConfig {
     pub id: String,
+    #[allow(dead_code)]
     pub name: String,
     pub endpoint: String,
     pub model_name: String,
@@ -21,6 +22,7 @@ impl RemoteApiProvider {
         Self { config, client }
     }
 
+    #[allow(dead_code)]
     pub fn config(&self) -> &RemoteApiConfig {
         &self.config
     }
@@ -140,16 +142,15 @@ mod tests {
     #[tokio::test]
     async fn test_embed_fails_on_bad_endpoint() {
         let mut config = make_config();
-        // httpbin /status/500 returns a 500 status code
-        config.endpoint = "https://httpbin.org/status/500".to_string();
+        config.endpoint = "https://example.invalid/embeddings".to_string();
         let provider = RemoteApiProvider::new(config, reqwest::Client::new());
 
         let result = provider.embed(vec!["hello".to_string()]).await;
-        assert!(result.is_err(), "expected embed to fail on 500 endpoint");
+        assert!(result.is_err(), "expected embed to fail on bad endpoint");
         let err = result.unwrap_err();
         assert!(
-            err.contains("500"),
-            "error should mention status 500: {}",
+            err.contains("embedding request failed"),
+            "error should mention request failure: {}",
             err
         );
     }

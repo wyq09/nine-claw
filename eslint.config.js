@@ -8,6 +8,8 @@ import { defineConfig, globalIgnores } from 'eslint/config'
 export default defineConfig([
   globalIgnores([
     'dist',
+    '.agents/**',
+    'skills/**',
     // Bundled / vendored artifacts (not authored in-repo)
     'src-tauri/resources/**',
     'src-tauri/target/**',

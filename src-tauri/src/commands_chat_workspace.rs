@@ -1,5 +1,5 @@
 use crate::agent_tasks::{self, AgentTaskDeliveryRecord, AgentTaskListItem, AgentTaskUpdateInput};
-use crate::history_app_state::storage_conn;
+use crate::history_app_state::{storage_conn, sync_history_v1_backup_from_structured};
 use crate::provider_runtime::ProviderRuntimeConfig;
 use crate::scheduler;
 use crate::storage;
@@ -23,6 +23,8 @@ pub(crate) struct ChatSessionListItem {
     session_llm_provider_id: Option<String>,
     session_llm_model: Option<String>,
     workspace_id: Option<String>,
+    topic_workspace_dir: Option<String>,
+    current_workspace_dir: Option<String>,
     turn_count: i64,
 }
 
@@ -39,7 +41,9 @@ impl From<storage::chat_history::ChatSession> for ChatSessionListItem {
             bot_target_json: s.bot_target_json,
             session_llm_provider_id: s.session_llm_provider_id,
             session_llm_model: s.session_llm_model,
-            workspace_id: s.workspace_id.clone(),
+            workspace_id: s.workspace_id,
+            topic_workspace_dir: s.topic_workspace_dir,
+            current_workspace_dir: s.current_workspace_dir,
             turn_count: 0,
         }
     }
@@ -59,6 +63,8 @@ pub(crate) struct ChatSessionDetail {
     session_llm_provider_id: Option<String>,
     session_llm_model: Option<String>,
     workspace_id: Option<String>,
+    topic_workspace_dir: Option<String>,
+    current_workspace_dir: Option<String>,
     turns: Vec<storage::chat_history::ChatTurn>,
 }
 
@@ -76,6 +82,8 @@ impl From<storage::chat_history::ChatSession> for ChatSessionDetail {
             session_llm_provider_id: s.session_llm_provider_id,
             session_llm_model: s.session_llm_model,
             workspace_id: s.workspace_id,
+            topic_workspace_dir: s.topic_workspace_dir,
+            current_workspace_dir: s.current_workspace_dir,
             turns: Vec::new(),
         }
     }
@@ -189,6 +197,7 @@ pub(crate) fn chat_create_session(
     workspace_id: Option<String>,
 ) -> Result<ChatSessionDetail, String> {
     let conn = storage_conn(&app)?;
+    let workspace_id_for_default = workspace_id.clone();
     let session = storage::chat_history::create_chat_session(
         &conn,
         &storage::chat_history::CreateChatSessionInput {
@@ -203,6 +212,13 @@ pub(crate) fn chat_create_session(
             workspace_id,
         },
     )?;
+    let _ = crate::session_workspace::create_default_for_new_session(
+        &conn,
+        &session.id,
+        workspace_id_for_default.as_deref(),
+    )?;
+    let session = storage::chat_history::get_chat_session(&conn, &session.id)?
+        .ok_or_else(|| "刚创建的会话查询不到".to_string())?;
     Ok(ChatSessionDetail::from(session))
 }
 
@@ -223,7 +239,8 @@ pub(crate) fn chat_append_turn(
     speaker_agent_id: Option<String>,
 ) -> Result<storage::chat_history::ChatTurn, String> {
     let conn = storage_conn(&app)?;
-    let turn = storage::chat_history::append_chat_turn(
+    let _ = turn_index;
+    let turn = storage::chat_history::append_chat_turn_allocating_index(
         &conn,
         &storage::chat_history::AppendChatTurnInput {
             id,
@@ -279,13 +296,15 @@ pub(crate) fn chat_update_turn(
 #[tauri::command]
 pub(crate) fn chat_delete_session(app: AppHandle, session_id: String) -> Result<(), String> {
     let conn = storage_conn(&app)?;
-    storage::chat_history::delete_chat_session(&conn, &session_id)
+    storage::chat_history::delete_chat_session(&conn, &session_id)?;
+    sync_history_v1_backup_from_structured(&conn)
 }
 
 #[tauri::command]
 pub(crate) fn chat_clear_all_sessions(app: AppHandle) -> Result<(), String> {
     let conn = storage_conn(&app)?;
-    storage::chat_history::clear_all_chat_sessions(&conn)
+    storage::chat_history::clear_all_chat_sessions(&conn)?;
+    sync_history_v1_backup_from_structured(&conn)
 }
 
 #[tauri::command]
@@ -293,6 +312,12 @@ pub(crate) fn chat_migrate_history_v1(app: AppHandle) -> Result<String, String> 
     let mut conn = storage_conn(&app)?;
     let result = storage::migrations::migrate_history_v1_to_structured(&mut conn)?;
     Ok(format!("{result:?}"))
+}
+
+#[tauri::command]
+pub(crate) fn sync_history_backup_from_structured(app: AppHandle) -> Result<(), String> {
+    let conn = storage_conn(&app)?;
+    sync_history_v1_backup_from_structured(&conn)
 }
 
 #[tauri::command]
@@ -598,7 +623,7 @@ pub(crate) async fn workspace_abort_delegate(app: AppHandle, run_id: String) -> 
         Err(error) => Some(format!("尝试中止子智能体失败：{error}")),
     };
     let _ = app.emit(
-        "workspace.delegate.done",
+        "workspace:delegate:done",
         serde_json::json!({
             "runId": run_id,
             "status": "aborted",
@@ -618,7 +643,7 @@ pub(crate) async fn workspace_augment_delegate(
     note: String,
 ) -> Result<(), String> {
     let _ = app.emit(
-        "workspace.delegate.progress",
+        "workspace:delegate:progress",
         serde_json::json!({
             "runId": run_id,
             "workspaceId": workspace_id,
@@ -638,7 +663,7 @@ pub(crate) async fn workspace_augment_delegate(
     Ok(())
 }
 
-/// 从委派计划卡片触发的"下发一项"。发出 `workspace.delegate.*` 事件
+/// 从委派计划卡片触发的"下发一项"。发出 `workspace:delegate:*` 事件
 /// 供前端 DelegationCard 渲染 running/done/error。
 ///
 /// 返回: (run_id, output)。同步版本（阶段 D 再加 abort/augment）。
@@ -659,7 +684,7 @@ pub(crate) async fn workspace_run_delegate_task(
 
     let started_at = chrono::Utc::now().timestamp_millis();
     let _ = app.emit(
-        "workspace.delegate.progress",
+        "workspace:delegate:progress",
         serde_json::json!({
             "runId": run_id,
             "workspaceId": ws_id,
@@ -702,7 +727,7 @@ pub(crate) async fn workspace_run_delegate_task(
     match &out {
         Ok(body) => {
             let _ = app.emit(
-                "workspace.delegate.done",
+                "workspace:delegate:done",
                 serde_json::json!({
                     "runId": run_id_clone,
                     "workspaceId": ws_id,
@@ -722,7 +747,7 @@ pub(crate) async fn workspace_run_delegate_task(
         }
         Err(e) => {
             let _ = app.emit(
-                "workspace.delegate.error",
+                "workspace:delegate:error",
                 serde_json::json!({
                     "runId": run_id_clone,
                     "workspaceId": ws_id,

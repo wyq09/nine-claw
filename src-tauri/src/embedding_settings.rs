@@ -316,7 +316,7 @@ pub async fn configure_embedding_runtime(
     clear_embedding_providers(&conn)?;
 
     let mut active_provider_id = None;
-    let mut message = String::new();
+    let message: String;
 
     match settings.mode {
         EmbeddingMode::Local => {

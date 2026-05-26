@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, FixedOffset, Local, LocalResult, NaiveDate,
     NaiveDateTime, NaiveTime, TimeZone, Utc,

@@ -333,6 +333,22 @@ mod tests {
     }
 
     #[test]
+    fn runtime_skill_prompt_is_observability_only() {
+        let prompt = runtime_skill_prompt(&SkillBrokerDecision {
+            strategy: "hybrid".to_string(),
+            mounted_skill_ids: vec!["alpha".into()],
+            skipped_skill_ids: vec![],
+            reasons: vec![],
+        })
+        .expect("prompt");
+
+        assert!(
+            prompt.contains("本轮已装配技能"),
+            "callers may log this string, but must not append it to the system prompt"
+        );
+    }
+
+    #[test]
     fn static_strategy_mounts_preferred_and_required() {
         let mut agent = sample_agent("static");
         agent.capability_policy.required_skill_ids = vec!["required".to_string()];

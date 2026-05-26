@@ -59,14 +59,42 @@ const DEFAULT_ALLOWED_TOOL_IDS: &[&str] = &[
     "query_scheduled_task_info",
 ];
 
-/// 用户在「系统指令」中填写的内容会进入 `agent_system_prompt`；不应对其做过短截断，仅保留与模型侧类似的硬上限防误粘贴。
-const MAX_USER_SYSTEM_INSTRUCTION_CHARS: usize = 32_000;
-
 type SessionAgentPromptCache = HashMap<(String, String), String>;
 
 fn session_agent_prompt_cache() -> &'static Mutex<SessionAgentPromptCache> {
     static CACHE: OnceLock<Mutex<SessionAgentPromptCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn safe_session_prompt_segment(value: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    for char in value.trim().chars() {
+        if char.is_ascii_alphanumeric() || matches!(char, '-' | '_' | '.') {
+            out.push(char);
+        } else {
+            out.push('_');
+        }
+        if out.len() >= 160 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn session_agent_prompt_snapshot_path(agent_id: &str, session_id: &str) -> Result<PathBuf, String> {
+    let root = agent_workspace::resolve_workspace_root()?;
+    let safe_session = safe_session_prompt_segment(session_id, "session");
+    Ok(root
+        .join("agents")
+        .join(agent_id)
+        .join(".cache")
+        .join("session-stable-system-prompts")
+        .join(format!("{safe_session}.agent.md")))
 }
 
 pub fn clear_session_agent_system_prompt_cache(agent_id: &str, session_id: &str) {
@@ -77,6 +105,17 @@ pub fn clear_session_agent_system_prompt_cache(agent_id: &str, session_id: &str)
     }
     if let Ok(mut guard) = session_agent_prompt_cache().lock() {
         guard.remove(&(agent_id.to_string(), session_id.to_string()));
+    }
+    if let Ok(path) = session_agent_prompt_snapshot_path(agent_id, session_id) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "清理 session agent prompt 快照失败 {}: {}",
+                path.display(),
+                error
+            ),
+        }
     }
 }
 
@@ -710,19 +749,44 @@ pub fn build_agent_system_prompt_for_session_prompt(
             return Some(snapshot.clone());
         }
     }
+    if let Ok(path) = session_agent_prompt_snapshot_path(agent_id, session_id) {
+        if let Ok(snapshot) = fs::read_to_string(&path) {
+            if let Ok(mut guard) = session_agent_prompt_cache().lock() {
+                guard.entry(cache_key).or_insert_with(|| snapshot.clone());
+            }
+            return Some(snapshot);
+        }
+    }
 
     let snapshot =
         build_agent_system_prompt_for_prompt_inner(agent, Some(session_id), current_prompt)?;
     if let Ok(mut guard) = session_agent_prompt_cache().lock() {
         guard.entry(cache_key).or_insert_with(|| snapshot.clone());
     }
+    if let Ok(path) = session_agent_prompt_snapshot_path(agent_id, session_id) {
+        if let Some(parent) = path.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                log::warn!(
+                    "创建 session agent prompt 快照目录失败 {}: {}",
+                    parent.display(),
+                    error
+                );
+            } else if let Err(error) = fs::write(&path, &snapshot) {
+                log::warn!(
+                    "写入 session agent prompt 快照失败 {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
+    }
     Some(snapshot)
 }
 
 fn build_agent_system_prompt_for_prompt_inner(
     agent: &ConversationAgentConfig,
-    session_id: Option<&str>,
-    current_prompt: Option<&str>,
+    _session_id: Option<&str>,
+    _current_prompt: Option<&str>,
 ) -> Option<String> {
     let mut sections = Vec::new();
 
@@ -794,35 +858,7 @@ fn build_agent_system_prompt_for_prompt_inner(
 
     let system_prompt = agent.system_prompt.trim();
     if !system_prompt.is_empty() {
-        let expanded_prompt = current_prompt
-            .map(|arg| system_prompt.replace("${ARG}", arg.trim()))
-            .unwrap_or_else(|| system_prompt.to_string());
-        let body = if expanded_prompt.chars().count() > MAX_USER_SYSTEM_INSTRUCTION_CHARS {
-            let head: String = expanded_prompt
-                .chars()
-                .take(MAX_USER_SYSTEM_INSTRUCTION_CHARS)
-                .collect();
-            format!("{head}…\n(已截断至约 {MAX_USER_SYSTEM_INSTRUCTION_CHARS} 字，见仓库文档 docs/AGENT_SYSTEM_PROMPT.md)")
-        } else {
-            expanded_prompt
-        };
-        sections.push(format!(
-            "最高优先级执行要求（MUST）：以下是用户为当前智能体配置的专属系统提示词。除非违反平台安全或系统级限制，否则必须严格遵守；若与下面的通用能力说明冲突，以本段为准。\n{body}"
-        ));
-    }
-
-    if agent_workspace::runtime_sync_enabled() {
-        if let Ok(workspace_prompt) =
-            agent_workspace::build_session_workspace_system_prompt_for_query(
-                &agent.id,
-                session_id,
-                current_prompt,
-            )
-        {
-            if !workspace_prompt.trim().is_empty() {
-                sections.push(workspace_prompt);
-            }
-        }
+        sections.push(crate::prompts::stable_agent_dynamic_instruction_notice().to_string());
     }
 
     if sections.is_empty() {
@@ -3691,8 +3727,8 @@ mod tests {
         assert!(prompt.contains("必须使用 web_fetch 工具"));
         assert!(prompt.contains("允许工具：read_file、web_fetch"));
         assert!(prompt.contains("偏好技能"));
-        assert!(prompt.contains("最高优先级执行要求（MUST）"));
-        assert!(prompt.contains("避免省略关键确认步骤"));
+        assert!(prompt.contains("专属执行要求"));
+        assert!(!prompt.contains("避免省略关键确认步骤"));
     }
 
     #[test]
@@ -3752,7 +3788,8 @@ mod tests {
 
         assert!(prompt.contains("触发条件：用户要求审查时"));
         assert!(prompt.contains("禁止模型自动调用"));
-        assert!(prompt.contains("请审查：合同条款"));
+        assert!(prompt.contains("专属执行要求"));
+        assert!(!prompt.contains("请审查：合同条款"));
         assert!(!prompt.contains("${ARG}"));
     }
 
@@ -3789,18 +3826,18 @@ mod tests {
         let first =
             build_agent_system_prompt_for_session_prompt(&agent, Some("session-a"), Some("第一轮"))
                 .expect("first prompt");
-        assert!(first.contains("处理当前请求：第一轮"));
+        assert!(first.contains("专属执行要求"));
+        assert!(!first.contains("第一轮"));
 
         let second =
             build_agent_system_prompt_for_session_prompt(&agent, Some("session-a"), Some("第二轮"))
                 .expect("second prompt");
         assert_eq!(second, first);
-        assert!(!second.contains("第二轮"));
 
         let other_session =
             build_agent_system_prompt_for_session_prompt(&agent, Some("session-b"), Some("第二轮"))
                 .expect("other session prompt");
-        assert!(other_session.contains("处理当前请求：第二轮"));
+        assert_eq!(other_session, first);
 
         let _ = fs::remove_dir_all(root);
         std::env::remove_var(TEST_WORKSPACE_ROOT_ENV);

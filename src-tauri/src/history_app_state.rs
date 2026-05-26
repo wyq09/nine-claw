@@ -1,5 +1,7 @@
 use crate::agent_workspace;
-use crate::app_constants::{HISTORY_DB_FILE, LEGACY_HISTORY_DB_FILES};
+use crate::app_constants::{
+    HISTORY_DB_FILE, HISTORY_RECOVERY_MARKER_KEY, HISTORY_STATE_KEY, LEGACY_HISTORY_DB_FILES,
+};
 use crate::pi_usage::{
     extract_usage_metadata_payload, extract_usage_payload, json_i64, json_string,
     usage_row_total_tokens, PiTokenUsagePayload, PiUsageMetadataPayload,
@@ -32,6 +34,21 @@ pub(crate) struct TokenUsageRecordRow {
     pub(crate) cache_write_tokens: u64,
     pub(crate) total_tokens: u64,
     pub(crate) recorded_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct HistoryDbSignal {
+    structured_session_count: i64,
+    structured_turn_count: i64,
+    snapshot_session_count: i64,
+}
+
+impl HistoryDbSignal {
+    fn has_history(self) -> bool {
+        self.structured_session_count > 0
+            || self.structured_turn_count > 0
+            || self.snapshot_session_count > 0
+    }
 }
 
 fn migrate_legacy_history_db(app_data_dir: &Path, target_path: &Path) -> Result<(), String> {
@@ -100,6 +117,121 @@ fn migrate_history_db_from_candidates(
     Ok(())
 }
 
+fn count_optional_table_rows(conn: &Connection, table_name: &str) -> Result<i64, String> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table_name],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("检查表 {table_name} 是否存在失败: {error}"))?;
+    if exists == 0 {
+        return Ok(0);
+    }
+
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table_name}"), [], |row| {
+        row.get(0)
+    })
+    .map_err(|error| format!("统计表 {table_name} 行数失败: {error}"))
+}
+
+fn read_history_db_signal(path: &Path) -> Result<Option<HistoryDbSignal>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let db_path = path.to_path_buf();
+    let connection = storage::db::open_at(&db_path)?;
+    maybe_recover_structured_history_from_backup(&connection)?;
+
+    let structured_session_count = count_optional_table_rows(&connection, "chat_sessions")?;
+    let structured_turn_count = count_optional_table_rows(&connection, "chat_turns")?;
+    let snapshot_session_count = load_history_v1_snapshot(&connection)?
+        .as_deref()
+        .map(storage::chat_history_snapshot::session_count_from_snapshot_json)
+        .transpose()?
+        .unwrap_or(0);
+
+    Ok(Some(HistoryDbSignal {
+        structured_session_count,
+        structured_turn_count,
+        snapshot_session_count,
+    }))
+}
+
+fn history_db_candidate_paths(candidate_dirs: &[PathBuf], target_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for candidate_dir in candidate_dirs {
+        for file_name in std::iter::once(HISTORY_DB_FILE).chain(LEGACY_HISTORY_DB_FILES.iter().copied()) {
+            let candidate_path = candidate_dir.join(file_name);
+            if candidate_path == target_path || !candidate_path.exists() {
+                continue;
+            }
+            if !paths.iter().any(|existing| existing == &candidate_path) {
+                paths.push(candidate_path);
+            }
+        }
+    }
+    paths
+}
+
+fn recover_empty_target_history_db_from_candidates(
+    candidate_dirs: &[PathBuf],
+    target_path: &Path,
+) -> Result<(), String> {
+    let Some(target_signal) = read_history_db_signal(target_path)? else {
+        return Ok(());
+    };
+    if target_signal.has_history() {
+        return Ok(());
+    }
+
+    let mut best_candidate: Option<(PathBuf, HistoryDbSignal)> = None;
+    for candidate_path in history_db_candidate_paths(candidate_dirs, target_path) {
+        let Some(candidate_signal) = read_history_db_signal(&candidate_path)? else {
+            continue;
+        };
+        if !candidate_signal.has_history() {
+            continue;
+        }
+        let should_replace = best_candidate
+            .as_ref()
+            .map(|(_, existing_signal)| candidate_signal > *existing_signal)
+            .unwrap_or(true);
+        if should_replace {
+            best_candidate = Some((candidate_path, candidate_signal));
+        }
+    }
+
+    let Some((candidate_path, candidate_signal)) = best_candidate else {
+        return Ok(());
+    };
+
+    let candidate_db_path = candidate_path.clone();
+    let candidate_conn = storage::db::open_at(&candidate_db_path)?;
+    maybe_recover_structured_history_from_backup(&candidate_conn)?;
+    let payload = storage::chat_history_snapshot::export_history_snapshot_json(&candidate_conn)?;
+    if storage::chat_history_snapshot::session_count_from_snapshot_json(&payload)? == 0 {
+        return Ok(());
+    }
+
+    let target_db_path = target_path.to_path_buf();
+    let target_conn = storage::db::open_at(&target_db_path)?;
+    storage::chat_history_snapshot::merge_history_snapshot_json(&target_conn, &payload)?;
+    sync_history_v1_backup_from_structured(&target_conn)?;
+
+    log::warn!(
+        "Recovered empty history DB {} from candidate {} (sessions={}, turns={}, snapshot_sessions={})",
+        target_path.display(),
+        candidate_path.display(),
+        candidate_signal.structured_session_count,
+        candidate_signal.structured_turn_count,
+        candidate_signal.snapshot_session_count,
+    );
+
+    Ok(())
+}
+
 pub(crate) fn history_db_path(app: &AppHandle) -> Result<PathBuf, String> {
     let workspace_root = agent_workspace::resolve_workspace_root()?;
     fs::create_dir_all(&workspace_root)
@@ -113,7 +245,9 @@ pub(crate) fn history_db_path(app: &AppHandle) -> Result<PathBuf, String> {
     fs::create_dir_all(&app_data_dir).map_err(|error| format!("创建应用数据目录失败: {error}"))?;
 
     let target_path = workspace_root.join(HISTORY_DB_FILE);
-    migrate_history_db_from_candidates(&[workspace_root.clone(), app_data_dir], &target_path)?;
+    let candidate_dirs = [workspace_root.clone(), app_data_dir];
+    migrate_history_db_from_candidates(&candidate_dirs, &target_path)?;
+    recover_empty_target_history_db_from_candidates(&candidate_dirs, &target_path)?;
 
     Ok(target_path)
 }
@@ -388,9 +522,86 @@ pub(crate) fn open_history_db(app: &AppHandle) -> Result<Connection, String> {
     Ok(connection)
 }
 
+fn load_history_v1_snapshot(conn: &Connection) -> Result<Option<String>, String> {
+    use rusqlite::OptionalExtension;
+
+    conn.query_row(
+        "SELECT value FROM app_state WHERE key = ?1",
+        params![HISTORY_STATE_KEY],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| format!("读取 history_v1 失败: {error}"))
+}
+
+fn write_history_v1_snapshot(conn: &Connection, payload: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO app_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![HISTORY_STATE_KEY, payload, chrono_like_timestamp()],
+    )
+    .map_err(|error| format!("写入 history_v1 备份失败: {error}"))?;
+    Ok(())
+}
+
+fn history_recovery_already_applied(conn: &Connection) -> Result<bool, String> {
+    use rusqlite::OptionalExtension;
+
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_state WHERE key = ?1",
+            params![HISTORY_RECOVERY_MARKER_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("检查历史恢复标记失败: {error}"))?;
+    Ok(value.as_deref() == Some("true"))
+}
+
+fn mark_history_recovery_applied(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO app_state (key, value, updated_at) VALUES (?1, 'true', ?2)
+         ON CONFLICT(key) DO UPDATE SET value = 'true', updated_at = excluded.updated_at",
+        params![HISTORY_RECOVERY_MARKER_KEY, chrono_like_timestamp()],
+    )
+    .map_err(|error| format!("写入历史恢复标记失败: {error}"))?;
+    Ok(())
+}
+
+fn maybe_recover_structured_history_from_backup(conn: &Connection) -> Result<(), String> {
+    let session_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chat_sessions", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    if session_count != 0 || history_recovery_already_applied(conn)? {
+        return Ok(());
+    }
+
+    let Some(v1_json) = load_history_v1_snapshot(conn)? else {
+        return Ok(());
+    };
+
+    let backup_session_count =
+        storage::chat_history_snapshot::session_count_from_snapshot_json(&v1_json)?;
+    if backup_session_count > 0 {
+        storage::chat_history_snapshot::merge_history_snapshot_json(conn, &v1_json)?;
+        mark_history_recovery_applied(conn)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn sync_history_v1_backup_from_structured(conn: &Connection) -> Result<(), String> {
+    let payload = storage::chat_history_snapshot::export_history_snapshot_json(conn)?;
+    write_history_v1_snapshot(conn, &payload)
+}
+
 #[tauri::command]
 pub(crate) fn load_history_state(app: AppHandle) -> Result<Option<String>, String> {
     let connection = open_history_db(&app)?;
+    maybe_recover_structured_history_from_backup(&connection)?;
+    sync_history_v1_backup_from_structured(&connection)?;
+
     let payload = storage::chat_history_snapshot::export_history_snapshot_json(&connection)?;
     Ok(Some(payload))
 }
@@ -398,9 +609,11 @@ pub(crate) fn load_history_state(app: AppHandle) -> Result<Option<String>, Strin
 #[tauri::command]
 pub(crate) fn save_history_state(app: AppHandle, payload: String) -> Result<(), String> {
     let mut connection = open_history_db(&app)?;
-    storage::chat_history_snapshot::replace_history_snapshot_json(&connection, &payload)?;
-
+    // Red line: front-end history snapshots may be incomplete during reload/recovery.
+    // Never replace structured history from them; only merge/upsert.
+    storage::chat_history_snapshot::merge_history_snapshot_json(&connection, &payload)?;
     sync_usage_records_from_history_payload(&mut connection, &payload)?;
+    sync_history_v1_backup_from_structured(&connection)?;
     reindex_chat_turn_vectors_async(app);
 
     Ok(())
@@ -410,12 +623,21 @@ pub(crate) fn save_history_state(app: AppHandle, payload: String) -> Result<(), 
 pub(crate) fn clear_history_state(app: AppHandle) -> Result<(), String> {
     let connection = open_history_db(&app)?;
     storage::chat_history::clear_all_chat_sessions(&connection)?;
+    sync_history_v1_backup_from_structured(&connection)?;
     Ok(())
 }
 
 pub(crate) fn storage_conn(app: &AppHandle) -> Result<rusqlite::Connection, String> {
     let db_path = history_db_path(app)?;
     storage::db::open_at(&db_path)
+}
+
+pub(crate) fn history_db_diagnostics(app: &AppHandle) -> Result<(PathBuf, i64, i64), String> {
+    let db_path = history_db_path(app)?;
+    let connection = storage::db::open_at(&db_path)?;
+    let session_count = count_optional_table_rows(&connection, "chat_sessions")?;
+    let turn_count = count_optional_table_rows(&connection, "chat_turns")?;
+    Ok((db_path, session_count, turn_count))
 }
 
 fn reindex_chat_turn_vectors_async(app: AppHandle) {
@@ -560,4 +782,157 @@ pub(crate) fn list_token_usage_records(app: AppHandle) -> Result<Vec<TokenUsageR
     }
 
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_constants::HISTORY_STATE_KEY;
+    use crate::storage::chat_history::{
+        append_chat_turn, create_chat_session, list_chat_sessions, list_chat_turns,
+        AppendChatTurnInput, CreateChatSessionInput,
+    };
+    use crate::storage::db::open_at;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!("nineclaw-history-tests-{label}-{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn create_structured_session(path: &Path, session_id: &str, prompt: &str) {
+        let db_path = path.to_path_buf();
+        let conn = open_at(&db_path).unwrap();
+        create_chat_session(
+            &conn,
+            &CreateChatSessionInput {
+                id: session_id.to_string(),
+                title: format!("Title {session_id}"),
+                status: "done".to_string(),
+                agent_id: None,
+                agent_snapshot_json: None,
+                bot_target_json: None,
+                session_llm_provider_id: None,
+                session_llm_model: None,
+                workspace_id: None,
+            },
+        )
+        .unwrap();
+        append_chat_turn(
+            &conn,
+            &AppendChatTurnInput {
+                id: format!("{session_id}-turn-1"),
+                session_id: session_id.to_string(),
+                turn_index: 0,
+                prompt: prompt.to_string(),
+                answer: "answer".to_string(),
+                thinking: String::new(),
+                status: "done".to_string(),
+                usage_json: None,
+                response_segments_json: None,
+                tool_calls_json: None,
+                activity_json: None,
+                speaker_agent_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn recover_empty_target_history_db_from_structured_candidate() {
+        let root_dir = temp_dir_path("structured-candidate");
+        let target_path = root_dir.join(HISTORY_DB_FILE);
+        let candidate_dir = root_dir.join("app-data");
+        fs::create_dir_all(&candidate_dir).unwrap();
+
+        open_at(&target_path).unwrap();
+        create_structured_session(&candidate_dir.join(HISTORY_DB_FILE), "candidate-session", "hello");
+
+        recover_empty_target_history_db_from_candidates(&[candidate_dir], &target_path).unwrap();
+
+        let target_conn = open_at(&target_path).unwrap();
+        let sessions = list_chat_sessions(&target_conn).unwrap();
+        let turns = list_chat_turns(&target_conn, "candidate-session").unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "candidate-session");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].prompt, "hello");
+    }
+
+    #[test]
+    fn recover_empty_target_history_db_from_history_v1_candidate() {
+        let root_dir = temp_dir_path("snapshot-candidate");
+        let target_path = root_dir.join(HISTORY_DB_FILE);
+        let candidate_dir = root_dir.join("app-data");
+        fs::create_dir_all(&candidate_dir).unwrap();
+
+        open_at(&target_path).unwrap();
+
+        let candidate_path = candidate_dir.join(HISTORY_DB_FILE);
+        let candidate_conn = open_at(&candidate_path).unwrap();
+        let payload = serde_json::json!([
+            {
+                "id": "snapshot-session",
+                "title": "Recovered from snapshot",
+                "status": "done",
+                "createdAt": 100,
+                "updatedAt": 200,
+                "turns": [
+                    {
+                        "id": "snapshot-turn",
+                        "prompt": "from backup",
+                        "answer": "answer",
+                        "thinking": "",
+                        "status": "done",
+                        "createdAt": 101,
+                        "completedAt": 102,
+                        "activity": [],
+                        "toolCalls": [],
+                        "responseSegments": []
+                    }
+                ]
+            }
+        ])
+        .to_string();
+        candidate_conn
+            .execute(
+                "INSERT INTO app_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![HISTORY_STATE_KEY, payload, chrono_like_timestamp()],
+            )
+            .unwrap();
+
+        recover_empty_target_history_db_from_candidates(&[candidate_dir], &target_path).unwrap();
+
+        let target_conn = open_at(&target_path).unwrap();
+        let sessions = list_chat_sessions(&target_conn).unwrap();
+        let turns = list_chat_turns(&target_conn, "snapshot-session").unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "snapshot-session");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].prompt, "from backup");
+    }
+
+    #[test]
+    fn recover_empty_target_history_db_does_not_override_non_empty_target() {
+        let root_dir = temp_dir_path("preserve-target");
+        let target_path = root_dir.join(HISTORY_DB_FILE);
+        let candidate_dir = root_dir.join("app-data");
+        fs::create_dir_all(&candidate_dir).unwrap();
+
+        create_structured_session(&target_path, "target-session", "keep me");
+        create_structured_session(&candidate_dir.join(HISTORY_DB_FILE), "candidate-session", "old data");
+
+        recover_empty_target_history_db_from_candidates(&[candidate_dir], &target_path).unwrap();
+
+        let target_conn = open_at(&target_path).unwrap();
+        let sessions = list_chat_sessions(&target_conn).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "target-session");
+    }
 }

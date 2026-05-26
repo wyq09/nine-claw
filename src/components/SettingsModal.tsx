@@ -8,6 +8,13 @@ import {
   testNetworkProxyConnection,
   testLlmProviderConnection,
 } from '../lib/piClient'
+import {
+  getNotificationPermissionState,
+  openSystemNotificationSettings,
+  requestNotificationPermission,
+  sendTestNotification,
+  type NotificationPermissionState,
+} from '../lib/taskDeliveryNotification'
 import { THEME_OPTIONS } from '../theme/themePresets'
 import { describeNetworkProxyMode } from '../app/lib'
 import type {
@@ -181,6 +188,78 @@ function Toggle({ checked, onChange }: ToggleProps) {
     <button type="button" className={`toggle ${checked ? 'checked' : ''}`} onClick={onChange} aria-pressed={checked}>
       <span />
     </button>
+  )
+}
+
+/** 通知设置行：应用层开关 + 系统权限状态 + 跳转系统设置按钮 */
+function NotificationSettingRow({ appEnabled, onSetAppEnabled }: {
+  appEnabled: boolean
+  onSetAppEnabled: (enabled: boolean) => void
+}) {
+  const [systemPerm, setSystemPerm] = useState<NotificationPermissionState>('not_determined')
+
+  useEffect(() => {
+    void getNotificationPermissionState().then(setSystemPerm)
+  }, [appEnabled])
+
+  const systemGranted = systemPerm === 'granted'
+  // 开关状态 = 应用层开启 AND 系统已授权
+  const effectiveChecked = appEnabled && systemGranted
+
+  const handleToggle = async () => {
+    if (!effectiveChecked) {
+      // 用户想开启 → 当场向系统重新查询，避免依赖进入设置页时的旧状态
+      const currentPerm = await getNotificationPermissionState()
+      setSystemPerm(currentPerm)
+      if (currentPerm !== 'granted') {
+        // 尝试请求一次（可能触发系统弹窗）
+        const result = await requestNotificationPermission()
+        setSystemPerm(result)
+        if (result !== 'granted') {
+          // 系统没给权限 → 打开系统设置引导
+          await openSystemNotificationSettings()
+          return
+        }
+      }
+      onSetAppEnabled(true)
+    } else {
+      onSetAppEnabled(false)
+    }
+  }
+
+  return (
+    <div className="settings-row switch">
+      <div>
+        <strong>回复完成通知</strong>
+        <p>
+          Agent 回复完成时推送系统通知，点击可直接跳转到对应会话
+          {!systemGranted && (
+            <span style={{ color: 'var(--text-danger, #f87171)', marginLeft: 6 }}>
+              · 系统通知权限未开启
+              <button
+                type="button"
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: 'var(--text-link, #60a5fa)',
+                  cursor: 'pointer',
+                  padding: '0 4px',
+                  textDecoration: 'underline',
+                  fontSize: 'inherit',
+                }}
+                onClick={() => void openSystemNotificationSettings()}
+              >
+                去开启
+              </button>
+            </span>
+          )}
+        </p>
+        <button type="button" className="outline-button" onClick={() => void sendTestNotification()}>
+          发送测试通知
+        </button>
+      </div>
+      <Toggle checked={effectiveChecked} onChange={() => void handleToggle()} />
+    </div>
   )
 }
 
@@ -544,6 +623,16 @@ export function SettingsModal({
                     setGeneralSettings((previous) => ({
                       ...previous,
                       launchOnStartup: !previous.launchOnStartup,
+                    }))
+                  }
+                />
+
+                <NotificationSettingRow
+                  appEnabled={generalSettings.notificationEnabled}
+                  onSetAppEnabled={(enabled) =>
+                    setGeneralSettings((previous) => ({
+                      ...previous,
+                      notificationEnabled: enabled,
                     }))
                   }
                 />

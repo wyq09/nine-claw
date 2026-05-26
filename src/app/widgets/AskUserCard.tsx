@@ -43,6 +43,10 @@ function validateQuestion(question: AskUserQuestion, draft: AskUserAnswerDraft |
   return questionHasAnswer(question, draft) ? null : '此项必填'
 }
 
+function isChoiceQuestion(question: AskUserQuestion): question is AskUserChoiceQuestion {
+  return question.type === 'single_select' || question.type === 'multi_select'
+}
+
 function updateChoiceSelection(
   question: AskUserChoiceQuestion,
   current: AskUserAnswerDraft,
@@ -187,7 +191,7 @@ export function AskUserCard({ widget, onSubmit, onCancel }: AskUserCardProps) {
                     }
                   />
                 )
-              ) : (
+              ) : isChoiceQuestion(question) ? (
                 <div className="widget-choice-list">
                   {question.options.map((option) => {
                     const selected = Array.isArray(draft?.value)
@@ -237,7 +241,7 @@ export function AskUserCard({ widget, onSubmit, onCancel }: AskUserCardProps) {
                     />
                   ) : null}
                 </div>
-              )}
+              ) : null}
 
               {error ? <div className="widget-question-error">{error}</div> : null}
             </section>

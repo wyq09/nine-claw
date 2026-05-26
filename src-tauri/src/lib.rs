@@ -1,4 +1,5 @@
 mod agent_capabilities;
+mod agent_turn_context;
 mod agent_loop;
 mod agent_loop_types;
 mod agent_task_schedule;
@@ -28,6 +29,7 @@ mod prompt_attachments;
 mod proxy_settings;
 mod runtime_parameters;
 mod scheduler;
+mod session_workspace;
 mod skills;
 pub mod storage;
 mod team_supervisor;
@@ -47,6 +49,7 @@ mod commands_llm_log_export;
 mod commands_llm_trace;
 mod commands_memory;
 mod commands_session_llm_log;
+mod commands_session_workspace;
 mod commands_workspace_kv_memory;
 mod history_app_state;
 mod pi_usage;
@@ -80,13 +83,14 @@ pub(crate) use pi_usage::{
     extract_usage_payload, json_string, usage_row_total_tokens, PiTokenUsagePayload,
     PiUsageMetadataPayload,
 };
+#[cfg(test)]
+pub(crate) use provider_runtime::should_force_pi_thinking_off;
 pub(crate) use provider_runtime::{
     anthropic_messages_url, forced_pi_thinking_level, load_provider_preferences,
     normalize_anthropic_base_url, normalize_provider_api_format, normalize_provider_base_url,
     normalized_provider_runtime_base_url, openai_pi_compat_requires_explicit_thinking_disable,
     openai_pi_compat_requires_reasoning_content_replay, openai_pi_compat_supports_reasoning_effort,
-    pi_runtime_dir, resolve_im_llm_runtime, save_provider_preferences,
-    should_force_pi_thinking_off, ProviderRuntimeConfig,
+    pi_runtime_dir, resolve_im_llm_runtime, save_provider_preferences, ProviderRuntimeConfig,
 };
 pub(crate) use proxy_settings::build_http_client;
 pub(crate) use session_llm_titles::refine_agent_task_metadata;
@@ -99,6 +103,7 @@ use commands_llm_log_export::*;
 use commands_llm_trace::*;
 use commands_memory::*;
 use commands_session_llm_log::*;
+use commands_session_workspace::*;
 use commands_workspace_kv_memory::*;
 use history_app_state::{
     clear_history_state, list_token_usage_records, load_history_state, save_history_state,
@@ -213,6 +218,35 @@ pub(crate) fn open_path_in_default_app(path: &Path) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("打开文件失败: {error}"))
+}
+
+pub(crate) fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut cmd = Command::new("open");
+        cmd.args(["-R"]);
+        cmd.arg(path);
+        cmd
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut cmd = Command::new("explorer");
+        cmd.arg(format!("/select,{}", path.display()));
+        cmd
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(path.parent().unwrap_or(path));
+        cmd
+    };
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("在文件管理器中显示失败: {error}"))
 }
 
 fn open_url_in_default_browser(url: &str) -> Result<(), String> {
@@ -516,9 +550,9 @@ struct DesktopParsedMediaItem {
 
 fn desktop_media_reply_prompt(
     agent_home: Option<&Path>,
-    team_artifacts_root: Option<&Path>,
+    workspace_output_root: Option<&Path>,
 ) -> String {
-    prompts::desktop_media_reply_prompt(agent_home, team_artifacts_root)
+    prompts::desktop_media_reply_prompt(agent_home, workspace_output_root)
 }
 
 fn is_desktop_image_path(path: &str) -> bool {
@@ -774,6 +808,7 @@ struct SessionContextStats {
     source: String,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_context_stats_from_rpc_response(value: &serde_json::Value) -> Option<SessionContextStats> {
     let cu = value.get("contextUsage")?;
     let used_tokens = cu.get("usedTokens").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -795,6 +830,7 @@ fn parse_context_stats_from_rpc_response(value: &serde_json::Value) -> Option<Se
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_context_window_from_sources(
     auto_detected: Option<u64>,
     manual_config: Option<u64>,
@@ -1191,13 +1227,14 @@ mod lib_tests {
     }
 
     #[test]
-    fn desktop_media_reply_prompt_prefers_team_artifacts_root() {
+    fn desktop_media_reply_prompt_prefers_session_workspace_root() {
         let prompt = desktop_media_reply_prompt(
             Some(Path::new("/tmp/agent-home")),
-            Some(Path::new("/team/artifacts")),
+            Some(Path::new("/session/workspace")),
         );
         assert!(prompt.contains("::nc-media"));
-        assert!(prompt.contains("/team/artifacts"));
+        assert!(prompt.contains("/session/workspace"));
+        assert!(prompt.contains("当前会话工作区"));
         assert!(!prompt.contains("/tmp/agent-home/outbox"));
     }
 
@@ -3670,6 +3707,7 @@ fn build_provider_models_config_with_input(
     Some(json!({ "providers": providers }))
 }
 
+#[allow(dead_code)]
 fn prepare_pi_runtime_dir(provider_config: &ProviderRuntimeConfig) -> Result<PathBuf, String> {
     let runtime_dir = pi_runtime_dir();
     fs::create_dir_all(&runtime_dir).map_err(|error| format!("创建 pi 运行目录失败: {error}"))?;
@@ -4195,13 +4233,18 @@ async fn persist_chat_attachments(
     workspace_id: Option<String>,
     attachments: Vec<ChatAttachmentUpload>,
 ) -> Result<Vec<PersistedChatAttachment>, String> {
-    let team_artifacts_root: Option<std::path::PathBuf> = {
-        let wid = workspace_id
+    let session_workspace_root: Option<std::path::PathBuf> = {
+        let sid = session_id
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        if let Some(wid) = wid {
-            Some(team_workspace::resolve_workspace_artifacts_root(&app, wid)?)
+        if let Some(sid) = sid {
+            let conn = storage_conn(&app)?;
+            Some(crate::session_workspace::current_workspace_dir(
+                &conn,
+                sid,
+                workspace_id.as_deref(),
+            )?)
         } else {
             None
         }
@@ -4211,7 +4254,7 @@ async fn persist_chat_attachments(
         chat_attachments::persist_chat_attachments(
             &agent_id,
             session_id.as_deref(),
-            team_artifacts_root.as_deref(),
+            session_workspace_root.as_deref(),
             attachments,
         )
     })
@@ -4433,9 +4476,21 @@ async fn stream_pi_prompt(
         }
     }
 
-    let team_artifacts_root_for_media: Option<std::path::PathBuf> = workspace_id_for_stream
-        .as_deref()
-        .and_then(|wid| team_workspace::resolve_workspace_artifacts_root(&app, wid).ok());
+    let workspace_root_for_media: Option<std::path::PathBuf> = storage_conn(&app)
+        .ok()
+        .and_then(|conn| {
+            crate::session_workspace::current_workspace_dir(
+                &conn,
+                &normalized_session_id,
+                workspace_id_for_stream.as_deref(),
+            )
+            .ok()
+        })
+        .or_else(|| {
+            workspace_id_for_stream
+                .as_deref()
+                .and_then(|wid| team_workspace::resolve_workspace_artifacts_root(&app, wid).ok())
+        });
     let desktop_agent_home_for_runtime = agent_config.as_ref().and_then(|config| {
         agent_workspace::resolve_workspace_root()
             .ok()
@@ -4491,17 +4546,54 @@ async fn stream_pi_prompt(
         let agent_config = agent_config.clone();
         let attachments = attachments.clone();
         let workspace_id_for_stream = workspace_id_for_stream.clone();
-        let team_artifacts_root_for_media = team_artifacts_root_for_media.clone();
+        let workspace_root_for_media = workspace_root_for_media.clone();
         let summary_key = summary_key.clone();
         let trimmed_prompt = attempt_prompt.clone();
-        let prepared_input = prompt_attachments::prepare_prompt_input(
-            &build_turn_prompt_with_multimodal_summary(
-                &trimmed_prompt,
-                &summary_key,
-                &attachments,
-            )?,
-            &attachments,
-        )?;
+        let mut turn_prompt =
+            build_turn_prompt_with_multimodal_summary(&trimmed_prompt, &summary_key, &attachments)?;
+        if let Some(agent_config) = agent_config.as_ref() {
+            let mut blocks = agent_turn_context::build_session_context_blocks(
+                agent_config,
+                Some(normalized_session_id.as_str()),
+                trimmed_prompt.as_str(),
+            )?;
+            if let Some(wid) = workspace_id_for_stream.as_deref() {
+                let speaker_id = agent_config.id.trim();
+                agent_turn_context::extend_with_block(
+                    &mut blocks,
+                    "team_supervisor_instructions",
+                    team_workspace::supervisor_agent_prompt_appendix_for_pi(
+                        &app,
+                        wid,
+                        speaker_id,
+                    )?,
+                );
+                agent_turn_context::extend_with_block(
+                    &mut blocks,
+                    "team_workspace_context",
+                    team_workspace::build_workspace_preface(&app, wid, speaker_id)?,
+                );
+            }
+            agent_turn_context::extend_with_block(
+                &mut blocks,
+                "desktop_media_output",
+                desktop_media_reply_prompt(
+                    desktop_agent_home_for_runtime.as_deref(),
+                    workspace_root_for_media.as_deref(),
+                ),
+            );
+            turn_prompt = agent_turn_context::wrap_turn_context_message(&turn_prompt, &blocks);
+        } else {
+            turn_prompt = agent_turn_context::wrap_turn_context_message(
+                &turn_prompt,
+                &[agent_turn_context::TurnContextBlock::new(
+                    "desktop_media_output",
+                    desktop_media_reply_prompt(None, workspace_root_for_media.as_deref()),
+                )
+                .expect("desktop media context")],
+            );
+        }
+        let prepared_input = prompt_attachments::prepare_prompt_input(&turn_prompt, &attachments)?;
 
         let attempt_result = tauri::async_runtime::spawn_blocking(move || {
         let session_stream_mutex = desktop_session_stream_mutex(&runtime_session_id);
@@ -4692,8 +4784,6 @@ async fn stream_pi_prompt(
         let mut skill_paths: Vec<PathBuf> = Vec::new();
         let mut selected_skill_ids: Vec<String> = Vec::new();
         let mut desktop_agent_home: Option<PathBuf> = None;
-        let mut desktop_media_prompt = String::new();
-        let mut base_system_prompt_injected = false;
         if let Some(agent_config) = agent_config.as_ref() {
             if let Ok(workspace_root) = agent_workspace::resolve_workspace_root() {
                 let agent_home = workspace_root.join("agents").join(&agent_config.id);
@@ -4705,51 +4795,18 @@ async fn stream_pi_prompt(
                     .env("NINECLAW_WORKSPACE_ROOT", workspace_root.as_os_str())
                     .env("NINECLAW_AGENT_HOME", agent_home.as_os_str());
             }
-            desktop_media_prompt = desktop_media_reply_prompt(
-                desktop_agent_home.as_deref(),
-                team_artifacts_root_for_media.as_deref(),
-            );
-
             let base_agent_prompt = agents::build_agent_system_prompt_for_session_prompt(
                 agent_config,
                 Some(normalized_session_id.as_str()),
-                Some(trimmed_prompt.as_str()),
+                None,
             );
-            let speaker_id = agent_config.id.trim();
-            let merged_agent_prompt = match workspace_id_for_stream.as_deref() {
-                Some(wid) => {
-                    let extra = team_workspace::supervisor_agent_prompt_appendix_for_pi(&app, wid, speaker_id)?;
-                    match base_agent_prompt {
-                        Some(b) if !extra.trim().is_empty() => Some(format!(
-                            "{b}\n\n# NineClaw 团队 · 主智能体执行约束\n\n{extra}"
-                        )),
-                        Some(b) => Some(b),
-                        None if !extra.trim().is_empty() => Some(format!(
-                            "# NineClaw 团队 · 主智能体执行约束\n\n{extra}"
-                        )),
-                        None => None,
-                    }
-                }
-                None => base_agent_prompt,
-            };
-            let merged_agent_prompt = match merged_agent_prompt {
-                Some(prompt) if !desktop_media_prompt.trim().is_empty() => Some(format!(
-                    "{prompt}\n\n# NineClaw 媒体输出\n\n{desktop_media_prompt}"
-                )),
-                Some(prompt) => Some(prompt),
-                None if !desktop_media_prompt.trim().is_empty() => Some(format!(
-                    "# NineClaw 媒体输出\n\n{desktop_media_prompt}"
-                )),
-                None => None,
-            };
-            if let Some(system_prompt) = merged_agent_prompt {
+            if let Some(system_prompt) = base_agent_prompt {
                 system_prompt_chars += system_prompt.chars().count();
                 system_prompt_sections.push((
                     "agent_system_prompt".to_string(),
                     system_prompt.clone(),
                 ));
                 command.args(["--append-system-prompt", &system_prompt]);
-                base_system_prompt_injected = true;
             }
 
             let memory_isolation_prompt = "记忆隔离规则：当前智能体只能使用自己的私有工作区记忆。禁止读取、引用、总结或迁移其他智能体 `agents/<other-agent-id>/` 下的任何 markdown 记忆文件。";
@@ -4764,20 +4821,7 @@ async fn stream_pi_prompt(
             ]);
 
             if let Some(ref wid) = workspace_id_for_stream {
-                match team_workspace::build_workspace_preface(&app, wid, speaker_id) {
-                    Ok(preface) => {
-                        system_prompt_chars += preface.chars().count();
-                        system_prompt_sections.push(("workspace_team".into(), preface.clone()));
-                        command.env("NINECLAW_WORKSPACE_ID", wid);
-                        command.args(["--append-system-prompt", &preface]);
-                    }
-                    Err(error) => {
-                        dev_trace(
-                            "desktop.stream",
-                            format!("workspace preface skipped: session={} err={}", normalized_session_id, error),
-                        );
-                    }
-                }
+                command.env("NINECLAW_WORKSPACE_ID", wid);
             }
 
             let skill_decision =
@@ -4823,21 +4867,6 @@ async fn stream_pi_prompt(
                 command.args(["--skill", &skill_path]);
             }
         }
-        if desktop_media_prompt.is_empty() {
-            desktop_media_prompt = desktop_media_reply_prompt(
-                desktop_agent_home.as_deref(),
-                team_artifacts_root_for_media.as_deref(),
-            );
-        }
-        if !base_system_prompt_injected && !desktop_media_prompt.trim().is_empty() {
-            system_prompt_chars += desktop_media_prompt.chars().count();
-            system_prompt_sections.push((
-                "system_prompt".to_string(),
-                desktop_media_prompt.clone(),
-            ));
-            command.args(["--append-system-prompt", &desktop_media_prompt]);
-        }
-
         dev_trace(
             "desktop.stream",
             format!(
@@ -7247,7 +7276,19 @@ fn macos_open_native_dictation_panel(app: tauri::AppHandle) -> Result<(), String
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
@@ -7262,7 +7303,8 @@ pub fn run() {
                 if let Err(error) = std::fs::create_dir_all(&log_dir) {
                     eprintln!("创建日志目录失败: {error}");
                 } else {
-                    let date_logger = fern::DateBased::new(&log_dir, "nineclaw-%Y-%m-%d.log");
+                    let date_logger =
+                        fern::DateBased::new(log_dir.join("nineclaw-"), "%Y-%m-%d.log");
                     let file_dispatch = fern::Dispatch::new().chain(date_logger);
                     let mut log_builder = tauri_plugin_log::Builder::new()
                         .clear_targets()
@@ -7297,6 +7339,34 @@ pub fn run() {
             }
 
             dev_trace("app", "NineClaw 启动");
+            let process_id = std::process::id();
+            log::info!("NineClaw 进程启动 pid={process_id}");
+            match history_app_state::history_db_diagnostics(&app.handle()) {
+                Ok((db_path, session_count, turn_count)) => {
+                    log::info!(
+                        "历史数据库诊断: pid={} path={} sessions={} turns={}",
+                        process_id,
+                        db_path.display(),
+                        session_count,
+                        turn_count
+                    );
+                }
+                Err(error) => {
+                    log::warn!("历史数据库诊断失败: pid={} error={}", process_id, error);
+                }
+            }
+            std::env::set_var("ORT_LOG", "warning");
+            let _ = ort::init()
+                .with_logger(std::sync::Arc::new(
+                    |level, _category, _id, _location, message| match level {
+                        ort::logging::LogLevel::Warning => log::warn!("[onnxruntime] {message}"),
+                        ort::logging::LogLevel::Error | ort::logging::LogLevel::Fatal => {
+                            log::error!("[onnxruntime] {message}")
+                        }
+                        _ => {}
+                    },
+                ))
+                .commit();
             managed_runtime::inject_credential_proxy_app_handle(app.handle().clone());
             resize_main_window_to_screen(&app.handle());
             if let Err(error) = proxy_settings::apply_saved_proxy_settings(&app.handle()) {
@@ -7453,6 +7523,7 @@ pub fn run() {
             chat_delete_session,
             chat_clear_all_sessions,
             chat_migrate_history_v1,
+            sync_history_backup_from_structured,
             list_token_usage_records,
             load_provider_preferences,
             save_provider_preferences,
@@ -7515,6 +7586,19 @@ pub fn run() {
             session_llm_log_get,
             session_llm_log_list,
             session_llm_log_clear,
+            session_workspace_get,
+            session_workspace_switch,
+            session_workspace_reset_to_topic,
+            session_workspace_list_entries,
+            session_workspace_read_file,
+            session_workspace_absolute_path,
+            session_workspace_create_file,
+            session_workspace_create_dir,
+            session_workspace_rename,
+            session_workspace_delete,
+            session_workspace_open_path,
+            session_workspace_reveal_path,
+            session_workspace_import_files,
             llm_log_export_get,
             llm_log_export_set,
             llm_log_export_preview,
@@ -7588,6 +7672,26 @@ pub fn run_scheduler_daemon() -> Result<(), String> {
         .build(app_context())
         .map_err(|error| format!("初始化 scheduler daemon 失败: {error}"))?;
     let app_handle = app.handle().clone();
+    let process_id = std::process::id();
+    log::info!("NineClaw scheduler daemon 启动 pid={process_id}");
+    match history_app_state::history_db_diagnostics(&app_handle) {
+        Ok((db_path, session_count, turn_count)) => {
+            log::info!(
+                "scheduler daemon 历史数据库诊断: pid={} path={} sessions={} turns={}",
+                process_id,
+                db_path.display(),
+                session_count,
+                turn_count
+            );
+        }
+        Err(error) => {
+            log::warn!(
+                "scheduler daemon 历史数据库诊断失败: pid={} error={}",
+                process_id,
+                error
+            );
+        }
+    }
 
     let status = pi_runtime::ensure_runtime_dependencies_impl(&app_handle);
     if !status.pi_available {
@@ -7595,9 +7699,6 @@ pub fn run_scheduler_daemon() -> Result<(), String> {
             "scheduler daemon runtime dependency check: {}",
             status.messages.join(" | ")
         );
-    }
-    if let Err(error) = auto_start_bound_im_services(&app_handle) {
-        log::warn!("scheduler daemon 自动启动 IM 服务失败: {}", error);
     }
 
     scheduler::run_daemon(app_handle)

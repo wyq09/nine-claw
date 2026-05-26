@@ -54,7 +54,7 @@ export function createChatSearchTool(deps) {
       }
       if (input.time_range_start != null) body.time_range_start = input.time_range_start
       if (input.time_range_end != null) body.time_range_end = input.time_range_end
-      const resp = await fetch(`${proxyBase}/chat/${token}/search`, {
+      const resp = await deps.fetchImpl(`${proxyBase}/chat/${token}/search`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),

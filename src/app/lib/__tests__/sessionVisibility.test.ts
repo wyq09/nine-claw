@@ -27,22 +27,22 @@ describe('sessionVisibility', () => {
     expect(isWorkspaceHistoryItem(null)).toBe(false)
   })
 
-  it('filters workspace sessions out of global history', () => {
+  it('keeps workspace sessions visible in global history', () => {
     const items = [
       makeHistoryItem('chat-1'),
       makeHistoryItem('workspace-1', 'ws-1'),
       makeHistoryItem('chat-2'),
     ]
 
-    expect(filterStandaloneHistory(items).map((item) => item.id)).toEqual(['chat-1', 'chat-2'])
+    expect(filterStandaloneHistory(items).map((item) => item.id)).toEqual(['chat-1', 'workspace-1', 'chat-2'])
   })
 
-  it('drops workspace session from standalone active selection', () => {
+  it('keeps workspace session in standalone active selection', () => {
     const workspaceItem = makeHistoryItem('workspace-1', 'ws-1')
     const standaloneItem = makeHistoryItem('chat-1')
 
-    expect(resolveStandaloneActiveHistoryItem(workspaceItem)).toBeNull()
-    expect(resolveStandaloneActiveHistoryId(workspaceItem, 'workspace-1')).toBe('')
+    expect(resolveStandaloneActiveHistoryItem(workspaceItem)).toBe(workspaceItem)
+    expect(resolveStandaloneActiveHistoryId(workspaceItem, 'workspace-1')).toBe('workspace-1')
 
     expect(resolveStandaloneActiveHistoryItem(standaloneItem)).toBe(standaloneItem)
     expect(resolveStandaloneActiveHistoryId(standaloneItem, 'chat-1')).toBe('chat-1')

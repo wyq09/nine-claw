@@ -57,6 +57,7 @@ pub fn merge_from_payload(payload: Option<RuntimeParametersPayload>) -> RuntimeP
     merged
 }
 
+#[allow(dead_code)]
 pub fn current() -> RuntimeParametersPayload {
     RUNTIME_PARAMETERS
         .read()

@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 #[async_trait::async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     fn id(&self) -> &str;
+    #[allow(dead_code)]
     fn dimension(&self) -> usize;
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String>;
 }
@@ -37,6 +38,7 @@ impl ProviderRegistry {
         self.get(&self.default_id)
     }
 
+    #[allow(dead_code)]
     pub fn list_ids(&self) -> Vec<String> {
         self.providers.keys().cloned().collect()
     }

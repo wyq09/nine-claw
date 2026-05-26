@@ -236,8 +236,9 @@ export function ChatView({
         setComposerHasTypedContent(text.trim().length > 0)
       }
     }
+    const composerTextarea = composerTextareaRef.current
     return () => {
-      composerDraftBackupRef.current = composerTextareaRef.current?.value ?? ''
+      composerDraftBackupRef.current = composerTextarea?.value ?? ''
       composerClearRef.current = null
       if (composerSetTextRef) {
         composerSetTextRef.current = null
@@ -341,7 +342,7 @@ export function ChatView({
       cancelled = true
       unlisten?.()
     }
-  }, [onComposerInput])
+  }, [composerDraftBackupRef, onComposerInput])
 
   useEffect(() => {
     const handlePointerMove = (event: PointerEvent) => {

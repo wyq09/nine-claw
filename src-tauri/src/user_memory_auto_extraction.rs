@@ -155,7 +155,7 @@ fn normalize_bucket(raw: &str) -> Option<String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "identity" | "profile" => Some("identity".to_string()),
         "work" | "workflow" => Some("work".to_string()),
-        "writing" | "style" => Some("writing".to_string()),
+        "writing" | "style" | "voice" => Some("writing".to_string()),
         "directive" | "instruction" => Some("directive".to_string()),
         _ => None,
     }
@@ -507,5 +507,31 @@ mod tests {
         let turns = build_conversation_turns(&[], "用户提问", "助手回答");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].turn_index, 1);
+    }
+
+    #[test]
+    fn parse_output_accepts_workflow_voice_and_instruction_aliases() {
+        let raw = r#"{"shouldWrite":true,"memories":[
+            {"bucket":"workflow","text":"用户习惯先规划再执行。","tags":["workflow"]},
+            {"bucket":"voice","text":"用户说话偏好短句直给。","tags":["style"]},
+            {"bucket":"instruction","text":"用户要求以后叫他老公。","tags":["instruction"]}
+        ]}"#;
+        let parsed = parse_output(raw);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].bucket, "work");
+        assert_eq!(
+            parsed[0].tags,
+            vec!["work".to_string(), "workflow".to_string()]
+        );
+        assert_eq!(parsed[1].bucket, "writing");
+        assert_eq!(
+            parsed[1].tags,
+            vec!["writing".to_string(), "style".to_string()]
+        );
+        assert_eq!(parsed[2].bucket, "directive");
+        assert_eq!(
+            parsed[2].tags,
+            vec!["directive".to_string(), "instruction".to_string()]
+        );
     }
 }

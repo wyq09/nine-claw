@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
@@ -335,6 +335,8 @@ pub(crate) fn repair_runtime_directory(root: &Path) -> Result<(), String> {
     {
         let _ = Command::new("xattr")
             .args(["-cr", root.to_string_lossy().as_ref()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
     }
 

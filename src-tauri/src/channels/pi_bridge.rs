@@ -1,3 +1,4 @@
+use crate::agent_turn_context;
 use crate::agents::{self, ConversationAgentConfig};
 use crate::dev_trace::{dev_trace, dev_trace_block};
 use crate::managed_runtime;
@@ -27,17 +28,6 @@ fn pi_reuse_im_enabled() -> bool {
     std::env::var("NINECLAW_PI_REUSE_IM")
         .map(|value| value.trim() == "1")
         .unwrap_or(false)
-}
-
-fn channel_formatting_prompt(channel_id: &str) -> Option<&'static str> {
-    let normalized = channel_id.trim().to_ascii_lowercase();
-    if normalized.starts_with("wechat:") || normalized == "wechat" {
-        Some(
-            "当前通道是微信。默认只用纯文本自然段回复，不要使用 Markdown 标题、列表、表格、加粗、代码块或项目符号；除非用户明确要求，否则不要输出任何 Markdown 结构。",
-        )
-    } else {
-        None
-    }
 }
 
 struct ImPooledPi {
@@ -213,8 +203,7 @@ impl PiRunHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        channel_formatting_prompt, fingerprint_im_pi_turn, BotSlashCommand, PiBridge,
-        ProviderRuntimeConfig,
+        fingerprint_im_pi_turn, BotSlashCommand, PiBridge, ProviderRuntimeConfig,
     };
     use crate::pi_runtime::{PiRuntimeLocation, PiRuntimeSource};
     use serde_json::json;
@@ -452,13 +441,6 @@ mod tests {
     }
 
     #[test]
-    fn channel_formatting_prompt_only_applies_to_wechat() {
-        let prompt = channel_formatting_prompt("wechat:test-agent").expect("wechat prompt");
-        assert!(prompt.contains("纯文本自然段"));
-        assert!(channel_formatting_prompt("lark:test-agent").is_none());
-    }
-
-    #[test]
     fn slash_new_deletes_existing_im_session_file() {
         let bridge = PiBridge::new(
             PiRuntimeLocation {
@@ -561,9 +543,8 @@ enum BotSlashCommand {
 }
 
 /// Manages pi sessions for bot channel message processing.
-/// Temporary IM session context stays isolated per (channel_id, user_id) pair.
-/// Long-term memory is still shared at the agent workspace layer because each
-/// turn re-injects the bound agent's md files into the system prompt.
+/// Runtime IM context stays keyed by channel/user. Frontend chat history keeps
+/// using its original visible session id so old history remains addressable.
 pub struct PiBridge {
     // sessions field reserved for future persistent-session reuse
     #[allow(dead_code)]
@@ -601,16 +582,13 @@ impl PiBridge {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_runtime_dir(mut self, dir: PathBuf) -> Self {
         self.runtime_dir_override = Some(dir);
         self
     }
 
-    /// Generate a deterministic session key from (channel, user) pair.
-    ///
-    /// Cross-channel sharing belongs to the persistent workspace memory layer,
-    /// not the transient IM session file. We intentionally keep bot sessions
-    /// isolated so WeChat and Lark can each maintain their own short-term turns.
+    /// Generate the deterministic runtime key for one IM channel/user pair.
     fn session_key(&self, channel_id: &str, user_id: &str) -> String {
         let mut hasher = Md5::new();
         hasher.update(format!("nineclaw:{}:{}", channel_id, user_id).as_bytes());
@@ -835,6 +813,7 @@ impl PiBridge {
         }
     }
 
+    #[allow(dead_code)]
     fn normalized_runtime_base_url(&self) -> String {
         match Self::normalize_provider_api_format(&self.api_format, self.provider_id.trim()) {
             "anthropic" => Self::normalize_anthropic_base_url(&self.base_url),
@@ -884,6 +863,7 @@ impl PiBridge {
         }
     }
 
+    #[allow(dead_code)]
     fn build_provider_models_config(&self) -> Option<serde_json::Value> {
         Self::build_provider_models_config_from_config(
             &ProviderRuntimeConfig {
@@ -1357,10 +1337,26 @@ impl PiBridge {
             }
         }
         let runtime_dir = self.prepare_runtime_dir(&key)?;
-        let prompt_with_summary =
+        let mut turn_prompt =
             crate::build_turn_prompt_with_multimodal_summary(prompt, &key, attachments)?;
-        let prepared_input =
-            prompt_attachments::prepare_prompt_input(&prompt_with_summary, attachments)?;
+        let mut turn_context_blocks = Vec::new();
+        if !channel_id.trim().starts_with("nc:") {
+            agent_turn_context::extend_with_block(
+                &mut turn_context_blocks,
+                "im_channel_context",
+                crate::prompts::im_turn_context_note(channel_id),
+            );
+        }
+        if let Some(agent_config) = agent_config.as_ref() {
+            turn_context_blocks.extend(agent_turn_context::build_session_context_blocks(
+                agent_config,
+                Some(key.as_str()),
+                prompt,
+            )?);
+        }
+        turn_prompt =
+            agent_turn_context::wrap_turn_context_message(&turn_prompt, &turn_context_blocks);
+        let prepared_input = prompt_attachments::prepare_prompt_input(&turn_prompt, attachments)?;
         let agent_home = agent_config.as_ref().and_then(|agent_config| {
             crate::agent_workspace::resolve_workspace_root()
                 .ok()
@@ -1411,7 +1407,7 @@ impl PiBridge {
                 &self.pi_runtime.executable,
                 &runtime_dir,
                 agent_config,
-                Some(prepared_input.message.as_str()),
+                Some(prompt),
                 &key,
                 Some(provider_config),
                 None,
@@ -1511,7 +1507,6 @@ impl PiBridge {
         let mut system_prompt_chars = 0usize;
         let mut system_prompt_sections: Vec<(String, String)> = Vec::new();
         if let Some(agent_config) = agent_config.as_ref() {
-            let media_prompt = "当前回复目标是 IM 用户。NineClaw 已具备把本地图片、文件、视频发送给用户的能力，微信等通道会在你输出媒体指令后自动上传并下发。用户要图片或文件时，不要回答“当前通道不支持”“不能稳定发送”“只能读取展示”之类的限制性描述；如果文件已经存在或刚生成，请直接单独输出一行 `::nc-media{type=\"image|file|video\" path=\"/absolute/path/to/file\"}`。该指令行不要附加解释文字；普通文本说明单独写在其他行。若你在正文里单独列出本地绝对路径，NineClaw 也会把它视为待发送媒体，但优先使用 `::nc-media`。";
             if let Ok(workspace_root) = crate::agent_workspace::resolve_workspace_root() {
                 let agent_home = workspace_root.join("agents").join(&agent_config.id);
                 cmd.current_dir(&agent_home)
@@ -1524,11 +1519,8 @@ impl PiBridge {
             if let Some(system_prompt) = agents::build_agent_system_prompt_for_session_prompt(
                 agent_config,
                 Some(key.as_str()),
-                Some(prepared_input.message.as_str()),
-            )
-            .map(|prompt| format!("{prompt}\n\n# NineClaw 媒体输出\n\n{media_prompt}"))
-            .or_else(|| Some(format!("# NineClaw 媒体输出\n\n{media_prompt}")))
-            {
+                None,
+            ) {
                 system_prompt_chars += system_prompt.chars().count();
                 system_prompt_sections
                     .push(("agent_system_prompt".to_string(), system_prompt.clone()));
@@ -1542,16 +1534,9 @@ impl PiBridge {
             ));
             cmd.args(["--append-system-prompt", memory_isolation_prompt]);
 
-            if let Some(channel_prompt) = channel_formatting_prompt(channel_id) {
-                system_prompt_chars += channel_prompt.chars().count();
-                system_prompt_sections
-                    .push(("channel_formatting".to_string(), channel_prompt.to_string()));
-                cmd.args(["--append-system-prompt", channel_prompt]);
-            }
-
             let skill_decision = crate::skill_broker::select_skills_for_turn(
                 agent_config,
-                prepared_input.message.as_str(),
+                prompt,
                 &[],
             )?;
             if let Some(skill_prompt) = crate::skill_broker::runtime_skill_prompt(&skill_decision) {

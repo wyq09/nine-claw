@@ -1,4 +1,4 @@
-use crate::agent_workspace;
+use crate::{agent_workspace, session_workspace};
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as Base64Engine};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -28,7 +28,7 @@ pub struct PersistedChatAttachment {
 pub fn persist_chat_attachments(
     agent_id: &str,
     session_id: Option<&str>,
-    team_artifacts_root: Option<&Path>,
+    session_workspace_root: Option<&Path>,
     uploads: Vec<ChatAttachmentUpload>,
 ) -> Result<Vec<PersistedChatAttachment>, String> {
     let trimmed_agent_id = agent_id.trim();
@@ -47,8 +47,8 @@ pub fn persist_chat_attachments(
     let mut persisted = Vec::new();
     for upload in uploads {
         let prepared = prepare_upload(upload)?;
-        let path = if let Some(root) = team_artifacts_root {
-            agent_workspace::persist_team_artifacts_inbound_file(
+        let path = if let Some(root) = session_workspace_root {
+            session_workspace::persist_inbound_file(
                 root,
                 scope,
                 &prepared.file_name,
@@ -181,5 +181,49 @@ fn infer_attachment_kind(reference: &str, mime_type: &str) -> &'static str {
         "audio"
     } else {
         "file"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "nineclaw-chat-attachments-{name}-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[test]
+    fn persists_uploads_under_session_workspace_root_when_available() {
+        let _guard = crate::workspace_env_test_lock();
+        let workspace_root = temp_root("agent-root");
+        let session_root = temp_root("session-root");
+        std::env::set_var("NINECLAW_WORKSPACE_ROOT", &workspace_root);
+
+        let persisted = persist_chat_attachments(
+            "agent-1",
+            Some("session-1"),
+            Some(&session_root),
+            vec![ChatAttachmentUpload {
+                file_name: "note.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                data_base64: Some(BASE64_ENGINE.encode(b"hello")),
+                source_path: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(persisted.len(), 1);
+        let canonical_session_root = session_root.canonicalize().unwrap();
+        let path = std::path::PathBuf::from(&persisted[0].file_path);
+        assert!(path.starts_with(&canonical_session_root));
+        assert!(path.to_string_lossy().contains("chat-inbox"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+        let _ = std::fs::remove_dir_all(session_root);
+        std::env::remove_var("NINECLAW_WORKSPACE_ROOT");
     }
 }

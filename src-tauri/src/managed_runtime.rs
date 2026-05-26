@@ -19,8 +19,10 @@ use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::Emitter;
 use uuid::Uuid;
 
 const SESSIONS_DIR: &str = "memory/sessions";
@@ -29,7 +31,6 @@ const HARNESS_DEFAULT_FILE: &str = "harness/default.json";
 const HARNESS_CHAT_FILE: &str = "harness/chat.json";
 const HARNESS_CODE_FILE: &str = "harness/code.json";
 const HARNESS_CREDENTIALS_FILE: &str = "harness/credentials.json";
-const SESSION_CONTEXT_CHAR_LIMIT: usize = 520;
 const DEFAULT_SESSION_REPLAY_LIMIT: usize = 12;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,7 +107,9 @@ pub struct SelectedHarness {
 pub struct PreparedManagedRuntime {
     pub extension_path: PathBuf,
     pub harness: SelectedHarness,
+    #[allow(dead_code)]
     pub llm_proxy: Option<LlmProxyBinding>,
+    #[allow(dead_code)]
     pub image_proxy: Option<ImageGenerationRuntimeConfig>,
     pub proxy_base_url: Option<String>,
     pub session_token: Option<String>,
@@ -1151,6 +1154,9 @@ fn credential_proxy_server() -> Result<&'static CredentialProxyServer, String> {
         .route("/memory/:token/forget", post(memory_forget_handler))
         .route("/memory/:token/list", post(memory_list_handler))
         .route("/chat/:token/search", post(chat_search_handler))
+        .route("/task/:token/create", post(task_create_handler))
+        .route("/task/:token/list", post(task_list_handler))
+        .route("/task/:token/detail", post(task_detail_handler))
         .with_state(state.clone());
     tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::from_std(listener) {
@@ -1481,7 +1487,10 @@ async fn delegate_proxy_handler(
             .unwrap_or((None, None, None, None, None))
     };
     let Some(llm) = llm_binding else {
-        log::warn!("delegate_proxy: 未找到 session 或 LLM 配置 token={}", token.len());
+        log::warn!(
+            "delegate_proxy: 未找到 session 或 LLM 配置 token={}",
+            token.len()
+        );
         return Err((
             StatusCode::UNAUTHORIZED,
             "unknown session or no LLM config".to_string(),
@@ -1588,6 +1597,92 @@ async fn delegate_proxy_handler(
         provider_config.model,
     );
 
+    // Generate runId for real-time event tracking
+    let run_id = Uuid::new_v4().simple().to_string();
+
+    // Emit delegate.progress event (status: "running")
+    let ws_id_for_progress = workspace_id.clone();
+    let _ = app_handle.emit(
+        "workspace:delegate:progress",
+        serde_json::json!({
+            "runId": run_id,
+            "workspaceId": ws_id_for_progress,
+            "agentId": agent.id,
+            "agentName": agent.name,
+            "status": "running",
+        }),
+    );
+
+    // Build event callbacks that emit Tauri events
+    let app_for_chunk_cb = app_handle.clone();
+    let run_id_for_chunk_cb = run_id.clone();
+    let ws_id_for_chunk_cb = workspace_id.clone();
+    let on_chunk_cb: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |chunk: &str| {
+        if !chunk.is_empty() {
+            let _ = app_for_chunk_cb.emit(
+                "workspace:delegate:chunk",
+                serde_json::json!({
+                    "runId": run_id_for_chunk_cb,
+                    "workspaceId": ws_id_for_chunk_cb,
+                    "deltaText": chunk,
+                }),
+            );
+        }
+    });
+
+    let app_for_tool_cb = app_handle.clone();
+    let run_id_for_tool_cb = run_id.clone();
+    let ws_id_for_tool_cb = workspace_id.clone();
+    let seen_tool_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let tool_counter: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let on_tool_cb: Arc<dyn Fn(&str, &str, &str) + Send + Sync> =
+        Arc::new(move |tool_call_id: &str, tool_name: &str, status: &str| {
+            let is_new = if !tool_call_id.is_empty() {
+                seen_tool_ids
+                    .lock()
+                    .map(|mut s| s.insert(tool_call_id.to_string()))
+                    .unwrap_or(true)
+            } else {
+                true
+            };
+            let index = if is_new {
+                tool_counter.fetch_add(1, Ordering::SeqCst)
+            } else {
+                tool_counter.load(Ordering::SeqCst).saturating_sub(1)
+            };
+            let _ = app_for_tool_cb.emit(
+                "workspace:delegate:tool",
+                serde_json::json!({
+                    "runId": run_id_for_tool_cb,
+                    "workspaceId": ws_id_for_tool_cb,
+                    "toolIndex": index,
+                    "toolCallId": tool_call_id,
+                    "toolName": tool_name,
+                    "status": status,
+                }),
+            );
+        });
+
+    let app_for_turn_cb = app_handle.clone();
+    let run_id_for_turn_cb = run_id.clone();
+    let ws_id_for_turn_cb = workspace_id.clone();
+    let on_turn_cb: Arc<dyn Fn(u32) + Send + Sync> = Arc::new(move |turn_index: u32| {
+        let _ = app_for_turn_cb.emit(
+            "workspace:delegate:turn",
+            serde_json::json!({
+                "runId": run_id_for_turn_cb,
+                "workspaceId": ws_id_for_turn_cb,
+                "turnIndex": turn_index,
+            }),
+        );
+    });
+
+    let event_cbs = crate::agent_loop::DelegateEventCallbacks {
+        on_chunk: Some(on_chunk_cb),
+        on_tool: Some(on_tool_cb),
+        on_turn: Some(on_turn_cb),
+    };
+
     // Execute delegation (blocking call with PiBridge)
     let app = app_handle.clone();
     let agent_id = agent.id.clone();
@@ -1599,6 +1694,8 @@ async fn delegate_proxy_handler(
         Some(body.context.clone())
     };
     let trace_id_for_delegate = trace_id.clone();
+    let run_id_for_done = run_id.clone();
+    let ws_id_for_done = workspace_id.clone();
 
     let result = tauri::async_runtime::spawn_blocking(move || {
         log::info!(
@@ -1613,6 +1710,7 @@ async fn delegate_proxy_handler(
             context.as_deref(),
             &provider_config,
             Some(trace_id_for_delegate.as_str()),
+            event_cbs,
         );
         log::info!(
             "delegate_proxy: spawn_blocking 完成 agent_id={} status={} output_len={}",
@@ -1627,6 +1725,24 @@ async fn delegate_proxy_handler(
         log::error!("delegate_proxy: spawn_blocking JoinError: {e}");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
+
+    // Emit delegate.done event
+    let done_status = if result.status == "success" {
+        "success"
+    } else {
+        "error"
+    };
+    let _ = app_handle.emit(
+        "workspace:delegate:done",
+        serde_json::json!({
+            "runId": run_id_for_done,
+            "workspaceId": ws_id_for_done,
+            "status": done_status,
+            "agentId": result.agent_id,
+            "agentName": result.agent_name,
+            "durationMs": result.duration_ms,
+        }),
+    );
 
     // Finalize trace
     let final_status = if result.status == "success" {
@@ -1657,6 +1773,7 @@ async fn delegate_proxy_handler(
         "agentId": result.agent_id,
         "agentName": result.agent_name,
         "durationMs": result.duration_ms,
+        "runId": run_id,
         "error": if result.status == "success" { Value::Null } else { Value::String(result.output.clone()) }
     })))
 }
@@ -2455,7 +2572,7 @@ async fn memory_save_handler(
     })?;
     let session = resolve_proxy_session(&state, &token)?;
     let workspace_id = resolve_memory_workspace(&state, &token, body.workspace_id.as_deref())?;
-    let conn =
+    let _conn =
         crate::storage_conn(&app_handle).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let memory_id = format!("saved::{}", uuid::Uuid::new_v4().simple());
@@ -2956,6 +3073,157 @@ fn response_with_status(status: StatusCode, message: &str) -> Response<Body> {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskCreateRequest {
+    goal: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default = "default_task_create_task_type")]
+    task_type: String,
+    schedule_type: String,
+    #[serde(default)]
+    timezone: String,
+    #[serde(default)]
+    interval_minutes: Option<i64>,
+    #[serde(default)]
+    daily_times: Vec<String>,
+    #[serde(default)]
+    weekly_days: Vec<u32>,
+    #[serde(default)]
+    monthly_days: Vec<u32>,
+    #[serde(default)]
+    run_at_ms: Option<i64>,
+    #[serde(default)]
+    result_in_new_session: bool,
+}
+
+fn default_task_create_task_type() -> String {
+    "agent_prompt".to_string()
+}
+
+async fn task_create_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<TaskCreateRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入".to_string(),
+        )
+    })?;
+    let session = resolve_proxy_session(&state, &token)?;
+    let agent_id = session
+        .caller_agent_id
+        .clone()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "缺少 agent_id".to_string()))?;
+    let source_session_id = session
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "unknown_session".to_string());
+
+    let input = crate::agent_tasks::AgentTaskCreateInput {
+        goal: body.goal,
+        title: body.title,
+        task_type: body.task_type,
+        schedule_type: body.schedule_type,
+        timezone: body.timezone,
+        interval_minutes: body.interval_minutes,
+        daily_times: body.daily_times,
+        weekly_days: body.weekly_days,
+        monthly_days: body.monthly_days,
+        run_at_ms: body.run_at_ms,
+        result_in_new_session: body.result_in_new_session,
+    };
+
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        crate::agent_tasks::create_task(&app_handle, &agent_id, &source_session_id, &input)
+    })
+    .await
+    .map_err(|e| {
+        log::error!("task_create: spawn_blocking JoinError: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "data": task,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskListRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    schedule_type: Option<String>,
+}
+
+async fn task_list_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<TaskListRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入".to_string(),
+        )
+    })?;
+    let session = resolve_proxy_session(&state, &token)?;
+    let agent_id = session.caller_agent_id.as_deref();
+
+    let tasks = crate::agent_tasks::list_tasks_filtered(
+        &app_handle,
+        agent_id,
+        body.status.as_deref(),
+        body.schedule_type.as_deref(),
+    )
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "data": tasks,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskDetailRequest {
+    task_id: String,
+}
+
+async fn task_detail_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<TaskDetailRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app_handle = APP_HANDLE.get().cloned().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AppHandle 尚未注入".to_string(),
+        )
+    })?;
+    let _session = resolve_proxy_session(&state, &token)?;
+
+    let task = crate::agent_tasks::get_task_detail(&app_handle, &body.task_id)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    match task {
+        Some(item) => Ok(Json(serde_json::json!({
+            "ok": true,
+            "data": item,
+        }))),
+        None => Ok(Json(serde_json::json!({
+            "ok": false,
+            "error": "未找到对应的定时任务",
+        }))),
+    }
 }
 
 #[cfg(test)]

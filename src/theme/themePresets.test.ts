@@ -2,6 +2,30 @@ import { describe, expect, it } from 'vitest'
 import { THEME_OPTIONS, THEME_PRESETS, THEME_VARIABLE_KEYS } from './themePresets'
 
 describe('themePresets', () => {
+  it('exposes the paper ink preset in theme options', () => {
+    expect(THEME_OPTIONS).toContainEqual({
+      value: 'paper_ink',
+      label: '纸案·蓝批',
+    })
+  })
+
+  it('maps paper ink core tokens to the warm editorial palette', () => {
+    const preset = THEME_PRESETS.paper_ink
+
+    expect(preset.colorScheme).toBe('light')
+    expect(preset.variables['--app-bg']).toBe('#f5f4ed')
+    expect(preset.variables['--panel']).toBe('#faf9f5')
+    expect(preset.variables['--sidebar-bg']).toBe('#efede4')
+    expect(preset.variables['--blue']).toBe('#1b365d')
+    expect(preset.variables['--text']).toBe('#141413')
+    expect(preset.variables['--text-muted']).toBe('#4d4c48')
+    expect(preset.variables['--text-soft']).toBe('#87867f')
+    expect(preset.variables['--control-border-focus']).toBe('#1b365d')
+    expect(preset.variables['--font-display']).toContain('仓耳今楷 02')
+    expect(preset.variables['--font-sans']).toContain('Source Han Sans SC')
+    expect(preset.variables['--mono-font']).toContain('JetBrains Mono')
+  })
+
   it('exposes the shrimp tide preset in theme options', () => {
     expect(THEME_OPTIONS).toContainEqual({
       value: 'shrimp_tide',

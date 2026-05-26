@@ -20,6 +20,7 @@ import {
   WidgetSegmentsContext,
   type WidgetSegmentsContextValue,
 } from '../widgets/WidgetSegmentsContext'
+import { SessionWorkspacePanel } from './panels/SessionWorkspacePanel'
 
 export type WorkspaceChatPageProps = Omit<ChatViewProps, 'onSubmit'> & {
   workspaceId: string
@@ -452,33 +453,40 @@ export function WorkspaceChatPage({
           collapsed={sidebarCollapsed}
           onToggleCollapsed={() => setSidebarCollapsed((v) => !v)}
         />
-        <div className="workspace-chat-surface">
-          <DelegateSegmentsContext.Provider value={delegateCtxValue}>
-            <WidgetSegmentsContext.Provider value={widgetCtxValue}>
-              <ChatView
-                {...chatProps}
-                onSubmit={handleWorkspaceSubmit}
-                composerSetTextRef={composerSetTextRef}
-                workspaceComposerNoteMode={isNoteMode}
-                workspaceComposerPlaceholder={
-                  isNoteMode
-                    ? '旁白：Enter 保存便签，Shift+Enter 换行；关闭「旁白」后照常发送，便签会一并注入。'
-                    : null
-                }
-                workspaceHomeSlot={homeSlot}
-                workspaceHomeTitle={workspaceHomeTitle}
-                workspaceComposerOverlay={
-                  <>
-                    {notesChipRow}
-                    {mentionChipRow}
-                    {mentionPopover}
-                  </>
-                }
-                onComposerInput={handleComposerInput}
-                resolveSpeaker={resolveSpeaker}
-              />
-            </WidgetSegmentsContext.Provider>
-          </DelegateSegmentsContext.Provider>
+        <div className="workspace-chat-surface-with-session-workspace">
+          <div className="workspace-chat-surface">
+            <DelegateSegmentsContext.Provider value={delegateCtxValue}>
+              <WidgetSegmentsContext.Provider value={widgetCtxValue}>
+                <ChatView
+                  {...chatProps}
+                  onSubmit={handleWorkspaceSubmit}
+                  composerSetTextRef={composerSetTextRef}
+                  workspaceComposerNoteMode={isNoteMode}
+                  workspaceComposerPlaceholder={
+                    isNoteMode
+                      ? '旁白：Enter 保存便签，Shift+Enter 换行；关闭「旁白」后照常发送，便签会一并注入。'
+                      : null
+                  }
+                  workspaceHomeSlot={homeSlot}
+                  workspaceHomeTitle={workspaceHomeTitle}
+                  workspaceComposerOverlay={
+                    <>
+                      {notesChipRow}
+                      {mentionChipRow}
+                      {mentionPopover}
+                    </>
+                  }
+                  onComposerInput={handleComposerInput}
+                  resolveSpeaker={resolveSpeaker}
+                />
+              </WidgetSegmentsContext.Provider>
+            </DelegateSegmentsContext.Provider>
+          </div>
+          <SessionWorkspacePanel
+            sessionId={chatProps.activeHistoryId || null}
+            modelLabel={chatProps.activeHistoryItem?.sessionLlmModel ?? null}
+            onAddToComposer={(text) => composerSetTextRef.current?.(text)}
+          />
         </div>
         {workspace ? (
           <TeamDrawer

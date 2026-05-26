@@ -3,7 +3,13 @@ import { startTransition, useCallback, useEffect, useEffectEvent, useRef, useSta
 import { listen } from '@tauri-apps/api/event'
 import {
   abortPiStream,
-  clearHistoryState,
+  chatAppendTurn,
+  chatClearAllSessions,
+  chatCreateSession,
+  chatDeleteSession,
+  chatGetSessionDetail,
+  chatListSessions,
+  chatUpdateTurn,
   clearPiSession,
   clearPiSessionForId,
   ensureRuntimeDependencies,
@@ -20,6 +26,8 @@ import {
   widgetSubmitResponse,
 } from '../lib/piClient'
 import type { BotMessageEvent } from '../lib/piClient'
+import { sessionDetailToHistoryItem, sessionListItemToHistoryItem } from '../lib/chatAdapter'
+import { buildPromptWithAttachments, stripAttachmentDirectivesFromPrompt } from '../lib/composerAttachments'
 import { generateSessionConversationTitle } from '../lib/sessionTitleClient'
 import { isToolLoopGuardBlockResult } from '../lib/toolLoopGuard'
 import {
@@ -48,6 +56,15 @@ import {
   appendOrReplaceWidgetSegment,
 } from './piAgent/piAgentWidgets'
 import {
+  buildPersistedBotConversationForInbound,
+  serializeConversationTurnForStructuredUpdate,
+} from './piAgent/botHistoryPersistence'
+import {
+  resolveHydratedHistorySources,
+  type StructuredHistoryLoadResult,
+} from './piAgent/historyHydration'
+import { persistAttachmentsForSessionWorkspace } from './piAgent/sessionWorkspaceAttachments'
+import {
   appendAgentTaskDeliveriesToHistory,
   appendTextToSegments,
   buildBotConversationTitle,
@@ -62,8 +79,6 @@ import {
   extractTokenUsage,
   HISTORY_STORAGE_KEY,
   loadLegacyHistoryFromStorage,
-  MAX_HISTORY_ITEMS,
-  parseHistorySnapshot,
   parseUsageFromPayload,
   truncateTitle,
   updateLatestActivityState,
@@ -72,6 +87,9 @@ import {
 import { parseWidgetSegment } from '../widgetTypes'
 
 export { getHistoryStatusLabel } from './piAgent/piAgentPure'
+
+const HISTORY_PERSIST_DELAY_IDLE_MS = 10
+const HISTORY_PERSIST_DELAY_RUNNING_MS = 20
 
 /** 让出主线程，便于浏览器先完成上一轮 paint，再进入长时间 `invoke` */
 function yieldToNextPaint(): Promise<void> {
@@ -113,22 +131,29 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
   const historyHydratedRef = useRef(false)
   /** 仅在为 true 时允许把内存写回 SQLite：初始加载失败时必须为 false，否则会误用 [] 覆盖库内数据 */
   const historyPersistAllowedRef = useRef(false)
+  const saveHistoryTimerRef = useRef<number | null>(null)
+  const saveHistoryDueAtRef = useRef<number | null>(null)
+  const saveHistoryInFlightRef = useRef<Promise<void> | null>(null)
+  const saveHistoryAfterFlightRef = useRef(false)
 
-  const updateHistoryItem = (id: string, updater: (item: HistoryItem) => HistoryItem) => {
+  const updateHistoryItem = useCallback((id: string, updater: (item: HistoryItem) => HistoryItem) => {
     setHistory((previous) => previous.map((item) => (item.id === id ? updater(item) : item)))
-  }
+  }, [])
 
-  const updateTurn = (
-    historyId: string,
-    turnId: string,
-    updater: (turn: ConversationTurn) => ConversationTurn,
-  ) => {
-    updateHistoryItem(historyId, (item) => ({
-      ...item,
-      updatedAt: Date.now(),
-      turns: item.turns.map((turn) => (turn.id === turnId ? updater(turn) : turn)),
-    }))
-  }
+  const updateTurn = useCallback(
+    (
+      historyId: string,
+      turnId: string,
+      updater: (turn: ConversationTurn) => ConversationTurn,
+    ) => {
+      updateHistoryItem(historyId, (item) => ({
+        ...item,
+        updatedAt: Date.now(),
+        turns: item.turns.map((turn) => (turn.id === turnId ? updater(turn) : turn)),
+      }))
+    },
+    [updateHistoryItem],
+  )
 
   const appendActivity = (historyId: string, turnId: string, label: string, detail: string, state: ActivityState) => {
     updateTurn(historyId, turnId, (turn) => ({
@@ -212,6 +237,142 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     setStreamingHistoryIds((previous) => (previous.includes(historyId) ? previous : [...previous, historyId]))
   }
 
+  const persistHistoryItemToStructuredStorage = useCallback(
+    async (item: HistoryItem, turn?: ConversationTurn, options?: { forceCreateSession?: boolean }) => {
+      const shouldCreateSession = options?.forceCreateSession || (!turn && item.turns.length === 0)
+
+      if (shouldCreateSession) {
+        try {
+          await chatCreateSession({
+            id: item.id,
+            title: item.title,
+            status: item.status,
+            agentId: item.agent?.id ?? null,
+            agentSnapshotJson: item.agent ? JSON.stringify(item.agent) : null,
+            botTargetJson: item.botTarget ? JSON.stringify(item.botTarget) : null,
+            sessionLlmProviderId: item.sessionLlmProviderId ?? null,
+            sessionLlmModel: item.sessionLlmModel ?? null,
+            workspaceId: item.workspaceId ?? null,
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          if (!/UNIQUE|already exists|constraint/i.test(message)) {
+            throw error
+          }
+        }
+      }
+
+      if (turn) {
+        await chatAppendTurn({
+          id: turn.id,
+          sessionId: item.id,
+          turnIndex: item.turns.length - 1,
+          prompt: turn.prompt,
+          answer: turn.answer,
+          thinking: turn.thinking,
+          status: turn.status,
+          usageJson: turn.usage ? JSON.stringify(turn.usage) : null,
+          responseSegmentsJson: turn.responseSegments ? JSON.stringify(turn.responseSegments) : null,
+          toolCallsJson: turn.toolCalls.length > 0 ? JSON.stringify(turn.toolCalls) : null,
+          activityJson: turn.activity.length > 0 ? JSON.stringify(turn.activity) : null,
+          speakerAgentId: turn.speakerAgentId ?? null,
+        })
+      }
+    },
+    [],
+  )
+
+  const flushHistoryToStorage = useCallback(async () => {
+    if (!historyHydratedRef.current) {
+      return
+    }
+    if (!historyPersistAllowedRef.current && latestHistoryRef.current.length === 0) {
+      return
+    }
+
+    const payload = JSON.stringify(latestHistoryRef.current)
+    latestHistorySerializedRef.current = payload
+
+    if (saveHistoryInFlightRef.current) {
+      saveHistoryAfterFlightRef.current = true
+      return
+    }
+
+    const run = async () => {
+      try {
+        await saveHistoryState(payload)
+      } catch (error) {
+        console.error('[NineClaw] async history save failed:', error)
+      } finally {
+        saveHistoryInFlightRef.current = null
+        if (saveHistoryAfterFlightRef.current) {
+          saveHistoryAfterFlightRef.current = false
+          void flushHistoryToStorage()
+        }
+      }
+    }
+
+    const promise = run()
+    saveHistoryInFlightRef.current = promise
+    await promise
+  }, [])
+
+  const scheduleHistoryPersist = useCallback((delayMs: number) => {
+    if (!historyHydratedRef.current) {
+      return
+    }
+    if (!historyPersistAllowedRef.current && latestHistoryRef.current.length === 0) {
+      return
+    }
+
+    const now = Date.now()
+    const requestedDelay = Math.max(0, delayMs)
+    const requestedDueAt = now + requestedDelay
+    const currentDueAt = saveHistoryDueAtRef.current
+
+    if (saveHistoryTimerRef.current !== null && currentDueAt !== null && currentDueAt <= requestedDueAt) {
+      return
+    }
+
+    if (saveHistoryTimerRef.current !== null) {
+      window.clearTimeout(saveHistoryTimerRef.current)
+      saveHistoryTimerRef.current = null
+    }
+
+    saveHistoryDueAtRef.current = requestedDueAt
+    saveHistoryTimerRef.current = window.setTimeout(() => {
+      saveHistoryTimerRef.current = null
+      saveHistoryDueAtRef.current = null
+      void flushHistoryToStorage()
+    }, requestedDelay)
+  }, [flushHistoryToStorage])
+
+  const loadHistoryFromStructuredStorage = useCallback(async (): Promise<StructuredHistoryLoadResult> => {
+    const sessions = await chatListSessions()
+    if (sessions.length === 0) {
+      return { history: [], sessionIds: new Set() }
+    }
+
+    const details = await Promise.all(
+      sessions.map(async (session) => {
+        try {
+          const detail = await chatGetSessionDetail(session.id)
+          return detail ? sessionDetailToHistoryItem(detail) : sessionListItemToHistoryItem(session)
+        } catch (error) {
+          console.warn('[NineClaw] load structured session detail failed:', session.id, error)
+          return sessionListItemToHistoryItem(session)
+        }
+      }),
+    )
+
+    const history = details
+      .sort((left, right) => (right.updatedAt || right.createdAt) - (left.updatedAt || left.createdAt))
+    return {
+      history,
+      sessionIds: new Set(history.map((item) => item.id)),
+    }
+  }, [])
+
   const requestLlmSessionTitle = (payload: {
     historyId: string
     agentId: string
@@ -246,6 +407,13 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       })()
     })
   }
+
+  const persistBotTurnUpdateToStructuredStorage = useCallback(
+    async (turn: ConversationTurn) => {
+      await chatUpdateTurn(serializeConversationTurnForStructuredUpdate(turn))
+    },
+    [],
+  )
 
   /** 首轮完成后用智能体「标题生成」模型起名；多轮仅按首轮文案做本地摘要；无智能体则始终本地摘要。 */
   const finalizeHistoryTitleAfterTurn = (historyId: string) => {
@@ -366,26 +534,45 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     let isMounted = true
 
     void (async () => {
+      const legacyHistory = loadLegacyHistoryFromStorage()
       try {
-        const sqlitePayload = await loadHistoryState()
-        let nextHistory = parseHistorySnapshot(sqlitePayload)
+        const [snapshotPayloadResult, structuredResult] = await Promise.allSettled([
+          loadHistoryState(),
+          loadHistoryFromStructuredStorage(),
+        ])
+        const resolution = resolveHydratedHistorySources({
+          snapshotPayloadResult,
+          structuredResult,
+          legacyHistory,
+        })
 
-        if (nextHistory.length === 0) {
-          const legacyHistory = loadLegacyHistoryFromStorage()
-          if (legacyHistory.length > 0) {
-            nextHistory = legacyHistory
-            await saveHistoryState(JSON.stringify(legacyHistory))
-            clearLegacyHistoryStorage()
-          }
+        for (const warning of resolution.warnings) {
+          console.warn('[NineClaw] history hydration warning:', warning)
         }
 
         if (!isMounted) {
           return
         }
 
-        setHistory(nextHistory)
-        setActiveHistoryId((current) => (current && nextHistory.some((item) => item.id === current) ? current : (nextHistory[0]?.id ?? '')))
+        setHistory(resolution.history)
+        setActiveHistoryId((current) =>
+          current && resolution.history.some((item) => item.id === current)
+            ? current
+            : (resolution.history[0]?.id ?? ''),
+        )
         historyPersistAllowedRef.current = true
+
+        if (resolution.usedLegacy) {
+          clearLegacyHistoryStorage()
+        }
+        if (resolution.shouldPersist) {
+          void saveHistoryState(JSON.stringify(resolution.history)).catch((persistError) => {
+            console.warn('[NineClaw] history hydration repair save failed:', persistError)
+          })
+        }
+        if (resolution.history.length === 0 && resolution.warnings.length > 0 && !resolution.loaded) {
+          setError((current) => current || `读取历史会话失败：${resolution.warnings.join(' | ')}`)
+        }
       } catch (loadError) {
         if (!isMounted) {
           return
@@ -404,7 +591,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     return () => {
       isMounted = false
     }
-  }, [])
+  }, [loadHistoryFromStructuredStorage])
 
   useEffect(() => {
     if (!historyHydrated) {
@@ -416,32 +603,28 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     if (!historyPersistAllowedRef.current && history.length === 0) {
       return
     }
-    const delay = runningHistoryIds.length > 0 ? 1200 : 200
-    const timer = window.setTimeout(() => {
-      const serialized = JSON.stringify(history)
-      latestHistorySerializedRef.current = serialized
-      saveHistoryState(serialized).catch((e) => console.error('[NineClaw] auto-save failed:', e))
-    }, delay)
-    return () => {
-      window.clearTimeout(timer)
-    }
-  }, [history, historyHydrated, runningHistoryIds.length])
+    const delay = runningHistoryIds.length > 0
+      ? HISTORY_PERSIST_DELAY_RUNNING_MS
+      : HISTORY_PERSIST_DELAY_IDLE_MS
+    scheduleHistoryPersist(delay)
+  }, [history, historyHydrated, runningHistoryIds.length, scheduleHistoryPersist])
 
   useEffect(() => {
     return () => {
+      if (saveHistoryTimerRef.current !== null) {
+        window.clearTimeout(saveHistoryTimerRef.current)
+        saveHistoryTimerRef.current = null
+      }
+      saveHistoryDueAtRef.current = null
       if (!historyHydratedRef.current) {
         return
       }
       if (!historyPersistAllowedRef.current && latestHistoryRef.current.length === 0) {
         return
       }
-      const payload =
-        latestHistorySerializedRef.current || JSON.stringify(latestHistoryRef.current)
-      if (payload) {
-        saveHistoryState(payload).catch((e) => console.error('[NineClaw] unmount-save failed:', e))
-      }
+      void flushHistoryToStorage()
     }
-  }, [])
+  }, [flushHistoryToStorage])
 
   const handleStreamPayload = useEffectEvent((payload: PiStreamPayload) => {
     const currentHistoryId = payload.sessionId ?? payload.session_id ?? ''
@@ -828,7 +1011,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       isMounted = false
       for (const un of unsubs) un()
     }
-  }, [activeHistoryId])
+  }, [activeHistoryId, updateTurn])
 
   // ── Bot channel message history integration ──
 
@@ -889,7 +1072,20 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
           )
           const current = updated.find((item) => item.id === historyId)
           const others = updated.filter((item) => item.id !== historyId)
-          return current ? [current, ...others].slice(0, MAX_HISTORY_ITEMS) : updated.slice(0, MAX_HISTORY_ITEMS)
+          return current ? [current, ...others] : updated
+        })
+        const existingItem = latestHistoryRef.current.find((item) => item.id === historyId)
+        const persisted = buildPersistedBotConversationForInbound({
+          existingItem,
+          historyId,
+          message: msg,
+          now,
+          turn,
+        })
+        void persistHistoryItemToStructuredStorage(persisted.item, turn, {
+          forceCreateSession: persisted.forceCreateSession,
+        }).catch((error) => {
+          console.error('[NineClaw] async bot inbound save failed:', error)
         })
       } else {
         // First message from this channel:user — create new history item
@@ -908,7 +1104,18 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
           },
           ...(msg.agent ? { agent: msg.agent } : {}),
         }
-        setHistory((prev) => [newSession, ...prev].slice(0, MAX_HISTORY_ITEMS))
+        setHistory((prev) => [newSession, ...prev])
+        const persisted = buildPersistedBotConversationForInbound({
+          historyId,
+          message: msg,
+          now,
+          turn,
+        })
+        void persistHistoryItemToStructuredStorage(persisted.item, turn, {
+          forceCreateSession: persisted.forceCreateSession,
+        }).catch((error) => {
+          console.error('[NineClaw] async bot inbound save failed:', error)
+        })
       }
       return
     }
@@ -934,6 +1141,9 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
 
     if (msg.direction === 'outbound_done') {
       const usage = extractTokenUsage(msg as unknown as Record<string, unknown>)
+      const currentTurn = latestHistoryRef.current
+        .find((item) => item.id === historyId)
+        ?.turns.find((item) => item.id === turnId)
       // Final complete reply → set answer to full text, mark done
       updateHistoryItem(historyId, (item) => withBotAgentMetadata(item, msg))
       updateTurn(historyId, turnId, (turn) => ({
@@ -946,10 +1156,26 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       }))
       updateSessionStatus(historyId, 'done')
       finalizeHistoryTitleAfterTurn(historyId)
+      if (currentTurn) {
+        const updatedTurn: ConversationTurn = {
+          ...currentTurn,
+          answer: msg.content,
+          responseSegments: [{ type: 'text', text: msg.content }],
+          status: 'done',
+          completedAt: currentTurn.completedAt ?? Date.now(),
+          usage: usage ?? currentTurn.usage,
+        }
+        void persistBotTurnUpdateToStructuredStorage(updatedTurn).catch((error) => {
+          console.error('[NineClaw] async bot outbound save failed:', error)
+        })
+      }
       return
     }
 
     if (msg.direction === 'error') {
+      const currentTurn = latestHistoryRef.current
+        .find((item) => item.id === historyId)
+        ?.turns.find((item) => item.id === turnId)
       updateHistoryItem(historyId, (item) => withBotAgentMetadata(item, msg))
       updateTurn(historyId, turnId, (turn) => ({
         ...turn,
@@ -962,6 +1188,20 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       }))
       updateSessionStatus(historyId, 'error')
       finalizeHistoryTitleAfterTurn(historyId)
+      if (currentTurn) {
+        const failedTurn: ConversationTurn = {
+          ...currentTurn,
+          answer: currentTurn.answer || msg.content,
+          responseSegments: currentTurn.answer
+            ? currentTurn.responseSegments
+            : appendTextToSegments(currentTurn.responseSegments, msg.content),
+          status: 'error',
+          completedAt: currentTurn.completedAt ?? Date.now(),
+        }
+        void persistBotTurnUpdateToStructuredStorage(failedTurn).catch((error) => {
+          console.error('[NineClaw] async bot outbound save failed:', error)
+        })
+      }
     }
   })
 
@@ -1127,15 +1367,26 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     },
     options?: { forceNewSession?: boolean },
   ) => {
-    const trimmedPrompt = rawPrompt.trim()
-    if (!trimmedPrompt) {
+    const contextAttachments = context?.attachments ?? []
+    const userPromptText = stripAttachmentDirectivesFromPrompt(rawPrompt).trim()
+    if (!userPromptText && contextAttachments.length === 0) {
       setError('请输入内容')
       return false
     }
+    const trimmedPrompt =
+      contextAttachments.length > 0
+        ? buildPromptWithAttachments(userPromptText, contextAttachments)
+        : userPromptText
+    const titlePrompt =
+      userPromptText ||
+      contextAttachments
+        .map((attachment) => attachment.fileName.trim())
+        .filter(Boolean)
+        .join('、') ||
+      '附件'
 
     const speakerAgentIdForTurn =
       context?.overrideAgentId?.trim() || context?.agent?.id?.trim() || null
-    const turn = buildNewTurn(trimmedPrompt, speakerAgentIdForTurn)
     const nextHistoryId = options?.forceNewSession ? createId() : (activeHistoryId || createId())
 
     const prevFly = desktopStreamFlyRef.current.get(nextHistoryId)
@@ -1143,11 +1394,17 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
 
     const hasActiveConversation =
       !options?.forceNewSession && Boolean(activeHistoryId && history.some((item) => item.id === activeHistoryId))
+    const needsSessionWorkspaceAttachmentPersist = contextAttachments.length > 0 && !hasActiveConversation
+    const initialTurnPrompt =
+      contextAttachments.length > 0 && !needsSessionWorkspaceAttachmentPersist
+        ? buildPromptWithAttachments(userPromptText, contextAttachments)
+        : userPromptText
+    const turn = buildNewTurn(initialTurnPrompt, speakerAgentIdForTurn)
 
     const prevTurnCountForTitle =
       history.find((item) => item.id === nextHistoryId)?.turns.length ?? 0
     if (!hasActiveConversation || prevTurnCountForTitle === 0) {
-      sessionFirstUserPromptRef.current.set(nextHistoryId, trimmedPrompt)
+      sessionFirstUserPromptRef.current.set(nextHistoryId, titlePrompt)
     }
 
     /** 先清输入（同步）；仅将 `setHistory` 放入 transition，减轻长会话下列表 diff / 虚拟列表的同步阻塞 */
@@ -1180,7 +1437,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
               : {}),
           }
 
-          return [nextConversation, ...previous].slice(0, MAX_HISTORY_ITEMS)
+          return [nextConversation, ...previous]
         }
 
         const updated = previous.map((item): HistoryItem =>
@@ -1195,10 +1452,68 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
         )
         const current = updated.find((item) => item.id === nextHistoryId)
         const others = updated.filter((item) => item.id !== nextHistoryId)
-        return current ? [current, ...others].slice(0, MAX_HISTORY_ITEMS) : updated.slice(0, MAX_HISTORY_ITEMS)
+        return current ? [current, ...others] : updated
       })
     })
+
+    const persistedConversation: HistoryItem | null = hasActiveConversation
+      ? (() => {
+          const current = history.find((item) => item.id === nextHistoryId)
+          if (!current) {
+            return null
+          }
+          return {
+            ...current,
+            status: 'running',
+            updatedAt: turn.createdAt,
+            turns: [...current.turns, turn],
+          }
+        })()
+      : {
+          id: nextHistoryId,
+          title: '新会话',
+          status: 'running',
+          createdAt: turn.createdAt,
+          updatedAt: turn.createdAt,
+          turns: [turn],
+          ...(context?.agent ? { agent: context.agent } : {}),
+          ...(context?.workspaceId ? { workspaceId: context.workspaceId } : {}),
+          ...(context?.sessionLlm
+            ? {
+                sessionLlmProviderId: context.sessionLlm.providerId,
+                sessionLlmModel: context.sessionLlm.model,
+              }
+            : context?.providerConfig
+            ? {
+                sessionLlmProviderId: context.providerConfig.providerId,
+                sessionLlmModel: context.providerConfig.model,
+              }
+            : {}),
+        }
+
+    if (persistedConversation) {
+      try {
+        if (needsSessionWorkspaceAttachmentPersist) {
+          await persistHistoryItemToStructuredStorage(
+            { ...persistedConversation, turns: [] },
+            undefined,
+            { forceCreateSession: true },
+          )
+        } else {
+          await persistHistoryItemToStructuredStorage(persistedConversation, turn, {
+            forceCreateSession: !hasActiveConversation,
+          })
+        }
+      } catch (invokeError) {
+        const message = invokeError instanceof Error ? invokeError.message : String(invokeError)
+        setError(`保存会话失败：${message}`)
+        markSessionSettled(nextHistoryId)
+        return false
+      }
+    }
+
     await yieldToNextPaint()
+    scheduleHistoryPersist(0)
 
     desktopStreamHoldRef.current.add(nextHistoryId)
     let streamFly: Promise<void> | undefined
@@ -1229,13 +1544,37 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       receivedFirstDeltaRef.current.set(nextHistoryId, false)
 
       try {
+        const attachmentsForStream = await persistAttachmentsForSessionWorkspace({
+          agentId: speakerAgentIdForTurn,
+          sessionId: nextHistoryId,
+          workspaceId: context?.workspaceId ?? null,
+          attachments: contextAttachments,
+          enabled: contextAttachments.length > 0 && !hasActiveConversation,
+        })
+        const promptForStream =
+          attachmentsForStream.length > 0
+            ? buildPromptWithAttachments(userPromptText, attachmentsForStream)
+            : userPromptText
+        if (promptForStream && promptForStream !== turn.prompt) {
+          updateTurn(nextHistoryId, turn.id, (current) => ({
+            ...current,
+            prompt: promptForStream,
+          }))
+        }
+        if (needsSessionWorkspaceAttachmentPersist && persistedConversation) {
+          await persistHistoryItemToStructuredStorage(
+            { ...persistedConversation, turns: [{ ...turn, prompt: promptForStream || turn.prompt }] },
+            { ...turn, prompt: promptForStream || turn.prompt },
+            { forceCreateSession: false },
+          )
+        }
         await yieldToNextPaint()
         markSessionStreaming(nextHistoryId)
-        streamFly = streamPiPrompt(trimmedPrompt, {
+        streamFly = streamPiPrompt(promptForStream || trimmedPrompt, {
           sessionId: nextHistoryId,
           providerConfig: context?.providerConfig,
           agentConfig: context?.agent,
-          attachments: context?.attachments ?? [],
+          attachments: attachmentsForStream,
           workspaceId: context?.workspaceId ?? null,
           overrideAgentId: context?.overrideAgentId ?? null,
           runtimeParameters: context?.runtimeParameters ?? null,
@@ -1260,9 +1599,9 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
             requestLlmSessionTitle({
               historyId: nextHistoryId,
               agentId: agentIdForTitle,
-              userMsg: trimmedPrompt,
+              userMsg: titlePrompt,
               heuristicTitle: truncateTitle(
-                deriveFirstUserTurnConversationTitle(trimmedPrompt, '新会话'),
+                deriveFirstUserTurnConversationTitle(titlePrompt, '新会话'),
               ),
             })
           } else {
@@ -1377,7 +1716,11 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     const nextConversation = createEmptyHistoryItem(context)
     setError('')
     setActiveHistoryId(nextConversation.id)
-    setHistory((previous) => [nextConversation, ...previous].slice(0, MAX_HISTORY_ITEMS))
+    setHistory((previous) => [nextConversation, ...previous])
+    void persistHistoryItemToStructuredStorage(nextConversation).catch((error) => {
+      console.error('[NineClaw] async empty-session save failed:', error)
+    })
+    queueMicrotask(() => scheduleHistoryPersist(0))
     return nextConversation.id
   }
 
@@ -1426,7 +1769,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     setActiveHistoryId('')
     localStorage.removeItem(HISTORY_STORAGE_KEY)
     clearLegacyHistoryStorage()
-    void clearHistoryState()
+    void chatClearAllSessions()
     void clearPiSession()
   }
 
@@ -1446,10 +1789,22 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       return
     }
 
-    const nextHistory = history.filter((item) => item.id !== trimmedId)
+    const previousHistory = history
+    const previousActiveHistoryId = activeHistoryId
+    const nextHistory = previousHistory.filter((item) => item.id !== trimmedId)
     setHistory(nextHistory)
     setActiveHistoryId((current) => (current === trimmedId ? (nextHistory[0]?.id ?? '') : current))
     setError('')
+
+    try {
+      await chatDeleteSession(trimmedId)
+    } catch (invokeError) {
+      const message = invokeError instanceof Error ? invokeError.message : String(invokeError)
+      setError(`删除会话失败：${message}`)
+      setHistory(previousHistory)
+      setActiveHistoryId(previousActiveHistoryId)
+      return
+    }
 
     try {
       await clearPiSessionForId(trimmedId)

@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { sessionDetailToHistoryItem, turnRowToConversationTurn } from '../../lib/chatAdapter'
-import type { ChatSessionDetail, ChatTurnRow } from '../../types'
+import {
+  sessionDetailToHistoryItem,
+  sessionListItemToHistoryItem,
+  turnRowToConversationTurn,
+} from '../../lib/chatAdapter'
+import type { ChatSessionDetail, ChatSessionListItem, ChatTurnRow } from '../../types'
 
 describe('turnRowToConversationTurn', () => {
   it('converts a basic turn row', () => {
@@ -232,5 +236,40 @@ describe('sessionDetailToHistoryItem', () => {
     const item = sessionDetailToHistoryItem(detail)
 
     expect(item.botTarget).toEqual({ channelId: 'ch1', userId: 'u1' })
+  })
+
+  it('converts a session list item without turns', () => {
+    const item: ChatSessionListItem = {
+      id: 's4',
+      title: 'Recovered Session',
+      status: 'running',
+      created_at: 1700000003000,
+      updated_at: 1700000004000,
+      agent_id: 'agent-1',
+      agent_snapshot_json: JSON.stringify({
+        id: 'agent-1',
+        name: '九节虾',
+      }),
+      bot_target_json: '{"channelId":"wechat","userId":"u42"}',
+      session_llm_provider_id: 'openai',
+      session_llm_model: 'gpt-4o-mini',
+      workspace_id: null,
+      turn_count: 3,
+    }
+
+    const historyItem = sessionListItemToHistoryItem(item)
+
+    expect(historyItem).toMatchObject({
+      id: 's4',
+      title: 'Recovered Session',
+      status: 'running',
+      createdAt: 1700000003000,
+      updatedAt: 1700000004000,
+      sessionLlmProviderId: 'openai',
+      sessionLlmModel: 'gpt-4o-mini',
+      botTarget: { channelId: 'wechat', userId: 'u42' },
+    })
+    expect(historyItem.turns).toEqual([])
+    expect(historyItem.agent?.name).toBe('九节虾')
   })
 })

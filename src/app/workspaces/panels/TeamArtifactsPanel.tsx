@@ -32,6 +32,12 @@ function guessMimeFromFileName(fileName: string): string {
   return map[ext] ?? 'application/octet-stream'
 }
 
+function isHtmlResource(mime: string, fileName: string): boolean {
+  if (mime.toLowerCase().trim() === 'text/html') return true
+  const ext = fileName.split('.').pop()?.toLowerCase()
+  return ext === 'html' || ext === 'htm'
+}
+
 function isTextLikeResource(mime: string, fileName: string): boolean {
   const m = mime.toLowerCase().trim()
   if (
@@ -173,6 +179,11 @@ export function TeamArtifactsPanel({ workspace, onWorkspaceUpdated, onError }: T
         } catch {
           await openLocalFile(path)
         }
+        return
+      }
+      if (isHtmlResource(mime, entry.name)) {
+        const path = await workspaceArtifactAbsolutePath(workspace.id, entry.relPath)
+        await openLocalFile(path)
         return
       }
       if (isTextLikeResource(mime, entry.name)) {

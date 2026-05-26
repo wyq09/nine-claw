@@ -44,6 +44,7 @@ pub(crate) fn resolve_kv_workspace_ui(
     ))
 }
 
+#[allow(dead_code)]
 pub(crate) fn workspace_kv_commit_value(
     app: &AppHandle,
     workspace_id: &str,

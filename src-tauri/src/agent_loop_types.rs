@@ -4,6 +4,8 @@
 //! state, and error types used by `agent_loop.rs` (engine) and `agents.rs`
 //! (data model).
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;

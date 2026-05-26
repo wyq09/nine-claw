@@ -360,6 +360,8 @@ export const VirtualizedChatTurns = forwardRef<VirtualizedChatTurnsHandle, Virtu
     const turnsRef = useRef(turns)
     turnsRef.current = turns
 
+    // TanStack Virtual exposes imperative helpers; memoizing them would make measurement stale.
+    // eslint-disable-next-line react-hooks/incompatible-library
     const virtualizer = useVirtualizer({
       count: turns.length,
       getScrollElement: () => scrollParentRef.current,

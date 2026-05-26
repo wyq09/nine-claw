@@ -1,4 +1,4 @@
-import { Fragment, lazy, Suspense, useMemo, useState } from 'react'
+import { Fragment, lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import type { MouseEvent, ReactNode } from 'react'
 import { Check, Copy } from 'lucide-react'
 import { AppIcon } from '../../components/AppIcon'
@@ -728,6 +728,108 @@ export function ToolCallContentBlock({
   )
 }
 
+/** Real-time progress panel for agent_delegate tool calls during execution. */
+function DelegateLiveProgress() {
+  const [runId, setRunId] = useState<string | null>(null)
+  const [toolCalls, setToolCalls] = useState<{ toolName: string; status: string; toolCallId: string }[]>([])
+  const [turns, setTurns] = useState(0)
+  const [output, setOutput] = useState('')
+  const outputRef = useRef<HTMLPreElement>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    const unsubs: Array<() => void> = []
+    const disposers: Array<Promise<() => void>> = []
+
+    import('@tauri-apps/api/event').then(({ listen }) => {
+      if (cancelled) return
+
+      disposers.push(
+        listen<{ runId: string; agentName?: string; agentId?: string; status: string }>(
+          'workspace:delegate:progress',
+          (event) => {
+            if (cancelled) return
+            setRunId(event.payload.runId)
+          },
+        ),
+      )
+
+      disposers.push(
+        listen<{ runId: string; toolIndex: number; toolCallId: string; toolName: string; status: string }>(
+          'workspace:delegate:tool',
+          (event) => {
+            if (event.payload.runId !== runId && runId !== null) return
+            if (cancelled) return
+            setToolCalls((prev) => {
+              const idx = prev.findIndex((t) => t.toolCallId === event.payload.toolCallId)
+              if (idx >= 0) {
+                const updated = [...prev]
+                updated[idx] = { ...updated[idx], status: event.payload.status }
+                return updated
+              }
+              return [...prev, { toolName: event.payload.toolName, status: event.payload.status, toolCallId: event.payload.toolCallId }]
+            })
+          },
+        ),
+      )
+
+      disposers.push(
+        listen<{ runId: string; turnIndex: number }>('workspace:delegate:turn', (event) => {
+          if (event.payload.runId !== runId && runId !== null) return
+          if (cancelled) return
+          setTurns((prev) => prev + 1)
+        }),
+      )
+
+      disposers.push(
+        listen<{ runId: string; deltaText: string }>('workspace:delegate:chunk', (event) => {
+          if (event.payload.runId !== runId && runId !== null) return
+          if (cancelled) return
+          setOutput((prev) => prev + event.payload.deltaText)
+        }),
+      )
+
+      Promise.all(disposers).then((fns) => {
+        if (cancelled) { fns.forEach((fn) => fn()); return }
+        unsubs.push(...fns)
+      }).catch(() => {})
+    })
+
+    return () => {
+      cancelled = true
+      unsubs.forEach((fn) => { try { fn() } catch { /* noop */ } })
+    }
+  }, [runId])
+
+  useEffect(() => {
+    if (outputRef.current) outputRef.current.scrollTop = outputRef.current.scrollHeight
+  }, [output])
+
+  return (
+    <div className="delegate-live-progress">
+      <div className="delegate-live-progress-header">
+        <span className="delegate-live-dot" aria-hidden />
+        <span>{toolCalls.length} 次工具调用 · 思考 {turns} 轮</span>
+      </div>
+      {toolCalls.length > 0 ? (
+        <ul className="delegate-live-tool-list">
+          {toolCalls.map((tc, i) => (
+            <li key={`${tc.toolCallId}-${i}`} className={`delegate-live-tool-item is-${tc.status}`}>
+              <code>{tc.toolName}</code>
+              <span className="delegate-live-tool-status">
+                {tc.status === 'running' ? '进行中' : tc.status === 'error' ? '出错' : '完成'}
+              </span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {output ? (
+        <pre ref={outputRef} className="delegate-live-output">{output}</pre>
+      ) : null}
+    </div>
+  )
+}
+
 export function ToolRoundIoPanels({
   toolCall,
   onImageClick,
@@ -813,7 +915,9 @@ export function ToolRoundIoPanels({
           </button>
         </div>
         <div className={`tool-io-panel-body${delegateResult ? ' tool-io-panel-body-delegate' : ''}`}>
-          {delegateResult ? (
+          {isDelegateTool && isStreaming ? (
+            <DelegateLiveProgress />
+          ) : delegateResult ? (
             <DelegateToolResultCard
               agentName={delegateResult.agentName}
               durationLabel={delegateResult.durationLabel}

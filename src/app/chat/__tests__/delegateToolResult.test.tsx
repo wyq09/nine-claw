@@ -50,6 +50,10 @@ describe('DelegateToolResultCard', () => {
     expect(screen.getByText('结果 >')).toBeInTheDocument()
     expect(screen.getByText('出来打个招呼')).toBeInTheDocument()
     expect(await screen.findByText('嘿群哥，我是 ColorMaster。')).toBeInTheDocument()
+
+    const body = document.querySelector('.delegate-tool-result-body')
+    expect(body).toHaveClass('theme-markdown-surface')
+    expect(body?.querySelector('.markdown-content')).not.toBeNull()
   })
 
   it('collapses result body from the 结果 button', async () => {

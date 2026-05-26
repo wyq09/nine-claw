@@ -4,9 +4,11 @@ import './index.css'
 import App from './App.tsx'
 import { ToastProvider } from './components/ToastProvider'
 import { LlmTraceStandaloneApp } from './app/workspaces/panels/LlmTraceStandaloneApp'
+import { SessionLlmLogStandaloneApp } from './app/workspaces/panels/SessionLlmLogStandaloneApp'
 
 const hash = window.location.hash || ''
 const isTraceStandalone = hash.startsWith('#/llm-trace')
+const isSessionLogStandalone = hash.startsWith('#/session-llm-log')
 
 function BootReadyMarker() {
   useEffect(() => {
@@ -34,7 +36,7 @@ createRoot(document.getElementById('root')!, {
   <StrictMode>
     <BootReadyMarker />
     <ToastProvider>
-      {isTraceStandalone ? <LlmTraceStandaloneApp /> : <App />}
+      {isTraceStandalone ? <LlmTraceStandaloneApp /> : isSessionLogStandalone ? <SessionLlmLogStandaloneApp /> : <App />}
     </ToastProvider>
   </StrictMode>,
 )

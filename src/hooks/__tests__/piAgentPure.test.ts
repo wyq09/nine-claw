@@ -112,4 +112,22 @@ describe('parseHistorySnapshot', () => {
 
     expect(history[0]?.title).toBe(deriveConversationTitle('帮我写一版咖啡店开业海报文案'))
   })
+
+  it('does not silently truncate sessions beyond 30 items during snapshot hydration', () => {
+    const payload = JSON.stringify(
+      Array.from({ length: 33 }, (_, index) => ({
+        id: `session-${index + 1}`,
+        title: `会话 ${index + 1}`,
+        status: 'done',
+        createdAt: 100 + index,
+        updatedAt: 200 + index,
+        turns: [],
+      })),
+    )
+
+    const history = parseHistorySnapshot(payload)
+
+    expect(history).toHaveLength(33)
+    expect(history.at(-1)?.id).toBe('session-33')
+  })
 })

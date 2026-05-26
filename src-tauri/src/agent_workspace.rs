@@ -90,6 +90,20 @@ fn session_workspace_prompt_cache() -> &'static Mutex<SessionPromptCache> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn session_workspace_prompt_snapshot_path(
+    agent_id: &str,
+    session_id: &str,
+) -> Result<PathBuf, String> {
+    let root = resolve_workspace_root()?;
+    let safe_session = sanitize_workspace_segment(session_id, "session");
+    Ok(root
+        .join("agents")
+        .join(agent_id)
+        .join(".cache")
+        .join("session-system-prompts")
+        .join(format!("{safe_session}.workspace.md")))
+}
+
 pub fn clear_session_workspace_prompt_cache(agent_id: &str, session_id: &str) {
     let agent_id = agent_id.trim();
     let session_id = session_id.trim();
@@ -98,6 +112,17 @@ pub fn clear_session_workspace_prompt_cache(agent_id: &str, session_id: &str) {
     }
     if let Ok(mut guard) = session_workspace_prompt_cache().lock() {
         guard.remove(&(agent_id.to_string(), session_id.to_string()));
+    }
+    if let Ok(path) = session_workspace_prompt_snapshot_path(agent_id, session_id) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "清理 session workspace prompt 快照失败 {}: {}",
+                path.display(),
+                error
+            ),
+        }
     }
 }
 
@@ -576,10 +601,35 @@ pub fn build_session_workspace_system_prompt_for_query(
             return Ok(snapshot.clone());
         }
     }
+    if let Ok(path) = session_workspace_prompt_snapshot_path(agent_id, session_id) {
+        if let Ok(snapshot) = fs::read_to_string(&path) {
+            if let Ok(mut guard) = session_workspace_prompt_cache().lock() {
+                guard.entry(cache_key).or_insert_with(|| snapshot.clone());
+            }
+            return Ok(snapshot);
+        }
+    }
 
     let snapshot = build_workspace_system_prompt_for_query_inner(agent_id, current_prompt, true)?;
     if let Ok(mut guard) = session_workspace_prompt_cache().lock() {
         guard.entry(cache_key).or_insert_with(|| snapshot.clone());
+    }
+    if let Ok(path) = session_workspace_prompt_snapshot_path(agent_id, session_id) {
+        if let Some(parent) = path.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                log::warn!(
+                    "创建 session workspace prompt 快照目录失败 {}: {}",
+                    parent.display(),
+                    error
+                );
+            } else if let Err(error) = fs::write(&path, &snapshot) {
+                log::warn!(
+                    "写入 session workspace prompt 快照失败 {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
     }
     Ok(snapshot)
 }
@@ -619,11 +669,6 @@ fn build_workspace_system_prompt_for_query_inner(
         build_specialized_memory_snapshot(&root, agent_id, current_prompt)?
     {
         sections.push(specialized_snapshot);
-    }
-    if let Some(daily_index_snapshot) =
-        build_daily_digest_retrieval_snapshot(&root, agent_id, current_prompt)?
-    {
-        sections.push(daily_index_snapshot);
     }
     if let Some(db_snapshot) = db_projection::build_db_memory_snapshot(agent_id, current_prompt)? {
         sections.push(db_snapshot);
@@ -1580,132 +1625,6 @@ fn build_specialized_memory_snapshot(
     }
 }
 
-struct DailyIndexRow {
-    day: String,
-    ts: String,
-    user: String,
-    cats: String,
-    summary: String,
-}
-
-fn parse_daily_index_line(line: &str) -> Option<DailyIndexRow> {
-    let rest = line.strip_prefix("DAILY|")?;
-    let mut it = rest.splitn(5, '|');
-    let day = it.next()?.to_string();
-    let ts = it.next()?.to_string();
-    let user = it.next()?.to_string();
-    let cats = it.next()?.to_string();
-    let summary = it.next()?.to_string();
-    Some(DailyIndexRow {
-        day,
-        ts,
-        user,
-        cats,
-        summary,
-    })
-}
-
-fn daily_index_row_matches(row: &DailyIndexRow, selected_keys: &[&str], prompt_norm: &str) -> bool {
-    let cat_tokens: Vec<&str> = row
-        .cats
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let non_general_keys: Vec<&str> = selected_keys
-        .iter()
-        .copied()
-        .filter(|k| *k != "general")
-        .collect();
-    if !non_general_keys.is_empty() {
-        for sk in &non_general_keys {
-            if cat_tokens.iter().any(|c| *c == *sk) {
-                return true;
-            }
-        }
-    }
-    if !prompt_norm.is_empty()
-        && prompt_norm.len() >= 2
-        && row.summary.to_lowercase().contains(prompt_norm)
-    {
-        return true;
-    }
-    false
-}
-
-fn build_daily_digest_retrieval_snapshot(
-    root: &Path,
-    agent_id: &str,
-    current_prompt: Option<&str>,
-) -> Result<Option<String>, String> {
-    let agent_home = root.join("agents").join(agent_id);
-    let path = agent_home.join("memory").join("DAILY_INDEX.md");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw =
-        fs::read_to_string(&path).map_err(|error| format!("读取 DAILY_INDEX.md 失败: {error}"))?;
-    let lines: Vec<&str> = raw
-        .lines()
-        .filter(|line| line.starts_with("DAILY|"))
-        .collect();
-    if lines.is_empty() {
-        return Ok(None);
-    }
-
-    let prompt_raw = current_prompt.unwrap_or_default();
-    let prompt_norm = normalize_memory_match_text(prompt_raw);
-    if prompt_norm.is_empty() {
-        return Ok(None);
-    }
-
-    let selected = select_memory_categories_for_query(current_prompt);
-    let selected_keys: Vec<&str> = selected.iter().map(|category| category.key).collect();
-    let mut matched: Vec<String> = Vec::new();
-
-    if contains_memory_recall_signal(prompt_raw) {
-        for line in lines.iter().rev().take(10) {
-            if let Some(row) = parse_daily_index_line(line) {
-                matched.push(format!(
-                    "- {} · {} · {} | {}",
-                    row.day,
-                    row.ts,
-                    row.user,
-                    trim_to_char_limit(&row.summary, 120)
-                ));
-            }
-        }
-    } else {
-        for line in lines.iter().rev() {
-            let Some(row) = parse_daily_index_line(line) else {
-                continue;
-            };
-            if daily_index_row_matches(&row, &selected_keys, &prompt_norm) {
-                matched.push(format!(
-                    "- {} · {} · {} | {}",
-                    row.day,
-                    row.ts,
-                    row.user,
-                    trim_to_char_limit(&row.summary, 120)
-                ));
-            }
-            if matched.len() >= 12 {
-                break;
-            }
-        }
-    }
-
-    if matched.is_empty() {
-        return Ok(None);
-    }
-
-    let block = format!(
-        "日记检索（由 memory/DAILY_INDEX.md 按分类/关键词筛选；全文见对应 memory/YYYY-MM-DD.md）：\n{}",
-        matched.join("\n")
-    );
-    Ok(Some(trim_to_char_limit(&block, 900)))
-}
-
 fn read_agent_wiki_files(root: &Path, agent_id: &str) -> Result<Vec<AgentWorkspaceFile>, String> {
     let wiki_dir = root.join("agents").join(agent_id).join("wiki");
     if !wiki_dir.exists() {
@@ -1777,53 +1696,6 @@ fn classify_memory_categories(
     {
         if contains_any_keyword(&combined, category.storage_keywords) {
             categories.push(category);
-        }
-    }
-
-    categories
-}
-
-fn select_memory_categories_for_query(
-    current_prompt: Option<&str>,
-) -> Vec<MemoryCategoryDefinition> {
-    let mut categories = vec![memory_category_definition("general").expect("general category")];
-    let prompt = normalize_memory_match_text(current_prompt.unwrap_or_default());
-
-    if prompt.is_empty() {
-        for key in ["projects", "commitments", "decisions"] {
-            if let Some(category) = memory_category_definition(key) {
-                categories.push(category);
-            }
-        }
-        return categories;
-    }
-
-    for category in MEMORY_CATEGORY_DEFINITIONS
-        .iter()
-        .copied()
-        .filter(|category| category.key != "general")
-    {
-        if contains_any_keyword(&prompt, category.query_keywords)
-            || contains_any_keyword(&prompt, category.storage_keywords)
-        {
-            categories.push(category);
-        }
-    }
-
-    if categories.len() == 1 {
-        if contains_memory_recall_signal(&prompt) {
-            categories.extend(
-                MEMORY_CATEGORY_DEFINITIONS
-                    .iter()
-                    .copied()
-                    .filter(|category| category.key != "general"),
-            );
-        } else {
-            for key in ["projects", "commitments", "decisions"] {
-                if let Some(category) = memory_category_definition(key) {
-                    categories.push(category);
-                }
-            }
         }
     }
 
@@ -3847,6 +3719,11 @@ mod tests {
         };
 
         let home = ensure_agent_workspace(seed, true).expect("scaffold workspace");
+        fs::write(
+            home.join("memory").join("DAILY_INDEX.md"),
+            "DAILY|2026-05-22|2026-05-22 00:15:00|user-1|decision,project|上一轮把缓存命中率和 system prompt 稳定性作为重点。\n",
+        )
+        .expect("write daily index");
         crate::managed_runtime::append_session_event(
             &home,
             "session-1",
@@ -3861,6 +3738,7 @@ mod tests {
                 .expect("workspace prompt");
         assert!(prompt.contains("Recent Session Events:"));
         assert!(prompt.contains("调用 bash 运行 cargo test"));
+        assert!(!prompt.contains("日记检索"));
 
         let _ = fs::remove_dir_all(root);
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
@@ -3920,6 +3798,40 @@ mod tests {
         assert_eq!(second, first);
         assert!(!second.contains("第二次事件"));
 
+        fs::write(
+            home.join("WORKING.md"),
+            "# WORKING.md\n\n## Current Focus\n\n- 新 focus 不应该进入已冻结 prompt\n\n## IM Latest Context\n\n- Current note: 新 note 不应该进入已冻结 prompt\n",
+        )
+        .expect("rewrite working");
+        fs::write(
+            home.join("DECISIONS.md"),
+            "# DECISIONS.md\n\n## Decision Log\n\n- 新 decision 不应该进入已冻结 prompt\n",
+        )
+        .expect("rewrite decisions");
+
+        let third = build_session_workspace_system_prompt_for_query(
+            "frozen-session-agent",
+            Some("session-1"),
+            Some("继续刚才的任务"),
+        )
+        .expect("third prompt");
+        assert_eq!(third, first);
+        assert!(!third.contains("新 focus"));
+        assert!(!third.contains("新 note"));
+        assert!(!third.contains("新 decision"));
+
+        if let Ok(mut guard) = session_workspace_prompt_cache().lock() {
+            guard.remove(&("frozen-session-agent".to_string(), "session-1".to_string()));
+        }
+        let restored = build_session_workspace_system_prompt_for_query(
+            "frozen-session-agent",
+            Some("session-1"),
+            Some("恢复会话后继续刚才的任务"),
+        )
+        .expect("restored prompt");
+        assert_eq!(restored, first);
+        assert!(!restored.contains("第二次事件"));
+
         let other_session = build_session_workspace_system_prompt_for_query(
             "frozen-session-agent",
             Some("session-2"),
@@ -3927,6 +3839,10 @@ mod tests {
         )
         .expect("other session prompt");
         assert!(other_session.contains("第二次事件"));
+        assert!(other_session.contains("新 focus"));
+        assert!(other_session.contains("新 note"));
+        assert!(other_session.contains("新 decision"));
+        assert!(!other_session.contains("日记检索"));
 
         let _ = fs::remove_dir_all(root);
         std::env::remove_var(PRIMARY_WORKSPACE_ROOT_ENV);
