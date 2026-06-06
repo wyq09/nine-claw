@@ -1,0 +1,4 @@
+#!/bin/bash
+
+# Set SCRIPT_DIR to the script's directory
+SCRIPT_DIR=

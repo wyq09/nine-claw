@@ -19,7 +19,6 @@ import { SessionContextBadge } from '../../components/SessionContextBadge'
 import type {
   AgentBuilderDraft,
   ConversationAgentSnapshot,
-  ConversationTurn,
   HistoryItem,
   PersistedChatAttachment,
   ProviderConfig,

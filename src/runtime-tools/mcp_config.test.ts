@@ -136,9 +136,11 @@ describe('createMcpConfigTool', () => {
     })
 
     expect(fetchImpl).toHaveBeenCalledTimes(1)
-    const [calledUrl, calledInit] = fetchImpl.mock.calls[0]
+    const callArgs = fetchImpl.mock.calls[0] as unknown as [string, RequestInit]
+    const calledUrl = callArgs[0]
+    const calledInit = callArgs[1]
     expect(calledUrl).toBe('http://127.0.0.1:9000/mcp/tok/add')
-    const body = JSON.parse((calledInit as { body: string }).body)
+    const body = JSON.parse(calledInit.body as string)
     expect(body.servers[0]).toEqual(expect.objectContaining({ id: 'miview', transport: 'streamable_http' }))
 
     // Snapshot must be written so mcp_tool sees it without a restart.
@@ -171,9 +173,9 @@ describe('createMcpConfigTool', () => {
 
     await tool.execute('c', { operation: 'disable', id: 'miview' })
 
-    const [calledUrl, calledInit] = fetchImpl.mock.calls[0]
-    expect(calledUrl).toBe('http://h/mcp/tk/set-enabled')
-    expect(JSON.parse((calledInit as { body: string }).body)).toEqual({ id: 'miview', enabled: false })
+    const callArgs = fetchImpl.mock.calls[0] as unknown as [string, RequestInit]
+    expect(callArgs[0]).toBe('http://h/mcp/tk/set-enabled')
+    expect(JSON.parse(callArgs[1].body as string)).toEqual({ id: 'miview', enabled: false })
   })
 
   it('surfaces proxy errors', async () => {

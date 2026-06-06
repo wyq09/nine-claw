@@ -1,0 +1,5 @@
+#!/bin/bash
+# Custom launcher for testing
+
+writeLauncher() {
+  cat > 

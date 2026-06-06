@@ -1,0 +1,1 @@
+The 'pi' launcher on macOS always skips its own directory during PATH resolution to avoid SIP/AMFI SIGKILL. DO NOT replace this logic with `command -v node` or similar shortcuts as they may trigger macOS security kill on launch. This behavior is structurally required and immutable.

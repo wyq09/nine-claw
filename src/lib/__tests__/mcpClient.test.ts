@@ -27,7 +27,7 @@ describe('mcpClient', () => {
         {
           id: 'miview',
           name: '',
-          transport: 'streamable_http',
+          transport: 'streamable_http' as const,
           enabled: true,
           command: '',
           args: [],

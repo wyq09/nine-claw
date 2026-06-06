@@ -32,6 +32,7 @@ describe('getStreamingTurnLayoutRevision', () => {
       answer: 'a'.repeat(48),
       toolCalls: [
         {
+          id: 'tc-1',
           toolCallId: 'tool-1',
           toolName: 'search',
           argsText: '',

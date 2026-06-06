@@ -1,0 +1,1 @@
+photo access must verify relationship keywords strictly, avoid event/scene contamination; prioritize MCP paths with authentication proof

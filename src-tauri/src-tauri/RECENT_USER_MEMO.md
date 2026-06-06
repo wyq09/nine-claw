@@ -1,0 +1,1 @@
+No new stable user attributes detected in current dialog. All meaningful directives (macOS binary protection, SIP/AMFI risk requirement, structure-first communication) already captured in existing memory with build-20260529 timestamp.
