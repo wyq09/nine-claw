@@ -735,6 +735,22 @@ impl<'a> TraceGuard<'a> {
             );
         }
     }
+
+    pub fn finalize_aborted(&mut self, error: String) {
+        if let Some(id) = self.trace_id.take() {
+            finalize(
+                self.app,
+                &id,
+                "aborted",
+                Some(error),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+    }
 }
 
 impl<'a> Drop for TraceGuard<'a> {
@@ -887,4 +903,5 @@ mod tests {
         assert!(standalone_entry.matches_scope(None, Some("session-1")));
         assert!(!standalone_entry.matches_scope(Some("ws-1"), Some("session-1")));
     }
+
 }

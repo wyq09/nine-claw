@@ -28,6 +28,7 @@ const LEGACY_DEFAULT_ALLOWED_TOOL_IDS: &[&str] = &[
     "ask_user",
     "agent_spawn",
     "external_api",
+    "mcp_tool",
 ];
 const DEFAULT_ALLOWED_TOOL_IDS: &[&str] = &[
     "bash",
@@ -57,6 +58,8 @@ const DEFAULT_ALLOWED_TOOL_IDS: &[&str] = &[
     "create_scheduled_task",
     "query_scheduled_task",
     "query_scheduled_task_info",
+    "mcp_tool",
+    "mcp_config",
 ];
 
 type SessionAgentPromptCache = HashMap<(String, String), String>;
@@ -431,6 +434,8 @@ pub fn runtime_tool_names_for_allowed_tool_ids(tool_ids: &[String]) -> Vec<Strin
             "create_scheduled_task" => "create_scheduled_task",
             "query_scheduled_task" => "query_scheduled_task",
             "query_scheduled_task_info" => "query_scheduled_task_info",
+            "mcp_tool" => "mcp_tool",
+            "mcp_config" => "mcp_config",
             value => value,
         };
         let runtime_name = runtime_name.trim();

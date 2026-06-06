@@ -58,6 +58,8 @@ export const AGENT_TOOL_OPTIONS: { id: AgentToolId; label: string; description: 
   { id: 'create_scheduled_task', label: 'create_scheduled_task', description: '创建定时任务到任务中心' },
   { id: 'query_scheduled_task', label: 'query_scheduled_task', description: '查询当前智能体的定时任务列表' },
   { id: 'query_scheduled_task_info', label: 'query_scheduled_task_info', description: '查询单个定时任务的详情' },
+  { id: 'mcp_tool', label: 'mcp_tool', description: '调用已接入的 MCP 服务及其远端工具' },
+  { id: 'mcp_config', label: 'mcp_config', description: '管理 MCP 服务配置（新增 / 列出 / 启停），即时生效' },
 ]
 
 const AGENT_TOOL_ID_SET = new Set<AgentToolId>(AGENT_TOOL_OPTIONS.map((tool) => tool.id))

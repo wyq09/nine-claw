@@ -37,6 +37,7 @@ import {
   STARTER_CHIPS,
 } from '../lib'
 import { ImagePreviewModal } from './TurnAndTools'
+import { getStreamingTurnLayoutRevision } from './streamingLayout'
 import { useChatTurnWindow } from './useChatTurnWindow'
 import { useSessionContextWindow } from '../../hooks/useSessionContextWindow'
 import { VirtualizedChatTurns, type VirtualizedChatTurnsHandle } from './VirtualizedChatTurns'
@@ -44,20 +45,6 @@ import {
   isMacTauriComposerDesktop,
   openMacNativeDictationPanel,
 } from '../../lib/macosNativeDictationClient'
-
-function streamingTurnLayoutRevision(turn: ConversationTurn | undefined): number {
-  if (!turn) {
-    return 0
-  }
-  let n = turn.answer.length + turn.thinking.length + turn.toolCalls.length + turn.activity.length
-  const segs = turn.responseSegments
-  if (segs) {
-    for (const s of segs) {
-      n += s.type === 'text' ? s.text.length : 1
-    }
-  }
-  return n
-}
 
 export type SidebarButtonProps = {
   active: boolean
@@ -267,7 +254,7 @@ export function ChatView({
   }, [])
   /** 纯数值：与 `turns` 引用解耦，复制状态变化时 revision 不变则子树不跟滚 */
   const streamingLayoutRevision =
-    sessionRunning && lastTurn ? streamingTurnLayoutRevision(lastTurn) : 0
+    sessionRunning ? getStreamingTurnLayoutRevision(lastTurn) : 0
 
   /** 进入会话时恢复「跟到底」；具体滚动由 VirtualizedChatTurns 的 session 切换 / 首轮 layout 负责，避免与子组件重复 scrollToIndex 造成布局抖动 */
   useLayoutEffect(() => {

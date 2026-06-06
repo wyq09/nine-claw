@@ -12,6 +12,8 @@ const MANAGED_RUNTIME_WEB_SEARCH_TRANSPORT_FILE: &str = "web_search_transport.mj
 const MANAGED_RUNTIME_IMAGE_DOWNLOADER_FILE: &str = "image_downloader.mjs";
 const MANAGED_RUNTIME_AGENT_DELEGATE_FILE: &str = "nineclaw-agent-delegate-tool.mjs";
 const MANAGED_RUNTIME_ASK_USER_FILE: &str = "nineclaw-ask-user-tool.mjs";
+const MANAGED_RUNTIME_MCP_TOOL_FILE: &str = "nineclaw-mcp-tool.mjs";
+const MANAGED_RUNTIME_MCP_CONFIG_FILE: &str = "nineclaw-mcp-config-tool.mjs";
 const MANAGED_RUNTIME_MEMORY_UPDATE_FILE: &str = "memory_update_tool.mjs";
 const MANAGED_RUNTIME_MEMORY_SEARCH_FILE: &str = "memory_search_tool.mjs";
 const MANAGED_RUNTIME_MEMORY_READ_FILE: &str = "memory_read_tool.mjs";
@@ -45,6 +47,8 @@ const IMAGE_DOWNLOADER_SOURCE: &str = include_str!("../../src/runtime-tools/imag
 const AGENT_DELEGATE_TOOL_SOURCE: &str =
     include_str!("../../src/runtime-tools/agent_delegate_tool.mjs");
 const ASK_USER_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/ask_user_tool.mjs");
+const MCP_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/mcp_tool.mjs");
+const MCP_CONFIG_TOOL_SOURCE: &str = include_str!("../../src/runtime-tools/mcp_config.mjs");
 const MEMORY_UPDATE_TOOL_SOURCE: &str =
     include_str!("../../src/runtime-tools/memory_update_tool.mjs");
 const MEMORY_SEARCH_TOOL_SOURCE: &str =
@@ -165,6 +169,22 @@ pub(crate) fn write_managed_runtime_extension_files(
         format!(
             "写入 ask_user 运行时模块失败 {}: {error}",
             ask_user_path.display()
+        )
+    })?;
+
+    let mcp_tool_path = runtime_dir.join(MANAGED_RUNTIME_MCP_TOOL_FILE);
+    fs::write(&mcp_tool_path, MCP_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 mcp_tool 运行时模块失败 {}: {error}",
+            mcp_tool_path.display()
+        )
+    })?;
+
+    let mcp_config_path = runtime_dir.join(MANAGED_RUNTIME_MCP_CONFIG_FILE);
+    fs::write(&mcp_config_path, MCP_CONFIG_TOOL_SOURCE).map_err(|error| {
+        format!(
+            "写入 mcp_config 运行时模块失败 {}: {error}",
+            mcp_config_path.display()
         )
     })?;
 
@@ -354,6 +374,8 @@ import {{ createImageGenerationTool }} from "./{MANAGED_RUNTIME_IMAGE_GENERATION
 import {{ createImageTaskQueryTool }} from "./{MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE}";
 import {{ createAgentDelegateTool }} from "./{MANAGED_RUNTIME_AGENT_DELEGATE_FILE}";
 import {{ createAskUserTool }} from "./{MANAGED_RUNTIME_ASK_USER_FILE}";
+import {{ createMcpTool }} from "./{MANAGED_RUNTIME_MCP_TOOL_FILE}";
+import {{ createMcpConfigTool }} from "./{MANAGED_RUNTIME_MCP_CONFIG_FILE}";
 import {{ createMemoryUpdateTool }} from "./{MANAGED_RUNTIME_MEMORY_UPDATE_FILE}";
 import {{ createMemorySearchTool }} from "./{MANAGED_RUNTIME_MEMORY_SEARCH_FILE}";
 import {{ createMemoryReadTool }} from "./{MANAGED_RUNTIME_MEMORY_READ_FILE}";
@@ -493,6 +515,8 @@ export default function(pi) {{
   let imageTaskQueryToolRegistered = false;
   let agentDelegateToolRegistered = false;
   let askUserToolRegistered = false;
+  let mcpToolRegistered = false;
+  let mcpConfigToolRegistered = false;
   let memoryUpdateToolRegistered = false;
   let memorySearchToolRegistered = false;
   let memoryReadToolRegistered = false;
@@ -616,6 +640,32 @@ export default function(pi) {{
     pi.registerTool(
       createAskUserTool({{
         Type,
+        fetchImpl: localHttpPost,
+        processApi: process,
+      }})
+    );
+  }}
+
+  function ensureMcpTool() {{
+    if (mcpToolRegistered) return;
+    mcpToolRegistered = true;
+    pi.registerTool(
+      createMcpTool({{
+        Type,
+        fsSync: fs,
+        fetchImpl: fetch,
+        processApi: process,
+      }})
+    );
+  }}
+
+  function ensureMcpConfigTool() {{
+    if (mcpConfigToolRegistered) return;
+    mcpConfigToolRegistered = true;
+    pi.registerTool(
+      createMcpConfigTool({{
+        Type,
+        fsSync: fs,
         fetchImpl: localHttpPost,
         processApi: process,
       }})
@@ -757,6 +807,8 @@ export default function(pi) {{
     ensureImageTaskQueryTool();
     ensureAgentDelegateTool();
     ensureAskUserTool();
+    ensureMcpTool();
+    ensureMcpConfigTool();
     ensureMemoryUpdateTool();
     ensureMemorySearchTool();
     ensureMemoryReadTool();
@@ -785,6 +837,8 @@ export default function(pi) {{
     ensureImageTaskQueryTool();
     ensureAgentDelegateTool();
     ensureAskUserTool();
+    ensureMcpTool();
+    ensureMcpConfigTool();
     ensureMemoryUpdateTool();
     ensureMemorySearchTool();
     ensureMemoryReadTool();
@@ -883,6 +937,7 @@ mod tests {
         let image_downloader_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_DOWNLOADER_FILE);
         let image_task_query_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE);
         let image_generation_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_GENERATION_FILE);
+        let mcp_tool_path = runtime_dir.join(MANAGED_RUNTIME_MCP_TOOL_FILE);
         let skill_creator_path = runtime_dir.join(MANAGED_RUNTIME_SKILL_CREATOR_FILE);
         let skill_evolution_path = runtime_dir.join(MANAGED_RUNTIME_SKILL_EVOLUTION_FILE);
         let skill_auto_prompt_path =
@@ -898,6 +953,8 @@ mod tests {
                 "ensureImageGenerationTool",
                 "ensureImageTaskQueryTool",
                 "ensureAskUserTool",
+                "ensureMcpTool",
+                "ensureMcpConfigTool",
                 "NINECLAW_SYSTEM_PROMPT_APPEND",
                 "After a successful ask_user result, continue the task immediately and answer the user using the submitted information.",
                 "buildSystemPromptAppend",
@@ -910,6 +967,8 @@ mod tests {
                 "from \"@mariozechner/pi-coding-agent\";",
                 "createAgentDelegateTool",
                 "createAskUserTool",
+                "createMcpTool",
+                "createMcpConfigTool",
                 "createSkillCreatorTool",
                 "createSkillEvolutionRuntime",
                 "skillEvolution.reset(event.prompt)",
@@ -936,6 +995,9 @@ mod tests {
         );
         assert!(read(&image_generation_path).contains("name: \"image_generate\""));
         assert!(read(&image_task_query_path).contains("name: \"image_task_query\""));
+        assert!(read(&mcp_tool_path).contains("name: 'mcp_tool'"));
+        let mcp_config_path = runtime_dir.join(MANAGED_RUNTIME_MCP_CONFIG_FILE);
+        assert!(read(&mcp_config_path).contains("name: 'mcp_config'"));
         assert_contains_all(
             &read(&skill_creator_path),
             &["name: 'skill-creator'", ".agents"],

@@ -274,6 +274,7 @@ export type AgentToolId =
   | 'memory_read'
   | 'memory_delete'
   | 'memory_store'
+  | 'memory_save'
   | 'memory_get'
   | 'memory_forget'
   | 'memory_list'
@@ -281,6 +282,8 @@ export type AgentToolId =
   | 'create_scheduled_task'
   | 'query_scheduled_task'
   | 'query_scheduled_task_info'
+  | 'mcp_tool'
+  | 'mcp_config'
 
 export type AgentCapabilityPolicy = {
   strategy: AgentSkillStrategy
@@ -485,6 +488,7 @@ export type SettingsTab =
   | 'appearance'
   | 'parameters'
   | 'providers'
+  | 'mcp'
   | 'usage'
   | 'shortcuts'
   | 'skills'

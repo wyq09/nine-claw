@@ -38,6 +38,7 @@ import type { ResourcesViewProps, SkillsViewProps } from '../app/pages/LibraryAn
 import { AppIcon, type IconName } from './AppIcon'
 import { ApplicationLogsPanel } from './settings/ApplicationLogsPanel'
 import { LlmLogPreview } from './settings/LlmLogPreview'
+import { McpSettingsPanel } from './settings/McpSettingsPanel'
 import { NumericDraftField } from './NumericDraftField'
 import { ImageGenerationSettingsSection } from './settings/ImageGenerationSettingsSection'
 import { UserMemorySettingsPanel } from './settings/UserMemorySettingsPanel'
@@ -515,9 +516,11 @@ export function SettingsModal({
       : tab === 'appearance'
         ? '外观与行为'
         : tab === 'parameters'
-          ? '参数'
-          : tab === 'providers'
-            ? '模型提供方'
+        ? '参数'
+        : tab === 'providers'
+          ? '模型提供方'
+          : tab === 'mcp'
+            ? 'MCP'
             : tab === 'usage'
               ? '用量统计'
               : tab === 'skills'
@@ -536,9 +539,11 @@ export function SettingsModal({
       : tab === 'appearance'
         ? '控制侧栏密度、执行轨迹和页面动态效果。'
         : tab === 'parameters'
-          ? '统一管理 Agent 工具调用轮数上限、流式连接重试次数与大模型外层重试。'
-          : tab === 'providers'
-            ? '统一管理大模型接口、默认模型与连通性校验。'
+        ? '统一管理 Agent 工具调用轮数上限、流式连接重试次数与大模型外层重试。'
+        : tab === 'providers'
+          ? '统一管理大模型接口、默认模型与连通性校验。'
+          : tab === 'mcp'
+            ? '集中管理通过 stdio、Streamable HTTP、SSE 接入的 MCP 服务，并供 mcp_tool 统一调用。'
             : tab === 'usage'
               ? '按模型、智能体与日期查看本地累计用量。'
               : tab === 'skills'
@@ -573,6 +578,7 @@ export function SettingsModal({
               <SettingsTabButton active={tab === 'appearance'} icon="sparkles" label="个性化" onClick={() => onSelectTab('appearance')} />
               <SettingsTabButton active={tab === 'parameters'} icon="wrench" label="参数" onClick={() => onSelectTab('parameters')} />
               <SettingsTabButton active={tab === 'providers'} icon="provider" label="大模型 Provider" onClick={() => onSelectTab('providers')} />
+              <SettingsTabButton active={tab === 'mcp'} icon="network" label="MCP" onClick={() => onSelectTab('mcp')} />
               <SettingsTabButton active={tab === 'usage'} icon="zap" label="用量统计" onClick={() => onSelectTab('usage')} />
               <SettingsTabButton active={tab === 'skills'} icon="puzzle" label="探索技能" onClick={() => onSelectTab('skills')} />
               <SettingsTabButton active={tab === 'resources'} icon="book" label="资源库" onClick={() => onSelectTab('resources')} />
@@ -1441,6 +1447,12 @@ export function SettingsModal({
                     }}
                   />
                 )}
+              </div>
+            ) : null}
+
+            {tab === 'mcp' ? (
+              <div className="settings-tab-body-scroll">
+                <McpSettingsPanel />
               </div>
             ) : null}
 

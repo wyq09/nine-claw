@@ -67,6 +67,11 @@ vi.mock('../../lib/piClient', () => ({
   }),
 }))
 
+vi.mock('../../lib/mcpClient', () => ({
+  loadMcpSettings: vi.fn().mockResolvedValue({ servers: [] }),
+  saveMcpSettings: vi.fn(async (settings) => settings),
+}))
+
 vi.mock('@tauri-apps/plugin-dialog', () => ({
   open: vi.fn(),
 }))
@@ -421,6 +426,19 @@ describe('SettingsModal provider tabs', () => {
     expect(screen.getByLabelText('最大迭代次数')).toHaveDisplayValue('80')
     expect(screen.getByLabelText('流式中断重试')).toHaveDisplayValue('3')
     expect(screen.getByLabelText('LLM 外层最大重试次数')).toHaveDisplayValue('8')
+  })
+
+  it('renders the MCP tab entry and panel', async () => {
+    render(
+      <SettingsModal
+        {...baseModalProps}
+        tab="mcp"
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: 'MCP' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 2, name: 'MCP' })).toBeInTheDocument()
+    expect(await screen.findByText('MCP 接入')).toBeInTheDocument()
   })
 
   it('requests system notification permission when the user enables notifications', async () => {

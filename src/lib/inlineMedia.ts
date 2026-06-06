@@ -136,6 +136,20 @@ function parseDirectiveMediaToken(token: string): InlineMediaAttachment | null {
     }
   }
 
+  const salvageCandidates = [rawPath, rawName, rawLabel, decodeLocalPathSource(trimmed)].filter(Boolean)
+  for (const candidate of salvageCandidates) {
+    for (const nestedMatch of candidate.matchAll(/::nc-media\{[^}]*\}/g)) {
+      const nestedDirective = nestedMatch[0]?.trim()
+      if (!nestedDirective || nestedDirective === trimmed) {
+        continue
+      }
+      const nestedAttachment = parseDirectiveMediaToken(nestedDirective)
+      if (nestedAttachment) {
+        return nestedAttachment
+      }
+    }
+  }
+
   if (!rawPath || !isResolvableAssetReference(rawPath)) {
     return null
   }

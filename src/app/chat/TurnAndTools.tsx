@@ -7,7 +7,7 @@ import ReplyCardStack from '../../components/ReplyCardStack'
 import { extractInlineMediaAttachments, normalizeMarkdownImageSources } from '../../lib/inlineMedia'
 import { openExternalUrl } from '../../lib/piClient'
 import { resolveReplyCardItems } from '../../lib/replyCardFormat'
-import type { AgentBuilderDraft, ConversationTurn, TokenUsage, ToolCallEntry } from '../../types'
+import type { AgentBuilderDraft, ConversationTurn, ResponseSegment, TokenUsage, ToolCallEntry } from '../../types'
 import { DelegateSegmentsBlock } from '../workspaces/chat/DelegateSegmentsBlock'
 import { WidgetSegmentsBlock } from '../widgets/WidgetSegmentsBlock'
 import {
@@ -31,6 +31,7 @@ import {
   TokenUsageDetailPill,
   useLiveNow,
 } from '../lib'
+import { TurnPreparingIndicator } from './TurnPreparingIndicator'
 
 const MarkdownRenderer = lazy(() => import('../../components/MarkdownRenderer'))
 
@@ -102,6 +103,7 @@ export function TurnResponseBody({
     const renderBlocks: Array<
       | { type: 'text'; text: string; index: number }
       | { type: 'tools'; toolCalls: ToolCallEntry[]; index: number }
+      | { type: 'widget'; segment: Extract<ResponseSegment, { type: 'widget' }>; index: number }
     > = []
     let groupedToolCalls: ToolCallEntry[] = []
     let groupedToolStartIndex = -1
@@ -126,8 +128,14 @@ export function TurnResponseBody({
         return
       }
 
-      if (segment.type === 'delegate_plan' || segment.type === 'delegation_run' || segment.type === 'widget') {
+      if (segment.type === 'delegate_plan' || segment.type === 'delegation_run') {
         // 委派卡片在正文之后统一渲染（见下方 DelegateSegmentsBlock）。
+        return
+      }
+
+      if (segment.type === 'widget') {
+        flushGroupedToolCalls()
+        renderBlocks.push({ type: 'widget', segment, index })
         return
       }
 
@@ -253,6 +261,16 @@ export function TurnResponseBody({
             )
           }
 
+          if (block.type === 'widget') {
+            return (
+              <WidgetSegmentsBlock
+                key={`${turn.id}-widget-${block.index}-${block.segment.widget.widgetId}`}
+                segments={[block.segment]}
+                turnId={turn.id}
+              />
+            )
+          }
+
           if (block.toolCalls.length === 0) {
             return null
           }
@@ -274,9 +292,6 @@ export function TurnResponseBody({
             turnId={turn.id}
             resolveSpeaker={resolveSpeaker}
           />
-        ) : null}
-        {widgetSegments.length > 0 ? (
-          <WidgetSegmentsBlock segments={widgetSegments} turnId={turn.id} />
         ) : null}
         {preparing && turn.id === activeTurnId ? (
           <TurnPreparingIndicator />
@@ -379,21 +394,6 @@ export function TurnResponseBody({
         ) : null
       ) : null}
     </>
-  )
-}
-
-/** 前置逻辑（如定时任务意图）进行中：轻量提示，避免与主对话流混淆 */
-export function TurnPreparingIndicator() {
-  return (
-    <div className="turn-preparing-indicator" role="status" aria-live="polite">
-      <span className="turn-waiting-dots" aria-hidden="true">
-        <span />
-        <span />
-        <span />
-      </span>
-      <span className="turn-waiting-label">准备中</span>
-      <span className="turn-preparing-hint">正在连接模型…</span>
-    </div>
   )
 }
 
@@ -616,6 +616,9 @@ export function hasRenderableTurnContent(
       if (segment.type === 'text') {
         const t = segment.text.trim()
         return t.length > 0 && !isTurnPlaceholderNoOutputText(t)
+      }
+      if (segment.type === 'widget') {
+        return true
       }
       if (segment.type === 'delegate_plan' || segment.type === 'delegation_run') {
         return true

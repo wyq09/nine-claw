@@ -113,6 +113,7 @@ pub struct PreparedManagedRuntime {
     pub image_proxy: Option<ImageGenerationRuntimeConfig>,
     pub proxy_base_url: Option<String>,
     pub session_token: Option<String>,
+    pub mcp_config_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1097,6 +1098,21 @@ pub fn prepare_managed_runtime(
         runtime_dir,
         &typebox_import_path,
     )?;
+    // Always use the global snapshot path so that settings saved via UI or mcp_config
+    // take effect in the running session without a restart.
+    let mcp_config_path = if let Some(app) = injected_app_handle() {
+        match crate::mcp_settings::load_mcp_settings(&app)
+            .and_then(|settings| crate::mcp_settings::write_global_snapshot(&app, &settings))
+        {
+            Ok(path) => Some(path),
+            Err(error) => {
+                log::warn!("准备 MCP 全局快照失败，已跳过: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     Ok(PreparedManagedRuntime {
         extension_path,
@@ -1105,6 +1121,7 @@ pub fn prepare_managed_runtime(
         image_proxy: image_runtime_config.cloned(),
         proxy_base_url: Some(proxy_server.base_url.clone()),
         session_token: Some(proxy_session_token),
+        mcp_config_path,
     })
 }
 
@@ -1157,6 +1174,10 @@ fn credential_proxy_server() -> Result<&'static CredentialProxyServer, String> {
         .route("/task/:token/create", post(task_create_handler))
         .route("/task/:token/list", post(task_list_handler))
         .route("/task/:token/detail", post(task_detail_handler))
+        .route("/mcp/:token/add", post(mcp_config_add_handler))
+        .route("/mcp/:token/list", post(mcp_config_list_handler))
+        .route("/mcp/:token/remove", post(mcp_config_remove_handler))
+        .route("/mcp/:token/set-enabled", post(mcp_config_set_enabled_handler))
         .with_state(state.clone());
     tauri::async_runtime::spawn(async move {
         let listener = match tokio::net::TcpListener::from_std(listener) {
@@ -3224,6 +3245,131 @@ async fn task_detail_handler(
             "error": "未找到对应的定时任务",
         }))),
     }
+}
+
+#[derive(Deserialize)]
+struct McpConfigAddRequest {
+    #[serde(default)]
+    servers: Vec<crate::mcp_settings::McpServerConfig>,
+}
+
+#[derive(Deserialize)]
+struct McpConfigIdRequest {
+    #[serde(default)]
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpConfigSetEnabledRequest {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    enabled: bool,
+}
+
+fn require_app_handle() -> Result<tauri::AppHandle, (StatusCode, String)> {
+    APP_HANDLE.get().cloned().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "AppHandle 尚未注入".to_string(),
+    ))
+}
+
+fn mcp_settings_response(settings: &crate::mcp_settings::McpSettings) -> Json<Value> {
+    Json(serde_json::json!({
+        "ok": true,
+        "data": settings,
+        "snapshot": crate::mcp_settings::runtime_settings_snapshot(settings),
+    }))
+}
+
+async fn mcp_config_add_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<McpConfigAddRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app = require_app_handle()?;
+    let _session = resolve_proxy_session(&state, &token)?;
+    if body.servers.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "未提供任何 MCP server 配置".to_string()));
+    }
+    let updated = tauri::async_runtime::spawn_blocking(move || {
+        let current = crate::mcp_settings::load_mcp_settings(&app)?;
+        let merged = crate::mcp_settings::upsert_servers(&current, body.servers)?;
+        crate::mcp_settings::save_mcp_settings_and_snapshot(&app, &merged)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(mcp_settings_response(&updated))
+}
+
+async fn mcp_config_list_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app = require_app_handle()?;
+    let _session = resolve_proxy_session(&state, &token)?;
+    let settings = tauri::async_runtime::spawn_blocking(move || {
+        crate::mcp_settings::load_mcp_settings(&app)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(mcp_settings_response(&settings))
+}
+
+async fn mcp_config_remove_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<McpConfigIdRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app = require_app_handle()?;
+    let _session = resolve_proxy_session(&state, &token)?;
+    let server_id = body.id.trim().to_string();
+    if server_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "缺少要删除的 server id".to_string()));
+    }
+    let (updated, removed) = tauri::async_runtime::spawn_blocking(move || {
+        let current = crate::mcp_settings::load_mcp_settings(&app)?;
+        let (next, removed) = crate::mcp_settings::remove_server(&current, &server_id);
+        let saved = crate::mcp_settings::save_mcp_settings_and_snapshot(&app, &next)?;
+        Ok::<_, String>((saved, removed))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    if !removed {
+        return Err((StatusCode::NOT_FOUND, format!("未找到 MCP server: {}", body.id)));
+    }
+    Ok(mcp_settings_response(&updated))
+}
+
+async fn mcp_config_set_enabled_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(body): Json<McpConfigSetEnabledRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let app = require_app_handle()?;
+    let _session = resolve_proxy_session(&state, &token)?;
+    let server_id = body.id.trim().to_string();
+    if server_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "缺少 server id".to_string()));
+    }
+    let enabled = body.enabled;
+    let (updated, found) = tauri::async_runtime::spawn_blocking(move || {
+        let current = crate::mcp_settings::load_mcp_settings(&app)?;
+        let (next, found) = crate::mcp_settings::set_server_enabled(&current, &server_id, enabled);
+        let saved = crate::mcp_settings::save_mcp_settings_and_snapshot(&app, &next)?;
+        Ok::<_, String>((saved, found))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    if !found {
+        return Err((StatusCode::NOT_FOUND, format!("未找到 MCP server: {}", body.id)));
+    }
+    Ok(mcp_settings_response(&updated))
 }
 
 #[cfg(test)]

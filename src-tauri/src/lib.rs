@@ -17,6 +17,7 @@ mod image_generation;
 mod llm_log_export;
 mod llm_trace;
 mod macos_native_dictation_panel;
+mod mcp_settings;
 mod managed_runtime;
 mod managed_runtime_extension;
 mod media_directives;
@@ -1610,6 +1611,24 @@ mod lib_tests {
     }
 
     #[test]
+    fn anthropic_compat_extension_preserves_error_causes() {
+        let source = build_desktop_anthropic_compat_extension_source(
+            Path::new("/tmp/pi-ai/index.js"),
+            "provider",
+            "API_KEY",
+            "https://example.com/base/",
+            "mimo-v2.5-pro",
+            false,
+            true,
+        )
+        .expect("extension source");
+
+        assert!(source.contains("function formatErrorWithCause(error)"));
+        assert!(source.contains("error.cause"));
+        assert!(source.contains("output.errorMessage = formatErrorWithCause(error);"));
+    }
+
+    #[test]
     fn resolve_pi_ai_import_path_prefers_pi_package_node_modules() {
         let root = std::env::temp_dir().join(format!("nineclaw-pi-ai-path-{}", Uuid::new_v4()));
         let pi_dir = root.join("runtime");
@@ -2972,6 +2991,40 @@ fn js_string_literal(value: &str) -> Result<String, String> {
     serde_json::to_string(value).map_err(|error| format!("序列化 JS 字面量失败: {error}"))
 }
 
+fn format_js_error_with_cause() -> &'static str {
+    r#"function formatErrorWithCause(error) {
+  if (!(error instanceof Error)) {
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+
+  let message = error.message || String(error);
+  const cause = error.cause;
+  if (cause instanceof Error) {
+    const causeMessage = cause.message || String(cause);
+    if (causeMessage && !message.includes(causeMessage)) {
+      message += `; cause: ${causeMessage}`;
+    }
+  } else if (cause != null) {
+    let causeText = '';
+    try {
+      causeText = typeof cause === 'string' ? cause : JSON.stringify(cause);
+    } catch {
+      causeText = String(cause);
+    }
+    if (causeText && !message.includes(causeText)) {
+      message += `; cause: ${causeText}`;
+    }
+  }
+
+  return message;
+}
+"#
+}
+
 fn build_desktop_anthropic_compat_extension_source(
     pi_ai_import_path: &Path,
     provider_id: &str,
@@ -2999,6 +3052,8 @@ fn build_desktop_anthropic_compat_extension_source(
 
     Ok(format!(
         r#"import {{ createAssistantMessageEventStream, calculateCost, parseStreamingJson }} from {import_path};
+
+{format_error_with_cause}
 
 function sanitizeSurrogates(text) {{
   // 仅替换未成对的 UTF-16 代理项。旧实现会误伤所有 BMP 外字符（emoji 等），全部变成 U+FFFD。
@@ -3497,7 +3552,7 @@ function streamNineclawAnthropicCompat(model, context, options) {{
         delete block.index;
       }}
       output.stopReason = options?.signal?.aborted ? 'aborted' : 'error';
-      output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+      output.errorMessage = formatErrorWithCause(error);
       stream.push({{ type: 'error', reason: output.stopReason, error: output }});
       stream.end();
     }}
@@ -3531,6 +3586,7 @@ export default function(pi) {{
         model = model,
         model_input = model_input,
         model_reasoning = model_reasoning,
+        format_error_with_cause = format_js_error_with_cause(),
     ))
 }
 
@@ -4686,6 +4742,13 @@ async fn stream_pi_prompt(
             }
 
             command.env("PI_CODING_AGENT_DIR", &runtime_dir);
+            if let Some(runtime_root) = pi_location
+                .resource_root
+                .as_deref()
+                .or_else(|| pi_location.executable.parent())
+            {
+                command.env("NINECLAW_PI_RUNTIME_ROOT", runtime_root.as_os_str());
+            }
 
             if normalize_provider_api_format(
                 &runtime_provider_config.api_format,
@@ -4745,6 +4808,9 @@ async fn stream_pi_prompt(
                         prepared.session_token.as_deref().unwrap_or_default(),
                     )
                     .env("NINECLAW_SESSION_ID", normalized_session_id.as_str());
+                if let Some(path) = prepared.mcp_config_path.as_ref() {
+                    command.env("NINECLAW_MCP_CONFIG_FILE", path.as_os_str());
+                }
             }
 
             let runtime_provider_id = compat_extension
@@ -5142,6 +5208,9 @@ async fn stream_pi_prompt(
                     None,
                     None,
                 )?;
+                if let Some(guard) = pi_trace_guard.as_mut() {
+                    guard.finalize_error(timeout_error.clone());
+                }
                 session_text_log_guard.finish_error("error", timeout_error.clone(), None);
                 return Err(timeout_error);
             }
@@ -5195,12 +5264,18 @@ async fn stream_pi_prompt(
                             None,
                             None,
                         )?;
+                        if let Some(guard) = pi_trace_guard.as_mut() {
+                            guard.finalize_aborted("用户中止后读取 pi 输出失败".to_string());
+                        }
                         session_text_log_guard.finish_error(
                             "aborted",
                             "用户中止后读取 pi 输出失败".to_string(),
                             Some(emitted_assistant_text.clone()),
                         );
                         return Ok(());
+                    }
+                    if let Some(guard) = pi_trace_guard.as_mut() {
+                        guard.finalize_error(format!("读取 pi 输出失败: {error}"));
                     }
                     session_text_log_guard.finish_error(
                         "error",
@@ -5272,6 +5347,9 @@ async fn stream_pi_prompt(
                         None,
                         None,
                     )?;
+                    if let Some(guard) = pi_trace_guard.as_mut() {
+                        guard.finalize_error(timeout_error.clone());
+                    }
                     session_text_log_guard.finish_error(
                         "error",
                         timeout_error.clone(),
@@ -5311,12 +5389,18 @@ async fn stream_pi_prompt(
                             None,
                             None,
                         )?;
+                        if let Some(guard) = pi_trace_guard.as_mut() {
+                            guard.finalize_aborted("用户中止后解析 pi 输出失败".to_string());
+                        }
                         session_text_log_guard.finish_error(
                             "aborted",
                             "用户中止后解析 pi 输出失败".to_string(),
                             Some(emitted_assistant_text.clone()),
                         );
                         return Ok(());
+                    }
+                    if let Some(guard) = pi_trace_guard.as_mut() {
+                        guard.finalize_error(format!("解析 pi 输出失败: {error}"));
                     }
                     session_text_log_guard.finish_error(
                         "error",
@@ -5433,6 +5517,9 @@ async fn stream_pi_prompt(
                         None,
                         None,
                     )?;
+                    if let Some(guard) = pi_trace_guard.as_mut() {
+                        guard.finalize_error(error_text.clone());
+                    }
                     session_text_log_guard.finish_error(
                         "error",
                         error_text.clone(),
@@ -6111,6 +6198,9 @@ async fn stream_pi_prompt(
                 None,
                 None,
             )?;
+            if let Some(guard) = pi_trace_guard.as_mut() {
+                guard.finalize_aborted("用户中止".to_string());
+            }
             session_text_log_guard.finish_error(
                 "aborted",
                 "用户中止".to_string(),
@@ -6135,6 +6225,9 @@ async fn stream_pi_prompt(
                 Some("aborted".to_string()),
                 None,
             )?;
+            if let Some(guard) = pi_trace_guard.as_mut() {
+                guard.finalize_aborted("模型返回 aborted".to_string());
+            }
             session_text_log_guard.finish_error(
                 "aborted",
                 "模型返回 aborted".to_string(),
@@ -6180,6 +6273,9 @@ async fn stream_pi_prompt(
                 None,
                 final_usage,
             )?;
+            if let Some(guard) = pi_trace_guard.as_mut() {
+                guard.finalize_error(error_text.clone());
+            }
             session_text_log_guard.finish_error(
                 "error",
                 error_text.clone(),
@@ -6388,6 +6484,9 @@ async fn stream_pi_prompt(
                 None,
                 None,
             )?;
+            if let Some(guard) = pi_trace_guard.as_mut() {
+                guard.finalize_error(fallback_error.clone());
+            }
             session_text_log_guard.finish_error(
                 "error",
                 fallback_error.clone(),
@@ -6471,6 +6570,9 @@ async fn stream_pi_prompt(
                 None,
                 None,
             )?;
+            if let Some(guard) = pi_trace_guard.as_mut() {
+                guard.finalize_error(fallback_error.clone());
+            }
             session_text_log_guard.finish_error(
                 "error",
                 fallback_error.clone(),
@@ -6922,11 +7024,24 @@ fn load_network_proxy_settings(
 }
 
 #[tauri::command]
+fn load_mcp_settings(app: AppHandle) -> Result<mcp_settings::McpSettings, String> {
+    mcp_settings::load_mcp_settings(&app)
+}
+
+#[tauri::command]
 fn save_network_proxy_settings(
     app: AppHandle,
     settings: proxy_settings::NetworkProxySettings,
 ) -> Result<proxy_settings::NetworkProxySettings, String> {
     proxy_settings::save_proxy_settings(&app, &settings)
+}
+
+#[tauri::command]
+fn save_mcp_settings(
+    app: AppHandle,
+    settings: mcp_settings::McpSettings,
+) -> Result<mcp_settings::McpSettings, String> {
+    mcp_settings::save_mcp_settings_and_snapshot(&app, &settings)
 }
 
 #[tauri::command]
@@ -7533,6 +7648,7 @@ pub fn run() {
             trigger_embedding_reindex_command,
             load_image_generation_preferences,
             save_image_generation_preferences,
+            load_mcp_settings,
             list_installed_skills,
             list_system_skill_catalog,
             install_system_skill,
@@ -7542,6 +7658,7 @@ pub fn run() {
             update_agent,
             rotate_agent_peer_inbound_secret,
             get_peer_gateway_info,
+            save_mcp_settings,
             load_network_proxy_settings,
             load_peer_gateway_settings,
             save_network_proxy_settings,

@@ -21,6 +21,7 @@ use crate::agent_loop_types::{
 
 use crate::agent_capabilities::AgentCapabilityPolicy;
 use chrono::Local;
+use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::time::{timeout as tokio_timeout, Duration};
@@ -1653,8 +1654,15 @@ async fn run_verify(
             VerifyResult::default_fail()
         }
         Err(e) => {
-            log::warn!("AgentLoop [{loop_id}] verify failed: {e}");
-            VerifyResult::default_fail()
+            if is_transient_loop_error(&e) {
+                log::warn!(
+                    "AgentLoop [{loop_id}] verify hit transient error, will continue loop: {e}"
+                );
+                VerifyResult::transient_continue(format!("验证阶段遇到临时错误: {e}"))
+            } else {
+                log::warn!("AgentLoop [{loop_id}] verify failed: {e}");
+                VerifyResult::default_fail()
+            }
         }
     }
 }
@@ -1670,6 +1678,231 @@ fn parse_verify_from_free_text(text: &str) -> VerifyResult {
         }
     }
     VerifyResult::default_fail()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SessionLoopSeed {
+    original_task: String,
+    summary_text: String,
+    force_reflect: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct StoredToolCallSnapshot {
+    #[serde(default)]
+    tool_name: String,
+    #[serde(default)]
+    args_text: String,
+    #[serde(default)]
+    result_text: String,
+    #[serde(default)]
+    state: String,
+}
+
+fn looks_like_pseudo_tool_call(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.contains("<tool_call>")
+        || trimmed.contains("<function=")
+        || trimmed.contains("<parameter=")
+        || trimmed.contains("</tool_call>")
+}
+
+fn is_transient_loop_error(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    [
+        "429",
+        "rate limit",
+        "request limited",
+        "rpm reached",
+        "too many requests",
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "temporarily overloaded",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "broken pipe",
+        "econnreset",
+        "econnrefused",
+        "etimedout",
+        "network error",
+        "socket hang up",
+        "try again later",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn parse_stored_tool_calls(raw: &str) -> Vec<StoredToolCallSnapshot> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+fn build_session_loop_seed_from_turn(turn: &crate::storage::chat_history::ChatTurn) -> SessionLoopSeed {
+    let tool_calls = turn
+        .tool_calls_json
+        .as_deref()
+        .map(parse_stored_tool_calls)
+        .unwrap_or_default();
+    let force_reflect = turn.answer.trim().is_empty() && !tool_calls.is_empty();
+    let mut lines = vec![
+        "[会话上下文回填]".to_string(),
+        format!("用户请求:\n{}", truncate_str(turn.prompt.trim(), 1200)),
+    ];
+
+    if !turn.answer.trim().is_empty() {
+        lines.push(format!(
+            "当前已产出的主回复:\n{}",
+            truncate_str(turn.answer.trim(), 1200)
+        ));
+    } else if !tool_calls.is_empty() {
+        lines.push("当前还没有形成最终答复文本，只完成了工具探索。".to_string());
+    }
+
+    if !tool_calls.is_empty() {
+        let tool_lines = tool_calls
+            .iter()
+            .map(|call| {
+                let tool_name = if call.tool_name.trim().is_empty() {
+                    "unknown_tool"
+                } else {
+                    call.tool_name.trim()
+                };
+                let args = truncate_str(call.args_text.trim(), 180);
+                let result = truncate_str(call.result_text.trim(), 260);
+                format!(
+                    "- 工具 `{}` [{}]\n  参数: {}\n  结果: {}",
+                    tool_name,
+                    if call.state.trim().is_empty() {
+                        "unknown"
+                    } else {
+                        call.state.trim()
+                    },
+                    if args.is_empty() { "(空)" } else { args.as_str() },
+                    if result.is_empty() { "(空)" } else { result.as_str() }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        lines.push(format!("本轮已执行工具:\n{}", tool_lines));
+    }
+
+    SessionLoopSeed {
+        original_task: turn.prompt.trim().to_string(),
+        summary_text: lines.join("\n\n"),
+        force_reflect,
+    }
+}
+
+fn load_session_loop_seed(app: &AppHandle, session_id: &str) -> Option<SessionLoopSeed> {
+    let conn = crate::history_app_state::storage_conn(app).ok()?;
+    let turns = crate::storage::chat_history::list_chat_turns(&conn, session_id).ok()?;
+    let latest_turn = turns.last()?;
+    Some(build_session_loop_seed_from_turn(latest_turn))
+}
+
+async fn normalize_reflect_output(
+    app: &AppHandle,
+    loop_id: &str,
+    original_task: &str,
+    raw_text: &str,
+    provider: &crate::provider_runtime::ProviderRuntimeConfig,
+    abort_flag: &Arc<AtomicBool>,
+) -> Option<String> {
+    if abort_flag.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    let repair_prompt = format!(
+        "你刚才输出了不被 Agent Loop 接受的格式。\
+\n只允许以下 3 类输出之一，且最终答案里必须至少出现一个合法 marker：\
+\n1. {}{{\"agentId\":\"...\",\"task\":\"...\",\"params\":{{}}}}\
+\n2. {}{{\"calls\":[...]}}\
+\n3. {}{{\"score\":0-10,\"evidence\":\"...\",\"remaining\":[\"...\"],\"shouldContinue\":true/false}}\
+\n禁止输出 `<tool_call>`、`<function=...>`、普通工具调用文本、额外解释。\
+\n如果你认为还需要继续，但当前无法直接决定委派对象，请输出 VERIFY marker，且 `shouldContinue=true`。\
+\n任务: {}\
+\n原始非法输出:\n{}",
+        MARKER_CALL,
+        MARKER_BATCH,
+        MARKER_VERIFY,
+        truncate_str(original_task.trim(), 600),
+        truncate_str(raw_text.trim(), 2400),
+    );
+
+    let base_normalized = crate::normalized_provider_runtime_base_url(
+        &provider.base_url,
+        &provider.api_format,
+        &provider.provider_id,
+    );
+    let pi_rt = crate::pi_runtime::require_pi_runtime_location(app).ok()?;
+    let bridge = crate::channels::pi_bridge::PiBridge::new(
+        pi_rt,
+        &provider.provider_id,
+        &provider.api_format,
+        &base_normalized,
+        &provider.api_key,
+        &provider.model,
+        None,
+    );
+
+    let channel_id = format!("nc:agent-loop-reflect-repair:{}", uuid::Uuid::new_v4());
+    let user_id = uuid::Uuid::new_v4().simple().to_string();
+    let outcome = bridge.process_message_interruptible_with_events(
+        &channel_id,
+        &user_id,
+        &repair_prompt,
+        1024,
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+
+    match outcome {
+        Ok(crate::channels::pi_bridge::PiProcessOutcome::Completed(response)) => {
+            let repaired = response.full_text;
+            if extract_first_loop_marker(&repaired).is_some() {
+                Some(repaired)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NaturalEndVerifyDecision {
+    Pass,
+    Reflect,
+    Stop,
+}
+
+fn decide_natural_end_after_verify(
+    verify_result: &VerifyResult,
+    score_threshold: u8,
+) -> NaturalEndVerifyDecision {
+    if verify_result.score >= score_threshold {
+        return NaturalEndVerifyDecision::Pass;
+    }
+    if verify_result.should_continue {
+        NaturalEndVerifyDecision::Reflect
+    } else {
+        NaturalEndVerifyDecision::Stop
+    }
+}
+
+fn build_verify_feedback(verify_result: &VerifyResult, score_threshold: u8) -> String {
+    let remaining_text = if verify_result.remaining.is_empty() {
+        String::new()
+    } else {
+        format!("未完成项: {}", verify_result.remaining.join(", "))
+    };
+    format!(
+        "\n\n[验证反馈] 完成度: {}/{}. 依据: {}. {}",
+        verify_result.score, score_threshold, verify_result.evidence, remaining_text,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,7 +1924,7 @@ async fn reflect_for_next_action(
     original_task: &str,
     provider: &crate::provider_runtime::ProviderRuntimeConfig,
     abort_flag: &Arc<AtomicBool>,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     let clean_text = strip_loop_markers(accumulated_text);
 
     let failed_summary = if failed_actions.is_empty() {
@@ -1733,7 +1966,7 @@ async fn reflect_for_next_action(
         Ok(rt) => rt,
         Err(e) => {
             log::warn!("AgentLoop [{loop_id}] reflect: Pi runtime unavailable: {e}");
-            return None;
+            return Ok(None);
         }
     };
 
@@ -1751,7 +1984,7 @@ async fn reflect_for_next_action(
     let user_id = uuid::Uuid::new_v4().simple().to_string();
 
     if abort_flag.load(Ordering::Relaxed) {
-        return None;
+        return Ok(None);
     }
 
     let outcome = bridge.process_message_interruptible_with_events(
@@ -1769,23 +2002,45 @@ async fn reflect_for_next_action(
             let text = response.full_text;
             if text.trim().is_empty() {
                 log::info!("AgentLoop [{loop_id}] reflect returned empty text");
-                None
+                Ok(None)
             } else {
+                let has_marker = extract_first_loop_marker(&text).is_some();
+                if !has_marker && looks_like_pseudo_tool_call(&text) {
+                    log::warn!(
+                        "AgentLoop [{loop_id}] reflect produced pseudo tool-call text; attempting marker repair"
+                    );
+                    if let Some(repaired) = normalize_reflect_output(
+                        app,
+                        loop_id,
+                        original_task,
+                        &text,
+                        provider,
+                        abort_flag,
+                    )
+                    .await
+                    {
+                        log::info!(
+                            "AgentLoop [{loop_id}] reflect repair succeeded, repaired_chars={}",
+                            repaired.len()
+                        );
+                        return Ok(Some(repaired));
+                    }
+                }
                 log::info!(
                     "AgentLoop [{loop_id}] reflect produced {} chars, has_marker={}",
                     text.len(),
-                    extract_first_loop_marker(&text).is_some()
+                    has_marker
                 );
-                Some(text)
+                Ok(Some(text))
             }
         }
         Ok(crate::channels::pi_bridge::PiProcessOutcome::Aborted) => {
             log::info!("AgentLoop [{loop_id}] reflect aborted");
-            None
+            Ok(None)
         }
         Err(e) => {
             log::warn!("AgentLoop [{loop_id}] reflect failed: {e}");
-            None
+            Err(e)
         }
     }
 }
@@ -1801,6 +2056,15 @@ impl VerifyResult {
             evidence: "验证阶段未能获取有效评分".to_string(),
             remaining: vec!["无法确定剩余任务".to_string()],
             should_continue: false,
+        }
+    }
+
+    fn transient_continue(evidence: String) -> Self {
+        VerifyResult {
+            score: 0,
+            evidence,
+            remaining: vec!["等待临时错误恢复后继续执行".to_string()],
+            should_continue: true,
         }
     }
 }
@@ -1918,6 +2182,19 @@ pub async fn run_agent_loop(
     let verify_config = &config.verify_config;
     let approval_timeout = Duration::from_secs(30);
     let mut original_task = String::new();
+    let session_loop_seed = load_session_loop_seed(app, session_id);
+
+    if let Some(seed) = session_loop_seed.as_ref() {
+        if original_task.is_empty() && !seed.original_task.trim().is_empty() {
+            original_task = seed.original_task.trim().to_string();
+        }
+        if accumulated_text.trim().is_empty() && !seed.summary_text.trim().is_empty() {
+            log::info!(
+                "AgentLoop [{loop_id}] using session seed context because initial_text is empty"
+            );
+            accumulated_text = seed.summary_text.clone();
+        }
+    }
 
     // Load a default capability policy (can be refined later to use agent-specific policy).
     let capability_policy = AgentCapabilityPolicy::default();
@@ -1999,6 +2276,50 @@ pub async fn run_agent_loop(
 
         match marker {
             None => {
+                if iteration == 0
+                    && session_loop_seed
+                        .as_ref()
+                        .map(|seed| seed.force_reflect)
+                        .unwrap_or(false)
+                    && !original_task.trim().is_empty()
+                {
+                    log::info!(
+                        "AgentLoop [{loop_id}] tool-only session seed detected; skipping early verify and forcing reflect"
+                    );
+                    match reflect_for_next_action(
+                        app,
+                        &loop_id,
+                        iteration,
+                        max_iterations,
+                        &accumulated_text,
+                        &failed_actions,
+                        &original_task,
+                        provider,
+                        &abort_flag,
+                    )
+                    .await
+                    {
+                        Ok(Some(new_text)) => {
+                            accumulated_text = new_text;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            if is_transient_loop_error(&error) {
+                                log::warn!(
+                                    "AgentLoop [{loop_id}] reflect hit transient error during session-seed recovery; keeping loop alive: {error}"
+                                );
+                                accumulated_text = format!(
+                                    "{}\n\n[反思阶段临时错误] {}",
+                                    strip_loop_markers(&accumulated_text),
+                                    error
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 // No marker found — natural end.
                 // If verify is enabled, run verify once before ending.
                 if verify_config.enabled {
@@ -2013,17 +2334,37 @@ pub async fn run_agent_loop(
                     )
                     .await;
 
-                    if verify_result.score >= verify_config.score_threshold {
-                        emit_completed(&app, &loop_id, "verify_pass", iteration, &loop_start);
-                        break;
+                    match decide_natural_end_after_verify(&verify_result, verify_config.score_threshold)
+                    {
+                        NaturalEndVerifyDecision::Pass => {
+                            emit_completed(&app, &loop_id, "verify_pass", iteration, &loop_start);
+                            break;
+                        }
+                        NaturalEndVerifyDecision::Stop => {
+                            emit_completed(
+                                &app,
+                                &loop_id,
+                                "verify_should_stop",
+                                iteration,
+                                &loop_start,
+                            );
+                            break;
+                        }
+                        NaturalEndVerifyDecision::Reflect => {
+                            log::info!(
+                                "AgentLoop [{loop_id}] verify score {} < {} with shouldContinue=true; reflecting for next action",
+                                verify_result.score,
+                                verify_config.score_threshold
+                            );
+                            accumulated_text = format!(
+                                "{}{}",
+                                strip_loop_markers(&accumulated_text),
+                                build_verify_feedback(&verify_result, verify_config.score_threshold)
+                            );
+                            iteration += 1;
+                            continue;
+                        }
                     }
-
-                    // Score below threshold but no marker — treat as natural end.
-                    log::info!(
-                        "AgentLoop [{loop_id}] verify score {} < {} but no more markers, ending",
-                        verify_result.score,
-                        verify_config.score_threshold
-                    );
                 }
 
                 emit_completed(&app, &loop_id, "natural", iteration, &loop_start);
@@ -2391,18 +2732,7 @@ pub async fn run_agent_loop(
 
             // Inject verify feedback into the accumulated text so the LLM can adjust.
             if verify_result.score < verify_config.score_threshold {
-                let remaining_text = if verify_result.remaining.is_empty() {
-                    String::new()
-                } else {
-                    format!("未完成项: {}", verify_result.remaining.join(", "))
-                };
-                let feedback = format!(
-                    "\n\n[验证反馈] 完成度: {}/{}. 依据: {}. {}",
-                    verify_result.score,
-                    verify_config.score_threshold,
-                    verify_result.evidence,
-                    remaining_text,
-                );
+                let feedback = build_verify_feedback(&verify_result, verify_config.score_threshold);
                 accumulated_text = format!("{}{}", strip_loop_markers(&accumulated_text), feedback);
             }
         }
@@ -2425,7 +2755,7 @@ pub async fn run_agent_loop(
             )
             .await
             {
-                Some(new_text) => {
+                Ok(Some(new_text)) => {
                     emit_loop_event(
                         app,
                         "agent-loop://reflect",
@@ -2440,10 +2770,26 @@ pub async fn run_agent_loop(
                         "AgentLoop [{loop_id}] REFLECT phase complete (iteration {iteration})"
                     );
                 }
-                None => {
+                Ok(None) => {
                     log::debug!(
                         "AgentLoop [{loop_id}] REFLECT produced no output, accumulated text unchanged"
                     );
+                }
+                Err(error) => {
+                    if is_transient_loop_error(&error) {
+                        log::warn!(
+                            "AgentLoop [{loop_id}] REFLECT hit transient error; keeping loop alive: {error}"
+                        );
+                        accumulated_text = format!(
+                            "{}\n\n[反思阶段临时错误] {}",
+                            strip_loop_markers(&accumulated_text),
+                            error
+                        );
+                    } else {
+                        log::debug!(
+                            "AgentLoop [{loop_id}] REFLECT failed with non-transient error, accumulated text unchanged"
+                        );
+                    }
                 }
             }
         }
@@ -2517,6 +2863,96 @@ mod tests {
             }
             other => panic!("expected Batch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_decide_natural_end_after_verify_reflects_when_work_is_incomplete() {
+        let verify = VerifyResult {
+            score: 3,
+            evidence: "still incomplete".to_string(),
+            remaining: vec!["finish task".to_string()],
+            should_continue: true,
+        };
+
+        assert_eq!(
+            decide_natural_end_after_verify(&verify, 8),
+            NaturalEndVerifyDecision::Reflect
+        );
+    }
+
+    #[test]
+    fn test_decide_natural_end_after_verify_stops_when_verify_requests_stop() {
+        let verify = VerifyResult {
+            score: 3,
+            evidence: "blocked".to_string(),
+            remaining: vec!["needs input".to_string()],
+            should_continue: false,
+        };
+
+        assert_eq!(
+            decide_natural_end_after_verify(&verify, 8),
+            NaturalEndVerifyDecision::Stop
+        );
+    }
+
+    #[test]
+    fn test_build_verify_feedback_includes_remaining_items() {
+        let verify = VerifyResult {
+            score: 5,
+            evidence: "some progress".to_string(),
+            remaining: vec!["step a".to_string(), "step b".to_string()],
+            should_continue: true,
+        };
+
+        let feedback = build_verify_feedback(&verify, 8);
+        assert!(feedback.contains("完成度: 5/8"));
+        assert!(feedback.contains("依据: some progress"));
+        assert!(feedback.contains("未完成项: step a, step b"));
+    }
+
+    #[test]
+    fn test_looks_like_pseudo_tool_call_matches_xmlish_tool_output() {
+        let text = "<tool_call>\n<function=read>\n<parameter=path>\n/tmp/demo\n</parameter>\n</function>\n</tool_call>";
+        assert!(looks_like_pseudo_tool_call(text));
+        assert!(!looks_like_pseudo_tool_call("NC_AGENT_LOOP_CALL_JSON:{\"agentId\":\"a\",\"task\":\"b\",\"params\":{}}"));
+    }
+
+    #[test]
+    fn test_is_transient_loop_error_matches_rate_limit_and_timeout() {
+        assert!(is_transient_loop_error(
+            "pi assistant 错误: 429 request limited RPM reached, current: 11, limit: 10"
+        ));
+        assert!(is_transient_loop_error("request timed out after 30s"));
+        assert!(!is_transient_loop_error("invalid json marker payload"));
+    }
+
+    #[test]
+    fn test_build_session_loop_seed_from_turn_marks_tool_only_runs_for_reflect() {
+        let turn = crate::storage::chat_history::ChatTurn {
+            id: "turn-1".to_string(),
+            session_id: "session-1".to_string(),
+            turn_index: 0,
+            prompt: "做一个图".to_string(),
+            answer: "".to_string(),
+            thinking: "".to_string(),
+            status: "done".to_string(),
+            created_at: 1,
+            completed_at: Some(2),
+            usage_json: None,
+            response_segments_json: None,
+            tool_calls_json: Some(
+                r#"[{"toolName":"read","argsText":"{\"path\":\"/tmp/a\"}","resultText":"content","state":"done"}]"#
+                    .to_string(),
+            ),
+            activity_json: None,
+            speaker_agent_id: None,
+        };
+
+        let seed = build_session_loop_seed_from_turn(&turn);
+        assert_eq!(seed.original_task, "做一个图");
+        assert!(seed.force_reflect);
+        assert!(seed.summary_text.contains("当前还没有形成最终答复文本"));
+        assert!(seed.summary_text.contains("工具 `read`"));
     }
 
     #[test]
@@ -3075,6 +3511,15 @@ mod tests {
         let result = VerifyResult::default_fail();
         assert_eq!(result.score, 0);
         assert!(!result.should_continue);
+    }
+
+    #[test]
+    fn test_verify_result_transient_continue() {
+        let result = VerifyResult::transient_continue("rate limited".to_string());
+        assert_eq!(result.score, 0);
+        assert!(result.should_continue);
+        assert!(result.evidence.contains("rate limited"));
+        assert_eq!(result.remaining, vec!["等待临时错误恢复后继续执行"]);
     }
 
     #[test]

@@ -3,6 +3,7 @@ import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 const runtimePackageName = '@mariozechner/pi-coding-agent'
+const extraRuntimePackageNames = ['@modelcontextprotocol/sdk']
 const publishedMonoPackageNames = [
   '@mariozechner/pi-coding-agent',
   '@mariozechner/pi-agent-core',
@@ -644,6 +645,18 @@ function copyHoistedDependencies(sourcePackageDir, targetPackageDir) {
   }
 }
 
+function copyRuntimePackageToNodeModules(packageName, targetNodeModulesRoot) {
+  const sourceDir = resolveInstalledPackageDir(packageName, { localFirst: true, includeGlobal: false })
+  if (!sourceDir) {
+    throw new Error(`Runtime support package not found: ${packageName}. Run npm install first.`)
+  }
+
+  const targetPath = packagePathFromNodeModules(targetNodeModulesRoot, packageName)
+  copyRecursive(sourceDir, targetPath)
+  rewritePackageSymlinks(targetPath, sourceDir)
+  copyHoistedDependencies(sourceDir, targetPath)
+}
+
 function readPackageJson(pkgDir) {
   const p = path.join(pkgDir, 'package.json')
   if (!fs.existsSync(p)) return null
@@ -896,6 +909,11 @@ function main() {
   copyRecursive(packageDir, packageTargetPath)
   rewritePackageSymlinks(packageTargetPath, packageDir)
   copyHoistedDependencies(packageDir, packageTargetPath)
+  const runtimeNodeModulesRoot = path.join(targetDir, 'node_modules')
+  fs.mkdirSync(runtimeNodeModulesRoot, { recursive: true })
+  for (const packageName of extraRuntimePackageNames) {
+    copyRuntimePackageToNodeModules(packageName, runtimeNodeModulesRoot)
+  }
   const launcherPath = writeLauncher(platformDir, targetDir)
   const monoBundle = stageMonoBundle(targetDir)
 

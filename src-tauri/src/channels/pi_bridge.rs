@@ -1443,6 +1443,14 @@ impl PiBridge {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("PI_CODING_AGENT_DIR", &runtime_dir);
+        if let Some(runtime_root) = self
+            .pi_runtime
+            .resource_root
+            .as_deref()
+            .or_else(|| self.pi_runtime.executable.parent())
+        {
+            cmd.env("NINECLAW_PI_RUNTIME_ROOT", runtime_root.as_os_str());
+        }
 
         if runtime_provider_config
             .as_ref()
@@ -1501,6 +1509,9 @@ impl PiBridge {
                 prepared.session_token.as_deref().unwrap_or_default(),
             )
             .env("NINECLAW_SESSION_ID", key.as_str());
+            if let Some(path) = prepared.mcp_config_path.as_ref() {
+                cmd.env("NINECLAW_MCP_CONFIG_FILE", path.as_os_str());
+            }
         }
 
         let mut skill_paths: Vec<PathBuf> = Vec::new();
