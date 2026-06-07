@@ -10,6 +10,7 @@ import {
   chatListSessions,
   chatGetSessionDetail,
   chatCreateSession,
+  chatUpdateSessionTitle,
   chatAppendTurn,
   chatUpdateTurn,
   chatDeleteSession,
@@ -118,6 +119,21 @@ describe('chatCreateSession', () => {
       sessionLlmModel: null,
       workspaceId: null,
     })
+  })
+})
+
+describe('chatUpdateSessionTitle', () => {
+  it('calls chat_update_session_title with session id and title', async () => {
+    const mockResult = { id: 's1', title: '新标题', turns: [] }
+    mockedInvoke.mockResolvedValueOnce(mockResult)
+
+    const result = await chatUpdateSessionTitle({ sessionId: 's1', title: '新标题' })
+
+    expect(mockedInvoke).toHaveBeenCalledWith('chat_update_session_title', {
+      sessionId: 's1',
+      title: '新标题',
+    })
+    expect(result).toEqual(mockResult)
   })
 })
 

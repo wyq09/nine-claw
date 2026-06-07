@@ -7,18 +7,46 @@ const INITIAL_VISIBLE = 4
 const WARM_VISIBLE = 10
 const LOAD_MORE_BATCH = 35
 
+type WindowState = {
+  sessionId: string
+  loadedCount: number
+}
+
 export function useChatTurnWindow(
   fullTurns: ConversationTurn[],
   activeHistoryId: string,
   scrollParentRef: RefObject<HTMLDivElement | null>,
 ) {
   const total = fullTurns.length
-  const [loadedCount, setLoadedCount] = useState(() => Math.min(INITIAL_VISIBLE, total))
+  const [windowState, setWindowState] = useState<WindowState>(() => ({
+    sessionId: activeHistoryId,
+    loadedCount: Math.min(INITIAL_VISIBLE, total),
+  }))
   const pendingScrollRestoreRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null)
   const pagingRef = useRef(false)
   const warmupRafRef = useRef<number | null>(null)
+  const previousTurnsLengthRef = useRef({ sessionId: activeHistoryId, length: total })
 
-  /** 用 layout 阶段重置，避免切换会话首帧仍沿用上一会话的 loadedCount，导致虚拟列表滚底错位 */
+  const loadedCount =
+    windowState.sessionId === activeHistoryId
+      ? Math.min(windowState.loadedCount, total)
+      : Math.min(INITIAL_VISIBLE, total)
+
+  const setActiveLoadedCount = useCallback((updater: (current: number) => number) => {
+    setWindowState((current) => {
+      const currentLoaded =
+        current.sessionId === activeHistoryId
+          ? current.loadedCount
+          : Math.min(INITIAL_VISIBLE, fullTurns.length)
+      const nextLoaded = Math.min(fullTurns.length, Math.max(0, updater(currentLoaded)))
+      if (current.sessionId === activeHistoryId && current.loadedCount === nextLoaded) {
+        return current
+      }
+      return { sessionId: activeHistoryId, loadedCount: nextLoaded }
+    })
+  }, [activeHistoryId, fullTurns.length])
+
+  /** 切换会话时只同步清理 refs；窗口数量用派生值立即回到首屏，避免 layout 阶段二次渲染卡点击。 */
   useLayoutEffect(() => {
     pendingScrollRestoreRef.current = null
     pagingRef.current = false
@@ -26,18 +54,16 @@ export function useChatTurnWindow(
       cancelAnimationFrame(warmupRafRef.current)
       warmupRafRef.current = null
     }
-    // Session switches must reset the virtualization window before the first paint.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setLoadedCount(Math.min(INITIAL_VISIBLE, fullTurns.length))
   }, [activeHistoryId, fullTurns.length])
 
   useEffect(() => {
+    setActiveLoadedCount(() => Math.min(INITIAL_VISIBLE, fullTurns.length))
     if (fullTurns.length <= INITIAL_VISIBLE) {
       return
     }
     warmupRafRef.current = requestAnimationFrame(() => {
       warmupRafRef.current = null
-      setLoadedCount((current) => Math.min(fullTurns.length, Math.max(current, WARM_VISIBLE)))
+      setActiveLoadedCount((current) => Math.min(fullTurns.length, Math.max(current, WARM_VISIBLE)))
     })
     return () => {
       if (warmupRafRef.current !== null) {
@@ -45,13 +71,17 @@ export function useChatTurnWindow(
         warmupRafRef.current = null
       }
     }
-  }, [activeHistoryId, fullTurns.length])
+  }, [activeHistoryId, fullTurns.length, setActiveLoadedCount])
 
   useEffect(() => {
     const t = fullTurns.length
+    const previous = previousTurnsLengthRef.current
+    previousTurnsLengthRef.current = { sessionId: activeHistoryId, length: t }
+    if (previous.sessionId !== activeHistoryId || previous.length === t) {
+      return
+    }
     // Keep the window from staying at 0 while turns stream into the same session.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setLoadedCount((c) => {
+    setActiveLoadedCount((c) => {
       if (t === 0) {
         return 0
       }
@@ -59,7 +89,7 @@ export function useChatTurnWindow(
       const floor = Math.min(WARM_VISIBLE, t)
       return Math.min(Math.max(c, floor), t)
     })
-  }, [fullTurns.length])
+  }, [fullTurns.length, activeHistoryId, setActiveLoadedCount])
 
   const visibleRangeStart = Math.max(0, total - loadedCount)
   const visibleTurns = useMemo(() => fullTurns.slice(visibleRangeStart), [fullTurns, visibleRangeStart])
@@ -77,8 +107,8 @@ export function useChatTurnWindow(
       }
     }
     pagingRef.current = true
-    setLoadedCount((c) => Math.min(total, c + LOAD_MORE_BATCH))
-  }, [visibleRangeStart, total, scrollParentRef])
+    setActiveLoadedCount((c) => Math.min(total, c + LOAD_MORE_BATCH))
+  }, [visibleRangeStart, total, scrollParentRef, setActiveLoadedCount])
 
   useLayoutEffect(() => {
     const pending = pendingScrollRestoreRef.current

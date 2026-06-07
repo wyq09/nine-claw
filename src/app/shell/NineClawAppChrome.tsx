@@ -5,7 +5,8 @@ import { AppIcon } from '../../components/AppIcon'
 import { SettingsModal } from '../../components/SettingsModal'
 import { llmTraceList, onLlmTraceEvent } from '../../lib/llmTraceClient'
 import { sessionLlmLogGet, onSessionLlmLogEvent } from '../../lib/sessionLlmLogClient'
-import { groupHistoryIntoSidebarBuckets } from '../../lib/historySidebarBuckets'
+import { groupHistoryIntoSidebarBuckets, type HistorySidebarBucket, type HistorySidebarItem } from '../../lib/historySidebarBuckets'
+import type { HistorySidebarGroup } from '../../lib/historySidebarMeta'
 import { useHistorySidebarBucketsExpanded } from '../../hooks/useHistorySidebarBucketsExpanded'
 import type {
   AgentInput,
@@ -31,7 +32,6 @@ import {
   sessionLlmEncode,
   summarizePrompt,
 } from '../lib'
-import { getHistorySidebarCardMeta } from '../lib/historySidebarCardMeta'
 import { SidebarButton } from '../chat/ChatWorkspace'
 import { NewSessionDialog, SkillInstallDialog } from '../pages/SessionDialogs'
 import { AgentSkillPickerDialog } from '../agents/AgentDialogsBundle'
@@ -40,6 +40,10 @@ import { openSessionLlmLogPopout } from '../lib/sessionLlmLogPopout'
 import { matchesTraceScope } from '../workspaces/panels/llmTraceModel'
 import { matchesSessionLogScope } from '../workspaces/panels/sessionLlmLogModel'
 import type { SessionLlmSelectOption } from './NineClawRouteOutlet'
+import { HistorySidebarBucketHeader } from './HistorySidebarBucketHeader'
+import { HistorySidebarCard } from './HistorySidebarCard'
+import { HistorySidebarMenus } from './HistorySidebarMenus'
+import type { HistoryContextMenuState } from './historyContextMenuTypes'
 
 export type NineClawAppChromeProps = {
   routeOutlet: ReactNode
@@ -59,10 +63,11 @@ export type NineClawAppChromeProps = {
   historyBusy: boolean
   historySearch: string
   setHistorySearch: Dispatch<SetStateAction<string>>
-  visibleHistory: HistoryItem[]
+  visibleHistory: HistorySidebarItem[]
+  historyGroups: HistorySidebarGroup[]
   activeHistoryId: string | null
   onHistorySelect: (id: string) => void
-  onHistoryContextMenu: (event: MouseEvent<HTMLButtonElement>, item: HistoryItem) => void
+  onHistoryContextMenu: (event: MouseEvent<HTMLElement>, item: HistorySidebarItem) => void
   onOpenSettings: (tab: SettingsTab) => void
   skillInstallDialogOpen: boolean
   skillInstallError: string
@@ -72,22 +77,17 @@ export type NineClawAppChromeProps = {
   setSkillInstallError: Dispatch<SetStateAction<string>>
   onCloseSkillInstallDialog: () => void
   onConfirmSkillInstall: () => void | Promise<void>
-  historyContextMenu: {
-    sessionId: string
-    title: string
-    x: number
-    y: number
-    canDelete: boolean
-  } | null
-  setHistoryContextMenu: Dispatch<
-    SetStateAction<{
-      sessionId: string
-      title: string
-      x: number
-      y: number
-      canDelete: boolean
-    } | null>
-  >
+  historyContextMenu: HistoryContextMenuState | null
+  setHistoryContextMenu: Dispatch<SetStateAction<HistoryContextMenuState | null>>
+  onRenameHistoryItem: (sessionId: string, title: string) => void
+  onToggleHistoryPinned: (sessionId: string, pinned: boolean) => void
+  onAssignHistoryGroup: (sessionId: string, groupId: string | null) => void
+  onCreateHistoryGroup: (sessionId: string) => void
+  onCopyHistoryItem: (sessionId: string) => void
+  onRegenerateHistoryTitle: (sessionId: string) => void
+  onRenameHistoryGroup: (groupId: string, name: string) => void
+  onRegenerateHistoryGroupName: (groupId: string) => void
+  onDissolveHistoryGroup: (groupId: string) => void
   onRequestDeleteHistoryItem: (sessionId: string) => void
   historyDeleteTarget: { sessionId: string; title: string } | null
   setHistoryDeleteTarget: Dispatch<SetStateAction<{ sessionId: string; title: string } | null>>
@@ -167,6 +167,7 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
     historySearch,
     setHistorySearch,
     visibleHistory,
+    historyGroups,
     activeHistoryId,
     onHistorySelect,
     onHistoryContextMenu,
@@ -181,6 +182,15 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
     onConfirmSkillInstall,
     historyContextMenu,
     setHistoryContextMenu,
+    onRenameHistoryItem,
+    onToggleHistoryPinned,
+    onAssignHistoryGroup,
+    onCreateHistoryGroup,
+    onCopyHistoryItem,
+    onRegenerateHistoryTitle,
+    onRenameHistoryGroup,
+    onRegenerateHistoryGroupName,
+    onDissolveHistoryGroup,
     onRequestDeleteHistoryItem,
     historyDeleteTarget,
     setHistoryDeleteTarget,
@@ -234,8 +244,15 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
     llmTraceSessionId: llmTraceSessionIdProp,
     llmTraceWorkspaceId,
   } = props
-  const historyBuckets = useMemo(() => groupHistoryIntoSidebarBuckets(visibleHistory), [visibleHistory])
+  const historyBuckets = useMemo(
+    () => groupHistoryIntoSidebarBuckets(visibleHistory, undefined, historyGroups),
+    [historyGroups, visibleHistory],
+  )
   const { mergedBucketOpen, toggleBucket } = useHistorySidebarBucketsExpanded(historyBuckets, activeHistoryId)
+  const [editingHistorySessionId, setEditingHistorySessionId] = useState('')
+  const [editingHistoryTitle, setEditingHistoryTitle] = useState('')
+  const [editingHistoryGroupId, setEditingHistoryGroupId] = useState('')
+  const [editingHistoryGroupName, setEditingHistoryGroupName] = useState('')
 
   const [standaloneTraceCount, setStandaloneTraceCount] = useState(0)
   const [sessionLogAvailable, setSessionLogAvailable] = useState(false)
@@ -360,6 +377,51 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
 
     event.preventDefault()
     void getCurrentWindow().startDragging()
+  }
+
+  const clampHistoryMenuPosition = (x: number, y: number, menuWidth = 224, menuHeight = 280) => ({
+    x: Math.min(x, Math.max(12, window.innerWidth - menuWidth - 12)),
+    y: Math.min(y, Math.max(12, window.innerHeight - menuHeight - 12)),
+  })
+
+  const startEditingHistorySession = (sessionId: string, title: string) => {
+    setEditingHistorySessionId(sessionId)
+    setEditingHistoryTitle(title.trim() || '未命名会话')
+  }
+
+  const confirmEditingHistorySession = () => {
+    if (!editingHistorySessionId) return
+    onRenameHistoryItem(editingHistorySessionId, editingHistoryTitle)
+    setEditingHistorySessionId('')
+    setEditingHistoryTitle('')
+  }
+
+  const startEditingHistoryGroup = (groupId: string, name: string) => {
+    setEditingHistoryGroupId(groupId)
+    setEditingHistoryGroupName(name.trim() || '新分组')
+  }
+
+  const confirmEditingHistoryGroup = () => {
+    if (!editingHistoryGroupId) return
+    onRenameHistoryGroup(editingHistoryGroupId, editingHistoryGroupName)
+    setEditingHistoryGroupId('')
+    setEditingHistoryGroupName('')
+  }
+
+  const handleOpenHistoryGroupMenu = (
+    event: MouseEvent<HTMLButtonElement>,
+    bucket: HistorySidebarBucket<HistorySidebarItem>,
+  ) => {
+    event.preventDefault()
+    event.stopPropagation()
+    const pos = clampHistoryMenuPosition(event.clientX, event.clientY, 220, 150)
+    setHistoryContextMenu({
+      kind: 'group',
+      groupId: bucket.groupId ?? '',
+      title: bucket.label,
+      x: pos.x,
+      y: pos.y,
+    })
   }
 
   return (
@@ -517,49 +579,40 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
                 {visibleHistory.length > 0 ? (
                   historyBuckets.map((bucket) => (
                     <section key={bucket.key} className="history-bucket">
-                      <button
-                        type="button"
-                        className="history-bucket-head"
-                        aria-expanded={mergedBucketOpen[bucket.key]}
-                        onClick={() => toggleBucket(bucket.key)}
-                      >
-                        <span
-                          className={`history-bucket-chevron-wrap${mergedBucketOpen[bucket.key] ? ' is-open' : ''}`}
-                        >
-                          <AppIcon name="chevron-down" size={14} />
-                        </span>
-                        <span className="history-bucket-label">{bucket.label}</span>
-                        <span className="history-bucket-count">{bucket.items.length}</span>
-                      </button>
+                      <HistorySidebarBucketHeader
+                        bucket={bucket}
+                        open={mergedBucketOpen[bucket.key]}
+                        editingGroupId={editingHistoryGroupId}
+                        editingGroupName={editingHistoryGroupName}
+                        onToggle={toggleBucket}
+                        onOpenGroupMenu={handleOpenHistoryGroupMenu}
+                        onEditGroupNameChange={setEditingHistoryGroupName}
+                        onConfirmGroupEdit={confirmEditingHistoryGroup}
+                        onCancelGroupEdit={() => {
+                          setEditingHistoryGroupId('')
+                          setEditingHistoryGroupName('')
+                        }}
+                      />
                       {mergedBucketOpen[bucket.key] ? (
                         <div className="history-bucket-items" role="list">
-                          {bucket.items.map((item) => {
-                            const meta = getHistorySidebarCardMeta(item.status, item.updatedAt || item.createdAt)
-                            return (
-                              <button
-                                key={item.id}
-                                type="button"
-                                role="listitem"
-                                className={`history-card ${item.id === activeHistoryId ? 'active' : ''}`}
-                                onClick={() => onHistorySelect(item.id)}
-                                onContextMenu={(event) => onHistoryContextMenu(event, item)}
-                                title={item.title}
-                              >
-                                <span className="history-card-body">
-                                  <span className="history-card-title">{item.title?.trim() || '未命名会话'}</span>
-                                  {item.agent ? (
-                                    <span className="history-card-agent">{item.agent.name}</span>
-                                  ) : null}
-                                  <span className="history-card-meta-row">
-                                    <span className={`history-card-meta-icon ${meta.tone}`}>
-                                      <AppIcon name={meta.icon} size={12} />
-                                    </span>
-                                    <span className={`history-card-time ${meta.tone}`}>{meta.label}</span>
-                                  </span>
-                                </span>
-                              </button>
-                            )
-                          })}
+                          {bucket.items.map((item) => (
+                            <HistorySidebarCard
+                              key={item.id}
+                              item={item}
+                              active={item.id === activeHistoryId}
+                              onSelect={onHistorySelect}
+                              onContextMenu={onHistoryContextMenu}
+                              editing={editingHistorySessionId === item.id}
+                              editTitle={editingHistoryTitle}
+                              onStartMenu={onHistoryContextMenu}
+                              onEditTitleChange={setEditingHistoryTitle}
+                              onConfirmEdit={confirmEditingHistorySession}
+                              onCancelEdit={() => {
+                                setEditingHistorySessionId('')
+                                setEditingHistoryTitle('')
+                              }}
+                            />
+                          ))}
                         </div>
                       ) : null}
                     </section>
@@ -618,31 +671,21 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
       ) : null}
 
       {historyContextMenu ? (
-        <>
-          <button
-            type="button"
-            className="context-menu-backdrop"
-            aria-label="关闭会话菜单"
-            onClick={() => setHistoryContextMenu(null)}
-          />
-          <div
-            className="history-context-menu"
-            role="menu"
-            style={{ left: historyContextMenu.x, top: historyContextMenu.y }}
-          >
-            <button
-              type="button"
-              className="history-context-menu-item danger"
-              role="menuitem"
-              onClick={() => onRequestDeleteHistoryItem(historyContextMenu.sessionId)}
-              disabled={!historyContextMenu.canDelete}
-              title={historyContextMenu.canDelete ? `删除「${historyContextMenu.title}」` : '当前会话仍在生成，暂时不能删除'}
-            >
-              <AppIcon name="trash" size={16} />
-              <span>{historyContextMenu.canDelete ? '删除会话' : '会话生成中，暂不可删'}</span>
-            </button>
-          </div>
-        </>
+        <HistorySidebarMenus
+          menu={historyContextMenu}
+          groups={historyGroups}
+          onClose={() => setHistoryContextMenu(null)}
+          onRenameSession={startEditingHistorySession}
+          onTogglePinned={onToggleHistoryPinned}
+          onAssignToGroup={onAssignHistoryGroup}
+          onCreateGroup={onCreateHistoryGroup}
+          onCopySession={onCopyHistoryItem}
+          onRegenerateTitle={onRegenerateHistoryTitle}
+          onRequestDelete={onRequestDeleteHistoryItem}
+          onRenameGroup={startEditingHistoryGroup}
+          onRegenerateGroupName={onRegenerateHistoryGroupName}
+          onDissolveGroup={onDissolveHistoryGroup}
+        />
       ) : null}
 
       {historyDeleteTarget ? (

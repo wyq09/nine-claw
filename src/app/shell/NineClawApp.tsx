@@ -24,7 +24,6 @@ import type {
   BotConfig,
   ConversationAgentSnapshot,
   GeneralSettings,
-  HistoryItem,
   ProviderConfig,
   ProviderDefinition,
   ProviderId,
@@ -40,6 +39,22 @@ import type {
   ImageGenerationSystemConfig,
   ImageProviderConfig,
 } from '../../types/imageGeneration'
+import type { HistorySidebarItem } from '../../lib/historySidebarBuckets'
+import {
+  applyHistorySidebarMeta,
+  assignHistoryItemToGroup,
+  createEmptyHistorySidebarMeta,
+  createHistorySidebarGroup,
+  deriveHistorySidebarGroupName,
+  dissolveHistorySidebarGroup,
+  loadHistorySidebarMeta,
+  pruneHistorySidebarMeta,
+  renameHistorySidebarGroup,
+  saveHistorySidebarMeta,
+  setHistoryItemPinned,
+} from '../../lib/historySidebarMeta'
+import { useHistorySidebarItems } from '../../hooks/useHistorySidebarItems'
+import type { HistoryContextMenuState } from './historyContextMenuTypes'
 import {
   loadImageGenerationPreferences,
   saveImageGenerationPreferences,
@@ -182,6 +197,8 @@ export function NineClawApp() {
     selectHistoryItem,
     clearHistory,
     deleteHistoryItem,
+    renameHistoryItem,
+    regenerateHistoryTitle,
     updateSessionLlm,
     sanitizeSessionLlmReferences,
   } = usePiAgent(composerClearRef, { notificationEnabled: generalSettings.notificationEnabled })
@@ -237,16 +254,11 @@ export function NineClawApp() {
   const [agentWorkspaceSaving, setAgentWorkspaceSaving] = useState(false)
   const [agentWorkspaceSaveError, setAgentWorkspaceSaveError] = useState('')
   const [agentWorkspaceSaveNotice, setAgentWorkspaceSaveNotice] = useState('')
+  const [historySidebarMeta, setHistorySidebarMeta] = useState(() => loadHistorySidebarMeta())
   const [newSessionDialogOpen, setNewSessionDialogOpen] = useState(false)
   const [newSessionAgentId, setNewSessionAgentId] = useState('')
   const [newSessionLlm, setNewSessionLlm] = useState<{ providerId: ProviderId; model: string } | null>(null)
-  const [historyContextMenu, setHistoryContextMenu] = useState<{
-    sessionId: string
-    title: string
-    x: number
-    y: number
-    canDelete: boolean
-  } | null>(null)
+  const [historyContextMenu, setHistoryContextMenu] = useState<HistoryContextMenuState | null>(null)
   const [historyDeleteTarget, setHistoryDeleteTarget] = useState<{ sessionId: string; title: string } | null>(null)
   const [historyDeleteBusy, setHistoryDeleteBusy] = useState(false)
   const [qrDialogOpen, setQrDialogOpen] = useState(false)
@@ -422,18 +434,26 @@ export function NineClawApp() {
       })
   }, [agentEditorDraft?.skillIds, agentSkillSearch, builtinAgentSkillOptions, installedSkills])
   const standaloneHistory = useMemo(() => filterStandaloneHistory(history), [history])
-  const visibleHistory = standaloneHistory.filter((item) => {
+  const standaloneHistorySidebarItems = useHistorySidebarItems(standaloneHistory)
+  const historySidebarItems = useMemo(
+    () => applyHistorySidebarMeta(standaloneHistorySidebarItems, historySidebarMeta),
+    [historySidebarMeta, standaloneHistorySidebarItems],
+  )
+  const visibleHistory = historySidebarItems.filter((item) => {
     if (!deferredHistorySearch) return true
-
-    const searchableText = [
-      item.title,
-      ...item.turns.flatMap((turn) => [turn.prompt, turn.answer]),
-    ]
-      .join(' ')
-      .toLowerCase()
-
-    return searchableText.includes(deferredHistorySearch)
+    return item.searchText.includes(deferredHistorySearch)
   })
+
+  useEffect(() => {
+    saveHistorySidebarMeta(historySidebarMeta)
+  }, [historySidebarMeta])
+
+  useEffect(() => {
+    setHistorySidebarMeta((previous) => {
+      const next = pruneHistorySidebarMeta(previous, standaloneHistory.map((item) => item.id))
+      return JSON.stringify(next) === JSON.stringify(previous) ? previous : next
+    })
+  }, [standaloneHistory])
   const shouldHideSidebar = viewportWidth < 1180
   const effectiveSidebarCollapsed = !shouldHideSidebar && appearanceSettings.sidebarCollapsed
   const effectiveChatRuntime = useMemo(
@@ -1519,22 +1539,83 @@ export function NineClawApp() {
     selectHistoryItem(id)
   }
 
-  const handleHistoryContextMenu = (event: MouseEvent<HTMLButtonElement>, item: HistoryItem) => {
+  const handleClearHistory = () => {
+    setHistorySidebarMeta(createEmptyHistorySidebarMeta())
+    clearHistory()
+  }
+
+  const handleHistoryContextMenu = (event: MouseEvent<HTMLElement>, item: HistorySidebarItem) => {
     event.preventDefault()
 
-    const menuWidth = 196
-    const menuHeight = 56
+    const menuWidth = 224
+    const menuHeight = 320
     const maxX = Math.max(12, window.innerWidth - menuWidth - 12)
     const maxY = Math.max(12, window.innerHeight - menuHeight - 12)
     const canDelete = !runningHistoryIds.includes(item.id)
 
     setHistoryContextMenu({
+      kind: 'session',
       sessionId: item.id,
       title: item.title,
       x: Math.min(event.clientX, maxX),
       y: Math.min(event.clientY, maxY),
       canDelete,
+      pinned: item.pinned === true,
+      groupId: item.groupId ?? null,
     })
+  }
+
+  const handleToggleHistoryPinned = (sessionId: string, pinned: boolean) => {
+    setHistorySidebarMeta((previous) => setHistoryItemPinned(previous, sessionId, pinned))
+  }
+
+  const handleAssignHistoryGroup = (sessionId: string, groupId: string | null) => {
+    setHistorySidebarMeta((previous) => assignHistoryItemToGroup(previous, sessionId, groupId))
+  }
+
+  const handleCreateHistoryGroup = (sessionId: string) => {
+    const target = historySidebarItems.find((item) => item.id === sessionId)
+    const baseName = target?.title?.trim() ? `${target.title.trim().slice(0, 12)}分组` : '新分组'
+    const { meta, group } = createHistorySidebarGroup(historySidebarMeta, baseName)
+    setHistorySidebarMeta(assignHistoryItemToGroup(meta, sessionId, group.id))
+  }
+
+  const handleRenameHistoryGroup = (groupId: string, name: string) => {
+    setHistorySidebarMeta((previous) => renameHistorySidebarGroup(previous, groupId, name))
+  }
+
+  const handleRegenerateHistoryGroupName = (groupId: string) => {
+    const items = historySidebarItems.filter((item) => item.groupId === groupId)
+    setHistorySidebarMeta((previous) =>
+      renameHistorySidebarGroup(previous, groupId, deriveHistorySidebarGroupName(items)),
+    )
+  }
+
+  const handleDissolveHistoryGroup = (groupId: string) => {
+    setHistorySidebarMeta((previous) => dissolveHistorySidebarGroup(previous, groupId))
+  }
+
+  const handleCopyHistoryItem = (sessionId: string) => {
+    const item = history.find((historyItem) => historyItem.id === sessionId)
+    if (!item) {
+      return
+    }
+    const body = [
+      `# ${item.title || '未命名会话'}`,
+      ...item.turns.flatMap((turn, index) => [
+        '',
+        `## 第 ${index + 1} 轮`,
+        `用户：${turn.prompt}`,
+        turn.answer ? `助手：${turn.answer}` : '',
+      ]),
+    ].filter(Boolean).join('\n')
+    const copyPromise = navigator.clipboard?.writeText
+      ? navigator.clipboard.writeText(body)
+      : Promise.reject(new Error('Clipboard API unavailable'))
+    void copyPromise.then(
+      () => toast.success('已复制会话内容'),
+      () => toast.error('复制失败，请稍后重试'),
+    )
   }
 
   const handleRequestDeleteHistoryItem = (sessionId: string) => {
@@ -2556,11 +2637,12 @@ export function NineClawApp() {
       onNewSession={handleNewSession}
       onViewChange={handleViewChange}
       history={standaloneHistory}
-      onClearHistory={clearHistory}
+      onClearHistory={handleClearHistory}
       historyBusy={loading}
       historySearch={historySearch}
       setHistorySearch={setHistorySearch}
       visibleHistory={visibleHistory}
+      historyGroups={historySidebarMeta.groups}
       activeHistoryId={standaloneActiveHistoryId}
       onHistorySelect={handleHistorySelect}
       onHistoryContextMenu={handleHistoryContextMenu}
@@ -2579,6 +2661,15 @@ export function NineClawApp() {
       onConfirmSkillInstall={handleSkillInstallConversation}
       historyContextMenu={historyContextMenu}
       setHistoryContextMenu={setHistoryContextMenu}
+      onRenameHistoryItem={renameHistoryItem}
+      onToggleHistoryPinned={handleToggleHistoryPinned}
+      onAssignHistoryGroup={handleAssignHistoryGroup}
+      onCreateHistoryGroup={handleCreateHistoryGroup}
+      onCopyHistoryItem={handleCopyHistoryItem}
+      onRegenerateHistoryTitle={regenerateHistoryTitle}
+      onRenameHistoryGroup={handleRenameHistoryGroup}
+      onRegenerateHistoryGroupName={handleRegenerateHistoryGroupName}
+      onDissolveHistoryGroup={handleDissolveHistoryGroup}
       onRequestDeleteHistoryItem={handleRequestDeleteHistoryItem}
       historyDeleteTarget={historyDeleteTarget}
       setHistoryDeleteTarget={setHistoryDeleteTarget}

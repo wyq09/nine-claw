@@ -7633,6 +7633,7 @@ pub fn run() {
             chat_list_sessions,
             chat_get_session_detail,
             chat_create_session,
+            chat_update_session_title,
             chat_append_turn,
             chat_update_turn,
             chat_delete_session,

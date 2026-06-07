@@ -56,4 +56,21 @@ describe('groupHistoryIntoSidebarBuckets', () => {
     const groups = groupHistoryIntoSidebarBuckets([onlyToday], anchor)
     expect(groups.map((g) => g.key)).toEqual(['today'])
   })
+
+  it('places pinned and custom grouped items before time buckets', () => {
+    const anchor = new Date(2026, 4, 13, 12, 0, 0).getTime()
+    const startOfDay = new Date(2026, 4, 13, 0, 0, 0).getTime()
+    const pinned = makeItem({ id: 'pin', updatedAt: startOfDay + 4, pinned: true })
+    const grouped = makeItem({ id: 'grouped', updatedAt: startOfDay + 3, groupId: 'g1' })
+    const ungrouped = makeItem({ id: 'plain', updatedAt: startOfDay + 2 })
+
+    const buckets = groupHistoryIntoSidebarBuckets([ungrouped, grouped, pinned], anchor, [
+      { id: 'g1', name: '项目组', createdAt: 1, updatedAt: 1 },
+    ])
+
+    expect(buckets.map((bucket) => bucket.key)).toEqual(['pinned', 'group:g1', 'today'])
+    expect(buckets[0]?.items.map((item) => item.id)).toEqual(['pin'])
+    expect(buckets[1]).toMatchObject({ label: '项目组', kind: 'group', groupId: 'g1' })
+    expect(buckets[2]?.items.map((item) => item.id)).toEqual(['plain'])
+  })
 })

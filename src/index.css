@@ -1,6 +1,7 @@
 @import './styles/markdownSurface.css';
 
 @import 'tailwindcss';
+@import './styles/global-scrollbars.css';
 @source '../node_modules/streamdown/dist/*.js';
 
 /* Streamdown 使用 shadcn/Tailwind 语义色；这里把它接到运行时主题变量上。 */

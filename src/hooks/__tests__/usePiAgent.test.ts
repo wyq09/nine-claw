@@ -17,6 +17,7 @@ vi.mock('../../lib/piClient', () => ({
   chatDeleteSession: vi.fn().mockResolvedValue(undefined),
   chatGetSessionDetail: vi.fn().mockResolvedValue(null),
   chatListSessions: vi.fn().mockResolvedValue([]),
+  chatUpdateSessionTitle: vi.fn().mockResolvedValue({}),
   clearHistoryState: vi.fn(),
   clearPiSession: vi.fn(),
   clearPiSessionForId: vi.fn(),
@@ -68,6 +69,7 @@ import {
   chatCreateSession,
   chatGetSessionDetail,
   chatListSessions,
+  chatUpdateSessionTitle,
   loadHistoryState,
   persistChatAttachments,
   saveHistoryState,
@@ -85,6 +87,7 @@ const mockSaveHistoryState = vi.mocked(saveHistoryState)
 const mockGenerateSessionConversationTitle = vi.mocked(generateSessionConversationTitle)
 const mockChatCreateSession = vi.mocked(chatCreateSession)
 const mockChatAppendTurn = vi.mocked(chatAppendTurn)
+const mockChatUpdateSessionTitle = vi.mocked(chatUpdateSessionTitle)
 
 const sampleAgent = {
   id: 'agent-1',
@@ -125,6 +128,7 @@ describe('usePiAgent', () => {
     mockStreamPiPrompt.mockResolvedValue(undefined)
     mockSaveHistoryState.mockResolvedValue(undefined)
     mockGenerateSessionConversationTitle.mockResolvedValue('咖啡店开业海报')
+    mockChatUpdateSessionTitle.mockResolvedValue({} as Awaited<ReturnType<typeof chatUpdateSessionTitle>>)
     vi.stubGlobal('localStorage', {
       getItem: vi.fn().mockReturnValue(null),
       setItem: vi.fn(),
@@ -158,6 +162,30 @@ describe('usePiAgent', () => {
       sessionLlmModel: 'gpt-4o-mini',
     })
     expect(result.current.history[0]?.turns).toEqual([])
+  })
+
+  it('renames a history item and persists the structured session title', async () => {
+    const { result } = renderHook(() => usePiAgent())
+
+    await waitFor(() => expect(result.current.runtimeReady).toBe(true))
+
+    act(() => {
+      result.current.createEmptySession({
+        agent: sampleAgent,
+        sessionLlm: { providerId: 'openai', model: 'gpt-4o-mini' },
+      })
+    })
+
+    const sessionId = result.current.history[0]?.id ?? ''
+    act(() => {
+      result.current.renameHistoryItem(sessionId, '  新会话标题  ')
+    })
+
+    expect(result.current.history[0]?.title).toBe('新会话标题')
+    expect(mockChatUpdateSessionTitle).toHaveBeenCalledWith({
+      sessionId,
+      title: '新会话标题',
+    })
   })
 
   it('rehydrates history from structured sqlite sessions when snapshot payload is empty', async () => {
@@ -307,8 +335,10 @@ describe('usePiAgent', () => {
       title: 'Recovered Session',
     })
     expect(result.current.history[0]?.turns[0]?.prompt).toBe('hello')
-    expect(mockSaveHistoryState).toHaveBeenCalledWith(
-      expect.stringContaining('"Recovered Session"'),
+    await waitFor(() =>
+      expect(mockSaveHistoryState).toHaveBeenCalledWith(
+        expect.stringContaining('"Recovered Session"'),
+      ),
     )
   })
 
@@ -494,7 +524,7 @@ describe('usePiAgent', () => {
     })
 
     await act(async () => {
-      vi.advanceTimersByTime(3)
+      vi.advanceTimersByTime(30)
     })
 
     act(() => {
@@ -502,7 +532,7 @@ describe('usePiAgent', () => {
     })
 
     await act(async () => {
-      vi.advanceTimersByTime(3)
+      vi.advanceTimersByTime(30)
     })
 
     act(() => {
@@ -512,10 +542,62 @@ describe('usePiAgent', () => {
     expect(mockSaveHistoryState).not.toHaveBeenCalled()
 
     await act(async () => {
-      vi.advanceTimersByTime(4)
+      vi.advanceTimersByTime(40)
     })
 
     expect(mockSaveHistoryState).toHaveBeenCalledTimes(1)
+  })
+
+  it('throttles full snapshot persistence while a stream is running', async () => {
+    let resolveStream: (() => void) | undefined
+    mockStreamPiPrompt.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveStream = resolve
+        }),
+    )
+    const { result } = renderHook(() => usePiAgent())
+
+    await waitFor(() => expect(result.current.runtimeReady).toBe(true))
+    await waitFor(() => expect(piStreamHarness.listeners.length).toBeGreaterThan(0))
+
+    act(() => {
+      void result.current.submitPrompt('运行中不要高频保存完整快照', {
+        agent: sampleAgent,
+        sessionLlm: { providerId: 'openai', model: 'gpt-4o-mini' },
+      })
+    })
+
+    await waitFor(() => expect(mockStreamPiPrompt).toHaveBeenCalledTimes(1))
+    const sessionId = mockStreamPiPrompt.mock.calls[0]?.[1]?.sessionId
+    mockSaveHistoryState.mockClear()
+    vi.useFakeTimers()
+
+    act(() => {
+      for (const listener of piStreamHarness.listeners) {
+        listener({ event: 'delta', sessionId, text: 'a' })
+      }
+    })
+
+    await act(async () => {
+      vi.advanceTimersByTime(16)
+    })
+
+    await act(async () => {
+      vi.advanceTimersByTime(1000)
+    })
+
+    expect(mockSaveHistoryState).not.toHaveBeenCalled()
+
+    await act(async () => {
+      vi.advanceTimersByTime(1500)
+    })
+
+    expect(mockSaveHistoryState).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveStream?.()
+    })
   })
 
   it('reuses the empty session when the first message is sent', async () => {

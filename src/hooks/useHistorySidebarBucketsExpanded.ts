@@ -1,8 +1,8 @@
 import { useCallback, useMemo, useState } from 'react'
-import type { HistorySidebarBucket } from '../lib/historySidebarBuckets'
+import type { HistorySidebarBucket, HistorySidebarBucketItem } from '../lib/historySidebarBuckets'
 
-export function useHistorySidebarBucketsExpanded(
-  historyBuckets: HistorySidebarBucket[],
+export function useHistorySidebarBucketsExpanded<TItem extends HistorySidebarBucketItem>(
+  historyBuckets: HistorySidebarBucket<TItem>[],
   activeHistoryId: string | null,
 ): {
   mergedBucketOpen: Record<string, boolean>
@@ -19,7 +19,7 @@ export function useHistorySidebarBucketsExpanded(
 
     const out: Record<string, boolean> = {}
     for (const bucket of historyBuckets) {
-      const inferred = bucket.key === 'today' || bucket.key === activeBucketKey
+      const inferred = bucket.key === 'today' || bucket.kind === 'pinned' || bucket.kind === 'group' || bucket.key === activeBucketKey
       const exp = bucketExpandedOverrides[bucket.key]
       out[bucket.key] = exp !== undefined ? exp : inferred
     }
@@ -34,7 +34,8 @@ export function useHistorySidebarBucketsExpanded(
               bucket.items.some((item) => item.id === activeHistoryId),
             )?.key
           : undefined
-        const inferred = key === 'today' || key === activeBucketKey
+        const bucket = historyBuckets.find((item) => item.key === key)
+        const inferred = key === 'today' || bucket?.kind === 'pinned' || bucket?.kind === 'group' || key === activeBucketKey
         const currentlyOpen =
           prevOverrides[key] !== undefined ? Boolean(prevOverrides[key]) : inferred
         return {

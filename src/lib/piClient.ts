@@ -292,6 +292,16 @@ export async function chatCreateSession(payload: {
   })
 }
 
+export async function chatUpdateSessionTitle(payload: {
+  sessionId: string
+  title: string
+}): Promise<ChatSessionDetail> {
+  return invoke<ChatSessionDetail>('chat_update_session_title', {
+    sessionId: payload.sessionId,
+    title: payload.title,
+  })
+}
+
 export async function chatAppendTurn(payload: {
   id: string
   sessionId: string

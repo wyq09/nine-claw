@@ -9,6 +9,7 @@ import {
   chatDeleteSession,
   chatGetSessionDetail,
   chatListSessions,
+  chatUpdateSessionTitle,
   chatUpdateTurn,
   clearPiSession,
   clearPiSessionForId,
@@ -56,6 +57,10 @@ import {
   appendOrReplaceWidgetSegment,
 } from './piAgent/piAgentWidgets'
 import {
+  applyBatchedStreamDeltas,
+  type PendingToolDelta,
+} from './piAgent/streamDeltaBatcher'
+import {
   buildPersistedBotConversationForInbound,
   serializeConversationTurnForStructuredUpdate,
 } from './piAgent/botHistoryPersistence'
@@ -88,8 +93,8 @@ import { parseWidgetSegment } from '../widgetTypes'
 
 export { getHistoryStatusLabel } from './piAgent/piAgentPure'
 
-const HISTORY_PERSIST_DELAY_IDLE_MS = 10
-const HISTORY_PERSIST_DELAY_RUNNING_MS = 20
+const HISTORY_PERSIST_DELAY_IDLE_MS = 100
+const HISTORY_PERSIST_DELAY_RUNNING_MS = 2500
 
 /** 让出主线程，便于浏览器先完成上一轮 paint，再进入长时间 `invoke` */
 function yieldToNextPaint(): Promise<void> {
@@ -169,13 +174,6 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     }))
   }
 
-  const appendThinking = (historyId: string, turnId: string, chunk: string) => {
-    updateTurn(historyId, turnId, (turn) => ({
-      ...turn,
-      thinking: turn.thinking + chunk,
-    }))
-  }
-
   /** 连续发新消息时：上一轮若仍在 running，在流已结束后补一条说明（若已被 aborted 事件收尾则跳过）。 */
   const finalizeSupersededTurn = (historyId: string, turnId: string) => {
     updateTurn(historyId, turnId, (turn) => {
@@ -226,11 +224,58 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     )
   }
 
+  // ── Streaming delta batch buffer ──
+  // Groups per-character delta events into a single setHistory call per animation frame,
+  // preventing dozens-to-hundreds of reconciliations per second during streaming.
+  type StreamDeltaBuffer = {
+    turnId: string
+    textChunks: string[]
+    thinkingChunks: string[]
+    toolDeltas: PendingToolDelta[]
+    rafHandle: number | null
+  }
+  const streamDeltaBufferRef = useRef<Map<string, StreamDeltaBuffer>>(new Map())
+
+  const flushStreamDeltaBuffer = useCallback((historyId: string) => {
+    const buffer = streamDeltaBufferRef.current.get(historyId)
+    if (!buffer) return
+
+    if (buffer.rafHandle !== null) {
+      cancelAnimationFrame(buffer.rafHandle)
+      buffer.rafHandle = null
+    }
+
+    const { turnId, textChunks, thinkingChunks, toolDeltas } = buffer
+    const hasData = textChunks.length > 0 || thinkingChunks.length > 0 || toolDeltas.length > 0
+
+    buffer.textChunks = []
+    buffer.thinkingChunks = []
+    buffer.toolDeltas = []
+
+    if (!hasData) return
+
+    setHistory((prev) =>
+      applyBatchedStreamDeltas({
+        history: prev,
+        historyId,
+        turnId,
+        textChunks,
+        thinkingChunks,
+        toolDeltas,
+      }),
+    )
+  }, [])
+
   const markSessionSettled = (historyId: string) => {
     setRunningHistoryIds((previous) => previous.filter((item) => item !== historyId))
     setStreamingHistoryIds((previous) => previous.filter((item) => item !== historyId))
     currentTurnIdsRef.current.delete(historyId)
     receivedFirstDeltaRef.current.delete(historyId)
+    const buf = streamDeltaBufferRef.current.get(historyId)
+    if (buf) {
+      if (buf.rafHandle !== null) cancelAnimationFrame(buf.rafHandle)
+      streamDeltaBufferRef.current.delete(historyId)
+    }
   }
 
   const markSessionStreaming = (historyId: string) => {
@@ -317,7 +362,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     await promise
   }, [])
 
-  const scheduleHistoryPersist = useCallback((delayMs: number) => {
+  const scheduleHistoryPersist = useCallback((delayMs: number, options?: { preferEarlier?: boolean }) => {
     if (!historyHydratedRef.current) {
       return
     }
@@ -330,8 +375,14 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     const requestedDueAt = now + requestedDelay
     const currentDueAt = saveHistoryDueAtRef.current
 
-    if (saveHistoryTimerRef.current !== null && currentDueAt !== null && currentDueAt <= requestedDueAt) {
-      return
+    if (saveHistoryTimerRef.current !== null && currentDueAt !== null) {
+      if (options?.preferEarlier) {
+        if (currentDueAt <= requestedDueAt) {
+          return
+        }
+      } else {
+        return
+      }
     }
 
     if (saveHistoryTimerRef.current !== null) {
@@ -414,6 +465,62 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     },
     [],
   )
+
+  const persistHistoryTitle = useCallback(async (historyId: string, title: string) => {
+    try {
+      await chatUpdateSessionTitle({ sessionId: historyId, title })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setError(`更新会话标题失败：${message}`)
+    }
+  }, [])
+
+  const renameHistoryItem = useCallback((historyId: string, title: string) => {
+    const nextTitle = truncateTitle(title.trim())
+    if (!historyId.trim() || !nextTitle) {
+      return
+    }
+    setHistory((previous) => {
+      let changed = false
+      const next = previous.map((item) => {
+        if (item.id !== historyId || item.title === nextTitle) {
+          return item
+        }
+        changed = true
+        return { ...item, title: nextTitle, updatedAt: Date.now() }
+      })
+      return changed ? next : previous
+    })
+    void persistHistoryTitle(historyId, nextTitle)
+  }, [persistHistoryTitle])
+
+  const regenerateHistoryTitle = useCallback(async (historyId: string) => {
+    const item = latestHistoryRef.current.find((historyItem) => historyItem.id === historyId)
+    if (!item) {
+      return
+    }
+
+    const firstTurn = item.turns[0]
+    const userMsg = (firstTurn?.prompt || item.title).trim()
+    const heuristicTitle = truncateTitle(deriveFirstUserTurnConversationTitle(userMsg || item.title, item.title))
+    let nextTitle = heuristicTitle
+
+    if (item.agent?.id && firstTurn?.prompt) {
+      try {
+        const raw = await generateSessionConversationTitle(
+          item.agent.id,
+          firstTurn.prompt,
+          firstTurn.answer || item.title,
+        )
+        const cleaned = cleanLlmSessionTitle(raw).trim()
+        nextTitle = cleaned ? truncateTitle(cleaned) : heuristicTitle
+      } catch {
+        nextTitle = heuristicTitle
+      }
+    }
+
+    renameHistoryItem(historyId, nextTitle)
+  }, [renameHistoryItem])
 
   /** 首轮完成后用智能体「标题生成」模型起名；多轮仅按首轮文案做本地摘要；无智能体则始终本地摘要。 */
   const finalizeHistoryTitleAfterTurn = (historyId: string) => {
@@ -616,6 +723,11 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
         saveHistoryTimerRef.current = null
       }
       saveHistoryDueAtRef.current = null
+      // Cancel any pending streaming delta rAF flushes on unmount
+      for (const buf of streamDeltaBufferRef.current.values()) {
+        if (buf.rafHandle !== null) cancelAnimationFrame(buf.rafHandle)
+      }
+      streamDeltaBufferRef.current.clear()
       if (!historyHydratedRef.current) {
         return
       }
@@ -671,28 +783,39 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     }
 
     if (payload.event === 'thinking_delta' && payload.text) {
-      appendThinking(currentHistoryId, currentTurnId, payload.text)
+      // Buffer thinking chunk — flush via rAF to batch per-character updates
+      let thinkBuf = streamDeltaBufferRef.current.get(currentHistoryId)
+      if (!thinkBuf || thinkBuf.turnId !== currentTurnId) {
+        if (thinkBuf && thinkBuf.rafHandle !== null) cancelAnimationFrame(thinkBuf.rafHandle)
+        thinkBuf = { turnId: currentTurnId, textChunks: [], thinkingChunks: [], toolDeltas: [], rafHandle: null }
+        streamDeltaBufferRef.current.set(currentHistoryId, thinkBuf)
+      }
+      thinkBuf.thinkingChunks.push(payload.text)
+      if (thinkBuf.rafHandle === null) {
+        const capturedBuf = thinkBuf
+        capturedBuf.rafHandle = requestAnimationFrame(() => {
+          capturedBuf.rafHandle = null
+          flushStreamDeltaBuffer(currentHistoryId)
+        })
+      }
       return
     }
 
     if (payload.event === 'thinking_end') {
+      // Flush pending thinking chunks before marking thinking as done
+      flushStreamDeltaBuffer(currentHistoryId)
       setLatestActivityState(currentHistoryId, currentTurnId, '深度思考中', 'done')
       return
     }
 
     if (payload.event === 'delta' && payload.text) {
       const deltaText = payload.text
-      updateTurn(currentHistoryId, currentTurnId, (turn) => ({
-        ...turn,
-        answer: turn.answer + deltaText,
-        responseSegments: appendTextToSegments(turn.responseSegments, deltaText),
-        status: 'running',
-      }))
-      updateSessionStatus(currentHistoryId, 'running')
-      markSessionRunning(currentHistoryId)
 
+      // One-time first-delta setup: update session/UI state synchronously (fires only once per turn)
       if (!receivedFirstDeltaRef.current.get(currentHistoryId)) {
         receivedFirstDeltaRef.current.set(currentHistoryId, true)
+        updateSessionStatus(currentHistoryId, 'running')
+        markSessionRunning(currentHistoryId)
         setLatestActivityState(currentHistoryId, currentTurnId, '连接 pi 主脑', 'done')
         appendActivity(
           currentHistoryId,
@@ -702,10 +825,28 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
           'running',
         )
       }
+
+      // Buffer the text chunk — flush via rAF to batch all chunks within one frame
+      let deltaBuf = streamDeltaBufferRef.current.get(currentHistoryId)
+      if (!deltaBuf || deltaBuf.turnId !== currentTurnId) {
+        if (deltaBuf && deltaBuf.rafHandle !== null) cancelAnimationFrame(deltaBuf.rafHandle)
+        deltaBuf = { turnId: currentTurnId, textChunks: [], thinkingChunks: [], toolDeltas: [], rafHandle: null }
+        streamDeltaBufferRef.current.set(currentHistoryId, deltaBuf)
+      }
+      deltaBuf.textChunks.push(deltaText)
+      if (deltaBuf.rafHandle === null) {
+        const capturedBuf = deltaBuf
+        capturedBuf.rafHandle = requestAnimationFrame(() => {
+          capturedBuf.rafHandle = null
+          flushStreamDeltaBuffer(currentHistoryId)
+        })
+      }
       return
     }
 
     if (payload.event === 'final_text' && typeof payload.text === 'string') {
+      // Flush any buffered text deltas before replacing with the canonical final text
+      flushStreamDeltaBuffer(currentHistoryId)
       updateTurn(currentHistoryId, currentTurnId, (turn) => ({
         ...turn,
         answer: payload.text ?? turn.answer,
@@ -760,23 +901,39 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
 
       const argsDelta = payload.argsDelta ?? payload.args_delta
       const resultDelta = payload.resultDelta ?? payload.result_delta
+      const hasArgsDelta = typeof argsDelta === 'string' && argsDelta.length > 0
+      const hasResultDelta = typeof resultDelta === 'string' && resultDelta.length > 0
 
-      updateHistoryToolCall(currentHistoryId, currentTurnId, toolCallId, (toolCall) => {
-        const nextArgs =
-          typeof argsDelta === 'string' && argsDelta.length > 0
-            ? toolCall.argsText + argsDelta
-            : (payload.argsText ?? payload.args_text ?? toolCall.argsText)
-        const nextResult =
-          typeof resultDelta === 'string' && resultDelta.length > 0
-            ? toolCall.resultText + resultDelta
-            : (payload.resultText ?? payload.result_text ?? toolCall.resultText)
-        return {
-          ...toolCall,
-          argsText: nextArgs,
-          resultText: nextResult,
-          state: 'running',
+      if (hasArgsDelta || hasResultDelta) {
+        // Incremental update — buffer for rAF-batched flush
+        let toolBuf = streamDeltaBufferRef.current.get(currentHistoryId)
+        if (!toolBuf || toolBuf.turnId !== currentTurnId) {
+          if (toolBuf && toolBuf.rafHandle !== null) cancelAnimationFrame(toolBuf.rafHandle)
+          toolBuf = { turnId: currentTurnId, textChunks: [], thinkingChunks: [], toolDeltas: [], rafHandle: null }
+          streamDeltaBufferRef.current.set(currentHistoryId, toolBuf)
         }
-      })
+        toolBuf.toolDeltas.push({
+          toolCallId,
+          argsDelta: hasArgsDelta ? (argsDelta as string) : undefined,
+          resultDelta: hasResultDelta ? (resultDelta as string) : undefined,
+        })
+        if (toolBuf.rafHandle === null) {
+          const capturedBuf = toolBuf
+          capturedBuf.rafHandle = requestAnimationFrame(() => {
+            capturedBuf.rafHandle = null
+            flushStreamDeltaBuffer(currentHistoryId)
+          })
+        }
+      } else {
+        // Full replacement — flush pending buffer then apply synchronously
+        flushStreamDeltaBuffer(currentHistoryId)
+        updateHistoryToolCall(currentHistoryId, currentTurnId, toolCallId, (toolCall) => ({
+          ...toolCall,
+          argsText: payload.argsText ?? payload.args_text ?? toolCall.argsText,
+          resultText: payload.resultText ?? payload.result_text ?? toolCall.resultText,
+          state: 'running',
+        }))
+      }
       return
     }
 
@@ -785,6 +942,8 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       if (!toolCallId) {
         return
       }
+      // Flush any buffered deltas for this tool before finalizing
+      flushStreamDeltaBuffer(currentHistoryId)
       const rawResultText = payload.resultText ?? payload.result_text
       const resultText = rawResultText ?? ''
       const isError = payload.isError ?? payload.is_error
@@ -812,6 +971,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     }
 
     if (payload.event === 'aborted') {
+      flushStreamDeltaBuffer(currentHistoryId)
       const source = payload.abortedBy ?? payload.aborted_by ?? 'user'
       setError(source === 'model' ? '模型中断了当前生成' : '已中止当前生成')
       setLatestActivityState(currentHistoryId, currentTurnId, '连接 pi 主脑', 'done')
@@ -837,6 +997,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     }
 
     if (payload.event === 'done') {
+      flushStreamDeltaBuffer(currentHistoryId)
       const usage = parseUsageFromPayload(payload)
       setLatestActivityState(currentHistoryId, currentTurnId, '连接 pi 主脑', 'done')
       setLatestActivityState(currentHistoryId, currentTurnId, '流式输出中', 'done')
@@ -865,6 +1026,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     }
 
     if (payload.event === 'error' && payload.error) {
+      flushStreamDeltaBuffer(currentHistoryId)
       const errorText = payload.error
       setError(errorText)
       setLatestActivityState(currentHistoryId, currentTurnId, '连接 pi 主脑', 'error')
@@ -1018,10 +1180,14 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
   /** Map `channel_id:user_id` → { historyId, turnId } for tracking active bot sessions. */
   const botSessionMapRef = useRef<Map<string, { historyId: string; turnId: string }>>(new Map())
 
+  // Rebuild the bot-session lookup map once after history is hydrated.
+  // handleBotMessage keeps it up to date manually via botSessionMapRef.current.set();
+  // rebuilding on every `history` change during streaming was burning the main thread.
   useEffect(() => {
+    if (!historyHydrated) return
     const nextMap = new Map<string, { historyId: string; turnId: string }>()
 
-    for (const item of history) {
+    for (const item of latestHistoryRef.current) {
       const channelId = item.botTarget?.channelId?.trim()
       const userId = item.botTarget?.userId?.trim()
       const latestTurnId = item.turns[item.turns.length - 1]?.id
@@ -1041,7 +1207,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     }
 
     botSessionMapRef.current = nextMap
-  }, [history])
+  }, [historyHydrated])
 
   const handleBotMessage = useEffectEvent((msg: BotMessageEvent) => {
     const sessionKey = `${msg.channel_id}:${msg.user_id}`
@@ -1290,7 +1456,10 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     let cancelled = false
 
     const pollTaskDeliveries = async () => {
-      const sessionIds = history.map((item) => item.id).filter((item) => item.trim().length > 0)
+      // Read from ref instead of closure-captured `history` so that the
+      // interval can be created once on mount without being torn down and
+      // rebuilt on every streaming delta (which was the previous behaviour).
+      const sessionIds = latestHistoryRef.current.map((item) => item.id).filter((item) => item.trim().length > 0)
       if (sessionIds.length === 0) {
         return
       }
@@ -1318,7 +1487,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [history])
+  }, [])
 
   useEffect(() => {
     let active = true
@@ -1848,6 +2017,8 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     selectHistoryItem,
     clearHistory,
     deleteHistoryItem,
+    renameHistoryItem,
+    regenerateHistoryTitle,
     clearSession,
     updateSessionLlm,
     sanitizeSessionLlmReferences,

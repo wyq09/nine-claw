@@ -246,6 +246,25 @@ pub fn get_chat_session(conn: &Connection, id: &str) -> Result<Option<ChatSessio
     .map_err(|e| format!("查询会话失败: {e}"))
 }
 
+/// Update a chat session title and bump updated_at.
+pub fn update_chat_session_title(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+) -> Result<ChatSession, String> {
+    let trimmed_title = title.trim();
+    if trimmed_title.is_empty() {
+        return Err("会话标题不能为空".to_string());
+    }
+    conn.execute(
+        "UPDATE chat_sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
+        params![trimmed_title, now_ms(), id],
+    )
+    .map_err(|e| format!("更新会话标题失败: {e}"))?;
+
+    get_chat_session(conn, id)?.ok_or_else(|| "刚更新的会话查询不到".to_string())
+}
+
 /// Append a new turn to a session. Also bumps the session's updated_at.
 pub fn append_chat_turn(
     conn: &Connection,
@@ -717,6 +736,20 @@ mod tests {
         assert_eq!(updated.status, "done");
         assert!(updated.completed_at.is_some());
         assert!(updated.usage_json.is_some());
+    }
+
+    #[test]
+    fn test_update_chat_session_title() {
+        let conn = open_in_memory().unwrap();
+        let session = create_chat_session(&conn, &make_session_input("s1")).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let updated = update_chat_session_title(&conn, "s1", "  Better title  ").unwrap();
+
+        assert_eq!(updated.title, "Better title");
+        assert!(updated.updated_at > session.updated_at);
+        let fetched = get_chat_session(&conn, "s1").unwrap().unwrap();
+        assert_eq!(fetched.title, "Better title");
     }
 
     #[test]

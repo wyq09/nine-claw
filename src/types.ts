@@ -406,6 +406,10 @@ export type HistoryItem = {
   sessionLlmModel?: string
   /** 非空表示本会话属于某团队工作空间（群聊 / 多智能体） */
   workspaceId?: string
+  /** 侧栏展示元数据：置顶。旧会话缺省为 false。 */
+  pinned?: boolean
+  /** 侧栏展示元数据：自定义历史分组。旧会话缺省为未分组。 */
+  groupId?: string | null
   /** 会话创建时自动生成的话题工作区目录。 */
   topicWorkspaceDir?: string
   /** 当前产物写入目录，可切换到外部文件夹。 */

@@ -223,6 +223,18 @@ pub(crate) fn chat_create_session(
 }
 
 #[tauri::command]
+pub(crate) fn chat_update_session_title(
+    app: AppHandle,
+    session_id: String,
+    title: String,
+) -> Result<ChatSessionDetail, String> {
+    let conn = storage_conn(&app)?;
+    let session = storage::chat_history::update_chat_session_title(&conn, &session_id, &title)?;
+    sync_history_v1_backup_from_structured(&conn)?;
+    Ok(ChatSessionDetail::from(session))
+}
+
+#[tauri::command]
 pub(crate) fn chat_append_turn(
     app: AppHandle,
     id: String,

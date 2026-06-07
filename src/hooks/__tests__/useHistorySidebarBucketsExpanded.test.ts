@@ -18,7 +18,7 @@ function makeItem(id: string, updatedAt: number): HistoryItem {
 
 describe('useHistorySidebarBucketsExpanded', () => {
   it('defaults open for today bucket and expands bucket that contains selected session', () => {
-    const buckets: HistorySidebarBucket[] = [
+    const buckets: HistorySidebarBucket<HistoryItem>[] = [
       {
         key: 'today',
         label: '今天',
@@ -36,7 +36,7 @@ describe('useHistorySidebarBucketsExpanded', () => {
         buckets: nextBuckets,
         activeId,
       }: {
-        buckets: HistorySidebarBucket[]
+        buckets: HistorySidebarBucket<HistoryItem>[]
         activeId: string | null
       }) => useHistorySidebarBucketsExpanded(nextBuckets, activeId),
       {
@@ -56,7 +56,7 @@ describe('useHistorySidebarBucketsExpanded', () => {
   })
 
   it('toggleBucket persists user expand/collapse', () => {
-    const buckets: HistorySidebarBucket[] = [
+    const buckets: HistorySidebarBucket<HistoryItem>[] = [
       {
         key: 'today',
         label: '今天',

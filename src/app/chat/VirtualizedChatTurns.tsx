@@ -411,6 +411,7 @@ export const VirtualizedChatTurns = forwardRef<VirtualizedChatTurnsHandle, Virtu
     const virtualizerRef = useRef(virtualizer)
     virtualizerRef.current = virtualizer
     const streamFollowScrollRafRef = useRef<number | null>(null)
+    const sessionSwitchScrollRafRef = useRef<number | null>(null)
 
     useImperativeHandle(
       ref,
@@ -428,20 +429,34 @@ export const VirtualizedChatTurns = forwardRef<VirtualizedChatTurnsHandle, Virtu
     )
 
     useLayoutEffect(() => {
+      if (sessionSwitchScrollRafRef.current !== null) {
+        cancelAnimationFrame(sessionSwitchScrollRafRef.current)
+        sessionSwitchScrollRafRef.current = null
+      }
       const list = turnsRef.current
       if (list.length === 0 || !activeTurnId) {
         return
       }
-      const idx = list.findIndex((t) => t.id === activeTurnId)
-      if (idx < 0) {
-        return
-      }
-      markAutoScroll()
-      /* 与流式跟滚配合：须用 instant，避免 smooth 多帧 scroll 误判用户离底 */
-      virtualizerRef.current.scrollToIndex(idx, {
-        align: 'end',
-        behavior: 'instant',
+      sessionSwitchScrollRafRef.current = requestAnimationFrame(() => {
+        sessionSwitchScrollRafRef.current = null
+        const latestList = turnsRef.current
+        const idx = latestList.findIndex((t) => t.id === activeTurnId)
+        if (idx < 0) {
+          return
+        }
+        markAutoScroll()
+        /* 与流式跟滚配合：须用 instant，避免 smooth 多帧 scroll 误判用户离底 */
+        virtualizerRef.current.scrollToIndex(idx, {
+          align: 'end',
+          behavior: 'instant',
+        })
       })
+      return () => {
+        if (sessionSwitchScrollRafRef.current !== null) {
+          cancelAnimationFrame(sessionSwitchScrollRafRef.current)
+          sessionSwitchScrollRafRef.current = null
+        }
+      }
     }, [activeHistoryId, activeTurnId, markAutoScroll])
 
     /** 流式阶段每字都会改 layoutRevision；用 rAF 合并 scrollToIndex，避免同步 layout 风暴卡住主线程 */
