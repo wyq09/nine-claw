@@ -322,24 +322,26 @@ export function VectorMemoryPanel() {
 
       {/* Workspace selector */}
       <div className="user-memory-toolbar" style={{ marginBottom: 8 }}>
-        <label className="user-memory-agent-field">
+        <div className="user-memory-agent-field">
           <span className="user-memory-agent-label">工作空间</span>
-          <select
-            value={selectedWorkspaceId}
-            onChange={(e) => setSelectedWorkspaceId(e.target.value)}
-            aria-label="选择工作空间"
-          >
-            {workspaces.length === 0 ? (
-              <option value="">暂无工作空间</option>
-            ) : (
-              workspaces.map((w) => (
-                <option key={w.id} value={w.id}>
-                  {w.name}
-                </option>
-              ))
-            )}
-          </select>
-        </label>
+          <label className="select-field user-memory-agent-select">
+            <select
+              value={selectedWorkspaceId}
+              onChange={(e) => setSelectedWorkspaceId(e.target.value)}
+              aria-label="选择工作空间"
+            >
+              {workspaces.length === 0 ? (
+                <option value="">暂无工作空间</option>
+              ) : (
+                workspaces.map((w) => (
+                  <option key={w.id} value={w.id}>
+                    {w.name}
+                  </option>
+                ))
+              )}
+            </select>
+          </label>
+        </div>
         <button
           type="button"
           className="user-memory-toolbar-refresh ghost-link"

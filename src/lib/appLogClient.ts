@@ -11,12 +11,24 @@ export type AppLogsOverview = {
   totalBytes: number
 }
 
+export type AppLogReadResult = {
+  content: string
+  truncated: boolean
+  fileSizeBytes: number
+}
+
 export async function appLogList(): Promise<AppLogsOverview> {
   return invoke<AppLogsOverview>('app_log_list')
 }
 
-export async function appLogRead(fileName: string): Promise<string> {
-  return invoke<string>('app_log_read', { fileName })
+export async function appLogRead(
+  fileName: string,
+  options?: { tailBytes?: number | null },
+): Promise<AppLogReadResult> {
+  return invoke<AppLogReadResult>('app_log_read', {
+    fileName,
+    tailBytes: options?.tailBytes ?? null,
+  })
 }
 
 export async function appLogOpenDir(): Promise<void> {

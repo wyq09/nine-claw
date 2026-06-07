@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react'
 import {
   getPeerGatewayInfo,
   loadNetworkProxySettings,
@@ -46,6 +46,7 @@ import { VectorMemoryPanel } from './settings/VectorMemoryPanel'
 import { UsageStatsPanel } from './UsageStatsPanel'
 import { open } from '@tauri-apps/plugin-dialog'
 import { llmLogExportPreview } from '../lib/llmLogExportClient'
+import { filterLlmProviderDefinitions } from '../lib/providerListSearch'
 
 const SkillsViewLazy = lazy(async () => {
   const module = await import('../app/pages/LibraryAndTasks')
@@ -307,6 +308,7 @@ export function SettingsModal({
   memoryAgents = [],
   memoryDefaultAgentId = '',
 }: SettingsModalProps) {
+  const [providerListSearch, setProviderListSearch] = useState('')
   const [providerAddMode, setProviderAddMode] = useState(false)
   const [customFormOpen, setCustomFormOpen] = useState(false)
   const [customName, setCustomName] = useState('')
@@ -369,12 +371,6 @@ export function SettingsModal({
   }, [])
 
   useEffect(() => {
-    if (tab === 'logs') {
-      void refreshLogPreview()
-    }
-  }, [tab, refreshLogPreview, generalSettings.llmCallLogDir])
-
-  useEffect(() => {
     void loadNetworkProxySettings()
       .then((settings) => {
         setGeneralSettings((previous) => ({
@@ -390,6 +386,14 @@ export function SettingsModal({
 
   const addedProviders = allProviderDefinitions.filter((p) => providerConfigs[p.id]?.added)
   const availableProviders = allProviderDefinitions.filter((p) => !providerConfigs[p.id]?.added)
+  const filteredAddedProviders = useMemo(
+    () => filterLlmProviderDefinitions(addedProviders, providerConfigs, providerListSearch),
+    [addedProviders, providerConfigs, providerListSearch],
+  )
+  const filteredAvailableProviders = useMemo(
+    () => filterLlmProviderDefinitions(availableProviders, providerConfigs, providerListSearch),
+    [availableProviders, providerConfigs, providerListSearch],
+  )
   const proxyModeDescription = describeNetworkProxyMode({
     useSystemProxy: generalSettings.useSystemProxy,
     customProxyUrl: generalSettings.customProxyUrl,
@@ -1036,6 +1040,17 @@ export function SettingsModal({
                 {providerSettingsMode === 'llm' ? (
                   <div className="bot-settings-layout">
                     <div className="bot-channel-list">
+                      <div className="provider-list-search">
+                        <AppIcon name="search" size={16} />
+                        <input
+                          type="search"
+                          className="provider-list-search-input"
+                          value={providerListSearch}
+                          onChange={(event) => setProviderListSearch(event.target.value)}
+                          placeholder="搜索提供方或模型…"
+                          aria-label="搜索提供方或模型"
+                        />
+                      </div>
                       {providerAddMode ? (
                         <>
                           <div className="provider-add-header">
@@ -1046,6 +1061,7 @@ export function SettingsModal({
                               onClick={() => {
                                 setProviderAddMode(false)
                                 setCustomFormOpen(false)
+                                setProviderListSearch('')
                               }}
                             >
                               取消
@@ -1100,7 +1116,7 @@ export function SettingsModal({
                                 <AppIcon name="plus" size={18} />
                                 <span>添加自定义供应商（OpenAI / Anthropic 兼容）</span>
                               </button>
-                              {availableProviders.map((provider) => {
+                              {filteredAvailableProviders.map((provider) => {
                                 return (
                                   <button
                                     key={provider.id}
@@ -1110,14 +1126,19 @@ export function SettingsModal({
                                   >
                                     <span className="bot-channel-copy">
                                       <strong>{provider.name}</strong>
+                                      <span>{provider.suggestedModel}</span>
                                       <span>{provider.description}</span>
                                     </span>
                                     <AppIcon name="plus" size={16} />
                                   </button>
                                 )
                               })}
-                              {availableProviders.length === 0 && (
-                                <p className="settings-note">预设已全部添加；你仍可使用上方「自定义供应商」。</p>
+                              {filteredAvailableProviders.length === 0 && (
+                                <p className="settings-note">
+                                  {availableProviders.length === 0
+                                    ? '预设已全部添加；你仍可使用上方「自定义供应商」。'
+                                    : '没有匹配的 Provider，请换个关键词。'}
+                                </p>
                               )}
                             </>
                           )}
@@ -1137,9 +1158,12 @@ export function SettingsModal({
                           </button>
                           {addedProviders.length === 0 ? (
                             <p className="settings-note">暂未添加任何 Provider，请点击上方按钮添加。</p>
+                          ) : filteredAddedProviders.length === 0 ? (
+                            <p className="settings-note">没有匹配的 Provider，请换个关键词。</p>
                           ) : (
-                            addedProviders.map((provider) => {
+                            filteredAddedProviders.map((provider) => {
                               const config = providerConfigs[provider.id]
+                              const modelLabel = config.model.trim() || provider.suggestedModel || '未设置模型'
                               return (
                                 <div
                                   key={provider.id}
@@ -1156,6 +1180,7 @@ export function SettingsModal({
                                 >
                                   <span className="bot-channel-copy">
                                     <strong>{providerDisplayName(provider, config)}</strong>
+                                    <span>{modelLabel}</span>
                                     <span>{config.status}</span>
                                   </span>
                                   <button
@@ -1464,62 +1489,74 @@ export function SettingsModal({
             ) : null}
 
             {tab === 'logs' ? (
-              <div className="settings-section-stack">
+              <div className="settings-tab-body-scroll settings-logs-tab">
                 <ApplicationLogsPanel />
-                <div className="settings-row stacked">
-                  <div>
-                    <strong>LLM 调用日志导出（可选）</strong>
-                    <p>
-                      每条已完成的调用链会额外以 jsonl 追加到该目录下的 <code>llm-trace-日期.jsonl</code>（与团队空间内{' '}
-                      <code>.debug</code> 并行，不替代原文件）。与应用运行日志相互独立。
-                    </p>
+                <details
+                  className="settings-logs-llm-fold"
+                  onToggle={(event) => {
+                    const open = (event.currentTarget as HTMLDetailsElement).open
+                    if (open && !logPreviewBusy && !logPreviewTail) {
+                      void refreshLogPreview()
+                    }
+                  }}
+                >
+                  <summary>LLM 调用日志导出（可选）</summary>
+                  <div className="settings-logs-llm-body">
+                    <div className="settings-row stacked">
+                      <div>
+                        <p>
+                          每条已完成的调用链会额外以 jsonl 追加到该目录下的 <code>llm-trace-日期.jsonl</code>（与团队空间内{' '}
+                          <code>.debug</code> 并行，不替代原文件）。与应用运行日志相互独立。
+                        </p>
+                      </div>
+                      <div className="settings-row-actions" style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                        <button
+                          type="button"
+                          className="outline-button primary"
+                          onClick={async () => {
+                            const dir = await open({ directory: true, multiple: false })
+                            if (typeof dir === 'string' && dir) {
+                              setGeneralSettings((previous) => ({ ...previous, llmCallLogDir: dir }))
+                            }
+                          }}
+                        >
+                          选择目录
+                        </button>
+                        <button
+                          type="button"
+                          className="outline-button"
+                          onClick={() => setGeneralSettings((previous) => ({ ...previous, llmCallLogDir: '' }))}
+                        >
+                          清除
+                        </button>
+                        <button
+                          type="button"
+                          className="outline-button"
+                          disabled={logPreviewBusy}
+                          onClick={() => void refreshLogPreview()}
+                        >
+                          {logPreviewBusy ? '刷新中…' : '刷新预览'}
+                        </button>
+                      </div>
+                      <label className="input-field settings-peer-field">
+                        <input
+                          readOnly
+                          value={generalSettings.llmCallLogDir}
+                          placeholder="未设置"
+                          aria-label="当前 LLM 日志导出目录"
+                        />
+                      </label>
+                    </div>
+                    <div className="settings-row stacked">
+                      <strong>LLM 导出新文件预览</strong>
+                      <LlmLogPreview
+                        busy={logPreviewBusy}
+                        file={logPreviewFile}
+                        tail={logPreviewTail}
+                      />
+                    </div>
                   </div>
-                  <div className="settings-row-actions" style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                    <button
-                      type="button"
-                      className="outline-button primary"
-                      onClick={async () => {
-                        const dir = await open({ directory: true, multiple: false })
-                        if (typeof dir === 'string' && dir) {
-                          setGeneralSettings((previous) => ({ ...previous, llmCallLogDir: dir }))
-                        }
-                      }}
-                    >
-                      选择目录
-                    </button>
-                    <button
-                      type="button"
-                      className="outline-button"
-                      onClick={() => setGeneralSettings((previous) => ({ ...previous, llmCallLogDir: '' }))}
-                    >
-                      清除
-                    </button>
-                    <button
-                      type="button"
-                      className="outline-button"
-                      disabled={logPreviewBusy}
-                      onClick={() => void refreshLogPreview()}
-                    >
-                      {logPreviewBusy ? '刷新中…' : '刷新预览'}
-                    </button>
-                  </div>
-                  <label className="input-field settings-peer-field">
-                    <input
-                      readOnly
-                      value={generalSettings.llmCallLogDir}
-                      placeholder="未设置"
-                      aria-label="当前 LLM 日志导出目录"
-                    />
-                  </label>
-                </div>
-                <div className="settings-row stacked">
-                  <strong>LLM 导出新文件预览</strong>
-                  <LlmLogPreview
-                    busy={logPreviewBusy}
-                    file={logPreviewFile}
-                    tail={logPreviewTail}
-                  />
-                </div>
+                </details>
               </div>
             ) : null}
 

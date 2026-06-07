@@ -9,6 +9,15 @@ use tauri::Manager;
 const FILE_PREFIX: &str = "nineclaw-";
 const LEGACY_FILE_PREFIX: &str = "logsnineclaw-";
 const READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_TAIL_READ_BYTES: u64 = 512 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppLogReadResult {
+    pub content: String,
+    pub truncated: bool,
+    pub file_size_bytes: u64,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,7 +118,40 @@ pub fn list_logs(app: &tauri::AppHandle) -> Result<AppLogsOverview, String> {
     })
 }
 
-pub fn read_log_file(app: &tauri::AppHandle, file_name: String) -> Result<String, String> {
+fn read_file_tail(path: &std::path::Path, tail_bytes: u64) -> Result<String, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = fs::File::open(path).map_err(|e| format!("打开日志失败: {e}"))?;
+    let size = file
+        .metadata()
+        .map_err(|e| format!("读取文件信息失败: {e}"))?
+        .len();
+    if size == 0 {
+        return Ok(String::new());
+    }
+
+    let read_from = size.saturating_sub(tail_bytes);
+    file.seek(SeekFrom::Start(read_from))
+        .map_err(|e| format!("定位日志失败: {e}"))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|e| format!("读取日志失败: {e}"))?;
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if read_from > 0 {
+        if let Some(idx) = text.find('\n') {
+            text = text[idx + 1..].to_string();
+        } else {
+            text.clear();
+        }
+    }
+    Ok(text)
+}
+
+pub fn read_log_file(
+    app: &tauri::AppHandle,
+    file_name: String,
+    tail_bytes: Option<u64>,
+) -> Result<AppLogReadResult, String> {
     validate_log_basename(&file_name)?;
     let path = resolve_log_file_path(app, &file_name)?;
     let size = fs::metadata(&path)
@@ -121,7 +163,23 @@ pub fn read_log_file(app: &tauri::AppHandle, file_name: String) -> Result<String
             size.saturating_div(1024 * 1024)
         ));
     }
-    fs::read_to_string(&path).map_err(|e| format!("读取日志失败: {e}"))
+
+    let tail_limit = tail_bytes.unwrap_or(DEFAULT_TAIL_READ_BYTES);
+    if tail_limit > 0 && size > tail_limit {
+        let content = read_file_tail(&path, tail_limit)?;
+        return Ok(AppLogReadResult {
+            content,
+            truncated: true,
+            file_size_bytes: size,
+        });
+    }
+
+    let content = fs::read_to_string(&path).map_err(|e| format!("读取日志失败: {e}"))?;
+    Ok(AppLogReadResult {
+        content,
+        truncated: false,
+        file_size_bytes: size,
+    })
 }
 
 pub fn export_logs_to_dir(app: &tauri::AppHandle, dest_dir: String) -> Result<u32, String> {
@@ -164,8 +222,39 @@ pub fn app_log_list(app: tauri::AppHandle) -> Result<AppLogsOverview, String> {
 }
 
 #[tauri::command]
-pub fn app_log_read(app: tauri::AppHandle, file_name: String) -> Result<String, String> {
-    read_log_file(&app, file_name)
+pub fn app_log_read(
+    app: tauri::AppHandle,
+    file_name: String,
+    tail_bytes: Option<u64>,
+) -> Result<AppLogReadResult, String> {
+    read_log_file(&app, file_name, tail_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn read_file_tail_skips_partial_first_line() {
+        let path = std::env::temp_dir().join(format!(
+            "nineclaw-test-{}.log",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).expect("create");
+        write!(
+            file,
+            "line-one\nline-two\nline-three\nline-four\n"
+        )
+        .expect("write");
+        drop(file);
+
+        let tail = read_file_tail(&path, 20).expect("tail");
+        assert!(!tail.contains("line-one"));
+        assert!(tail.contains("line-four"));
+
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[tauri::command]

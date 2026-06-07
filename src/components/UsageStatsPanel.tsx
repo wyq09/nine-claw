@@ -1,6 +1,11 @@
 import { Download, RefreshCw } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { listTokenUsageRecords } from '../lib/piClient'
+import {
+  computeDailyBarHeight,
+  formatDailyChartDayLabel,
+  usageDailyChartMinWidth,
+} from '../lib/usageStatsChart'
 import type { TokenUsageRecord } from '../types'
 
 type UsageBucket = {
@@ -295,16 +300,12 @@ function UsageBreakdownShadcnTable({
   )
 }
 
-/** 柱状图轨道固定高度（px）。父级须为明确高度，百分比高度才能生效；用像素比例最稳妥 */
-const DAILY_BAR_TRACK_PX = 120
-
 function UsageDailyShadcnSection({ rows }: { rows: UsageBucket[] }) {
   const maxValue = rows.reduce((max, row) => Math.max(max, row.totalTokens), 0)
   const chronological = [...rows].sort((left, right) => left.label.localeCompare(right.label))
-  const reversedDetail = [...chronological].reverse()
 
   return (
-    <div className="rounded-xl border border-border bg-card text-card-foreground shadow-sm">
+    <div className="usage-daily-card rounded-xl border border-border bg-card text-card-foreground shadow-sm">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
         <div className="space-y-1">
           <h3 className="text-sm font-semibold leading-none tracking-tight">按天</h3>
@@ -316,40 +317,29 @@ function UsageDailyShadcnSection({ rows }: { rows: UsageBucket[] }) {
           暂无可展示的趋势数据
         </div>
       ) : (
-        <div className="space-y-0 p-4 pt-3">
-          <div
-            className="mb-4 grid max-h-[220px] min-h-[160px] items-end gap-2 border-b border-border/60 pb-4"
-            style={{
-              gridTemplateColumns: `repeat(${Math.max(chronological.length, 1)}, minmax(32px, 1fr))`,
-            }}
-            role="img"
-            aria-label="按天 Token 趋势"
-          >
-            {chronological.map((row) => {
-              const barPx =
-                maxValue > 0
-                  ? Math.max(6, Math.round((row.totalTokens / maxValue) * DAILY_BAR_TRACK_PX))
-                  : 6
-              return (
-                <div key={row.label} className="flex flex-col items-center gap-2">
-                  <span className="text-[11px] tabular-nums text-muted-foreground">
-                    {formatTokensTable(row.totalTokens)}
-                  </span>
-                  <div
-                    className="flex w-full items-end rounded-xl bg-muted/30 px-1 pb-1 pt-2"
-                    style={{ height: DAILY_BAR_TRACK_PX }}
-                  >
-                    <div
-                      className="w-full rounded-lg bg-linear-to-b from-primary/90 to-primary/60"
-                      style={{ height: barPx }}
-                    />
+        <div className="usage-daily-body space-y-0 p-4 pt-3">
+          <div className="usage-daily-chart-wrap">
+            <div
+              className="usage-daily-chart"
+              style={{ minWidth: usageDailyChartMinWidth(chronological.length) }}
+              role="img"
+              aria-label="按天 Token 趋势"
+            >
+              {chronological.map((row) => {
+                const barPx = computeDailyBarHeight(row.totalTokens, maxValue)
+                return (
+                  <div key={row.label} className="usage-daily-chart-column">
+                    <span className="usage-daily-chart-value">{formatTokensTable(row.totalTokens)}</span>
+                    <div className="usage-daily-chart-track">
+                      <div className="usage-daily-chart-bar" style={{ height: barPx }} />
+                    </div>
+                    <span className="usage-daily-chart-date">{formatDailyChartDayLabel(row.label)}</span>
                   </div>
-                  <span className="text-[11px] text-muted-foreground">{row.label.slice(5)}</span>
-                </div>
-              )
-            })}
+                )
+              })}
+            </div>
           </div>
-          <div className="relative max-h-[min(360px,45vh)] w-full overflow-auto rounded-lg border border-border/80">
+          <div className="usage-daily-table-wrap relative max-h-[min(360px,45vh)] w-full overflow-auto rounded-lg border border-border/80">
             <table className="w-full caption-bottom text-sm">
               <thead>
                 <tr className="border-b border-border">
@@ -374,7 +364,10 @@ function UsageDailyShadcnSection({ rows }: { rows: UsageBucket[] }) {
                 </tr>
               </thead>
               <tbody>
-                {reversedDetail.map((row) => (
+                {chronological
+                  .slice()
+                  .reverse()
+                  .map((row) => (
                   <tr
                     key={row.label}
                     className="border-b border-border/50 transition-colors last:border-0 hover:bg-muted/40"
@@ -475,10 +468,27 @@ export function UsageStatsPanel() {
 
   return (
     <div className="usage-dashboard flex flex-col gap-6">
-      <div className="usage-dashboard-toolbar flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-        <p className="usage-dashboard-lede m-0 max-w-[52ch] text-[13px] leading-relaxed text-muted-foreground">
-        </p>
-        <div className="flex shrink-0 flex-col items-stretch gap-3 sm:items-end">
+      <div className="usage-dashboard-controls flex flex-col gap-3 rounded-xl border border-border bg-card/40 px-4 py-3 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 flex-col gap-1 sm:flex-row sm:items-center sm:gap-3">
+          <span className="text-xs font-medium tabular-nums text-muted-foreground">{rangeLabel}</span>
+          <div className="usage-date-presets" role="group" aria-label="统计时间范围">
+            {presets.map(({ key, label }) => {
+              const active = datePreset === key
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  className={`usage-date-preset ${active ? 'active' : ''}`}
+                  aria-pressed={active}
+                  onClick={() => setDatePreset(key)}
+                >
+                  {label}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+        <div className="usage-dashboard-actions flex flex-wrap items-center justify-end gap-2">
           <button
             type="button"
             className="outline-button usage-dashboard-refresh inline-flex items-center justify-center gap-2"
@@ -488,38 +498,16 @@ export function UsageStatsPanel() {
             <RefreshCw className={`size-4 ${loading ? 'animate-spin' : ''}`} aria-hidden />
             <span>{loading ? '刷新中…' : '刷新'}</span>
           </button>
+          <button
+            type="button"
+            onClick={() => exportUsageRecordsCsv(filteredRecords)}
+            disabled={filteredRecords.length === 0}
+            className="inline-flex items-center justify-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50 disabled:pointer-events-none disabled:opacity-40"
+          >
+            <Download className="size-4 shrink-0 opacity-80" aria-hidden />
+            导出 CSV
+          </button>
         </div>
-      </div>
-
-      <div className="flex flex-col gap-3 rounded-xl border border-border bg-card/40 px-4 py-3 shadow-sm sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex min-w-0 flex-col gap-1 sm:flex-row sm:items-center sm:gap-3">
-          <span className="text-xs font-medium tabular-nums text-muted-foreground">{rangeLabel}</span>
-          <div className="inline-flex w-fit rounded-lg border border-border bg-muted/40 p-0.5">
-            {presets.map(({ key, label }) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => setDatePreset(key)}
-                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
-                  datePreset === key
-                    ? 'bg-background text-foreground shadow-sm'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-        </div>
-        <button
-          type="button"
-          onClick={() => exportUsageRecordsCsv(filteredRecords)}
-          disabled={filteredRecords.length === 0}
-          className="inline-flex items-center justify-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50 disabled:pointer-events-none disabled:opacity-40"
-        >
-          <Download className="size-4 shrink-0 opacity-80" aria-hidden />
-          导出 CSV
-        </button>
       </div>
 
       {error ? <div className="skills-feedback error">{error}</div> : null}

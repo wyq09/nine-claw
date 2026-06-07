@@ -296,21 +296,23 @@ export function UserMemorySettingsPanel({ agents, defaultAgentId }: UserMemorySe
   return (
     <div className="user-memory-panel">
       <div className="user-memory-toolbar">
-        <label className="user-memory-agent-field">
+        <div className="user-memory-agent-field">
           <span className="user-memory-agent-label">记忆归属</span>
-          <select
-            value={selection}
-            onChange={(e) => setSelection(e.target.value)}
-            aria-label="选择全局或某一智能体的记忆命名空间"
-          >
-            <option value={USER_MEMORY_DROPDOWN_GLOBAL}>全局用户记忆</option>
-            {uniqueAgents.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.name}
-              </option>
-            ))}
-          </select>
-        </label>
+          <label className="select-field user-memory-agent-select">
+            <select
+              value={selection}
+              onChange={(e) => setSelection(e.target.value)}
+              aria-label="选择全局或某一智能体的记忆命名空间"
+            >
+              <option value={USER_MEMORY_DROPDOWN_GLOBAL}>全局用户记忆</option>
+              {uniqueAgents.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
         <button type="button" className="user-memory-toolbar-refresh ghost-link" disabled={busy} onClick={() => void reorganizeThenRefresh()}>
           重新整理
         </button>

@@ -145,10 +145,12 @@ export function JsonTreeNode({
   label,
   value,
   depth,
+  defaultExpanded,
 }: {
   label?: string
   value: JsonValue
   depth: number
+  defaultExpanded?: boolean
 }) {
   if (!Array.isArray(value) && !isRecord(value)) {
     return (
@@ -166,10 +168,10 @@ export function JsonTreeNode({
     : Object.entries(value)
 
   const summary = isArray ? `数组(${entries.length})` : `对象(${entries.length})`
-  const defaultOpen = depth < 1
+  const open = defaultExpanded ?? depth < 1
 
   return (
-    <details className="llm-log-json-node" open={defaultOpen}>
+    <details className="llm-log-json-node" open={open}>
       <summary className="llm-log-json-summary">
         {label ? <span className="llm-log-json-key">{label}</span> : null}
         {label ? <span className="llm-log-json-sep">:</span> : null}
@@ -182,6 +184,7 @@ export function JsonTreeNode({
             label={childKey}
             value={childValue}
             depth={depth + 1}
+            defaultExpanded={defaultExpanded}
           />
         ))}
       </div>

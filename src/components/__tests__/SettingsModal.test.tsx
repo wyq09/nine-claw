@@ -89,7 +89,11 @@ vi.mock('../../lib/appLogClient', () => ({
     files: [],
     totalBytes: 0,
   }),
-  appLogRead: vi.fn().mockResolvedValue(''),
+  appLogRead: vi.fn().mockResolvedValue({
+    content: '',
+    truncated: false,
+    fileSizeBytes: 0,
+  }),
   appLogOpenDir: vi.fn(),
   appLogExportAll: vi.fn().mockResolvedValue(0),
 }))
@@ -512,5 +516,62 @@ describe('SettingsModal provider tabs', () => {
     })
 
     expect(sendTestNotification).toHaveBeenCalledTimes(1)
+  })
+
+  it('filters llm provider list by provider name and model name', () => {
+    const anthropicDefinition: ProviderDefinition = {
+      id: 'anthropic',
+      name: 'Anthropic',
+      defaultBaseUrl: 'https://api.anthropic.com',
+      suggestedModel: 'claude-sonnet-4-0',
+      description: 'Anthropic 官方接口',
+      apiFormat: 'anthropic',
+    }
+    const anthropicConfig: ProviderConfig = {
+      ...llmProviderConfig,
+      added: true,
+      displayName: 'Anthropic',
+      model: 'claude-opus-4-0',
+      apiFormat: 'anthropic',
+      status: '已配置',
+    }
+
+    render(
+      <SettingsModal
+        activeProviderBadge="系统默认：OpenAI"
+        allProviderDefinitions={[llmProviderDefinition, anthropicDefinition]}
+        appearanceSettings={appearanceSettings}
+        generalSettings={generalSettings}
+        imageGenerationSystem={imageGenerationSystem}
+        imageProviderConfigs={{ openai_image: imageProviderConfig }}
+        imageProviderDefinitions={[imageProviderDefinition]}
+        onAddCustomProvider={vi.fn()}
+        onSaveImageGenerationSettings={vi.fn().mockResolvedValue(undefined)}
+        onProviderConfigChange={vi.fn()}
+        onClose={vi.fn()}
+        onRemoveCustomProvider={vi.fn()}
+        onSelectProvider={vi.fn()}
+        onSelectTab={vi.fn()}
+        providerConfigs={{ openai: llmProviderConfig, anthropic: anthropicConfig }}
+        selectedProviderConfig={llmProviderConfig}
+        selectedProviderDefinition={llmProviderDefinition}
+        selectedProviderId="openai"
+        setAppearanceSettings={vi.fn()}
+        setGeneralSettings={vi.fn()}
+        tab="providers"
+        skillsLibrary={baseModalProps.skillsLibrary}
+        resourcesLibrary={baseModalProps.resourcesLibrary}
+      />,
+    )
+
+    expect(screen.getByText('gpt-4o-mini')).toBeInTheDocument()
+    expect(screen.getByText('claude-opus-4-0')).toBeInTheDocument()
+
+    fireEvent.change(screen.getByRole('searchbox', { name: '搜索提供方或模型' }), {
+      target: { value: 'claude-opus' },
+    })
+
+    expect(screen.queryByText('gpt-4o-mini')).not.toBeInTheDocument()
+    expect(screen.getByText('claude-opus-4-0')).toBeInTheDocument()
   })
 })
