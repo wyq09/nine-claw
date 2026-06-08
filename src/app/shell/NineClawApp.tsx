@@ -2221,6 +2221,40 @@ export function NineClawApp() {
     setSelectedProviderId(id)
   }
 
+  const duplicateProvider = (providerId: ProviderId) => {
+    const definition = mergedProviderDefinitions.find((item) => item.id === providerId)
+    const config = providerConfigs[providerId]
+    if (!definition || !config) {
+      return
+    }
+
+    const id = `custom_${crypto.randomUUID().replace(/-/g, '')}`
+    const displayName = `${providerDisplayName(definition, config)} 副本`
+    const copiedConfig: ProviderConfig = {
+      ...emptyProviderConfig(),
+      ...config,
+      added: true,
+      apiKey: '',
+      displayName,
+      status: '未配置',
+    }
+
+    setCustomProviderMeta((previous) => [
+      ...previous,
+      {
+        id,
+        name: displayName,
+        description: definition.description,
+        apiFormat: copiedConfig.apiFormat,
+      },
+    ])
+    setProviderConfigs((previous) => ({
+      ...previous,
+      [id]: copiedConfig,
+    }))
+    setSelectedProviderId(id)
+  }
+
   const removeCustomProvider = (providerId: ProviderId) => {
     if (!providerId.startsWith('custom_')) {
       return
@@ -2705,6 +2739,7 @@ export function NineClawApp() {
       onAddCustomProvider={addCustomProvider}
       onSaveImageGenerationSettings={saveImageGenerationSettings}
       onProviderConfigChange={updateProviderConfig}
+      onDuplicateProvider={duplicateProvider}
       onCloseSettings={() => setSettingsOpen(false)}
       onRemoveCustomProvider={removeCustomProvider}
       onSelectProvider={setSelectedProviderId}

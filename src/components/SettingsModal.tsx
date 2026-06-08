@@ -72,6 +72,7 @@ type SettingsModalProps = {
     imageGenerationSystem: ImageGenerationSystemConfig,
   ) => Promise<void>
   onProviderConfigChange: (providerId: ProviderId, updates: Partial<ProviderConfig>) => void
+  onDuplicateProvider: (providerId: ProviderId) => void
   onClose: () => void
   onRemoveCustomProvider: (providerId: ProviderId) => void
   onSelectProvider: (id: ProviderId) => void
@@ -292,6 +293,7 @@ export function SettingsModal({
   onAddCustomProvider,
   onSaveImageGenerationSettings,
   onProviderConfigChange,
+  onDuplicateProvider,
   onClose,
   onRemoveCustomProvider,
   onSelectProvider,
@@ -1040,6 +1042,24 @@ export function SettingsModal({
                 {providerSettingsMode === 'llm' ? (
                   <div className="bot-settings-layout">
                     <div className="bot-channel-list">
+                      <div className="image-provider-list-head provider-list-head">
+                        <div>
+                          <strong>{providerAddMode ? '添加模型提供方' : '模型提供方'}</strong>
+                          <span>共 {providerAddMode ? filteredAvailableProviders.length : addedProviders.length} 个</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="image-provider-add-icon"
+                          onClick={() => {
+                            setProviderAddMode((previous) => !previous)
+                            setCustomFormOpen(false)
+                            setProviderListSearch('')
+                          }}
+                          aria-label={providerAddMode ? '返回模型列表' : '添加 Provider'}
+                        >
+                          <AppIcon name={providerAddMode ? 'close' : 'plus'} size={18} />
+                        </button>
+                      </div>
                       <div className="provider-list-search">
                         <AppIcon name="search" size={16} />
                         <input
@@ -1051,22 +1071,9 @@ export function SettingsModal({
                           aria-label="搜索提供方或模型"
                         />
                       </div>
+                      <div className="provider-list-items">
                       {providerAddMode ? (
                         <>
-                          <div className="provider-add-header">
-                            <span>选择要添加的 Provider</span>
-                            <button
-                              type="button"
-                              className="link-button"
-                              onClick={() => {
-                                setProviderAddMode(false)
-                                setCustomFormOpen(false)
-                                setProviderListSearch('')
-                              }}
-                            >
-                              取消
-                            </button>
-                          </div>
                           {customFormOpen ? (
                             <div className="provider-custom-form">
                               <label className="input-field">
@@ -1110,11 +1117,11 @@ export function SettingsModal({
                             <>
                               <button
                                 type="button"
-                                className="provider-add-button subtle"
+                                className="provider-add-button provider-custom-shortcut"
                                 onClick={() => setCustomFormOpen(true)}
                               >
                                 <AppIcon name="plus" size={18} />
-                                <span>添加自定义供应商（OpenAI / Anthropic 兼容）</span>
+                                <span>新建自定义 Provider</span>
                               </button>
                               {filteredAvailableProviders.map((provider) => {
                                 return (
@@ -1124,12 +1131,16 @@ export function SettingsModal({
                                     className={`bot-channel-card ${selectedProviderId === provider.id ? 'active' : ''}`}
                                     onClick={() => handleProviderSelect(provider.id)}
                                   >
-                                    <span className="bot-channel-copy">
-                                      <strong>{provider.name}</strong>
-                                      <span>{provider.suggestedModel}</span>
-                                      <span>{provider.description}</span>
+                                    <span className="bot-channel-main">
+                                      <span className="bot-channel-icon" aria-hidden="true">
+                                        {provider.name.slice(0, 1).toUpperCase()}
+                                      </span>
+                                      <span className="bot-channel-copy">
+                                        <strong>{provider.name}</strong>
+                                        <span className="bot-channel-model">{provider.suggestedModel}</span>
+                                      </span>
                                     </span>
-                                    <AppIcon name="plus" size={16} />
+                                    <span className="image-provider-state">添加</span>
                                   </button>
                                 )
                               })}
@@ -1145,17 +1156,6 @@ export function SettingsModal({
                         </>
                       ) : (
                         <>
-                          <button
-                            type="button"
-                            className="provider-add-button"
-                            onClick={() => {
-                              setProviderAddMode(true)
-                              setCustomFormOpen(false)
-                            }}
-                          >
-                            <AppIcon name="plus" size={18} />
-                            <span>添加 Provider</span>
-                          </button>
                           {addedProviders.length === 0 ? (
                             <p className="settings-note">暂未添加任何 Provider，请点击上方按钮添加。</p>
                           ) : filteredAddedProviders.length === 0 ? (
@@ -1178,28 +1178,49 @@ export function SettingsModal({
                                     }
                                   }}
                                 >
-                                  <span className="bot-channel-copy">
-                                    <strong>{providerDisplayName(provider, config)}</strong>
-                                    <span>{modelLabel}</span>
-                                    <span>{config.status}</span>
-                                  </span>
-                                  <button
-                                    type="button"
-                                    className="provider-remove-button"
-                                    onClick={(event) => {
-                                      event.stopPropagation()
-                                      setProviderDeleteConfirmId(provider.id)
-                                    }}
-                                    aria-label={`移除 ${providerDisplayName(provider, config)}`}
-                                  >
-                                    <AppIcon name="close" size={14} />
-                                  </button>
+                                  <div className="bot-channel-main">
+                                    <span className="bot-channel-icon" aria-hidden="true">
+                                      {providerDisplayName(provider, config).slice(0, 1).toUpperCase()}
+                                    </span>
+                                    <span className="bot-channel-copy">
+                                      <strong>{providerDisplayName(provider, config)}</strong>
+                                      <span className="bot-channel-model">{modelLabel}</span>
+                                    </span>
+                                  </div>
+                                  <div className="provider-card-end">
+                                    <span className={`bot-channel-status status-${config.status}`}>{config.status}</span>
+                                    <button
+                                      type="button"
+                                      className="provider-card-action-button"
+                                      onClick={(event) => {
+                                        event.stopPropagation()
+                                        onDuplicateProvider(provider.id)
+                                      }}
+                                      aria-label={`复制 ${providerDisplayName(provider, config)}`}
+                                      title="复制模型配置"
+                                    >
+                                      <AppIcon name="copy" size={14} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="provider-card-action-button provider-remove-button"
+                                      onClick={(event) => {
+                                        event.stopPropagation()
+                                        setProviderDeleteConfirmId(provider.id)
+                                      }}
+                                      aria-label={`移除 ${providerDisplayName(provider, config)}`}
+                                      title="移除 Provider"
+                                    >
+                                      <AppIcon name="close" size={14} />
+                                    </button>
+                                  </div>
                                 </div>
                               )
                             })
                           )}
                         </>
                       )}
+                      </div>
                     </div>
 
                     <div className="bot-detail-panel">

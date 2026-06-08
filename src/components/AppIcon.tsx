@@ -10,6 +10,7 @@ export type IconName =
   | 'chevron-down'
   | 'clock'
   | 'close'
+  | 'copy'
   | 'download'
   | 'folder'
   | 'keyboard'
@@ -202,6 +203,12 @@ export function AppIcon({ name, size = 20 }: { name: IconName; size?: number }) 
         </>
       ) : null}
       {name === 'close' ? <path d="m6 6 12 12M18 6 6 18" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} /> : null}
+      {name === 'copy' ? (
+        <>
+          <rect x="8" y="8" width="11" height="11" rx="2" stroke="currentColor" strokeWidth={stroke} />
+          <path d="M5 15V6a2 2 0 0 1 2-2h9" stroke="currentColor" strokeLinecap="round" strokeWidth={stroke} />
+        </>
+      ) : null}
       {name === 'sparkles' ? (
         <>
           <path d="M6 4 7.4 7.6 11 9l-3.6 1.4L6 14l-1.4-3.6L1 9l3.6-1.4L6 4ZM18 9l1.1 2.9L22 13l-2.9 1.1L18 17l-1.1-2.9L14 13l2.9-1.1L18 9ZM16 2l.7 1.8L18.5 4.5l-1.8.7L16 7l-.7-1.8-1.8-.7 1.8-.7L16 2Z" stroke="currentColor" strokeLinejoin="round" strokeWidth={1.4} />

@@ -191,6 +191,7 @@ const baseModalProps = {
   onAddCustomProvider: vi.fn(),
   onSaveImageGenerationSettings: vi.fn().mockResolvedValue(undefined),
   onProviderConfigChange: vi.fn(),
+  onDuplicateProvider: vi.fn(),
   onClose: vi.fn(),
   onRemoveCustomProvider: vi.fn(),
   onSelectProvider: vi.fn(),
@@ -256,6 +257,7 @@ describe('SettingsModal provider tabs', () => {
         onAddCustomProvider={vi.fn()}
         onSaveImageGenerationSettings={vi.fn().mockResolvedValue(undefined)}
         onProviderConfigChange={vi.fn()}
+        onDuplicateProvider={vi.fn()}
         onClose={vi.fn()}
         onRemoveCustomProvider={vi.fn()}
         onSelectProvider={vi.fn()}
@@ -320,6 +322,7 @@ describe('SettingsModal provider tabs', () => {
         onAddCustomProvider={vi.fn()}
         onSaveImageGenerationSettings={onSaveImageGenerationSettings}
         onProviderConfigChange={vi.fn()}
+        onDuplicateProvider={vi.fn()}
         onClose={vi.fn()}
         onRemoveCustomProvider={vi.fn()}
         onSelectProvider={vi.fn()}
@@ -389,6 +392,7 @@ describe('SettingsModal provider tabs', () => {
         onAddCustomProvider={vi.fn()}
         onSaveImageGenerationSettings={vi.fn().mockResolvedValue(undefined)}
         onProviderConfigChange={vi.fn()}
+        onDuplicateProvider={vi.fn()}
         onClose={vi.fn()}
         onRemoveCustomProvider={vi.fn()}
         onSelectProvider={vi.fn()}
@@ -548,6 +552,7 @@ describe('SettingsModal provider tabs', () => {
         onAddCustomProvider={vi.fn()}
         onSaveImageGenerationSettings={vi.fn().mockResolvedValue(undefined)}
         onProviderConfigChange={vi.fn()}
+        onDuplicateProvider={vi.fn()}
         onClose={vi.fn()}
         onRemoveCustomProvider={vi.fn()}
         onSelectProvider={vi.fn()}
@@ -573,5 +578,39 @@ describe('SettingsModal provider tabs', () => {
 
     expect(screen.queryByText('gpt-4o-mini')).not.toBeInTheDocument()
     expect(screen.getByText('claude-opus-4-0')).toBeInTheDocument()
+  })
+
+  it('duplicates an added provider from the model list', () => {
+    const onDuplicateProvider = vi.fn()
+
+    render(
+      <SettingsModal
+        {...baseModalProps}
+        onDuplicateProvider={onDuplicateProvider}
+        tab="providers"
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '复制 OpenAI' }))
+
+    expect(onDuplicateProvider).toHaveBeenCalledWith('openai')
+  })
+
+  it('keeps custom provider creation behind a simple shortcut', () => {
+    render(
+      <SettingsModal
+        {...baseModalProps}
+        tab="providers"
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '添加 Provider' }))
+
+    expect(screen.getByRole('button', { name: '新建自定义 Provider' })).toBeInTheDocument()
+    expect(screen.queryByText('供应商名称')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '新建自定义 Provider' }))
+
+    expect(screen.getByText('供应商名称')).toBeInTheDocument()
   })
 })

@@ -126,6 +126,7 @@ export type NineClawAppChromeProps = {
     imageGenerationSystem: ImageGenerationSystemConfig,
   ) => Promise<void>
   onProviderConfigChange: (providerId: ProviderId, updates: Partial<ProviderConfig>) => void
+  onDuplicateProvider: (providerId: ProviderId) => void
   onCloseSettings: () => void
   onRemoveCustomProvider: (providerId: ProviderId) => void
   onSelectProvider: (id: ProviderId) => void
@@ -226,6 +227,7 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
     onAddCustomProvider,
     onSaveImageGenerationSettings,
     onProviderConfigChange,
+    onDuplicateProvider,
     onCloseSettings,
     onRemoveCustomProvider,
     onSelectProvider,
@@ -776,6 +778,7 @@ export const NineClawAppChrome = (props: NineClawAppChromeProps) => {
           onAddCustomProvider={onAddCustomProvider}
           onSaveImageGenerationSettings={onSaveImageGenerationSettings}
           onProviderConfigChange={onProviderConfigChange}
+          onDuplicateProvider={onDuplicateProvider}
           onClose={onCloseSettings}
           onRemoveCustomProvider={onRemoveCustomProvider}
           onSelectProvider={onSelectProvider}
