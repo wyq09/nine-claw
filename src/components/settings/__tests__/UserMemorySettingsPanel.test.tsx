@@ -12,8 +12,8 @@ vi.mock('../../../lib/workspaceKvMemoryClient', () => ({
 
 describe('UserMemorySettingsPanel', () => {
   beforeEach(() => {
-    vi.mocked(workspaceKvMemoryUiReorganize).mockResolvedValue(undefined)
-    vi.mocked(workspaceKvMemoryUiList).mockResolvedValue([])
+    vi.mocked(workspaceKvMemoryUiReorganize).mockResolvedValue({ ok: true })
+    vi.mocked(workspaceKvMemoryUiList).mockResolvedValue({ ok: true, workspaceId: 'global', entries: [] })
   })
 
   it('uses the shared settings select field styling for the memory scope dropdown', async () => {

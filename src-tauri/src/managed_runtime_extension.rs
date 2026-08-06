@@ -367,7 +367,7 @@ import {{
   formatSize,
   truncateHead,
   withFileMutationQueue,
-}} from "@mariozechner/pi-coding-agent";
+}} from "@earendil-works/pi-coding-agent";
 import {{ createWebSearchTool }} from "./{MANAGED_RUNTIME_WEB_SEARCH_FILE}";
 import {{ createWebFetchTool }} from "./{MANAGED_RUNTIME_WEB_FETCH_FILE}";
 import {{ createImageGenerationTool }} from "./{MANAGED_RUNTIME_IMAGE_GENERATION_FILE}";
@@ -964,7 +964,7 @@ mod tests {
                 "stableToolSignature(event.toolName, event.input)",
                 "[NineClaw loop guard]",
                 "import { Type } from \"/tmp/typebox/index.mjs\";",
-                "from \"@mariozechner/pi-coding-agent\";",
+                "from \"@earendil-works/pi-coding-agent\";",
                 "createAgentDelegateTool",
                 "createAskUserTool",
                 "createMcpTool",

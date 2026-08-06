@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# pi - Protected wrapper for macOS node
 
-# Set SCRIPT_DIR to the script's directory
 SCRIPT_DIR=

@@ -1636,7 +1636,7 @@ mod lib_tests {
         let candidate = root
             .join("pi-package")
             .join("node_modules")
-            .join("@mariozechner")
+            .join("@earendil-works")
             .join("pi-ai")
             .join("dist")
             .join("index.js");
@@ -1661,8 +1661,35 @@ mod lib_tests {
         let pi_path = pi_dir.join("pi");
         let candidate = root
             .join("node_modules")
-            .join("@mariozechner")
+            .join("@earendil-works")
             .join("pi-coding-agent")
+            .join("node_modules")
+            .join("@earendil-works")
+            .join("pi-ai")
+            .join("dist")
+            .join("index.js");
+
+        fs::create_dir_all(candidate.parent().expect("candidate parent"))
+            .expect("create candidate");
+        fs::create_dir_all(&pi_dir).expect("create pi dir");
+        fs::write(&pi_path, "#!/bin/sh\n").expect("write pi");
+        fs::write(&candidate, "export {};\n").expect("write candidate");
+
+        let resolved = resolve_pi_ai_import_path(&pi_path).expect("resolve path");
+        let expected = fs::canonicalize(&candidate).expect("canonical candidate");
+        assert_eq!(resolved, expected);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_pi_ai_import_path_falls_back_to_legacy_mariozechner_scope() {
+        let root =
+            std::env::temp_dir().join(format!("nineclaw-pi-ai-legacy-{}", Uuid::new_v4()));
+        let pi_dir = root.join("runtime");
+        let pi_path = pi_dir.join("pi");
+        let candidate = root
+            .join("pi-package")
             .join("node_modules")
             .join("@mariozechner")
             .join("pi-ai")
@@ -1675,7 +1702,7 @@ mod lib_tests {
         fs::write(&pi_path, "#!/bin/sh\n").expect("write pi");
         fs::write(&candidate, "export {};\n").expect("write candidate");
 
-        let resolved = resolve_pi_ai_import_path(&pi_path).expect("resolve path");
+        let resolved = resolve_pi_ai_import_path(&pi_path).expect("resolve legacy path");
         let expected = fs::canonicalize(&candidate).expect("canonical candidate");
         assert_eq!(resolved, expected);
 
@@ -2954,6 +2981,28 @@ fn resolve_pi_ai_import_path(pi_executable: &Path) -> Option<PathBuf> {
     for root in roots {
         for ancestor in root.ancestors() {
             for candidate in [
+                ancestor
+                    .join("pi-package")
+                    .join("node_modules")
+                    .join("@earendil-works")
+                    .join("pi-ai")
+                    .join("dist")
+                    .join("index.js"),
+                ancestor
+                    .join("node_modules")
+                    .join("@earendil-works")
+                    .join("pi-ai")
+                    .join("dist")
+                    .join("index.js"),
+                ancestor
+                    .join("node_modules")
+                    .join("@earendil-works")
+                    .join("pi-coding-agent")
+                    .join("node_modules")
+                    .join("@earendil-works")
+                    .join("pi-ai")
+                    .join("dist")
+                    .join("index.js"),
                 ancestor
                     .join("pi-package")
                     .join("node_modules")

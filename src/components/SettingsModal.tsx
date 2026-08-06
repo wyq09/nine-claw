@@ -1188,7 +1188,6 @@ export function SettingsModal({
                                     </span>
                                   </div>
                                   <div className="provider-card-end">
-                                    <span className={`bot-channel-status status-${config.status}`}>{config.status}</span>
                                     <button
                                       type="button"
                                       className="provider-card-action-button"

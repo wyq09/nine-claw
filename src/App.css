@@ -8410,8 +8410,7 @@ select.task-edit-control {
 }
 
 .bot-channel-copy strong,
-.bot-channel-model,
-.bot-channel-status {
+.bot-channel-model {
   min-width: 0;
 }
 
@@ -8436,21 +8435,6 @@ select.task-edit-control {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.bot-channel-status {
-  flex-shrink: 0;
-  border-radius: 999px;
-  background: var(--surface-field);
-  color: var(--chrome-soft);
-  padding: 3px 7px;
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-.bot-channel-status.status-测试通过 {
-  color: var(--green);
-  background: rgba(34, 160, 107, 0.12);
 }
 
 .provider-card-end {

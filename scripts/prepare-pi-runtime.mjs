@@ -2,17 +2,16 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-const runtimePackageName = '@mariozechner/pi-coding-agent'
+const runtimePackageName = '@earendil-works/pi-coding-agent'
 const extraRuntimePackageNames = ['@modelcontextprotocol/sdk']
 const publishedMonoPackageNames = [
-  '@mariozechner/pi-coding-agent',
-  '@mariozechner/pi-agent-core',
-  '@mariozechner/pi-ai',
-  '@mariozechner/pi-tui',
-  '@mariozechner/pi-web-ui',
-  '@mariozechner/pi-mom',
+  '@earendil-works/pi-coding-agent',
+  '@earendil-works/pi-agent-core',
+  '@earendil-works/pi-ai',
+  '@earendil-works/pi-tui',
+  '@earendil-works/pi-web-ui',
 ]
-const repoOnlyMonoPackageNames = ['@mariozechner/pi-pods']
+const repoOnlyMonoPackageNames = ['@earendil-works/pi-pods']
 const projectRoot = process.cwd()
 const localNodeModulesRoot = path.resolve(projectRoot, 'node_modules')
 const resourceRoot = path.resolve(projectRoot, 'src-tauri', 'resources', 'pi-runtime')

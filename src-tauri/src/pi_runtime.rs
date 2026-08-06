@@ -608,7 +608,7 @@ fn install_pi_with_npm(messages: &mut Vec<String>) -> bool {
 
     messages.push("尝试通过 npm 全局安装 pi 运行时。".to_string());
     match Command::new(npm_path)
-        .args(["install", "-g", "@mariozechner/pi-coding-agent"])
+        .args(["install", "-g", "@earendil-works/pi-coding-agent@0.80.6"])
         .status()
     {
         Ok(status) if status.success() => {

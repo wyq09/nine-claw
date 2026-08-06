@@ -155,4 +155,4 @@ When reviewing plans or code changes, evaluate on these dimensions (1-10 scale):
 
 **Pass**: overall >= 7.0 AND no dimension <= 3.
 
-## 所有的功能开发前必须设计单元测试，覆盖所以修改到的功能，全部测试通过了，才算完成任务
+## 所有的功能开发前必须设计单元测试，覆盖所有修改到的功能，全部测试通过了，才算完成任务
