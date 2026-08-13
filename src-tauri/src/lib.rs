@@ -35,6 +35,10 @@ mod scheduler;
 mod session_sanitize;
 mod session_workspace;
 mod skills;
+mod skill_broker;
+mod skill_cache;
+mod skill_manifest;
+mod skill_providers;
 pub mod storage;
 mod team_supervisor;
 mod team_workspace;
@@ -64,7 +68,6 @@ mod runtime_agent_config;
 mod session_compression;
 mod session_llm_log;
 mod session_llm_titles;
-mod skill_broker;
 mod time_util;
 mod user_kv_memory_reorganize;
 
@@ -7362,6 +7365,7 @@ pub fn run() {
                 log::warn!("应用启动时载入代理设置失败: {error}");
             }
             llm_log_export::init(&app.handle());
+            skills::start_runtime_skill_watchers(&app.handle());
 
             // Initialize embedding provider registry
             let embedding_registry = embedding::new_registry();

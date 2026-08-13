@@ -11,6 +11,14 @@
 | 04-① | CI + 测试门禁 | 报告 04 | 🟡 | `.github/workflows/ci.yml` 已加 tsc/vitest/cargo test/800 行 ratchet；lint、clippy、rustfmt 因存量欠账暂未硬门禁 |
 | 04-⑥ | 800 行机械校验 | 报告 04 | ✅ | `scripts/check-file-size.mjs` + 40 个存量超限文件的 ratchet baseline |
 
+## 第二批已落地（2026-08-13）
+
+| ID | 动作 | 来源 | 状态 | 备注 |
+|----|------|------|------|------|
+| 04-② | 临时文件 0700 私有目录 + 0o600 + 拒符号链接 | 报告 04 | ✅ | `runtime_paths.rs`：会话/摘要/runtime 迁到 app data 私有目录，旧 /tmp 迁移一次；共享 temp 目录不再被 chmod（macOS EPERM 回归测试） |
+| 04-④ | redact 安全默认 | 报告 04 | ✅ | Rust `include_secrets: Option<bool>` 缺省 false；前端 `includeSecrets?` 缺省传 false，2 个 vitest 用例 |
+| 04-⑤ | emit 统一吞错 + log | 报告 04 | ✅ | `emit_safe.rs` helper（mock_app 真实路径测试），12 个模块全部替换裸/吞错 emit |
+
 ## 待办池
 
 | ID | 动作 | 来源 | 优先级 | 备注 |
@@ -29,10 +37,7 @@
 | 03-③ | flat `<name>.md` + kebab 校验 | 报告 03 | P1 | |
 | 03-④ | `execution_mode` 日志 fold | 报告 03 | P2 | 先做一个样板状态 |
 | 03-⑤ | Scope 原语能力隔离 | 报告 03 | P3 | 依赖 02-② 的 PI 侧拦截才真正 enforce |
-| 04-② | 临时文件 0700 + 随机名 + 0o600 | 报告 04 | P0 | 剩余 P0，建议下一批 |
 | 04-③ | dispatcher `catch_unwind` | 报告 04 | P1 | |
-| 04-④ | redact 安全默认 | 报告 04 | P0 | 剩余 P0，建议下一批 |
-| 04-⑤ | emit 统一吞错 + log | 报告 04 | P1 | |
 | 04-⑦ | clippy 纪律 | 报告 04 | P1 | 当前 142 个存量错误，需逐条 allow/fix |
 | 04-⑧ | coverage gate / snapshot / real-API e2e 自 skip | 报告 04 | P1 | |
 | 04-⑨ | postmortem 模板 + ADR | 报告 04 | P2 | |
@@ -40,8 +45,7 @@
 
 ## 建议下一批
 
-1. `04-②` 临时文件安全
-2. `04-④` redact 安全默认
-3. `04-⑤` emit 统一吞错 + log
-4. `03-① + 03-② + 03-③` Skills 发现优化（一组做）
-5. `01-③ + 01-④` compaction 可靠性
+1. `03-① + 03-② + 03-③` Skills 发现优化（一组做，进行中）
+2. `04-③` dispatcher `catch_unwind`
+3. `01-③ + 01-④` compaction 可靠性
+4. `04-⑦` clippy 纪律（存量 142 错误逐条清理）

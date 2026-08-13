@@ -1,7 +1,11 @@
+use crate::skill_cache::SkillCache;
+use crate::skill_manifest::parse_skill_manifest;
+use crate::skill_providers::{candidate_skill_roots, home_dir, SkillRoot};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
@@ -62,13 +66,6 @@ pub struct SystemSkillItem {
     pub installed: bool,
 }
 
-#[derive(Debug, Clone)]
-struct SkillRoot {
-    path: PathBuf,
-    scope: &'static str,
-    lock_path: Option<PathBuf>,
-}
-
 #[derive(Debug, Default, Deserialize)]
 struct SkillLockFile {
     #[serde(default)]
@@ -82,34 +79,66 @@ struct SkillLockEntry {
     source_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct SkillManifest {
-    name: Option<String>,
-    description: Option<String>,
-    triggers: Vec<String>,
-    examples: Vec<String>,
-    capabilities: Vec<String>,
-    requires_auth: bool,
-    side_effect_level: Option<String>,
-    modes: Vec<String>,
-}
-
 pub fn list_installed_skills() -> Result<Vec<InstalledSkill>, String> {
     scan_skill_roots(&candidate_skill_roots())
 }
 
+static RUNTIME_SKILL_CACHE: OnceLock<Arc<SkillCache<SkillDefinition>>> = OnceLock::new();
+
+/// Process-wide per-root cache for runtime skill definitions. Watchers
+/// invalidate on filesystem changes; reads fall back to direct scanning.
+pub(crate) fn runtime_skill_cache() -> Arc<SkillCache<SkillDefinition>> {
+    RUNTIME_SKILL_CACHE
+        .get_or_init(|| Arc::new(SkillCache::new()))
+        .clone()
+}
+
+/// Start filesystem watchers for every candidate skill root, kept alive for
+/// the process lifetime. Model-written skills and human edits both surface
+/// as filesystem events, so no extra write-path invalidation is needed.
+pub(crate) fn start_runtime_skill_watchers(app: &AppHandle) {
+    let roots = candidate_skill_roots()
+        .into_iter()
+        .map(|root| root.path)
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return;
+    }
+    // Process-lifetime resource: intentionally leaked (never dropped) so the
+    // watcher thread outlives every scan. A bounded one-time allocation.
+    let handle = crate::skill_cache::start_skill_watchers(roots, runtime_skill_cache(), app);
+    std::mem::forget(handle);
+}
+
 pub fn list_runtime_available_skills() -> Result<Vec<SkillDefinition>, String> {
-    let mut skills = scan_skill_definitions_from_roots(&candidate_skill_roots())?;
-    let mut seen_ids = skills
-        .iter()
-        .map(|skill| skill.id.clone())
-        .collect::<HashSet<_>>();
+    let cache = runtime_skill_cache();
+    let mut skills = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    // candidate_skill_roots() is rank-sorted; first-seen dedup across the
+    // cached per-root scans therefore keeps the explicit priority table as
+    // the name-resolution rule (lowest rank wins).
+    for root in candidate_skill_roots() {
+        let definitions = cache.get_or_scan(&root.path, || {
+            scan_skill_definitions_from_roots(&[root.clone()]).unwrap_or_else(|error| {
+                log::warn!("扫描技能根目录失败 {}: {error}", root.path.display());
+                Vec::new()
+            })
+        });
+        for definition in definitions {
+            if seen_ids.insert(definition.id.clone()) {
+                skills.push(definition);
+            }
+        }
+    }
 
     for (skill_id, path) in list_runtime_system_skill_directories()? {
         if seen_ids.contains(&skill_id) {
             continue;
         }
-        if let Some(definition) = load_skill_definition("runtime", &skill_id, &path)? {
+        if let Some(definition) =
+            load_skill_definition("runtime", &skill_id, &path.join("SKILL.md"), &path)?
+        {
             seen_ids.insert(skill_id);
             skills.push(definition);
         }
@@ -127,27 +156,46 @@ pub fn resolve_skill_directories(skill_ids: &[String]) -> Result<Vec<PathBuf>, S
     let installed = list_installed_skills()?;
     let mut available_by_id = installed
         .into_iter()
-        .map(|skill| (skill.id, PathBuf::from(skill.path)))
+        .map(|skill| (skill.id, (PathBuf::from(skill.path), skill.install_type)))
         .collect::<HashMap<_, _>>();
     for (skill_id, path) in list_runtime_system_skill_directories()? {
-        available_by_id.entry(skill_id).or_insert(path);
+        available_by_id
+            .entry(skill_id)
+            .or_insert((path, "directory".to_string()));
     }
 
     let mut resolved = Vec::new();
     let mut seen = HashSet::new();
 
     for skill_id in skill_ids {
-        let Some(path) = available_by_id.get(skill_id) else {
+        let Some((path, install_type)) = available_by_id.get(skill_id) else {
             continue;
         };
-
-        let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        let mount_path = if install_type == "file" {
+            materialize_flat_skill(skill_id, path)?
+        } else {
+            path.clone()
+        };
+        let canonical = fs::canonicalize(&mount_path).unwrap_or_else(|_| mount_path.clone());
         if seen.insert(canonical) {
-            resolved.push(path.clone());
+            resolved.push(mount_path);
         }
     }
 
     Ok(resolved)
+}
+
+/// Materialize a flat `<name>.md` skill into a bundle directory
+/// (`<name>/SKILL.md`) under the private runtime dir, so the PI process can
+/// mount it with the same `--skill <dir>` mechanism as bundle skills.
+fn materialize_flat_skill(skill_id: &str, source_file: &Path) -> Result<PathBuf, String> {
+    let bundle_dir = crate::runtime_paths::pi_runtime_dir()
+        .join("skill-materialize")
+        .join(skill_id);
+    let content = fs::read(source_file)
+        .map_err(|error| format!("读取 flat 技能失败 {}: {error}", source_file.display()))?;
+    crate::runtime_paths::write_private_file(&bundle_dir.join("SKILL.md"), &content)?;
+    Ok(bundle_dir)
 }
 
 fn list_runtime_system_skill_directories() -> Result<HashMap<String, PathBuf>, String> {
@@ -487,6 +535,67 @@ pub fn resolve_skill_source_info(
     Ok(out)
 }
 
+/// A discovered skill entry: either a bundle directory (`<id>/SKILL.md`)
+/// or a flat file (`<id>.md`). Symlinked directories are treated as their
+/// target and classify as bundles, preserving the legacy install behavior.
+struct SkillEntry {
+    id: String,
+    manifest_path: PathBuf,
+    skill_path: PathBuf,
+    is_flat: bool,
+}
+
+fn is_valid_skill_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !id.starts_with('-')
+        && !id.ends_with('-')
+        && !id.contains("--")
+}
+
+fn classify_skill_entry(entry: &fs::DirEntry) -> Option<SkillEntry> {
+    let name = entry.file_name().to_string_lossy().trim().to_string();
+    if name.is_empty() || name.starts_with('.') {
+        return None;
+    }
+
+    let path = entry.path();
+    if path.is_dir() {
+        if !is_valid_skill_id(&name) {
+            log::warn!("跳过非法技能 id（需 kebab-case）: {}", path.display());
+            return None;
+        }
+        let manifest_path = path.join("SKILL.md");
+        if !manifest_path.is_file() {
+            return None;
+        }
+        Some(SkillEntry {
+            id: name,
+            manifest_path,
+            skill_path: path,
+            is_flat: false,
+        })
+    } else if path.is_file() {
+        let Some(id) = name.strip_suffix(".md").map(ToOwned::to_owned) else {
+            return None;
+        };
+        if !is_valid_skill_id(&id) {
+            log::warn!("跳过非法技能 id（需 kebab-case）: {}", path.display());
+            return None;
+        }
+        Some(SkillEntry {
+            id,
+            manifest_path: path.clone(),
+            skill_path: path,
+            is_flat: true,
+        })
+    } else {
+        None
+    }
+}
+
 fn scan_skill_roots(roots: &[SkillRoot]) -> Result<Vec<InstalledSkill>, String> {
     let mut skills = Vec::new();
     let mut seen_ids = HashSet::new();
@@ -505,39 +614,41 @@ fn scan_skill_roots(roots: &[SkillRoot]) -> Result<Vec<InstalledSkill>, String> 
             let entry = entry.map_err(|error| {
                 format!("读取技能目录条目失败 {}: {error}", root.path.display())
             })?;
-            let skill_id = entry.file_name().to_string_lossy().trim().to_string();
-            if skill_id.is_empty() || skill_id.starts_with('.') {
+            let Some(skill_entry) = classify_skill_entry(&entry) else {
+                continue;
+            };
+
+            if !seen_ids.insert(skill_entry.id.clone()) {
                 continue;
             }
 
-            let skill_path = entry.path();
-            let manifest_path = skill_path.join("SKILL.md");
-            if !manifest_path.is_file() {
-                continue;
-            }
-
-            if !seen_ids.insert(skill_id.clone()) {
-                continue;
-            }
-
-            let canonical_skill_path =
-                fs::canonicalize(&skill_path).unwrap_or_else(|_| skill_path.clone());
+            let canonical_skill_path = fs::canonicalize(&skill_entry.skill_path)
+                .unwrap_or_else(|_| skill_entry.skill_path.clone());
             if !seen_paths.insert(canonical_skill_path) {
                 continue;
             }
 
-            let manifest_text = fs::read_to_string(&manifest_path).map_err(|error| {
-                format!("读取技能说明失败 {}: {error}", manifest_path.display())
+            let manifest_text = fs::read_to_string(&skill_entry.manifest_path).map_err(|error| {
+                format!(
+                    "读取技能说明失败 {}: {error}",
+                    skill_entry.manifest_path.display()
+                )
             })?;
             let manifest = parse_skill_manifest(&manifest_text);
-            let metadata = fs::symlink_metadata(&skill_path)
-                .map_err(|error| format!("读取技能元数据失败 {}: {error}", skill_path.display()))?;
+            let metadata = fs::symlink_metadata(&skill_entry.skill_path).map_err(|error| {
+                format!(
+                    "读取技能元数据失败 {}: {error}",
+                    skill_entry.skill_path.display()
+                )
+            })?;
 
-            let updated_at = fs::metadata(&manifest_path)
+            let updated_at = fs::metadata(&skill_entry.manifest_path)
                 .and_then(|item| item.modified())
                 .map(system_time_to_ms)
                 .unwrap_or_default();
-            let install_type = if metadata.file_type().is_symlink() {
+            let install_type = if skill_entry.is_flat {
+                "file"
+            } else if metadata.file_type().is_symlink() {
                 "symlink"
             } else {
                 "directory"
@@ -545,19 +656,19 @@ fn scan_skill_roots(roots: &[SkillRoot]) -> Result<Vec<InstalledSkill>, String> 
             let name = manifest
                 .name
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| skill_id.clone());
+                .unwrap_or_else(|| skill_entry.id.clone());
             let description = manifest
                 .description
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "暂无描述".to_string());
-            let lock_entry = lock_entries.get(&skill_id).cloned().unwrap_or_default();
+            let lock_entry = lock_entries.get(&skill_entry.id).cloned().unwrap_or_default();
 
             skills.push(InstalledSkill {
-                id: skill_id,
+                id: skill_entry.id,
                 name,
                 description,
-                path: skill_path.display().to_string(),
-                manifest_path: manifest_path.display().to_string(),
+                path: skill_entry.skill_path.display().to_string(),
+                manifest_path: skill_entry.manifest_path.display().to_string(),
                 scope: root.scope.to_string(),
                 install_type: install_type.to_string(),
                 updated_at,
@@ -592,22 +703,25 @@ fn scan_skill_definitions_from_roots(roots: &[SkillRoot]) -> Result<Vec<SkillDef
             let entry = entry.map_err(|error| {
                 format!("读取技能目录条目失败 {}: {error}", root.path.display())
             })?;
-            let skill_id = entry.file_name().to_string_lossy().trim().to_string();
-            if skill_id.is_empty()
-                || skill_id.starts_with('.')
-                || !seen_ids.insert(skill_id.clone())
-            {
+            let Some(skill_entry) = classify_skill_entry(&entry) else {
+                continue;
+            };
+            if !seen_ids.insert(skill_entry.id.clone()) {
                 continue;
             }
 
-            let skill_path = entry.path();
-            let canonical_skill_path =
-                fs::canonicalize(&skill_path).unwrap_or_else(|_| skill_path.clone());
+            let canonical_skill_path = fs::canonicalize(&skill_entry.skill_path)
+                .unwrap_or_else(|_| skill_entry.skill_path.clone());
             if !seen_paths.insert(canonical_skill_path) {
                 continue;
             }
 
-            if let Some(definition) = load_skill_definition(root.scope, &skill_id, &skill_path)? {
+            if let Some(definition) = load_skill_definition(
+                root.scope,
+                &skill_entry.id,
+                &skill_entry.manifest_path,
+                &skill_entry.skill_path,
+            )? {
                 skills.push(definition);
             }
         }
@@ -619,14 +733,10 @@ fn scan_skill_definitions_from_roots(roots: &[SkillRoot]) -> Result<Vec<SkillDef
 fn load_skill_definition(
     _scope: &str,
     skill_id: &str,
+    manifest_path: &Path,
     skill_path: &Path,
 ) -> Result<Option<SkillDefinition>, String> {
-    let manifest_path = skill_path.join("SKILL.md");
-    if !manifest_path.is_file() {
-        return Ok(None);
-    }
-
-    let manifest_text = fs::read_to_string(&manifest_path)
+    let manifest_text = fs::read_to_string(manifest_path)
         .map_err(|error| format!("读取技能说明失败 {}: {error}", manifest_path.display()))?;
     let manifest = parse_skill_manifest(&manifest_text);
     let name = manifest
@@ -660,111 +770,6 @@ fn load_skill_definition(
     }))
 }
 
-fn candidate_skill_roots() -> Vec<SkillRoot> {
-    let mut roots = Vec::new();
-    let mut seen = HashSet::new();
-
-    for workspace_root in discover_workspace_roots() {
-        push_skill_root(
-            &mut roots,
-            &mut seen,
-            workspace_root.join("skills"),
-            "workspace",
-            Some(workspace_root.join("skills-lock.json")),
-        );
-        push_skill_root(
-            &mut roots,
-            &mut seen,
-            workspace_root.join(".agents").join("skills"),
-            "workspace",
-            Some(workspace_root.join("skills-lock.json")),
-        );
-    }
-
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-        let base = PathBuf::from(codex_home);
-        push_skill_root(&mut roots, &mut seen, base.join("skills"), "global", None);
-    }
-
-    if let Some(home_dir) = home_dir() {
-        push_skill_root(
-            &mut roots,
-            &mut seen,
-            home_dir.join(".codex").join("skills"),
-            "global",
-            None,
-        );
-        push_skill_root(
-            &mut roots,
-            &mut seen,
-            home_dir.join(".agents").join("skills"),
-            "global",
-            None,
-        );
-    }
-
-    roots
-}
-
-fn discover_workspace_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    let mut seen = HashSet::new();
-
-    let mut start_points = Vec::new();
-    if let Ok(current_dir) = std::env::current_dir() {
-        start_points.push(current_dir);
-    }
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            start_points.push(parent.to_path_buf());
-        }
-    }
-
-    for start_point in start_points {
-        for ancestor in start_point.ancestors() {
-            let candidate = ancestor.to_path_buf();
-            if !looks_like_workspace_root(&candidate) {
-                continue;
-            }
-            let canonical = fs::canonicalize(&candidate).unwrap_or(candidate.clone());
-            if seen.insert(canonical) {
-                roots.push(candidate);
-            }
-        }
-    }
-
-    roots
-}
-
-fn looks_like_workspace_root(path: &Path) -> bool {
-    path.join("skills").exists()
-        || path.join(".agents").join("skills").exists()
-        || path.join("skills-lock.json").exists()
-        || path.join("package.json").exists()
-            && path.join("src-tauri").join("tauri.conf.json").exists()
-}
-
-fn push_skill_root(
-    roots: &mut Vec<SkillRoot>,
-    seen: &mut HashSet<PathBuf>,
-    path: PathBuf,
-    scope: &'static str,
-    lock_path: Option<PathBuf>,
-) {
-    if !path.exists() || !path.is_dir() {
-        return;
-    }
-
-    let canonical = fs::canonicalize(&path).unwrap_or(path.clone());
-    if seen.insert(canonical) {
-        roots.push(SkillRoot {
-            path,
-            scope,
-            lock_path,
-        });
-    }
-}
-
 fn load_skill_lock_entries(path: Option<&Path>) -> HashMap<String, SkillLockEntry> {
     let Some(path) = path else {
         return HashMap::new();
@@ -777,138 +782,6 @@ fn load_skill_lock_entries(path: Option<&Path>) -> HashMap<String, SkillLockEntr
 
     serde_json::from_str::<SkillLockFile>(&content)
         .map(|file| file.skills)
-        .unwrap_or_default()
-}
-
-fn parse_skill_manifest(content: &str) -> SkillManifest {
-    let mut manifest = SkillManifest::default();
-    let mut body_lines = Vec::new();
-    let mut lines = content.lines().peekable();
-
-    if matches!(lines.peek(), Some(line) if line.trim() == "---") {
-        lines.next();
-        let mut frontmatter_lines = Vec::new();
-        let mut block_scalar_indent: Option<usize> = None;
-        while let Some(line) = lines.next() {
-            let trimmed = line.trim();
-            let indent = line.chars().take_while(|char| char.is_whitespace()).count();
-
-            if let Some(active_indent) = block_scalar_indent {
-                if trimmed.is_empty() {
-                    frontmatter_lines.push(line.to_string());
-                    continue;
-                }
-                if indent > active_indent {
-                    frontmatter_lines.push(line.to_string());
-                    continue;
-                }
-                block_scalar_indent = None;
-            }
-
-            if trimmed == "---" {
-                break;
-            }
-            if let Some((_, value)) = trimmed.split_once(':') {
-                let value = value.trim();
-                if matches!(value, "|" | "|-" | "|+" | ">" | ">-" | ">+") {
-                    block_scalar_indent = Some(indent);
-                }
-            }
-            frontmatter_lines.push(line.to_string());
-        }
-
-        if let Some(frontmatter) = parse_frontmatter(&frontmatter_lines.join("\n")) {
-            manifest = frontmatter;
-        }
-    }
-
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        body_lines.push(trimmed.to_string());
-    }
-
-    if manifest.name.is_none() {
-        manifest.name = body_lines
-            .iter()
-            .find_map(|line| {
-                if line.starts_with('#') {
-                    Some(line.trim_start_matches('#').trim().to_string())
-                } else {
-                    None
-                }
-            })
-            .filter(|value| !value.is_empty());
-    }
-
-    if manifest.description.is_none() {
-        manifest.description = body_lines
-            .iter()
-            .find(|line| {
-                !line.starts_with('#')
-                    && !line.starts_with("```")
-                    && !line.starts_with('-')
-                    && !line.starts_with('*')
-            })
-            .map(|line| line.trim().to_string())
-            .filter(|value| !value.is_empty());
-    }
-
-    manifest
-}
-
-fn parse_frontmatter(content: &str) -> Option<SkillManifest> {
-    let parsed = serde_yaml::from_str::<serde_yaml::Value>(content).ok()?;
-    let map = parsed.as_mapping()?;
-    Some(SkillManifest {
-        name: read_yaml_string(map, "name"),
-        description: read_yaml_string(map, "description"),
-        triggers: read_yaml_string_list(map, "triggers"),
-        examples: read_yaml_string_list(map, "examples"),
-        capabilities: read_yaml_string_list(map, "capabilities"),
-        requires_auth: read_yaml_bool(map, "requiresAuth"),
-        side_effect_level: read_yaml_string(map, "sideEffectLevel"),
-        modes: read_yaml_string_list(map, "modes"),
-    })
-}
-
-fn read_yaml_string(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    map.get(&serde_yaml::Value::String(key.to_string()))
-        .and_then(|value| value.as_str())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn read_yaml_bool(map: &serde_yaml::Mapping, key: &str) -> bool {
-    map.get(&serde_yaml::Value::String(key.to_string()))
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false)
-}
-
-fn read_yaml_string_list(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {
-    let Some(value) = map.get(&serde_yaml::Value::String(key.to_string())) else {
-        return Vec::new();
-    };
-
-    if let Some(single) = value.as_str() {
-        return vec![single.trim().to_string()]
-            .into_iter()
-            .filter(|item| !item.is_empty())
-            .collect();
-    }
-
-    value
-        .as_sequence()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str())
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty())
-                .collect()
-        })
         .unwrap_or_default()
 }
 
@@ -926,144 +799,10 @@ fn skill_scope_rank(scope: &str) -> u8 {
     }
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::{create_dir_all, remove_dir_all, write};
-
-    #[test]
-    fn parse_manifest_prefers_frontmatter_fields() {
-        let manifest = parse_skill_manifest(
-            r#"---
-name: all-plan
-description: "Collaborative planning using abstract roles."
----
-
-# Ignored title
-
-Fallback description
-"#,
-        );
-
-        assert_eq!(
-            manifest,
-            SkillManifest {
-                name: Some("all-plan".to_string()),
-                description: Some("Collaborative planning using abstract roles.".to_string()),
-                ..SkillManifest::default()
-            }
-        );
-    }
-
-    #[test]
-    fn parse_manifest_falls_back_to_heading_and_body() {
-        let manifest = parse_skill_manifest(
-            r#"
-# Browser Skill
-
-Automate browser interactions for data collection.
-"#,
-        );
-
-        assert_eq!(
-            manifest,
-            SkillManifest {
-                name: Some("Browser Skill".to_string()),
-                description: Some("Automate browser interactions for data collection.".to_string()),
-                ..SkillManifest::default()
-            }
-        );
-    }
-
-    #[test]
-    fn parse_manifest_supports_literal_multiline_description() {
-        let manifest = parse_skill_manifest(
-            r#"---
-name: multiline-skill
-description: |
-  第一行简介
-  ---
-  第二行才是补充说明
-metadata:
-  short-description: ignored
----
-"#,
-        );
-
-        assert_eq!(
-            manifest,
-            SkillManifest {
-                name: Some("multiline-skill".to_string()),
-                description: Some("第一行简介\n---\n第二行才是补充说明".to_string()),
-                ..SkillManifest::default()
-            }
-        );
-    }
-
-    #[test]
-    fn parse_manifest_supports_folded_multiline_description() {
-        let manifest = parse_skill_manifest(
-            r#"---
-name: folded-skill
-description: >
-  第一行简介
-  第二行继续补充
-
-  第二段说明
----
-"#,
-        );
-
-        assert_eq!(
-            manifest,
-            SkillManifest {
-                name: Some("folded-skill".to_string()),
-                description: Some("第一行简介 第二行继续补充\n第二段说明".to_string()),
-                ..SkillManifest::default()
-            }
-        );
-    }
-
-    #[test]
-    fn parse_manifest_reads_dynamic_skill_metadata() {
-        let manifest = parse_skill_manifest(
-            r#"---
-name: pptx
-description: Create slides
-triggers:
-  - slides
-  - presentation
-examples:
-  - make a deck
-capabilities:
-  - export pptx
-requiresAuth: true
-sideEffectLevel: high
-modes:
-  - worker
-  - supervisor
----
-"#,
-        );
-
-        assert_eq!(manifest.name.as_deref(), Some("pptx"));
-        assert_eq!(
-            manifest.triggers,
-            vec!["slides".to_string(), "presentation".to_string()]
-        );
-        assert_eq!(manifest.examples, vec!["make a deck".to_string()]);
-        assert_eq!(manifest.capabilities, vec!["export pptx".to_string()]);
-        assert!(manifest.requires_auth);
-        assert_eq!(manifest.side_effect_level.as_deref(), Some("high"));
-        assert_eq!(
-            manifest.modes,
-            vec!["worker".to_string(), "supervisor".to_string()]
-        );
-    }
 
     #[test]
     fn scan_skill_roots_reads_lock_metadata_and_deduplicates_ids() {
@@ -1102,11 +841,13 @@ modes:
                 path: workspace_skills.clone(),
                 scope: "workspace",
                 lock_path: Some(temp_root.join("skills-lock.json")),
+                rank: 100,
             },
             SkillRoot {
                 path: global_skills.clone(),
                 scope: "global",
                 lock_path: None,
+                rank: 400,
             },
         ])
         .expect("scan skills");
@@ -1171,5 +912,159 @@ modes:
 
         assert_eq!(resolved.len(), 1);
         assert!(resolved[0].ends_with("nineclaw-task-creator"));
+    }
+
+    #[test]
+    fn scan_discovers_flat_skill_files_alongside_bundles() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "nineclaw-flat-skill-test-{}",
+            system_time_to_ms(SystemTime::now())
+        ));
+        let skills_root = temp_root.join("skills");
+        create_dir_all(skills_root.join("bundle-skill")).expect("create bundle skill");
+        write(
+            skills_root.join("bundle-skill").join("SKILL.md"),
+            "---\nname: bundle-skill\ndescription: bundled\n---\n",
+        )
+        .expect("write bundle manifest");
+        write(
+            skills_root.join("flat-skill.md"),
+            "---\nname: flat-skill\ndescription: flat file body\n---\n\n# Flat body\n",
+        )
+        .expect("write flat skill");
+
+        let roots = [SkillRoot {
+            path: skills_root,
+            scope: "workspace",
+            lock_path: None,
+            rank: 100,
+        }];
+        let definitions = scan_skill_definitions_from_roots(&roots).expect("scan");
+
+        remove_dir_all(temp_root).expect("cleanup temp root");
+
+        assert_eq!(definitions.len(), 2);
+        let flat = definitions
+            .iter()
+            .find(|skill| skill.id == "flat-skill")
+            .expect("flat skill discovered");
+        assert_eq!(flat.description, "flat file body");
+        assert_eq!(flat.name, "flat-skill");
+        assert!(flat.path.ends_with("flat-skill.md"));
+        assert!(definitions.iter().any(|skill| skill.id == "bundle-skill"));
+    }
+
+    #[test]
+    fn scan_skips_non_kebab_case_skill_ids() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "nineclaw-kebab-skill-test-{}",
+            system_time_to_ms(SystemTime::now())
+        ));
+        let skills_root = temp_root.join("skills");
+        create_dir_all(skills_root.join("Bad_Name")).expect("create invalid bundle");
+        write(
+            skills_root.join("Bad_Name").join("SKILL.md"),
+            "---\nname: bad\ndescription: nope\n---\n",
+        )
+        .expect("write invalid bundle manifest");
+        write(
+            skills_root.join("Prompt Engineer.md"),
+            "---\nname: invalid flat\ndescription: nope\n---\n",
+        )
+        .expect("write invalid flat skill");
+
+        let roots = [SkillRoot {
+            path: skills_root,
+            scope: "workspace",
+            lock_path: None,
+            rank: 100,
+        }];
+        let definitions = scan_skill_definitions_from_roots(&roots).expect("scan");
+
+        remove_dir_all(temp_root).expect("cleanup temp root");
+
+        assert!(definitions.is_empty(), "invalid ids must be skipped: {definitions:?}");
+    }
+
+    #[test]
+    fn lower_rank_root_wins_same_skill_id() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "nineclaw-rank-skill-test-{}",
+            system_time_to_ms(SystemTime::now())
+        ));
+        let workspace_skills = temp_root.join("workspace-skills");
+        let user_skills = temp_root.join("user-skills");
+        create_dir_all(workspace_skills.join("shared-skill")).expect("create workspace skill");
+        create_dir_all(user_skills.join("shared-skill")).expect("create user skill");
+        write(
+            workspace_skills.join("shared-skill").join("SKILL.md"),
+            "---\nname: shared-skill\ndescription: workspace wins\n---\n",
+        )
+        .expect("write workspace manifest");
+        write(
+            user_skills.join("shared-skill").join("SKILL.md"),
+            "---\nname: shared-skill\ndescription: user loses\n---\n",
+        )
+        .expect("write user manifest");
+
+        // candidate_skill_roots() returns roots sorted by rank ascending; the
+        // scan deduplicates first-seen, so the lower rank must win.
+        let roots = [
+            SkillRoot {
+                path: workspace_skills,
+                scope: "workspace",
+                lock_path: None,
+                rank: 100,
+            },
+            SkillRoot {
+                path: user_skills,
+                scope: "global",
+                lock_path: None,
+                rank: 400,
+            },
+        ];
+        let definitions = scan_skill_definitions_from_roots(&roots).expect("scan");
+
+        remove_dir_all(temp_root).expect("cleanup temp root");
+
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].id, "shared-skill");
+        assert_eq!(definitions[0].description, "workspace wins");
+    }
+
+    #[test]
+    fn resolve_skill_directories_materializes_flat_skills() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "nineclaw-flat-mount-test-{}",
+            system_time_to_ms(SystemTime::now())
+        ));
+        let skills_root = temp_root.join("skills");
+        create_dir_all(&skills_root).expect("create skills root");
+        write(
+            skills_root.join("mount-me.md"),
+            "---\nname: mount-me\ndescription: mountable\n---\n\n# Body\n",
+        )
+        .expect("write flat skill");
+
+        // The `skills/` directory alone makes this temp dir look like a
+        // workspace root, so list_installed_skills discovers the flat file.
+        let previous_dir = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&temp_root).expect("set current dir");
+
+        let resolved =
+            resolve_skill_directories(&["mount-me".to_string()]).expect("resolve flat skill");
+
+        std::env::set_current_dir(previous_dir).expect("restore current dir");
+        let mounted_skill = fs::read_to_string(resolved[0].join("SKILL.md"))
+            .expect("read materialized skill");
+        let materialized = crate::runtime_paths::pi_runtime_dir()
+            .join("skill-materialize")
+            .join("mount-me");
+        remove_dir_all(temp_root).expect("cleanup temp root");
+        let _ = remove_dir_all(materialized);
+
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].ends_with("mount-me"), "{resolved:?}");
+        assert!(mounted_skill.contains("# Body"));
     }
 }

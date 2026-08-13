@@ -42,6 +42,7 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["json"] }
 tower-http = { version = "0.5", features = ["limit"] }
 md-5 = "0.10"
+notify = "8"
 base64 = "0.22"
 qrcode = "0.14"
 rand = "0.8"
