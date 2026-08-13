@@ -1,2 +1,32 @@
+# 打包/资源生成目录
 resources/pi-runtime/
 resources/pi-runtime-bundles/
+
+# 构建产物
+target/
+gen/
+
+# 运行期/调试期会在 src-tauri 下产生的临时文件；
+# 不忽略它们会触发 `tauri dev` 的 watcher，导致反复重新编译和重启。
+.listenhub/
+.memories/
+.recovery/
+logs/
+tmp/
+*.log
+debug-log.txt
+pi-modified.log
+review.log
+user_memory.log
+memory-dump.md
+memory_output.json
+user-memory.json
+line_counts.txt
+allowed-photo-tags.txt
+user-preferences.txt
+.mcp_configured.json
+QR_Rubric.md
+important_ai_skills_summary.txt
+endpoint_pattern_results.json
+endpoint_test_results.json
+model_api_test_result.json

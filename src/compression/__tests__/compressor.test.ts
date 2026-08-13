@@ -127,3 +127,45 @@ describe('insert-then-compress core', () => {
     expect(message.topics).toBe('文件编辑, bug修复')
   })
 })
+
+describe('tool result truncation by Unicode code point', () => {
+  it('keeps short tool results unchanged', () => {
+    const content = 'short result 😀'
+    const [recent] = selectRecentMessagesWithToolPairs(
+      [{ role: 'tool', tool_call_id: 'call-1', name: 'read_file', content }],
+      1,
+    )
+
+    expect(recent?.content).toBe(content)
+  })
+
+  it('preserves both head and tail without splitting surrogate pairs', () => {
+    // The emoji starts at UTF-16 index 1999, exactly where the old .slice(0, 2000)
+    // would cut a surrogate pair in half.
+    const tail = 'z'.repeat(800)
+    const content = `${'x'.repeat(1_999)}😀${tail}`
+    const [recent] = selectRecentMessagesWithToolPairs(
+      [{ role: 'tool', tool_call_id: 'call-1', name: 'read_file', content }],
+      1,
+    )
+
+    const output = typeof recent?.content === 'string' ? recent.content : ''
+    expect(output).toContain('[Content truncated - 2800 chars total')
+    expect(output).toContain('last 500]')
+    expect(output.endsWith('z'.repeat(500))).toBe(true)
+    const outputChars = Array.from(output)
+    expect(outputChars.some((char) => char.codePointAt(0)! >= 0xd800 && char.codePointAt(0)! <= 0xdfff)).toBe(false)
+    expect(outputChars.length).toBeLessThanOrEqual(1_996)
+  })
+
+  it('does not truncate a result at exactly the code point limit', () => {
+    const content = `${'a'.repeat(1_999)}😀` // 2000 Unicode code points
+    const [recent] = selectRecentMessagesWithToolPairs(
+      [{ role: 'tool', tool_call_id: 'call-1', name: 'read_file', content }],
+      1,
+    )
+
+    expect(recent?.content).toBe(content)
+  })
+})
+

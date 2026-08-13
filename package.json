@@ -15,7 +15,11 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "build:macos": "bash scripts/build-macos.sh",
-    "build:macos:dmg": "bash scripts/build-macos.sh --bundles dmg"
+    "build:macos:dmg": "bash scripts/build-macos.sh --bundles dmg",
+    "check": "npm run check:size && tsc -b && npm run test",
+    "check:size": "node scripts/check-file-size.mjs",
+    "check:size:update": "node scripts/check-file-size.mjs --update-baseline",
+    "tauri:dev:no-watch": "tauri dev --no-watch"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.60.0",

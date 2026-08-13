@@ -2,6 +2,9 @@ import type { ContentBlockLike, ConversationMessage, ToolCallLike } from './type
 
 const TOOL_RESULT_TYPES = new Set(['tool_result', 'toolResult'])
 const TOOL_CALL_TYPES = new Set(['tool_call', 'toolCall'])
+const TOOL_RESULT_MAX_CHARS = 2_000
+const TOOL_RESULT_HEAD_CHARS = 1_400
+const TOOL_RESULT_TAIL_CHARS = 500
 
 export function getToolCallIds(message: ConversationMessage): string[] {
   const ids = new Set<string>()
@@ -123,12 +126,25 @@ function pullAssistantBefore(
 
 function truncateToolResult(message: ConversationMessage | undefined): ConversationMessage {
   if (!message) return { role: 'custom' }
-  if (!isToolResultMessage(message) || typeof message.content !== 'string' || message.content.length <= 2_000) {
+  if (!isToolResultMessage(message) || typeof message.content !== 'string') {
     return message
   }
+
+  const content = message.content
+  const chars = Array.from(content)
+  if (chars.length <= TOOL_RESULT_MAX_CHARS) {
+    return message
+  }
+
+  const tailStart = Math.max(TOOL_RESULT_HEAD_CHARS, chars.length - TOOL_RESULT_TAIL_CHARS)
+  const head = chars.slice(0, TOOL_RESULT_HEAD_CHARS).join('')
+  const tail = chars.slice(tailStart).join('')
+  const omitted = chars.length - TOOL_RESULT_HEAD_CHARS - (chars.length - tailStart)
   return {
     ...message,
-    content: `${message.content.slice(0, 2_000)}...\n[Content truncated - exceeded 2000 characters]`,
+    content:
+      `${head}\n... [Content truncated - ${chars.length} chars total, ` +
+      `${omitted} chars omitted, showing first ${TOOL_RESULT_HEAD_CHARS} and last ${TOOL_RESULT_TAIL_CHARS}]\n${tail}`,
   }
 }
 

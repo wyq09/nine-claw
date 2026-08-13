@@ -14,6 +14,8 @@ const DEFAULT_TARGET_COMPRESSED_TOKENS: u64 = 10_000;
 const DEFAULT_MAX_RECENT_MESSAGES: usize = 20;
 const DEFAULT_IDLE_TOKEN_THRESHOLD: u64 = 20_000;
 const TOOL_RESULT_MAX_CHARS: usize = 500;
+const TOOL_RESULT_HEAD_CHARS: usize = 400;
+const TOOL_RESULT_TAIL_CHARS: usize = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -116,7 +118,7 @@ pub(crate) fn plan_compression(
 
     let compression_level = next_compression_level(entries);
     let recent_entries =
-        select_recent_with_tool_pairs(&message_entries, config.max_recent_messages);
+        select_recent_with_tool_pairs_balanced(&message_entries, config.max_recent_messages);
     let recent_ids = recent_entries
         .iter()
         .filter_map(entry_id)
@@ -160,7 +162,7 @@ pub(crate) fn plan_model_switch_compression(
 
     let compression_level = next_compression_level(entries);
     let recent_entries =
-        select_recent_with_tool_pairs(&message_entries, config.max_recent_messages);
+        select_recent_with_tool_pairs_balanced(&message_entries, config.max_recent_messages);
     let recent_ids = recent_entries
         .iter()
         .filter_map(entry_id)
@@ -360,6 +362,34 @@ fn next_compression_level(entries: &[Value]) -> u64 {
 }
 
 fn select_recent_with_tool_pairs(entries: &[Value], max_recent: usize) -> Vec<Value> {
+    select_recent_indices_with_tool_pairs(entries, max_recent)
+        .into_iter()
+        .map(|idx| entries[idx].clone())
+        .collect()
+}
+
+fn select_recent_with_tool_pairs_balanced(entries: &[Value], max_recent: usize) -> Vec<Value> {
+    let selected = select_recent_indices_with_tool_pairs(entries, max_recent);
+    let Some(mut boundary) = selected.first().copied() else {
+        return Vec::new();
+    };
+
+    // The base selection already pulls complete call/result pairs, but check the
+    // cut explicitly. If an entry id crosses the boundary, move it left until
+    // both sides are self-contained. A boundary of 0 is always balanced.
+    while boundary > 0
+        && !(tool_pairing_balanced_before(entries, boundary)
+            && tool_pairing_balanced_after(entries, boundary))
+    {
+        boundary -= 1;
+    }
+    entries[boundary..].to_vec()
+}
+
+fn select_recent_indices_with_tool_pairs(entries: &[Value], max_recent: usize) -> Vec<usize> {
+    if entries.is_empty() || max_recent == 0 {
+        return Vec::new();
+    }
     let mut include = HashSet::new();
     let mut collected = 0usize;
     let mut index = entries.len();
@@ -393,9 +423,57 @@ fn select_recent_with_tool_pairs(entries: &[Value], max_recent: usize) -> Vec<Va
     let mut indexes = include.into_iter().collect::<Vec<_>>();
     indexes.sort_unstable();
     indexes
-        .into_iter()
-        .map(|idx| entries[idx].clone())
-        .collect()
+}
+
+/// Whether every tool call/result id in `entries[..boundary]` stays on the
+/// archive side of the cut. A pending call with no result anywhere does not
+/// make the boundary unbalanced; a result on the other side does.
+fn tool_pairing_balanced_before(entries: &[Value], boundary: usize) -> bool {
+    let boundary = boundary.min(entries.len());
+    for entry in &entries[..boundary] {
+        for call_id in tool_call_ids(entry) {
+            if entries[boundary..]
+                .iter()
+                .any(|candidate| tool_result_ids(candidate).iter().any(|id| id == &call_id))
+            {
+                return false;
+            }
+        }
+        for result_id in tool_result_ids(entry) {
+            if entries[boundary..]
+                .iter()
+                .any(|candidate| tool_call_ids(candidate).iter().any(|id| id == &result_id))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether every tool call/result id in `entries[boundary..]` stays on the
+/// recent side of the cut.
+fn tool_pairing_balanced_after(entries: &[Value], boundary: usize) -> bool {
+    let boundary = boundary.min(entries.len());
+    for entry in &entries[boundary..] {
+        for call_id in tool_call_ids(entry) {
+            if entries[..boundary]
+                .iter()
+                .any(|candidate| tool_result_ids(candidate).iter().any(|id| id == &call_id))
+            {
+                return false;
+            }
+        }
+        for result_id in tool_result_ids(entry) {
+            if entries[..boundary]
+                .iter()
+                .any(|candidate| tool_call_ids(candidate).iter().any(|id| id == &result_id))
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn tool_results_after(
@@ -578,9 +656,11 @@ fn append_entry_markdown(lines: &mut Vec<String>, entry: &Value) {
             lines.push("### Tool Result: tool".to_string());
             lines.push(String::new());
             lines.push("```".to_string());
-            lines.push(truncate(
+            lines.push(prune_text_codepoint(
                 &message_content_text(message),
                 TOOL_RESULT_MAX_CHARS,
+                TOOL_RESULT_HEAD_CHARS,
+                TOOL_RESULT_TAIL_CHARS,
             ));
             lines.push("```".to_string());
             lines.push(String::new());
@@ -611,14 +691,34 @@ fn strip_topics(content: &str) -> String {
     out.trim().to_string()
 }
 
-fn truncate(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_string();
+/// 按 Unicode 码点裁剪过长文本：保留 head/tail，中间用省略标记。
+/// Rust 的 `char` 是 Unicode 标量值，因此按 `chars()` 迭代绝不会劈开
+/// surrogate pair（grapheme cluster 仍可能被切，可接受）。
+fn prune_text_codepoint(
+    text: &str,
+    max_chars: usize,
+    head_chars: usize,
+    tail_chars: usize,
+) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
     }
-    let head = value.chars().take(max).collect::<String>();
+
+    let head_chars = head_chars.min(max_chars).min(count);
+    let tail_chars = tail_chars
+        .min(max_chars.saturating_sub(head_chars))
+        .min(count);
+    let head = text.chars().take(head_chars).collect::<String>();
+    let tail_start = count.saturating_sub(tail_chars);
+    if tail_start <= head_chars {
+        return text.to_string();
+    }
+    let tail = text.chars().skip(tail_start).collect::<String>();
+    let omitted = tail_start - head_chars;
     format!(
-        "{head}\n... [truncated, {} chars total]",
-        value.chars().count()
+        "{head}\n... [truncated, {count} chars total, {omitted} chars omitted, \
+         showing first {head_chars} and last {tail_chars}]\n{tail}"
     )
 }
 
@@ -723,6 +823,82 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a1", "t1", "u2"]
         );
+    }
+
+    #[test]
+    fn tool_pairing_balance_detects_split_pairs_across_boundary() {
+        let entries = vec![
+            message_entry(
+                "a1",
+                "assistant",
+                json!([{ "type": "toolCall", "id": "call-1", "name": "read", "arguments": {} }]),
+            ),
+            message_entry("u2", "user", json!([{ "type": "text", "text": "between" }])),
+            message_entry(
+                "t1",
+                "toolResult",
+                json!([{ "type": "tool_result", "toolUseId": "call-1", "text": "result" }]),
+            ),
+        ];
+
+        assert!(tool_pairing_balanced_before(&entries, 0));
+        assert!(tool_pairing_balanced_after(&entries, 3));
+        assert!(!tool_pairing_balanced_before(&entries, 2));
+        assert!(!tool_pairing_balanced_after(&entries, 1));
+    }
+
+    #[test]
+    fn balanced_recent_selection_does_not_archive_call_without_result() {
+        let entries = vec![
+            message_entry("u1", "user", json!([{ "type": "text", "text": "old" }])),
+            message_entry(
+                "a1",
+                "assistant",
+                json!([{ "type": "toolCall", "id": "call-1", "name": "read", "arguments": {} }]),
+            ),
+            message_entry(
+                "t1",
+                "toolResult",
+                json!([{ "type": "tool_result", "toolUseId": "call-1", "text": "result" }]),
+            ),
+            message_entry("u2", "user", json!([{ "type": "text", "text": "new" }])),
+        ];
+
+        let recent = select_recent_with_tool_pairs_balanced(&entries, 2);
+
+        assert_eq!(
+            recent.iter().filter_map(entry_id).collect::<Vec<_>>(),
+            vec!["a1", "t1", "u2"]
+        );
+        assert!(tool_pairing_balanced_before(&entries, 1));
+        assert!(tool_pairing_balanced_after(&entries, 1));
+    }
+
+    #[test]
+    fn prune_text_codepoint_preserves_head_and_tail() {
+        let text = format!("{}{}{}", "a".repeat(400), "m".repeat(120), "z".repeat(100));
+        let pruned = prune_text_codepoint(&text, 500, 400, 100);
+
+        assert!(pruned.starts_with(&"a".repeat(400)));
+        assert!(pruned.ends_with(&"z".repeat(100)));
+        assert!(pruned.contains("620 chars total"));
+        assert!(pruned.contains("120 chars omitted"));
+    }
+
+    #[test]
+    fn prune_text_codepoint_never_splits_unicode_scalars() {
+        let text = format!("{}{}{}", "界".repeat(300), "😀", "z".repeat(210));
+        let pruned = prune_text_codepoint(&text, 500, 400, 100);
+
+        assert!(pruned.starts_with(&"界".repeat(300)));
+        assert!(pruned.ends_with(&"z".repeat(100)));
+        assert!(pruned.contains('😀'));
+    }
+
+    #[test]
+    fn prune_text_codepoint_returns_short_text_unchanged() {
+        let text = "短文本😀".to_string();
+        assert_eq!(prune_text_codepoint(&text, 500, 400, 100), text);
     }
 
     #[test]
