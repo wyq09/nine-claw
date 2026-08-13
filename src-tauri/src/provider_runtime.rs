@@ -1,6 +1,4 @@
-use crate::app_constants::{
-    CUSTOM_PROVIDER_META_STATE_KEY, PI_RUNTIME_DIR_NAME, PROVIDER_CONFIGS_STATE_KEY,
-};
+use crate::app_constants::{CUSTOM_PROVIDER_META_STATE_KEY, PROVIDER_CONFIGS_STATE_KEY};
 use crate::history_app_state::open_history_db;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -39,7 +37,7 @@ pub(crate) struct ProviderPreferencesPayload {
 }
 
 pub(crate) fn pi_runtime_dir() -> PathBuf {
-    std::env::temp_dir().join(PI_RUNTIME_DIR_NAME)
+    crate::runtime_paths::pi_runtime_dir()
 }
 
 fn default_provider_api_format(provider_id: &str) -> &'static str {

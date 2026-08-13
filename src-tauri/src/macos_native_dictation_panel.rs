@@ -15,7 +15,7 @@ mod macos_impl {
         NSWindow,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
-    use tauri::{AppHandle, Emitter, Manager};
+    use tauri::{AppHandle, Manager};
 
     fn nsstring_to_string(s: &NSString) -> String {
         unsafe {
@@ -78,7 +78,8 @@ mod macos_impl {
             if response == NSAlertFirstButtonReturn {
                 let text = nsstring_to_string(&text_retained.string());
                 if has_meaningful_text(&text) {
-                    let _ = app_for_block.emit(
+                    crate::emit_safe::emit_safe(
+                        &app_for_block,
                         "macos-native-composer-insert",
                         serde_json::json!({ "text": text }),
                     );

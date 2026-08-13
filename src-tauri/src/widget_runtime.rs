@@ -2,7 +2,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle};
 use tokio::sync::oneshot;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
@@ -46,15 +46,16 @@ fn emit_widget_stream_event(
     session_id: &str,
     widget: &Value,
 ) -> Result<(), String> {
-    app.emit(
+    crate::emit_safe::emit_safe(
+        app,
         "pi://stream",
         json!({
             "event": event,
             "session_id": session_id,
             "widget": widget,
         }),
-    )
-    .map_err(|error| format!("发送 widget 流事件失败: {error}"))
+    );
+    Ok(())
 }
 
 pub async fn create_pending_widget_request(

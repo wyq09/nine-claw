@@ -207,7 +207,6 @@ mod tests {
     };
     use crate::pi_runtime::{PiRuntimeLocation, PiRuntimeSource};
     use serde_json::json;
-    use std::fs;
     use std::path::PathBuf;
 
     #[test]
@@ -458,8 +457,10 @@ mod tests {
         let channel_id = format!("test-channel-{}", std::process::id());
         let user_id = "slash-new-user";
         let key = bridge.session_key(&channel_id, user_id);
-        let session_path = PiBridge::session_file_path(&key);
-        fs::write(&session_path, "{\"type\":\"message\"}\n").expect("write session");
+        let session_path =
+            crate::runtime_paths::session_file_path(crate::BOT_PI_SESSION_FILE_PREFIX, &key);
+        crate::runtime_paths::write_private_file(&session_path, b"{\"type\":\"message\"}\n")
+            .expect("write session");
 
         let outcome = bridge
             .process_bot_slash_command(BotSlashCommand::New, &key, &channel_id, user_id)
@@ -595,10 +596,6 @@ impl PiBridge {
         format!("{:x}", hasher.finalize())
     }
 
-    fn session_file_path(key: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("nineclaw-bot-session-{key}.jsonl"))
-    }
-
     fn parse_bot_slash_command(prompt: &str) -> Option<BotSlashCommand> {
         if !prompt.starts_with('/') {
             return None;
@@ -635,7 +632,8 @@ impl PiBridge {
         channel_id: &str,
         user_id: &str,
     ) -> Result<(), String> {
-        let session_path = Self::session_file_path(key);
+        let session_path =
+            crate::runtime_paths::session_file_path(crate::BOT_PI_SESSION_FILE_PREFIX, key);
         match fs::remove_file(&session_path) {
             Ok(()) => dev_trace(
                 "bot.pi",
@@ -721,18 +719,6 @@ impl PiBridge {
             usage_meta: None,
             control_command: Some(command_name),
         }))
-    }
-
-    fn ephemeral_session_file_path(key: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("nineclaw-bot-session-{key}-media-{nonce}.jsonl"))
-    }
-
-    fn pi_runtime_dir() -> PathBuf {
-        std::env::temp_dir().join("nineclaw-pi-runtime")
     }
 
     fn attachment_requires_fresh_session(attachment: &PromptAttachmentInput) -> bool {
@@ -981,7 +967,7 @@ impl PiBridge {
         blob.push(0);
         blob.extend_from_slice(self.model.trim().as_bytes());
         let digest = format!("{:x}", Md5::digest(&blob));
-        Self::pi_runtime_dir().join(&digest[..16])
+        crate::runtime_paths::pi_runtime_dir().join(&digest[..16])
     }
 
     fn prepare_runtime_dir(&self, session_key: &str) -> Result<PathBuf, String> {
@@ -989,9 +975,9 @@ impl PiBridge {
             .runtime_dir_override
             .clone()
             .unwrap_or_else(|| self.scoped_runtime_dir(session_key));
-        fs::create_dir_all(&dir).map_err(|e| format!("创建 pi runtime 目录失败: {e}"))?;
+        crate::runtime_paths::ensure_private_dir(&dir)?;
 
-        fs::write(dir.join("auth.json"), "{}").map_err(|e| format!("写入 auth.json 失败: {e}"))?;
+        crate::runtime_paths::write_private_file(&dir.join("auth.json"), b"{}")?;
 
         Ok(dir)
     }
@@ -1306,10 +1292,19 @@ impl PiBridge {
 
         let fresh_multimodal_session = Self::has_multimodal_attachments(attachments);
         let session_path = if fresh_multimodal_session {
-            Self::ephemeral_session_file_path(&key)
+            crate::runtime_paths::ephemeral_session_file_path(
+                crate::BOT_PI_SESSION_FILE_PREFIX,
+                &key,
+            )
         } else {
-            Self::session_file_path(&key)
+            crate::runtime_paths::session_file_path(crate::BOT_PI_SESSION_FILE_PREFIX, &key)
         };
+        crate::runtime_paths::prepare_or_create_pi_session_file(
+            &session_path,
+            crate::BOT_PI_SESSION_FILE_PREFIX,
+            &key,
+            fresh_multimodal_session,
+        )?;
         if !fresh_multimodal_session
             && !crate::openai_pi_compat_requires_reasoning_content_replay(&self.model)
         {
@@ -1425,7 +1420,8 @@ impl PiBridge {
         }) {
             let content = serde_json::to_vec_pretty(&config)
                 .map_err(|e| format!("序列化 models 配置失败: {e}"))?;
-            fs::write(&models_path, content).map_err(|e| format!("写入 models.json 失败: {e}"))?;
+            crate::runtime_paths::write_private_file(&models_path, &content)
+                .map_err(|e| format!("写入 models.json 失败: {e}"))?;
         } else if models_path.exists() {
             fs::remove_file(&models_path).map_err(|e| format!("清理旧的 models.json 失败: {e}"))?;
         }

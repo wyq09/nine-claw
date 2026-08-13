@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle};
 use uuid::Uuid;
 
 mod delegate_markers;
@@ -598,7 +598,7 @@ pub fn run_delegate_with_provider_events(
         }
         if let Some(rid) = run_id_for_chunk.as_ref() {
             if !chunk.is_empty() {
-                let _ = app_for_chunk.emit(
+                crate::emit_safe::emit_safe(&app_for_chunk,
                     "workspace:delegate:chunk",
                     serde_json::json!({
                         "runId": rid,
@@ -676,7 +676,7 @@ pub fn run_delegate_with_provider_events(
                 } else {
                     "thinking"
                 };
-                let _ = app_for_event.emit(
+                crate::emit_safe::emit_safe(&app_for_event,
                     "workspace:delegate:turn",
                     serde_json::json!({
                         "runId": rid,
@@ -745,7 +745,7 @@ pub fn run_delegate_with_provider_events(
                         payload["status"] = serde_json::Value::String("error".to_string());
                     }
                 }
-                let _ = app_for_event.emit("workspace:delegate:tool", payload);
+                crate::emit_safe::emit_safe(&app_for_event, "workspace:delegate:tool", payload);
             }
             _ => {}
         }

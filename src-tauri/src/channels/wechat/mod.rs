@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as Base64Engine};
 use serde_json::Value;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use self::api::WeChatApi;
 use self::types::*;
@@ -1223,7 +1223,7 @@ impl WeChatChannel {
             .ok_or_else(|| "QR 码响应缺少 qrcode_img_content 字段".to_string())?;
 
         let qr_data_uri = generate_qr_data_uri(&qrcode_content)?;
-        let _ = app.emit(
+        crate::emit_safe::emit_safe(app,
             "bot://qr-code",
             serde_json::json!({
                 "channelId": &channel_id, "qrcodeUrl": &qr_data_uri, "status": "waiting"
@@ -1238,7 +1238,7 @@ impl WeChatChannel {
                 Ok(sr) => match sr.status.as_deref() {
                     Some("wait") => {}
                     Some("scaned") => {
-                        let _ = app.emit(
+                        crate::emit_safe::emit_safe(app,
                             "bot://qr-code",
                             serde_json::json!({
                                 "channelId": &channel_id, "status": "scanned"
@@ -1258,7 +1258,7 @@ impl WeChatChannel {
                             block_on_async(WeChatApi::get_bot_qrcode(&base_url, DEFAULT_BOT_TYPE))?;
                         let nc = nq.qrcode_img_content.as_deref().unwrap_or("");
                         let nd = generate_qr_data_uri(nc)?;
-                        let _ = app.emit(
+                        crate::emit_safe::emit_safe(app,
                             "bot://qr-code",
                             serde_json::json!({
                                 "channelId": &channel_id, "qrcodeUrl": &nd, "status": "refreshed"
@@ -1274,7 +1274,7 @@ impl WeChatChannel {
                             .ilink_bot_id
                             .clone()
                             .ok_or_else(|| "登录成功但未收到 ilink_bot_id".to_string())?;
-                        let _ = app.emit(
+                        crate::emit_safe::emit_safe(app,
                             "bot://qr-code",
                             serde_json::json!({
                                 "channelId": &channel_id, "status": "confirmed"
@@ -2061,7 +2061,7 @@ fn send_media_item(
 
 /// Emit a `bot://status` event to the frontend for diagnostic display.
 fn emit_bot_status(app: &AppHandle, channel_id: &str, user_id: &str, level: &str, message: &str) {
-    let _ = app.emit(
+    crate::emit_safe::emit_safe(app,
         "bot://status",
         serde_json::json!({
             "channelId": channel_id,
@@ -2107,9 +2107,7 @@ fn emit_bot_message_with_usage(
         usage,
         usage_meta,
     };
-    if let Err(e) = app.emit("bot://message", &payload) {
-        log::error!("emit bot://message 失败: {e}");
-    }
+    crate::emit_safe::emit_safe(app, "bot://message", &payload);
 }
 
 #[cfg(test)]

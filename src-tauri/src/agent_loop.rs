@@ -336,7 +336,7 @@ pub fn prepare_loop_iteration(history: &mut Vec<serde_json::Value>, permission_d
 // ===========================================================================
 
 use std::time::Instant;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -346,7 +346,7 @@ use uuid::Uuid;
 
 /// Emit a typed agent-loop event to the frontend via the Tauri event bus.
 fn emit_loop_event(app: &AppHandle, event: &str, payload: serde_json::Value) {
-    let _ = app.emit(event, payload);
+    crate::emit_safe::emit_safe(app, event, payload);
 }
 
 fn emit_completed(

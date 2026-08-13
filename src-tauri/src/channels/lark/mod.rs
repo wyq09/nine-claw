@@ -21,7 +21,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
 const TEXT_CHUNK_SIZE: usize = 3000;
@@ -1747,7 +1747,7 @@ fn emit_bot_status(app: &AppHandle, channel_id: &str, user_id: &str, level: &str
     });
     // 避免在 invoke 尚未返回时同步 eval 到 Webview，否则前端 await invoke 会与 emit 死锁。
     let _ = app.clone().run_on_main_thread(move || {
-        let _ = app_emit.emit("bot://status", payload);
+        crate::emit_safe::emit_safe(&app_emit, "bot://status", payload);
     });
 }
 
@@ -1786,8 +1786,6 @@ fn emit_bot_message_with_usage(
     };
     let app_emit = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
-        if let Err(error) = app_emit.emit("bot://message", &payload) {
-            log::error!("emit bot://message 失败: {error}");
-        }
+        crate::emit_safe::emit_safe(&app_emit, "bot://message", &payload);
     });
 }

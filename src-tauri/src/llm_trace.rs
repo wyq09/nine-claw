@@ -20,7 +20,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle};
 use uuid::Uuid;
 
 /// 单个 system prompt 分段（便于前端分节展示）。
@@ -318,7 +318,7 @@ fn emit_event(app: &AppHandle, phase: &str, entry: &TraceEntry) {
         "phase": phase,
         "entry": entry,
     });
-    let _ = app.emit("workspace.llm_trace", payload);
+    crate::emit_safe::emit_safe(app, "workspace.llm_trace", payload);
 }
 
 fn emit_text_delta_event(app: &AppHandle, entry: &TraceEntry, kind: &str, text: &str) {
@@ -353,7 +353,7 @@ fn emit_text_delta_event(app: &AppHandle, entry: &TraceEntry, kind: &str, text: 
             "text": text,
         },
     });
-    let _ = app.emit("workspace.llm_trace", payload);
+    crate::emit_safe::emit_safe(app, "workspace.llm_trace", payload);
 }
 
 /// 开始一条追踪。返回 `trace_id`，用于后续补充工具调用与结束时落盘。

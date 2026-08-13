@@ -7,6 +7,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 import { invoke } from '@tauri-apps/api/core'
 import {
   compactDesktopSessionBeforeModelSwitch,
+  exportAgentPackage,
   getSessionContextStats,
   listDefaultAgentPresets,
   resetAgentToDefaultPreset,
@@ -172,3 +173,45 @@ describe('default agent preset commands', () => {
     expect(result).toEqual({ id: 'jiujiexia', name: '九节虾' })
   })
 })
+
+describe('agent package export defaults to redacted secrets', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('sends includeSecrets=false when the caller omits it', async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined)
+
+    await exportAgentPackage({
+      agentId: 'agent-1',
+      destPath: '/tmp/agent.zip',
+      includeSharedRoot: false,
+    })
+
+    expect(invoke).toHaveBeenCalledWith('export_agent_package', {
+      agentId: 'agent-1',
+      destPath: '/tmp/agent.zip',
+      includeSecrets: false,
+      includeSharedRoot: false,
+    })
+  })
+
+  it('still honors an explicit includeSecrets=true', async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined)
+
+    await exportAgentPackage({
+      agentId: 'agent-1',
+      destPath: '/tmp/agent.zip',
+      includeSecrets: true,
+      includeSharedRoot: true,
+    })
+
+    expect(invoke).toHaveBeenCalledWith('export_agent_package', {
+      agentId: 'agent-1',
+      destPath: '/tmp/agent.zip',
+      includeSecrets: true,
+      includeSharedRoot: true,
+    })
+  })
+})
+

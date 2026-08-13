@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::Emitter;
 use uuid::Uuid;
 
 const SESSIONS_DIR: &str = "memory/sessions";
@@ -1623,7 +1622,7 @@ async fn delegate_proxy_handler(
 
     // Emit delegate.progress event (status: "running")
     let ws_id_for_progress = workspace_id.clone();
-    let _ = app_handle.emit(
+    crate::emit_safe::emit_safe(&app_handle,
         "workspace:delegate:progress",
         serde_json::json!({
             "runId": run_id,
@@ -1640,7 +1639,7 @@ async fn delegate_proxy_handler(
     let ws_id_for_chunk_cb = workspace_id.clone();
     let on_chunk_cb: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |chunk: &str| {
         if !chunk.is_empty() {
-            let _ = app_for_chunk_cb.emit(
+            crate::emit_safe::emit_safe(&app_for_chunk_cb,
                 "workspace:delegate:chunk",
                 serde_json::json!({
                     "runId": run_id_for_chunk_cb,
@@ -1671,7 +1670,7 @@ async fn delegate_proxy_handler(
             } else {
                 tool_counter.load(Ordering::SeqCst).saturating_sub(1)
             };
-            let _ = app_for_tool_cb.emit(
+            crate::emit_safe::emit_safe(&app_for_tool_cb,
                 "workspace:delegate:tool",
                 serde_json::json!({
                     "runId": run_id_for_tool_cb,
@@ -1688,7 +1687,7 @@ async fn delegate_proxy_handler(
     let run_id_for_turn_cb = run_id.clone();
     let ws_id_for_turn_cb = workspace_id.clone();
     let on_turn_cb: Arc<dyn Fn(u32) + Send + Sync> = Arc::new(move |turn_index: u32| {
-        let _ = app_for_turn_cb.emit(
+        crate::emit_safe::emit_safe(&app_for_turn_cb,
             "workspace:delegate:turn",
             serde_json::json!({
                 "runId": run_id_for_turn_cb,
@@ -1753,7 +1752,7 @@ async fn delegate_proxy_handler(
     } else {
         "error"
     };
-    let _ = app_handle.emit(
+    crate::emit_safe::emit_safe(&app_handle,
         "workspace:delegate:done",
         serde_json::json!({
             "runId": run_id_for_done,

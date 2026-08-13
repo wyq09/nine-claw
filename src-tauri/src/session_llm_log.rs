@@ -13,7 +13,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle};
 
 const PREVIEW_CHARS: usize = 220;
 const MAX_APPEND_CHARS: usize = 240_000;
@@ -261,7 +261,7 @@ fn emit_updated(
         session_id: session_id.to_string(),
         path: path.to_string_lossy().to_string(),
     };
-    let _ = app.emit("session.llm_log.updated", payload);
+    crate::emit_safe::emit_safe(app, "session.llm_log.updated", payload);
 }
 
 fn append_to_file(

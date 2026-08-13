@@ -119,14 +119,14 @@ pub(crate) fn export_agent_package(
     app: AppHandle,
     agent_id: String,
     dest_path: String,
-    include_secrets: bool,
+    include_secrets: Option<bool>,
     include_shared_root: bool,
 ) -> Result<(), String> {
     crate::agent_package::export_agent_package_to_path(
         &app,
         agent_id,
         dest_path,
-        include_secrets,
+        include_secrets.unwrap_or(false),
         include_shared_root,
     )
 }

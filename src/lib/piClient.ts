@@ -832,13 +832,13 @@ export async function writeAgentWorkspaceFile(payload: {
 export async function exportAgentPackage(payload: {
   agentId: string
   destPath: string
-  includeSecrets: boolean
+  includeSecrets?: boolean
   includeSharedRoot: boolean
 }): Promise<void> {
   await invoke('export_agent_package', {
     agentId: payload.agentId,
     destPath: payload.destPath,
-    includeSecrets: payload.includeSecrets,
+    includeSecrets: payload.includeSecrets ?? false,
     includeSharedRoot: payload.includeSharedRoot,
   })
 }

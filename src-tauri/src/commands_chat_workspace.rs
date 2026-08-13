@@ -7,7 +7,7 @@ use crate::team_workspace;
 use crate::workspace_fs;
 use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as _};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle};
 
 /// Session list item for the frontend — no turns included.
 #[derive(Serialize)]
@@ -634,8 +634,7 @@ pub(crate) async fn workspace_abort_delegate(app: AppHandle, run_id: String) -> 
         Ok(false) => Some("未找到仍在运行的子智能体，已回退为前端中止状态。".to_string()),
         Err(error) => Some(format!("尝试中止子智能体失败：{error}")),
     };
-    let _ = app.emit(
-        "workspace:delegate:done",
+    crate::emit_safe::emit_safe(&app, "workspace:delegate:done",
         serde_json::json!({
             "runId": run_id,
             "status": "aborted",
@@ -654,8 +653,7 @@ pub(crate) async fn workspace_augment_delegate(
     run_id: String,
     note: String,
 ) -> Result<(), String> {
-    let _ = app.emit(
-        "workspace:delegate:progress",
+    crate::emit_safe::emit_safe(&app, "workspace:delegate:progress",
         serde_json::json!({
             "runId": run_id,
             "workspaceId": workspace_id,
@@ -695,8 +693,7 @@ pub(crate) async fn workspace_run_delegate_task(
     let sess = session_id.unwrap_or_default();
 
     let started_at = chrono::Utc::now().timestamp_millis();
-    let _ = app.emit(
-        "workspace:delegate:progress",
+    crate::emit_safe::emit_safe(&app, "workspace:delegate:progress",
         serde_json::json!({
             "runId": run_id,
             "workspaceId": ws_id,
@@ -738,8 +735,7 @@ pub(crate) async fn workspace_run_delegate_task(
     let elapsed = chrono::Utc::now().timestamp_millis() - started_at;
     match &out {
         Ok(body) => {
-            let _ = app.emit(
-                "workspace:delegate:done",
+            crate::emit_safe::emit_safe(&app, "workspace:delegate:done",
                 serde_json::json!({
                     "runId": run_id_clone,
                     "workspaceId": ws_id,
@@ -758,8 +754,7 @@ pub(crate) async fn workspace_run_delegate_task(
             }))
         }
         Err(e) => {
-            let _ = app.emit(
-                "workspace:delegate:error",
+            crate::emit_safe::emit_safe(&app, "workspace:delegate:error",
                 serde_json::json!({
                     "runId": run_id_clone,
                     "workspaceId": ws_id,

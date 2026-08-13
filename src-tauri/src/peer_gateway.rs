@@ -13,7 +13,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::agents::{self, AgentRecord, ConversationAgentConfig};
@@ -526,7 +526,7 @@ fn emit_peer_status(app: &AppHandle, user_id: &str, level: &str, message: &str) 
         "timestamp": timestamp,
     });
     let _ = app.clone().run_on_main_thread(move || {
-        let _ = app_emit.emit("bot://status", payload);
+        crate::emit_safe::emit_safe(&app_emit, "bot://status", payload);
     });
 }
 
@@ -551,9 +551,7 @@ fn emit_peer_message(
     };
     let app_emit = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
-        if let Err(error) = app_emit.emit("bot://message", &payload) {
-            log::error!("emit bot://message (peer) 失败: {error}");
-        }
+        crate::emit_safe::emit_safe(&app_emit, "bot://message", &payload);
     });
 }
 
@@ -943,7 +941,8 @@ pub fn start_peer_gateway(app: &AppHandle, addr: SocketAddr) -> Result<(), Strin
                     log::error!("peer gateway 绑定 {addr} 失败: {e}");
                     let app_emit = app_clone.clone();
                     let _ = app_clone.run_on_main_thread(move || {
-                        let _ = app_emit.emit(
+                        crate::emit_safe::emit_safe(
+                            &app_emit,
                             "bot://status",
                             json!({
                                 "channelId": PEER_CHANNEL_ID,

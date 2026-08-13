@@ -12,6 +12,7 @@ mod chat_attachments;
 mod dev_trace;
 mod embedding;
 mod embedding_settings;
+mod emit_safe;
 mod heartbeat;
 mod image_generation;
 mod llm_log_export;
@@ -29,7 +30,9 @@ mod pi_timeouts;
 mod prompt_attachments;
 mod proxy_settings;
 mod runtime_parameters;
+mod runtime_paths;
 mod scheduler;
+mod session_sanitize;
 mod session_workspace;
 mod skills;
 pub mod storage;
@@ -66,6 +69,10 @@ mod time_util;
 mod user_kv_memory_reorganize;
 
 pub(crate) use app_constants::*;
+pub(crate) use session_sanitize::{
+    is_provider_reasoning_history_rejection_error, quarantine_pi_session_file,
+    sanitize_pi_session_replay_state,
+};
 pub(crate) use embedding_settings::{
     configure_embedding_runtime, embedding_status_command, load_embedding_settings_command,
     maybe_start_local_model_download, save_embedding_settings_command,
@@ -127,7 +134,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager, PhysicalSize, Size};
+use tauri::{AppHandle, Manager, PhysicalSize, Size};
 
 use agents::ConversationAgentConfig;
 use channels::factory::ChannelConfig;
@@ -1049,13 +1056,12 @@ mod lib_tests {
         build_provider_models_config_with_input, build_turn_prompt_with_multimodal_summary,
         channel_manager, desktop_incomplete_reply_error, desktop_media_reply_prompt,
         desktop_pi_fingerprint, forced_pi_thinking_level, infer_media_mime_type,
-        is_provider_image_block_rejection_error, is_provider_reasoning_history_rejection_error,
-        lock_channel_manager, parse_context_stats_from_rpc_response,
-        prepend_multimodal_summary_context, quarantine_pi_session_file, record_multimodal_summary,
-        render_multimodal_summary_context, resolve_context_window_from_sources,
-        resolve_pi_ai_import_path, sanitize_pi_session_replay_state, should_force_pi_thinking_off,
-        should_retry_text_only_after_image_rejection, summary_file_path, usage_row_total_tokens,
-        DesktopParsedMediaItem, ProviderRuntimeConfig,
+        is_provider_image_block_rejection_error, lock_channel_manager,
+        parse_context_stats_from_rpc_response, prepend_multimodal_summary_context,
+        record_multimodal_summary, render_multimodal_summary_context,
+        resolve_context_window_from_sources, resolve_pi_ai_import_path,
+        should_force_pi_thinking_off, should_retry_text_only_after_image_rejection,
+        summary_file_path, usage_row_total_tokens, DesktopParsedMediaItem, ProviderRuntimeConfig,
     };
     use crate::channels::types::MediaType;
     use crate::prompt_attachments;
@@ -1483,71 +1489,6 @@ mod lib_tests {
 
         assert_eq!(forced_pi_thinking_level(&provider, false), None);
         assert_eq!(forced_pi_thinking_level(&provider, true), Some("off"));
-    }
-
-    #[test]
-    fn detects_provider_reasoning_history_rejection() {
-        assert!(is_provider_reasoning_history_rejection_error(
-            "400 The reasoning_content in the thinking mode must be passed back to the API."
-        ));
-        assert!(!is_provider_reasoning_history_rejection_error(
-            "400 invalid api key"
-        ));
-    }
-
-    #[test]
-    fn sanitize_pi_session_replay_state_strips_reasoning_metadata() {
-        let path = std::env::temp_dir().join(format!(
-            "nineclaw-session-sanitize-test-{}.jsonl",
-            Uuid::new_v4()
-        ));
-        fs::write(
-            &path,
-            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hidden","thinkingSignature":"reasoning_content"},{"type":"text","text":"visible"}],"reasoning_content":"opaque","reasoning_details":[{"x":1}]}}"#,
-        )
-        .expect("write contaminated session");
-
-        let changed = sanitize_pi_session_replay_state(&path).expect("sanitize session");
-        let sanitized = fs::read_to_string(&path).expect("read sanitized");
-        let _ = fs::remove_file(&path);
-
-        assert!(changed);
-        assert!(sanitized.contains("visible"));
-        assert!(!sanitized.contains("reasoning_content"));
-        assert!(!sanitized.contains("thinkingSignature"));
-        assert!(!sanitized.contains(r#""type":"thinking""#));
-    }
-
-    #[test]
-    fn quarantine_pi_session_file_moves_contaminated_session_as_backup() {
-        let path = std::env::temp_dir().join(format!(
-            "nineclaw-session-quarantine-test-{}.jsonl",
-            Uuid::new_v4()
-        ));
-        fs::write(&path, "{}\n").expect("write session");
-
-        let changed = quarantine_pi_session_file(&path, "reasoning-history").expect("quarantine");
-        assert!(changed);
-        assert!(!path.exists());
-
-        let parent = path.parent().expect("temp parent");
-        let file_name = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .expect("file stem");
-        let backup = fs::read_dir(parent)
-            .expect("read temp")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|candidate| {
-                candidate
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .map(|name| name.starts_with(file_name) && name.contains("quarantine"))
-                    .unwrap_or(false)
-            })
-            .expect("backup exists");
-        let _ = fs::remove_file(backup);
     }
 
     #[test]
@@ -2168,7 +2109,8 @@ fn maybe_compact_desktop_session_with_plan(
             archive.path
         ),
     );
-    let _ = app.emit(
+    crate::emit_safe::emit_safe(
+        app,
         "nineclaw-runtime-notification",
         serde_json::json!({
             "kind": "session_compressed",
@@ -2585,164 +2527,23 @@ pub(crate) fn session_summary_key(session_id: &str) -> String {
     hash_session_id(session_id)
 }
 
-fn session_file_path(session_id: Option<&str>) -> PathBuf {
-    let key = session_id
+fn session_file_key(session_id: Option<&str>) -> String {
+    session_id
         .filter(|value| !value.trim().is_empty())
         .map(hash_session_id)
-        .unwrap_or_else(|| "default".to_string());
-    std::env::temp_dir().join(format!("{PI_SESSION_FILE_PREFIX}{key}.jsonl"))
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn session_file_path(session_id: Option<&str>) -> PathBuf {
+    runtime_paths::session_file_path(PI_SESSION_FILE_PREFIX, &session_file_key(session_id))
 }
 
 fn ephemeral_session_file_path(session_id: Option<&str>) -> PathBuf {
-    let key = session_id
-        .filter(|value| !value.trim().is_empty())
-        .map(hash_session_id)
-        .unwrap_or_else(|| "default".to_string());
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("{PI_SESSION_FILE_PREFIX}{key}-media-{nonce}.jsonl"))
+    runtime_paths::ephemeral_session_file_path(PI_SESSION_FILE_PREFIX, &session_file_key(session_id))
 }
 
 fn summary_file_path(summary_key: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{PI_SUMMARY_FILE_PREFIX}{summary_key}.json"))
-}
-
-fn strip_provider_replay_state(value: &mut serde_json::Value) -> bool {
-    let mut changed = false;
-    match value {
-        serde_json::Value::Object(map) => {
-            for key in [
-                "reasoning_content",
-                "reasoningContent",
-                "reasoning_details",
-                "reasoningDetails",
-                "reasoning",
-                "thinkingSignature",
-                "thoughtSignature",
-            ] {
-                if map.remove(key).is_some() {
-                    changed = true;
-                }
-            }
-
-            for child in map.values_mut() {
-                if strip_provider_replay_state(child) {
-                    changed = true;
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            let original_len = items.len();
-            items.retain(|item| {
-                let is_thinking = item
-                    .get("type")
-                    .and_then(|kind| kind.as_str())
-                    .map(|kind| {
-                        matches!(
-                            kind,
-                            "thinking"
-                                | "reasoning"
-                                | "reasoning_content"
-                                | "reasoningContent"
-                                | "redacted_thinking"
-                        )
-                    })
-                    .unwrap_or(false);
-                !is_thinking
-            });
-            if items.len() != original_len {
-                changed = true;
-            }
-            for child in items {
-                if strip_provider_replay_state(child) {
-                    changed = true;
-                }
-            }
-        }
-        _ => {}
-    }
-    changed
-}
-
-pub(crate) fn sanitize_pi_session_replay_state(path: &Path) -> Result<bool, String> {
-    if !path.exists() {
-        return Ok(false);
-    }
-
-    let raw = fs::read_to_string(path)
-        .map_err(|error| format!("读取 pi session 以修复 reasoning 历史失败: {error}"))?;
-    let mut changed = false;
-    let mut sanitized_lines = Vec::new();
-
-    for line in raw.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(mut value) => {
-                if strip_provider_replay_state(&mut value) {
-                    changed = true;
-                }
-                sanitized_lines.push(
-                    serde_json::to_string(&value)
-                        .map_err(|error| format!("序列化修复后的 pi session 失败: {error}"))?,
-                );
-            }
-            Err(_) => sanitized_lines.push(line.to_string()),
-        }
-    }
-
-    if !changed {
-        return Ok(false);
-    }
-
-    let backup_path = path.with_extension(format!(
-        "jsonl.reasoning-bak-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or(0)
-    ));
-    fs::write(&backup_path, raw).map_err(|error| {
-        format!(
-            "备份污染的 pi session 失败 {}: {error}",
-            backup_path.display()
-        )
-    })?;
-
-    let mut sanitized = sanitized_lines.join("\n");
-    sanitized.push('\n');
-    fs::write(path, sanitized)
-        .map_err(|error| format!("写回修复后的 pi session 失败 {}: {error}", path.display()))?;
-    Ok(true)
-}
-
-pub(crate) fn quarantine_pi_session_file(path: &Path, reason: &str) -> Result<bool, String> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let backup_path = path.with_extension(format!(
-        "jsonl.quarantine-{}-{}",
-        reason
-            .chars()
-            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-            .collect::<String>()
-            .trim_matches('-'),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or(0)
-    ));
-    fs::rename(path, &backup_path).map_err(|error| {
-        format!(
-            "隔离污染的 pi session 失败 {} -> {}: {error}",
-            path.display(),
-            backup_path.display()
-        )
-    })?;
-    Ok(true)
+    runtime_paths::summary_file_path(PI_SUMMARY_FILE_PREFIX, summary_key)
 }
 
 fn normalize_summary_text(text: &str, max_chars: usize) -> String {
@@ -2903,8 +2704,20 @@ pub(crate) fn record_multimodal_summary(
     let path = summary_file_path(summary_key);
     let content = serde_json::to_vec_pretty(&entries)
         .map_err(|error| format!("序列化多模态摘要失败: {error}"))?;
-    fs::write(&path, content)
-        .map_err(|error| format!("写入多模态摘要失败 {}: {error}", path.display()))
+    runtime_paths::write_private_file(&path, &content)
+}
+
+fn legacy_pi_session_paths(session_id: Option<&str>) -> Vec<PathBuf> {
+    let key = session_id
+        .filter(|value| !value.trim().is_empty())
+        .map(hash_session_id)
+        .unwrap_or_else(|| "default".to_string());
+    std::iter::once(PI_SESSION_FILE_PREFIX)
+        .chain(LEGACY_PI_SESSION_FILE_PREFIXES.iter().copied())
+        .map(|prefix| {
+            runtime_paths::legacy_session_dir().join(format!("{prefix}{key}.jsonl"))
+        })
+        .collect()
 }
 
 fn session_cleanup_paths(session_id: Option<&str>) -> Vec<PathBuf> {
@@ -2913,11 +2726,9 @@ fn session_cleanup_paths(session_id: Option<&str>) -> Vec<PathBuf> {
         .map(hash_session_id)
         .unwrap_or_else(|| "default".to_string());
 
-    let mut paths = vec![std::env::temp_dir().join(format!("{PI_SESSION_FILE_PREFIX}{key}.jsonl"))];
+    let mut paths = vec![runtime_paths::session_file_path(PI_SESSION_FILE_PREFIX, &key)];
     paths.push(summary_file_path(&key));
-    for prefix in LEGACY_PI_SESSION_FILE_PREFIXES {
-        paths.push(std::env::temp_dir().join(format!("{prefix}{key}.jsonl")));
-    }
+    paths.extend(legacy_pi_session_paths(session_id));
     paths
 }
 
@@ -3815,10 +3626,10 @@ fn build_provider_models_config_with_input(
 #[allow(dead_code)]
 fn prepare_pi_runtime_dir(provider_config: &ProviderRuntimeConfig) -> Result<PathBuf, String> {
     let runtime_dir = pi_runtime_dir();
-    fs::create_dir_all(&runtime_dir).map_err(|error| format!("创建 pi 运行目录失败: {error}"))?;
+    runtime_paths::ensure_private_dir(&runtime_dir)?;
 
     let auth_path = runtime_dir.join("auth.json");
-    fs::write(&auth_path, "{}").map_err(|error| format!("写入 pi auth 配置失败: {error}"))?;
+    runtime_paths::write_private_file(&auth_path, b"{}")?;
 
     let models_path = runtime_dir.join("models.json");
     if let Some(models_config) =
@@ -3826,8 +3637,7 @@ fn prepare_pi_runtime_dir(provider_config: &ProviderRuntimeConfig) -> Result<Pat
     {
         let content = serde_json::to_vec_pretty(&models_config)
             .map_err(|error| format!("序列化 provider 配置失败: {error}"))?;
-        fs::write(&models_path, content)
-            .map_err(|error| format!("写入 provider models 配置失败: {error}"))?;
+        runtime_paths::write_private_file(&models_path, &content)?;
     } else if models_path.exists() {
         fs::remove_file(&models_path)
             .map_err(|error| format!("清理 provider models 配置失败: {error}"))?;
@@ -3868,18 +3678,6 @@ fn is_provider_image_block_rejection_error(error: &str) -> bool {
             || lower.contains("expected text")
             || lower.contains("messages[")
             || lower.contains("deserialize"))
-}
-
-fn is_provider_reasoning_history_rejection_error(error: &str) -> bool {
-    let lower = error.trim().to_ascii_lowercase();
-    (lower.contains("reasoning_content")
-        || lower.contains("reasoning content")
-        || lower.contains("thinking mode")
-        || lower.contains("reasoning mode"))
-        && (lower.contains("must be passed back")
-            || lower.contains("pass back")
-            || lower.contains("missing")
-            || lower.contains("required"))
 }
 
 fn should_retry_text_only_after_image_rejection(
@@ -3941,7 +3739,8 @@ fn emit_stream_event_with_meta(
     usage: Option<PiTokenUsagePayload>,
     usage_meta: Option<PiUsageMetadataPayload>,
 ) -> Result<(), String> {
-    app.emit(
+    crate::emit_safe::emit_safe(
+        app,
         "pi://stream",
         PiStreamPayload {
             event: event.to_string(),
@@ -3961,8 +3760,8 @@ fn emit_stream_event_with_meta(
             usage,
             usage_meta,
         },
-    )
-    .map_err(|emit_error| format!("发送事件失败: {emit_error}"))
+    );
+    Ok(())
 }
 
 fn emit_pi_stream_skill_selection_event(
@@ -3970,7 +3769,8 @@ fn emit_pi_stream_skill_selection_event(
     session_id: Option<String>,
     decision: &crate::skill_broker::SkillBrokerDecision,
 ) -> Result<(), String> {
-    app.emit(
+    crate::emit_safe::emit_safe(
+        app,
         "pi://stream",
         PiStreamPayload {
             event: "skill_selection".to_string(),
@@ -3990,8 +3790,8 @@ fn emit_pi_stream_skill_selection_event(
             usage: None,
             usage_meta: None,
         },
-    )
-    .map_err(|emit_error| format!("发送能力装配事件失败: {emit_error}"))
+    );
+    Ok(())
 }
 
 fn extract_text_content(value: Option<&serde_json::Value>) -> Option<String> {
@@ -4277,6 +4077,34 @@ async fn compact_desktop_session_before_model_switch(
     .map_err(|error| format!("模型切换前压缩任务失败: {error}"))?
 }
 
+fn remove_known_pi_runtime_files_in(dir: &std::path::Path) -> Result<usize, String> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0usize;
+    for entry in fs::read_dir(dir).map_err(|error| format!("读取运行目录失败 {}: {error}", dir.display()))? {
+        let entry = entry.map_err(|error| format!("读取 session 条目失败: {error}"))?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let is_known_session = file_name.starts_with(PI_SESSION_FILE_PREFIX)
+            || LEGACY_PI_SESSION_FILE_PREFIXES
+                .iter()
+                .any(|prefix| file_name.starts_with(prefix));
+        let is_known_summary = file_name.starts_with(PI_SUMMARY_FILE_PREFIX);
+        if !is_known_session && !is_known_summary {
+            continue;
+        }
+        if !(file_name.ends_with(".jsonl") || file_name.ends_with(".json")) {
+            continue;
+        }
+        fs::remove_file(path).map_err(|error| format!("清理 session 失败: {error}"))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 #[tauri::command]
 async fn clear_pi_session() -> Result<(), String> {
     dev_trace("desktop.stream", "clear_pi_session invoked".to_string());
@@ -4284,23 +4112,14 @@ async fn clear_pi_session() -> Result<(), String> {
         kill_desktop_pooled_pi(pooled, None, "clear_pi_session");
     }
 
-    for entry in
-        fs::read_dir(std::env::temp_dir()).map_err(|error| format!("读取临时目录失败: {error}"))?
-    {
-        let entry = entry.map_err(|error| format!("读取 session 条目失败: {error}"))?;
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        let is_known_session_file = file_name.starts_with(PI_SESSION_FILE_PREFIX)
-            || LEGACY_PI_SESSION_FILE_PREFIXES
-                .iter()
-                .any(|prefix| file_name.starts_with(prefix));
-        if !is_known_session_file || !file_name.ends_with(".jsonl") {
-            continue;
-        }
-        fs::remove_file(path).map_err(|error| format!("清理 session 失败: {error}"))?;
-    }
+    let removed_private = remove_known_pi_runtime_files_in(&runtime_paths::pi_sessions_dir())?;
+    let removed_legacy = remove_known_pi_runtime_files_in(&runtime_paths::legacy_session_dir())?;
+    dev_trace(
+        "desktop.stream",
+        format!(
+            "clear_pi_session removed private={removed_private} legacy={removed_legacy}"
+        ),
+    );
     Ok(())
 }
 
@@ -4728,6 +4547,14 @@ async fn stream_pi_prompt(
         } else {
             session_file_path(Some(normalized_session_id.as_str()))
         };
+        if fresh_multimodal_session {
+            runtime_paths::create_private_file(&session_path)?;
+        } else {
+            runtime_paths::prepare_pi_session_file(
+                &session_path,
+                &legacy_pi_session_paths(Some(normalized_session_id.as_str())),
+            )?;
+        }
         let session_path_string = session_path.to_string_lossy().to_string();
         let pi_location = pi_runtime::require_pi_runtime_location(&app)?;
         let resolved_pi_path = pi_location.executable.display().to_string();
@@ -4752,11 +4579,9 @@ async fn stream_pi_prompt(
         if let Some(provider_config) = provider_config.as_ref() {
             validate_desktop_provider_config(provider_config)?;
             let runtime_dir = pi_runtime_dir();
-            fs::create_dir_all(&runtime_dir)
-                .map_err(|error| format!("创建 pi 运行目录失败: {error}"))?;
+            runtime_paths::ensure_private_dir(&runtime_dir)?;
             let auth_path = runtime_dir.join("auth.json");
-            fs::write(&auth_path, "{}")
-                .map_err(|error| format!("写入 pi auth 配置失败: {error}"))?;
+            runtime_paths::write_private_file(&auth_path, b"{}")?;
 
             if let Some(agent_config) = agent_config.as_ref() {
                 let image_runtime_config = resolve_default_image_generation_runtime(&app)?;
@@ -4783,8 +4608,7 @@ async fn stream_pi_prompt(
             {
                 let content = serde_json::to_vec_pretty(&models_config)
                     .map_err(|error| format!("序列化 provider 配置失败: {error}"))?;
-                fs::write(&models_path, content)
-                    .map_err(|error| format!("写入 provider models 配置失败: {error}"))?;
+                runtime_paths::write_private_file(&models_path, &content)?;
             } else if models_path.exists() {
                 fs::remove_file(&models_path)
                     .map_err(|error| format!("清理 provider models 配置失败: {error}"))?;
@@ -5471,7 +5295,8 @@ async fn stream_pi_prompt(
                 let warn_at = cap.saturating_sub(10).max(1);
                 if !iteration_limit_warned && completed_pi_turns >= warn_at && completed_pi_turns < cap {
                     iteration_limit_warned = true;
-                    let _ = app.emit(
+                    crate::emit_safe::emit_safe(
+                        &app,
                         "nineclaw-runtime-notification",
                         serde_json::json!({
                             "kind": "agent_loop_approaching_limit",
@@ -7556,7 +7381,7 @@ pub fn run() {
                 dev_trace("app", "后台 runtime 初始化完成");
 
                 // Notify frontend that the PI runtime is ready
-                let _ = app_handle.emit("pi://runtime-ready", status.pi_available);
+                crate::emit_safe::emit_safe(&app_handle, "pi://runtime-ready", status.pi_available);
 
                 // Start IM services after runtime is ready
                 if let Err(error) = auto_start_bound_im_services(&app_handle) {

@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle};
 use uuid::Uuid;
 
 const SCHEDULER_SCAN_INTERVAL_SECS: u64 = 30;
@@ -1653,7 +1653,7 @@ fn finalize_run(
                         &title,
                         &assistant_message,
                     ) {
-                        let _ = app.emit("agent-task-delivery", record);
+                        crate::emit_safe::emit_safe(app, "agent-task-delivery", record);
                     }
                 }
             }
@@ -2173,7 +2173,7 @@ fn send_task_message(
             &title,
             &outbound,
         )?;
-        let _ = app.emit("agent-task-delivery", record);
+        crate::emit_safe::emit_safe(app, "agent-task-delivery", record);
         return Ok(());
     }
 
