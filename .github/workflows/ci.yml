@@ -29,6 +29,10 @@ jobs:
       - name: Unit tests
         run: npm run test
 
+      # 04-⑧：coverage ratchet（阈值见 vite.config.ts，先松后紧）
+      - name: Coverage gate
+        run: npm run test:coverage
+
       # `npm run lint` currently has 92 pre-existing errors; wire it back
       # after the existing frontend violations are cleaned up.
 

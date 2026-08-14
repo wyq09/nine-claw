@@ -42,6 +42,7 @@ pub enum SessionEventKind {
     Decision,
     RuntimeError,
     RuntimeRetry,
+    ModeSet,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -658,15 +659,7 @@ pub fn append_session_event(
                 &event.id,
                 agent_id.as_deref(),
                 &event.session_id,
-                match event.kind {
-                    SessionEventKind::Prompt => "prompt",
-                    SessionEventKind::ToolCall => "tool_call",
-                    SessionEventKind::ToolResult => "tool_result",
-                    SessionEventKind::AssistantOutput => "assistant_output",
-                    SessionEventKind::Decision => "decision",
-                    SessionEventKind::RuntimeError => "runtime_error",
-                    SessionEventKind::RuntimeRetry => "runtime_retry",
-                },
+                crate::execution_mode_fold::session_event_kind_str(&event.kind),
                 &event.summary,
                 detail_json.as_deref(),
             );
@@ -817,6 +810,7 @@ pub fn build_session_context_snapshot(
             SessionEventKind::Decision => "decision",
             SessionEventKind::RuntimeError => "runtime_error",
             SessionEventKind::RuntimeRetry => "runtime_retry",
+            SessionEventKind::ModeSet => "mode_set",
         };
         lines.push(format!(
             "- [{}] {}",
@@ -880,6 +874,11 @@ fn session_log_path(agent_home: &Path, session_id: &str) -> PathBuf {
     agent_home
         .join(SESSIONS_DIR)
         .join(format!("{}.jsonl", sanitize_session_file_name(session_id)))
+}
+
+/// 会话日志路径访问器，供 `execution_mode_fold` 等模块读取事件流。
+pub fn session_log_path_for(agent_home: &Path, session_id: &str) -> PathBuf {
+    session_log_path(agent_home, session_id)
 }
 
 pub fn extract_decision_summaries(content: &str) -> Vec<String> {

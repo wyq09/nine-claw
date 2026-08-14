@@ -19,7 +19,8 @@
     "check": "npm run check:size && tsc -b && npm run test",
     "check:size": "node scripts/check-file-size.mjs",
     "check:size:update": "node scripts/check-file-size.mjs --update-baseline",
-    "tauri:dev:no-watch": "tauri dev --no-watch"
+    "tauri:dev:no-watch": "tauri dev --no-watch",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.60.0",
@@ -34,12 +35,12 @@
     "streamdown": "^2.5.0"
   },
   "devDependencies": {
-    "@eslint/js": "^9.39.4",
     "@earendil-works/pi-agent-core": "0.80.6",
     "@earendil-works/pi-ai": "0.80.6",
     "@earendil-works/pi-coding-agent": "0.80.6",
     "@earendil-works/pi-tui": "0.80.6",
     "@earendil-works/pi-web-ui": "0.75.3",
+    "@eslint/js": "^9.39.4",
     "@sinclair/typebox": "^0.34.41",
     "@tailwindcss/vite": "^4.2.2",
     "@tauri-apps/cli": "^2.10.1",
@@ -49,6 +50,7 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
+    "@vitest/coverage-v8": "^4.1.10",
     "esbuild": "^0.27.0",
     "eslint": "^9.39.4",
     "eslint-plugin-react-hooks": "^7.0.1",

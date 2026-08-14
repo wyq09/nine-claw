@@ -13,6 +13,7 @@ mod dev_trace;
 mod embedding;
 mod embedding_settings;
 mod emit_safe;
+mod execution_mode_fold;
 mod heartbeat;
 mod image_generation;
 mod llm_log_export;
@@ -4453,18 +4454,36 @@ async fn stream_pi_prompt(
             .ok()
             .map(|root| root.join("agents").join(&config.id))
     });
-    let desktop_harness_for_retry = match (
-        desktop_agent_home_for_runtime.as_ref(),
+    // 03-④：execution_mode 的权威值是会话事件流的 fold（最后一条 ModeSet），
+    // DB 列保留做快速读；resume/fork 因此恢复与 fork 点一致的模式。
+    let desktop_effective_execution_mode = match (
+        desktop_agent_home_for_runtime.as_deref(),
         agent_config.as_ref(),
     ) {
-        (Some(agent_home), Some(config)) => managed_runtime::select_harness(
+        (Some(agent_home), Some(config)) => crate::execution_mode_fold::resolved_execution_mode(
             agent_home,
+            &normalized_session_id,
             &config.execution_mode,
+        ),
+        _ => agent_config
+            .as_ref()
+            .map(|config| config.execution_mode.clone())
+            .unwrap_or_default(),
+    };
+    let desktop_harness_for_retry = match desktop_agent_home_for_runtime.as_ref() {
+        Some(agent_home) => managed_runtime::select_harness(
+            agent_home,
+            &desktop_effective_execution_mode,
             Some(trimmed_prompt.as_str()),
         )
         .ok(),
-        _ => None,
+        None => None,
     };
+    crate::execution_mode_fold::append_mode_set_event(
+        desktop_agent_home_for_runtime.as_deref(),
+        &normalized_session_id,
+        &desktop_effective_execution_mode,
+    );
     managed_runtime::append_session_event_quiet(
         desktop_agent_home_for_runtime.as_deref(),
         &normalized_session_id,

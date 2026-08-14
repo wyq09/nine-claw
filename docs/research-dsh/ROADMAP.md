@@ -41,6 +41,14 @@
 |----|------|------|------|------|
 | 04-⑦ | clippy 纪律 | 报告 04 | ✅ | 存量 149 警告 + 1 硬错误清零；`[lints.clippy]` 显式 allow 两噪音类；CI 新增 `cargo clippy --lib --tests -- -D warnings` 硬门禁 |
 
+## 第六批已落地（2026-08-14）
+
+| ID | 动作 | 来源 | 状态 | 备注 |
+|----|------|------|------|------|
+| 03-④ | `execution_mode` 日志 fold | 报告 03 | ✅ | `execution_mode_fold.rs`：ModeSet 整值替换事件 + 纯 fold，会话开始时落盘并据此选 harness，resume/fork 可恢复；5 个测试 |
+| 04-⑧ | coverage gate | 报告 04 | ✅ | `@vitest/coverage-v8` + 起步阈值（lines 50 / branches 40，基线 55/42，先松后紧 ratchet）+ CI 门禁 |
+| 04-⑨ | postmortem 模板 + ADR | 报告 04 | ✅ | `docs/research-dsh/postmortem-template.md`；`technical-notes/decisions/`（ADR-0001 模板 + ADR-0002 运行时私有目录）；`technical-notes/postmortems/`（DEV_NOTES 8 节迁为 postmortem-0001…0008 + README 索引） |
+
 ## 待办池
 
 | ID | 动作 | 来源 | 优先级 | 备注 |
@@ -52,15 +60,13 @@
 | 02-④ | Rust 侧工具错误归因 | 报告 02 | P2 | 纯观测层，不碰 PI |
 | 02-⑤ | 把 `run_guard_chain` 文档化为 waterfall 范本 | 报告 02 | P2 | 零代码 |
 | 02-⑥ | `ToolExecutor` trait 空壳 | 报告 02 | P3 | 前瞻扩展点 |
-| 03-④ | `execution_mode` 日志 fold | 报告 03 | P2 | 先做一个样板状态 |
 | 03-⑤ | Scope 原语能力隔离 | 报告 03 | P3 | 依赖 02-② 的 PI 侧拦截才真正 enforce |
-| 04-⑧ | coverage gate / snapshot / real-API e2e 自 skip | 报告 04 | P1 | |
-| 04-⑨ | postmortem 模板 + ADR | 报告 04 | P2 | |
+| 04-⑧ | snapshot / real-API e2e 自 skip | 报告 04 | P1 | coverage gate 已落地，剩余分层待做 |
 | 04-⑩ | 端到端 trace id | 报告 04 | P2 | |
 
 ## 建议下一批
 
-1. `03-④` `execution_mode` 日志 fold（先做一个样板状态）
-2. `04-⑧` coverage gate（先松后紧 ratchet）
-3. `04-⑨` postmortem 模板 + ADR（零代码）
+1. `04-⑧` 剩余分层：真 snapshot / real-API e2e 自 skip / 真实入口路径 smoke
+2. `03-⑤` Scope 原语能力隔离（依赖 02-②，可先建数据模型）
+3. `04-⑩` 端到端 trace id
 4. `01-⑤` / `02-①` 依赖 PI 配合的长期项

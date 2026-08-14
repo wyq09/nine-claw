@@ -48,3 +48,4 @@ src-tauri/resources/pi-runtime-bundles/*.tar.gz
 
 # Personal memory dump (private)
 src-tauri/memory-dump.md
+coverage/
