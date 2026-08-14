@@ -94,7 +94,7 @@ fn spawn_pi_stdout_logger<R>(
 ) where
     R: Read + Send + 'static,
 {
-    thread::spawn(move || {
+    crate::safe_task::safe_thread_spawn("pi-stdout-logger", move || {
         for line in BufReader::new(reader).lines() {
             match line {
                 Ok(line) => {
@@ -119,7 +119,7 @@ fn spawn_pi_stderr_logger<R>(reader: R, scope: &'static str, buffer: Arc<Mutex<S
 where
     R: Read + Send + 'static,
 {
-    thread::spawn(move || {
+    crate::safe_task::safe_thread_spawn("pi-stderr-logger", move || {
         for line in BufReader::new(reader).lines() {
             match line {
                 Ok(line) => {

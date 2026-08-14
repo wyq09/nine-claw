@@ -317,7 +317,7 @@ impl Channel for LarkChannel {
             let startup_signal = startup_signal.clone();
             let helper_child_wait = self.helper_child.clone();
 
-            thread::spawn(move || {
+            crate::safe_task::safe_thread_spawn("lark-helper-stdout", move || {
                 let reader = BufReader::new(helper_stdout);
                 for line_result in reader.lines() {
                     let line = match line_result {
@@ -589,7 +589,7 @@ impl Channel for LarkChannel {
             let app_handle = app.clone();
             let channel_id = self.channel_id.clone();
 
-            thread::spawn(move || {
+            crate::safe_task::safe_thread_spawn("lark-helper-stderr", move || {
                 let reader = BufReader::new(helper_stderr);
                 for line_result in reader.lines() {
                     let line = match line_result {
@@ -627,7 +627,7 @@ impl Channel for LarkChannel {
             let user_states = user_states.clone();
             let pi_runtime = pi_runtime.clone();
 
-            thread::spawn(move || {
+            crate::safe_task::safe_thread_spawn("lark-pi-bridge", move || {
                 let bridge = PiBridge::new(
                     pi_runtime,
                     &ai_pid,

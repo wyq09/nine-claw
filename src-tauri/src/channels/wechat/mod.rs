@@ -1357,7 +1357,7 @@ impl Channel for WeChatChannel {
             let channel_id = self.channel_id.clone();
             let user_states = user_states.clone();
 
-            thread::spawn(move || {
+            crate::safe_task::safe_thread_spawn("wechat-monitor", move || {
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(rt) => rt,
                     Err(e) => {
@@ -1536,7 +1536,7 @@ impl Channel for WeChatChannel {
             let channel_id = self.channel_id.clone();
             let user_states = user_states.clone();
 
-            thread::spawn(move || {
+            crate::safe_task::safe_thread_spawn("wechat-worker", move || {
                 let rt = match tokio::runtime::Runtime::new() {
                     Ok(rt) => rt,
                     Err(e) => {
@@ -1991,7 +1991,7 @@ fn start_typing_loop(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_flag = stop.clone();
 
-    thread::spawn(move || {
+    crate::safe_task::safe_thread_spawn("wechat-send-message", move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(_) => return,

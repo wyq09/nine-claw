@@ -19,12 +19,26 @@
 | 04-④ | redact 安全默认 | 报告 04 | ✅ | Rust `include_secrets: Option<bool>` 缺省 false；前端 `includeSecrets?` 缺省传 false，2 个 vitest 用例 |
 | 04-⑤ | emit 统一吞错 + log | 报告 04 | ✅ | `emit_safe.rs` helper（mock_app 真实路径测试），12 个模块全部替换裸/吞错 emit |
 
+## 第三批已落地（2026-08-13）
+
+| ID | 动作 | 来源 | 状态 | 备注 |
+|----|------|------|------|------|
+| 03-① | Skills watcher + 缓存 | 报告 03 | ✅ | `skill_cache.rs`：per-root 懒扫描缓存 + notify watcher，dirty 失效 + `skills/change` 事件，watcher 挂了回退读盘 |
+| 03-② | Skills 显式优先级 + provider 抽象 | 报告 03 | ✅ | `skill_providers.rs`：rank 100-600 + `SkillProvider` trait，rank 排序决定重名胜出 |
+| 03-③ | flat `<name>.md` + kebab 校验 | 报告 03 | ✅ | 双格式发现 + kebab 强制 + flat 物化挂载；skills.rs 1175→1070 行 |
+
+## 第四批已落地（2026-08-13）
+
+| ID | 动作 | 来源 | 状态 | 备注 |
+|----|------|------|------|------|
+| 04-③ | dispatcher `catch_unwind` | 报告 04 | ✅ | `safe_task.rs`：`safe_spawn`（observer 吞 JoinError）+ `safe_thread_spawn`（catch_unwind），8 个 bot worker 线程 + panic 隔离测试 |
+| 01-③ | compaction 锁事件 | 报告 01 | ✅ | `compaction_lock.rs`：start/end 生命周期事件（end 最后写）、孤儿锁检测、进程内 busy 互斥 |
+| 01-④ | 脱离式 TokenMeter | 报告 01 | ✅ | `token_meter.rs`：usage 锚点校验 + 角色启发式；provider 不回 usage 时压缩触发链不再失效 |
+
 ## 待办池
 
 | ID | 动作 | 来源 | 优先级 | 备注 |
 |----|------|------|--------|------|
-| 01-③ | compaction start/summary/end 锁事件 + 孤儿锁检测 | 报告 01 | P1 | 需先真机验证 PI 对未知 entry type 的容忍度 |
-| 01-④ | 脱离式 TokenMeter | 报告 01 | P1 | 修 provider 不回 usage 时压缩链失效 |
 | 01-⑤ | PI session.jsonl 投影 + 审计层 | 报告 01 | P3 | 依赖 PI 配合，长期方向 |
 | 02-① | 侦察 PI 扩展协议并沉淀能力清单 | 报告 02 | P2 | 解锁 02-②③ 的前置 |
 | 02-② | JS `tool_call` pre 规则链 | 报告 02 | P2 | 受 02-① 约束 |
@@ -32,12 +46,8 @@
 | 02-④ | Rust 侧工具错误归因 | 报告 02 | P2 | 纯观测层，不碰 PI |
 | 02-⑤ | 把 `run_guard_chain` 文档化为 waterfall 范本 | 报告 02 | P2 | 零代码 |
 | 02-⑥ | `ToolExecutor` trait 空壳 | 报告 02 | P3 | 前瞻扩展点 |
-| 03-① | Skills watcher + 缓存 | 报告 03 | P1 | 消灭每轮重扫盘 |
-| 03-② | Skills 显式优先级 + provider 抽象 | 报告 03 | P1 | 与 03-① 合并做 |
-| 03-③ | flat `<name>.md` + kebab 校验 | 报告 03 | P1 | |
 | 03-④ | `execution_mode` 日志 fold | 报告 03 | P2 | 先做一个样板状态 |
 | 03-⑤ | Scope 原语能力隔离 | 报告 03 | P3 | 依赖 02-② 的 PI 侧拦截才真正 enforce |
-| 04-③ | dispatcher `catch_unwind` | 报告 04 | P1 | |
 | 04-⑦ | clippy 纪律 | 报告 04 | P1 | 当前 142 个存量错误，需逐条 allow/fix |
 | 04-⑧ | coverage gate / snapshot / real-API e2e 自 skip | 报告 04 | P1 | |
 | 04-⑨ | postmortem 模板 + ADR | 报告 04 | P2 | |
@@ -45,7 +55,7 @@
 
 ## 建议下一批
 
-1. `03-① + 03-② + 03-③` Skills 发现优化（一组做，进行中）
-2. `04-③` dispatcher `catch_unwind`
-3. `01-③ + 01-④` compaction 可靠性
-4. `04-⑦` clippy 纪律（存量 142 错误逐条清理）
+1. `04-⑦` clippy 纪律（存量 142 错误逐条 allow/fix）
+2. `03-④` `execution_mode` 日志 fold（先做一个样板状态）
+3. `04-⑧` coverage gate（先松后紧 ratchet）
+4. `01-⑤` / `02-①` 依赖 PI 配合的长期项

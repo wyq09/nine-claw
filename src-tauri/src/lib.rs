@@ -31,6 +31,7 @@ mod prompt_attachments;
 mod proxy_settings;
 mod runtime_parameters;
 mod runtime_paths;
+mod safe_task;
 mod scheduler;
 mod session_sanitize;
 mod session_workspace;
@@ -59,6 +60,7 @@ mod commands_memory;
 mod commands_session_llm_log;
 mod commands_session_workspace;
 mod commands_workspace_kv_memory;
+mod compaction_lock;
 mod history_app_state;
 mod pi_usage;
 mod prompts;
@@ -69,6 +71,7 @@ mod session_compression;
 mod session_llm_log;
 mod session_llm_titles;
 mod time_util;
+mod token_meter;
 mod user_kv_memory_reorganize;
 
 pub(crate) use app_constants::*;
@@ -2039,12 +2042,13 @@ fn maybe_compact_desktop_session_after_turn(
     usage: Option<&PiTokenUsagePayload>,
     force_idle: bool,
 ) -> Result<bool, String> {
-    let Some(usage) = usage else {
-        return Ok(false);
-    };
-    let used_tokens = usage_row_total_tokens(usage);
     let config = compression_config_from_env();
     let entries = session_compression::load_session_entries(session_path)?;
+    // Provider 未回 usage 时改用脱离式压力快照兜底，压缩触发链不再失效。
+    let used_tokens = match usage {
+        Some(usage) => usage_row_total_tokens(usage),
+        None => token_meter::measure_session_pressure(&entries, None).total_tokens,
+    };
     let Some(plan) =
         session_compression::plan_compression(&entries, used_tokens, &config, force_idle)
     else {
@@ -2055,6 +2059,7 @@ fn maybe_compact_desktop_session_after_turn(
         app,
         workspace_id,
         session_id,
+        session_path,
         stdin,
         stdout_rx,
         plan,
@@ -2066,11 +2071,28 @@ fn maybe_compact_desktop_session_with_plan(
     app: &tauri::AppHandle,
     workspace_id: Option<&str>,
     session_id: &str,
+    session_path: &Path,
     stdin: &Arc<Mutex<Option<ChildStdin>>>,
     stdout_rx: &mpsc::Receiver<Result<String, String>>,
     plan: session_compression::CompressionPlan,
     config: &session_compression::CompressionConfig,
 ) -> Result<bool, String> {
+    // 同一会话的压缩互斥；崩溃留下的孤儿锁由下一次压缩上报并接管。
+    let _lock_guard = compaction_lock::acquire_compaction_lock(session_path)?;
+    let lock_id = format!("nc-compact-lock-{}", Utc::now().timestamp_millis());
+    let lock_entries = session_compression::load_session_entries(session_path)?;
+    compaction_lock::report_orphan_compaction(session_path, &lock_entries);
+    compaction_lock::append_compaction_lifecycle_entry(
+        session_path,
+        compaction_lock::COMPACTION_START,
+        &lock_id,
+        serde_json::json!({
+            "sessionId": session_id,
+            "reason": format!("{:?}", plan.reason),
+            "compressionLevel": plan.compression_level,
+            "tokensBefore": plan.original_token_count,
+        }),
+    )?;
     let archive_root = desktop_compression_archive_root(workspace_id)?;
     let command_id = format!("compact-{session_id}-{}", Utc::now().timestamp_millis());
     let custom_instructions = format!(
@@ -2100,6 +2122,16 @@ fn maybe_compact_desktop_session_with_plan(
         plan.compression_level,
         &plan,
         topics.as_deref(),
+    )?;
+    // 所有副作用成功后才写 end；任何失败路径都不写 end，留下可检测孤儿锁。
+    compaction_lock::append_compaction_lifecycle_entry(
+        session_path,
+        compaction_lock::COMPACTION_END,
+        &lock_id,
+        serde_json::json!({
+            "sessionId": session_id,
+            "archive": archive.path,
+        }),
     )?;
     dev_trace(
         "desktop.stream",
@@ -4048,6 +4080,7 @@ async fn compact_desktop_session_before_model_switch(
                 &app_for_task,
                 workspace_id.as_deref().or(pooled.workspace_id.as_deref()),
                 &session_id,
+                &pooled.session_path,
                 &pooled.stdin,
                 &pooled.stdout_rx,
                 plan,
