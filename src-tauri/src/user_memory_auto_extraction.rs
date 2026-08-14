@@ -472,9 +472,9 @@ pub(crate) fn spawn_user_memory_auto_extraction(
         agent_name: agent_name.trim().to_string(),
     };
     let app = app.clone();
-    let _ = tauri::async_runtime::spawn_blocking(move || {
+    std::mem::drop(tauri::async_runtime::spawn_blocking(move || {
         let _ = run_user_memory_auto_extraction(&app, request);
-    });
+    }));
 }
 
 #[cfg(test)]

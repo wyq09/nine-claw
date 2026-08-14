@@ -264,7 +264,7 @@ pub fn heal_orphaned_tool_calls(history: &mut Vec<serde_json::Value>) {
 /// Find the **last** message with `"role": "system"` in `history` and append
 /// a dynamic context block (current time + permission denials) to its
 /// `content`. Appending at the end protects the KV Cache prefix.
-pub fn inject_dynamic_context(history: &mut Vec<serde_json::Value>, permission_denials: &[String]) {
+pub fn inject_dynamic_context(history: &mut [serde_json::Value], permission_denials: &[String]) {
     let now_str = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
     let denials_text = if permission_denials.is_empty() {
         "无".to_string()
@@ -303,7 +303,7 @@ pub fn compress_assistant_message(msg: &mut serde_json::Value) {
     let has_tool_calls = msg
         .get("tool_calls")
         .and_then(|v| v.as_array())
-        .map_or(false, |arr| !arr.is_empty());
+        .is_some_and(|arr| !arr.is_empty());
 
     if !has_tool_calls {
         return;
@@ -519,21 +519,13 @@ pub(crate) fn delegate_to_agent(
 }
 
 /// Optional callbacks for emitting real-time delegate events (tool calls, text chunks, turns).
+#[derive(Default)]
 pub(crate) struct DelegateEventCallbacks {
     pub on_chunk: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     pub on_tool: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>, // (tool_call_id, tool_name, status)
     pub on_turn: Option<Arc<dyn Fn(u32) + Send + Sync>>,              // (turn_index)
 }
 
-impl Default for DelegateEventCallbacks {
-    fn default() -> Self {
-        Self {
-            on_chunk: None,
-            on_tool: None,
-            on_turn: None,
-        }
-    }
-}
 
 pub(crate) fn delegate_to_agent_with_trace(
     app: &AppHandle,
@@ -656,7 +648,7 @@ fn execute_single_delegate_internal(
 
     // Build delegate prompt with optional params.
     let mut prompt = call.task.clone();
-    if !call.params.is_null() && call.params.as_object().map_or(false, |o| !o.is_empty()) {
+    if !call.params.is_null() && call.params.as_object().is_some_and(|o| !o.is_empty()) {
         let pretty = serde_json::to_string_pretty(&call.params).unwrap_or_default();
         prompt = format!("{prompt}\n\n[委派参数]\n{pretty}");
     }
@@ -775,11 +767,11 @@ fn execute_single_delegate_internal(
                     .unwrap_or("");
                 let tool_name = value.get("toolName").and_then(|v| v.as_str()).unwrap_or("");
                 let args_json = value.get("args").map(|v| v.to_string());
-                let result_text = value.get("result").and_then(|v| {
+                let result_text = value.get("result").map(|v| {
                     if let Some(s) = v.as_str() {
-                        Some(s.to_string())
+                        s.to_string()
                     } else {
-                        Some(v.to_string())
+                        v.to_string()
                     }
                 });
                 let is_error = value.get("isError").and_then(|v| v.as_bool());
@@ -1046,36 +1038,34 @@ async fn request_user_review(
     drop(tx);
 
     // Poll abort flag while waiting for the timeout.
-    loop {
-        if abort_flag.load(Ordering::Relaxed) {
-            return ReviewResponse {
-                approved: false,
-                extend_to: None,
-            };
-        }
+    if abort_flag.load(Ordering::Relaxed) {
+        return ReviewResponse {
+            approved: false,
+            extend_to: None,
+        };
+    }
 
-        if start.elapsed() >= timeout {
-            // Timeout: auto-deny.
-            return ReviewResponse {
-                approved: false,
-                extend_to: None,
-            };
-        }
+    if start.elapsed() >= timeout {
+        // Timeout: auto-deny.
+        return ReviewResponse {
+            approved: false,
+            extend_to: None,
+        };
+    }
 
-        // Since the oneshot sender was dropped above, rx.await will resolve
-        // immediately with Err. In the real wiring (Task 6), the sender is
-        // stored in ActiveLoops and the frontend response handler sends
-        // through it.
-        match rx.await {
-            Ok(response) => return response,
-            Err(_) => {
-                // Sender dropped without response — placeholder: auto-approve
-                // with requested extra, capped at max_extend_limit.
-                let extra = extend_marker.requested_extra;
-                return ReviewResponse {
-                    approved: true,
-                    extend_to: Some(extend_marker.max_iterations + extra),
-                };
+    // Since the oneshot sender was dropped above, rx.await will resolve
+    // immediately with Err. In the real wiring (Task 6), the sender is
+    // stored in ActiveLoops and the frontend response handler sends
+    // through it.
+    match rx.await {
+        Ok(response) => response,
+        Err(_) => {
+            // Sender dropped without response — placeholder: auto-approve
+            // with requested extra, capped at max_extend_limit.
+            let extra = extend_marker.requested_extra;
+            ReviewResponse {
+                approved: true,
+                extend_to: Some(extend_marker.max_iterations + extra),
             }
         }
     }
@@ -1226,7 +1216,7 @@ fn format_environment_snapshot_for_injection(snapshot: &EnvironmentSnapshot) -> 
 
 /// Inject the environment snapshot into the last system message in history.
 fn inject_environment_snapshot(
-    history: &mut Vec<serde_json::Value>,
+    history: &mut [serde_json::Value],
     snapshot: &EnvironmentSnapshot,
 ) {
     let snapshot_text = format_environment_snapshot_for_injection(snapshot);
@@ -1804,7 +1794,7 @@ fn load_session_loop_seed(app: &AppHandle, session_id: &str) -> Option<SessionLo
 
 async fn normalize_reflect_output(
     app: &AppHandle,
-    loop_id: &str,
+    _loop_id: &str,
     original_task: &str,
     raw_text: &str,
     provider: &crate::provider_runtime::ProviderRuntimeConfig,
@@ -2202,7 +2192,7 @@ pub async fn run_agent_loop(
     loop {
         // ── Guard: max_iterations ──
         if iteration >= max_iterations {
-            emit_completed(&app, &loop_id, "max_iterations", iteration, &loop_start);
+            emit_completed(app, &loop_id, "max_iterations", iteration, &loop_start);
             break;
         }
 
@@ -2210,7 +2200,7 @@ pub async fn run_agent_loop(
         if let Some(deadline) = total_deadline {
             if Instant::now() >= deadline {
                 log::warn!("AgentLoop [{loop_id}] total_timeout exceeded at iteration {iteration}");
-                emit_completed(&app, &loop_id, "total_timeout", iteration, &loop_start);
+                emit_completed(app, &loop_id, "total_timeout", iteration, &loop_start);
                 break;
             }
         }
@@ -2270,7 +2260,7 @@ pub async fn run_agent_loop(
 
         // Check for FINAL marker anywhere in the text.
         if has_final_marker(&accumulated_text) {
-            emit_completed(&app, &loop_id, "final_marker", iteration, &loop_start);
+            emit_completed(app, &loop_id, "final_marker", iteration, &loop_start);
             break;
         }
 
@@ -2337,12 +2327,12 @@ pub async fn run_agent_loop(
                     match decide_natural_end_after_verify(&verify_result, verify_config.score_threshold)
                     {
                         NaturalEndVerifyDecision::Pass => {
-                            emit_completed(&app, &loop_id, "verify_pass", iteration, &loop_start);
+                            emit_completed(app, &loop_id, "verify_pass", iteration, &loop_start);
                             break;
                         }
                         NaturalEndVerifyDecision::Stop => {
                             emit_completed(
-                                &app,
+                                app,
                                 &loop_id,
                                 "verify_should_stop",
                                 iteration,
@@ -2367,7 +2357,7 @@ pub async fn run_agent_loop(
                     }
                 }
 
-                emit_completed(&app, &loop_id, "natural", iteration, &loop_start);
+                emit_completed(app, &loop_id, "natural", iteration, &loop_start);
                 break;
             }
 
@@ -2636,7 +2626,7 @@ pub async fn run_agent_loop(
                                 "AgentLoop [{loop_id}] verify threshold met: {} consecutive passes",
                                 consecutive_pass_count
                             );
-                            emit_completed(&app, &loop_id, "verify_pass", iteration, &loop_start);
+                            emit_completed(app, &loop_id, "verify_pass", iteration, &loop_start);
                             break;
                         }
                     } else {
@@ -2645,7 +2635,7 @@ pub async fn run_agent_loop(
 
                     if !verify_result.should_continue {
                         emit_completed(
-                            &app,
+                            app,
                             &loop_id,
                             "verify_should_stop",
                             iteration,
@@ -2665,7 +2655,7 @@ pub async fn run_agent_loop(
             // ══════════════════════════════════════════════════════════════════════
             Some((ParsedLoopMarker::Extend(extend), _offset)) => {
                 if !config.allow_extend {
-                    emit_completed(&app, &loop_id, "natural", iteration, &loop_start);
+                    emit_completed(app, &loop_id, "natural", iteration, &loop_start);
                     log::info!("AgentLoop [{loop_id}] EXTEND rejected (not allowed), ending");
                     break;
                 }
@@ -2688,7 +2678,7 @@ pub async fn run_agent_loop(
                     );
                     accumulated_text = strip_loop_markers(&accumulated_text);
                 } else {
-                    emit_completed(&app, &loop_id, "extend_denied", iteration, &loop_start);
+                    emit_completed(app, &loop_id, "extend_denied", iteration, &loop_start);
                     log::info!("AgentLoop [{loop_id}] EXTEND denied, ending");
                     break;
                 }
@@ -2718,7 +2708,7 @@ pub async fn run_agent_loop(
                         "AgentLoop [{loop_id}] verify threshold met after {} consecutive passes",
                         consecutive_pass_count
                     );
-                    emit_completed(&app, &loop_id, "verify_pass", iteration, &loop_start);
+                    emit_completed(app, &loop_id, "verify_pass", iteration, &loop_start);
                     break;
                 }
             } else {
@@ -2726,7 +2716,7 @@ pub async fn run_agent_loop(
             }
 
             if !verify_result.should_continue {
-                emit_completed(&app, &loop_id, "verify_should_stop", iteration, &loop_start);
+                emit_completed(app, &loop_id, "verify_should_stop", iteration, &loop_start);
                 break;
             }
 

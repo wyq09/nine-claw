@@ -277,7 +277,7 @@ mod tests {
         let legacy_path = root.join("legacy-session.jsonl");
         fs::write(&legacy_path, b"{\"legacy\":true}\n").expect("write legacy");
 
-        prepare_pi_session_file(&private_path, &[legacy_path.clone()]).expect("prepare session");
+        prepare_pi_session_file(&private_path, std::slice::from_ref(&legacy_path)).expect("prepare session");
         assert_eq!(
             fs::read_to_string(&private_path).expect("read private"),
             "{\"legacy\":true}\n"

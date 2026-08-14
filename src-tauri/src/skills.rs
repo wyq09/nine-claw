@@ -120,7 +120,7 @@ pub fn list_runtime_available_skills() -> Result<Vec<SkillDefinition>, String> {
     // the name-resolution rule (lowest rank wins).
     for root in candidate_skill_roots() {
         let definitions = cache.get_or_scan(&root.path, || {
-            scan_skill_definitions_from_roots(&[root.clone()]).unwrap_or_else(|error| {
+            scan_skill_definitions_from_roots(std::slice::from_ref(&root)).unwrap_or_else(|error| {
                 log::warn!("扫描技能根目录失败 {}: {error}", root.path.display());
                 Vec::new()
             })
@@ -144,7 +144,7 @@ pub fn list_runtime_available_skills() -> Result<Vec<SkillDefinition>, String> {
         }
     }
 
-    skills.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    skills.sort_by_key(|left| left.name.to_lowercase());
     Ok(skills)
 }
 
@@ -308,7 +308,7 @@ fn list_system_skill_catalog_with_roots(roots: &[PathBuf]) -> SystemSkillCatalog
         }
     }
 
-    items.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    items.sort_by_key(|left| left.name.to_lowercase());
 
     let updated_at = roots
         .iter()
@@ -500,9 +500,7 @@ pub fn resolve_skill_source_info(
         .into_iter()
         .map(|skill| (skill.id.clone(), skill))
         .collect::<HashMap<_, _>>();
-    let runtime_system_ids = list_runtime_system_skill_directories()?
-        .into_iter()
-        .map(|(skill_id, _)| skill_id)
+    let runtime_system_ids = list_runtime_system_skill_directories()?.into_keys()
         .collect::<HashSet<_>>();
 
     let mut out = HashMap::new();
@@ -578,9 +576,7 @@ fn classify_skill_entry(entry: &fs::DirEntry) -> Option<SkillEntry> {
             is_flat: false,
         })
     } else if path.is_file() {
-        let Some(id) = name.strip_suffix(".md").map(ToOwned::to_owned) else {
-            return None;
-        };
+        let id = name.strip_suffix(".md")?.to_owned();
         if !is_valid_skill_id(&id) {
             log::warn!("跳过非法技能 id（需 kebab-case）: {}", path.display());
             return None;
@@ -1046,25 +1042,23 @@ mod tests {
         )
         .expect("write flat skill");
 
-        // The `skills/` directory alone makes this temp dir look like a
-        // workspace root, so list_installed_skills discovers the flat file.
-        let previous_dir = std::env::current_dir().expect("current dir");
-        std::env::set_current_dir(&temp_root).expect("set current dir");
+        // 直接单测物化逻辑（resolve 的目录发现分支由
+        // resolve_skill_directories_reads_runtime_system_skills 覆盖；
+        // 这里不动全局 cwd，避免并行测试竞态）。
+        let mounted_dir =
+            materialize_flat_skill("mount-me", &skills_root.join("mount-me.md"))
+                .expect("materialize flat skill");
+        let mounted_skill =
+            fs::read_to_string(mounted_dir.join("SKILL.md")).expect("read materialized skill");
 
-        let resolved =
-            resolve_skill_directories(&["mount-me".to_string()]).expect("resolve flat skill");
-
-        std::env::set_current_dir(previous_dir).expect("restore current dir");
-        let mounted_skill = fs::read_to_string(resolved[0].join("SKILL.md"))
-            .expect("read materialized skill");
-        let materialized = crate::runtime_paths::pi_runtime_dir()
-            .join("skill-materialize")
-            .join("mount-me");
         remove_dir_all(temp_root).expect("cleanup temp root");
-        let _ = remove_dir_all(materialized);
+        let _ = remove_dir_all(
+            crate::runtime_paths::pi_runtime_dir()
+                .join("skill-materialize")
+                .join("mount-me"),
+        );
 
-        assert_eq!(resolved.len(), 1);
-        assert!(resolved[0].ends_with("mount-me"), "{resolved:?}");
+        assert!(mounted_dir.ends_with("mount-me"), "{mounted_dir:?}");
         assert!(mounted_skill.contains("# Body"));
     }
 }

@@ -309,7 +309,7 @@ fn day_file(scope: &TraceStorageScope, ts_ms: i64) -> Result<PathBuf, String> {
     let dt = Local
         .timestamp_millis_opt(ts_ms)
         .single()
-        .unwrap_or_else(|| Local::now());
+        .unwrap_or_else(Local::now);
     Ok(dir.join(format!("{}.jsonl", dt.format("%Y-%m-%d"))))
 }
 
@@ -639,12 +639,12 @@ pub fn list_recent(
     }
 
     let Some(scope) = storage_scope_for(workspace_id, session_id) else {
-        out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        out.sort_by_key(|item| std::cmp::Reverse(item.started_at));
         out.truncate(limit);
         return out;
     };
     let Ok(dir) = debug_dir(&scope) else {
-        out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        out.sort_by_key(|item| std::cmp::Reverse(item.started_at));
         out.truncate(limit);
         return out;
     };
@@ -672,7 +672,7 @@ pub fn list_recent(
         }
     }
 
-    out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    out.sort_by_key(|item| std::cmp::Reverse(item.started_at));
     out.truncate(limit);
     out
 }

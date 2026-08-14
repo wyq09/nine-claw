@@ -25,7 +25,7 @@ pub(crate) fn parse_skill_manifest(content: &str) -> SkillManifest {
         lines.next();
         let mut frontmatter_lines = Vec::new();
         let mut block_scalar_indent: Option<usize> = None;
-        while let Some(line) = lines.next() {
+        for line in lines.by_ref() {
             let trimmed = line.trim();
             let indent = line.chars().take_while(|char| char.is_whitespace()).count();
 
@@ -111,20 +111,20 @@ fn parse_frontmatter(content: &str) -> Option<SkillManifest> {
 }
 
 fn read_yaml_string(map: &serde_yaml::Mapping, key: &str) -> Option<String> {
-    map.get(&serde_yaml::Value::String(key.to_string()))
+    map.get(serde_yaml::Value::String(key.to_string()))
         .and_then(|value| value.as_str())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
 fn read_yaml_bool(map: &serde_yaml::Mapping, key: &str) -> bool {
-    map.get(&serde_yaml::Value::String(key.to_string()))
+    map.get(serde_yaml::Value::String(key.to_string()))
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
 }
 
 fn read_yaml_string_list(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {
-    let Some(value) = map.get(&serde_yaml::Value::String(key.to_string())) else {
+    let Some(value) = map.get(serde_yaml::Value::String(key.to_string())) else {
         return Vec::new();
     };
 

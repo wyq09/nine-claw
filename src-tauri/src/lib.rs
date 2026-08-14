@@ -3830,12 +3830,9 @@ fn emit_pi_stream_skill_selection_event(
 }
 
 fn extract_text_content(value: Option<&serde_json::Value>) -> Option<String> {
-    let Some(content) = value
+    let content = value
         .and_then(|item| item.get("content"))
-        .and_then(|item| item.as_array())
-    else {
-        return None;
-    };
+        .and_then(|item| item.as_array())?;
 
     let joined = content
         .iter()
@@ -4143,7 +4140,7 @@ fn remove_known_pi_runtime_files_in(dir: &std::path::Path) -> Result<usize, Stri
 
 #[tauri::command]
 async fn clear_pi_session() -> Result<(), String> {
-    dev_trace("desktop.stream", "clear_pi_session invoked".to_string());
+    dev_trace("desktop.stream", "clear_pi_session invoked");
     for pooled in drain_pooled_desktop_pi()? {
         kill_desktop_pooled_pi(pooled, None, "clear_pi_session");
     }
@@ -4483,16 +4480,14 @@ async fn stream_pi_prompt(
     let mut disable_reasoning_provider_retry = false;
     let llm_attempt_cap = merged_runtime_parameters
         .llm_outer_max_attempt_rounds
-        .max(1)
-        .min(24) as usize;
+        .clamp(1, 24) as usize;
     for attempt in 0..llm_attempt_cap {
         let app = app.clone();
         let tool_iteration_cap = merged_runtime_parameters.max_agent_tool_rounds_per_dialogue;
         let stall_retry_cap = merged_runtime_parameters.stream_disconnect_max_retries;
         let delegate_iteration_cap = merged_runtime_parameters
             .max_agent_tool_rounds_per_dialogue
-            .max(1)
-            .min(500);
+            .clamp(1, 500);
         let session_id_for_attempt = normalized_session_id.clone();
         let normalized_session_id = session_id_for_attempt.clone();
         let runtime_session_id = session_id_for_attempt.clone();
@@ -5211,7 +5206,7 @@ async fn stream_pi_prompt(
                     if stalled_waiting_for_more && stream_stall_retries < stall_retry_cap {
                         stream_stall_retries += 1;
                         let backoff_ms =
-                            (250u64 * (1u64 << stream_stall_retries.min(6))).min(7000).max(100);
+                            (250u64 * (1u64 << stream_stall_retries.min(6))).clamp(100, 7000);
                         thread::sleep(Duration::from_millis(backoff_ms));
                         dev_trace(
                             "desktop.stream",
@@ -5327,7 +5322,7 @@ async fn stream_pi_prompt(
 
             if line_type == "turn_end" {
                 completed_pi_turns += 1;
-                let cap = tool_iteration_cap.max(1).min(500);
+                let cap = tool_iteration_cap.clamp(1, 500);
                 let warn_at = cap.saturating_sub(10).max(1);
                 if !iteration_limit_warned && completed_pi_turns >= warn_at && completed_pi_turns < cap {
                     iteration_limit_warned = true;
@@ -7227,7 +7222,7 @@ async fn bot_send_media(
         "image" => MediaType::Image,
         "video" => MediaType::Video,
         "audio" | "voice" => MediaType::Audio,
-        "file" | _ => MediaType::File,
+        _ => MediaType::File,
     };
 
     let payload = MediaPayload {
@@ -7366,7 +7361,7 @@ pub fn run() {
             dev_trace("app", "NineClaw 启动");
             let process_id = std::process::id();
             log::info!("NineClaw 进程启动 pid={process_id}");
-            match history_app_state::history_db_diagnostics(&app.handle()) {
+            match history_app_state::history_db_diagnostics(app.handle()) {
                 Ok((db_path, session_count, turn_count)) => {
                     log::info!(
                         "历史数据库诊断: pid={} path={} sessions={} turns={}",
@@ -7393,12 +7388,12 @@ pub fn run() {
                 ))
                 .commit();
             managed_runtime::inject_credential_proxy_app_handle(app.handle().clone());
-            resize_main_window_to_screen(&app.handle());
-            if let Err(error) = proxy_settings::apply_saved_proxy_settings(&app.handle()) {
+            resize_main_window_to_screen(app.handle());
+            if let Err(error) = proxy_settings::apply_saved_proxy_settings(app.handle()) {
                 log::warn!("应用启动时载入代理设置失败: {error}");
             }
-            llm_log_export::init(&app.handle());
-            skills::start_runtime_skill_watchers(&app.handle());
+            llm_log_export::init(app.handle());
+            skills::start_runtime_skill_watchers(app.handle());
 
             // Initialize embedding provider registry
             let embedding_registry = embedding::new_registry();

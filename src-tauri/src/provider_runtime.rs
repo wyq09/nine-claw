@@ -107,8 +107,7 @@ pub(crate) fn openai_pi_compat_requires_reasoning_content_replay(model: &str) ->
     let normalized = model
         .trim()
         .to_ascii_lowercase()
-        .replace('_', "-")
-        .replace(' ', "-");
+        .replace(['_', ' '], "-");
     let model_id = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
     matches!(
         model_id,

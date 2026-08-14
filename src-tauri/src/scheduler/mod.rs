@@ -646,7 +646,7 @@ pub fn install_service() -> Result<SchedulerServiceStatus, String> {
         if !status.success() {
             return Err(format!("launchctl load 失败: {status}"));
         }
-        return service_status();
+        service_status()
     }
 
     #[cfg(target_os = "windows")]
@@ -695,7 +695,7 @@ pub fn uninstall_service() -> Result<SchedulerServiceStatus, String> {
                 format!("删除 LaunchAgent 失败 {}: {error}", launcher_path.display())
             })?;
         }
-        return service_status();
+        service_status()
     }
 
     #[cfg(target_os = "windows")]
@@ -724,7 +724,7 @@ pub fn service_status() -> Result<SchedulerServiceStatus, String> {
     {
         let launcher_path = macos_launch_agent_path()?;
         let installed = launcher_path.exists();
-        return Ok(SchedulerServiceStatus {
+        Ok(SchedulerServiceStatus {
             installed,
             platform: "macos".to_string(),
             detail: if installed {
@@ -733,7 +733,7 @@ pub fn service_status() -> Result<SchedulerServiceStatus, String> {
                 "LaunchAgent 未安装".to_string()
             },
             launcher_path: Some(launcher_path.to_string_lossy().to_string()),
-        });
+        })
     }
 
     #[cfg(target_os = "windows")]
@@ -2487,8 +2487,8 @@ fn compute_next_daily_run_at(
                         date.year(),
                         date.month(),
                         date.day(),
-                        time.hour() as u32,
-                        time.minute() as u32,
+                        time.hour(),
+                        time.minute(),
                         0,
                     )
                     .single();
@@ -2578,8 +2578,8 @@ where
                         date.year(),
                         date.month(),
                         date.day(),
-                        time.hour() as u32,
-                        time.minute() as u32,
+                        time.hour(),
+                        time.minute(),
                         0,
                     )
                     .single();

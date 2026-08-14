@@ -31,9 +31,11 @@ pub(crate) const RANK_WORKSPACE_AGENTS: u32 = 200;
 pub(crate) const RANK_CODEX_HOME: u32 = 300;
 pub(crate) const RANK_USER_CODEX: u32 = 400;
 pub(crate) const RANK_USER_AGENTS: u32 = 500;
+#[allow(dead_code)] // 优先级表完整性：bundled 层由调用方直接合并，rank 保留语义锚点
 pub(crate) const RANK_BUNDLED_SYSTEM: u32 = 600;
 
 pub(crate) trait SkillProvider {
+    #[allow(dead_code)] // provider 命名留给未来的诊断日志使用
     fn name(&self) -> &str;
     fn rank(&self) -> u32;
     /// Roots contributed by this provider, in provider-local priority order.

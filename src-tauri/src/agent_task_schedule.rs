@@ -242,47 +242,39 @@ pub fn detect_schedule_type(prompt: &str, timezone: &str) -> String {
     let text = prompt.trim();
     let lowered = text.to_lowercase();
 
-    if text.contains("每周")
+    if (text.contains("每周")
         || text.contains("每星期")
         || text.contains("工作日")
         || text.contains("周末")
         || lowered.contains("weekly")
-        || lowered.contains("every week")
-    {
-        if !extract_weekly_days(text).is_empty() {
+        || lowered.contains("every week"))
+        && !extract_weekly_days(text).is_empty() {
             return SCHEDULE_TYPE_WEEKLY_TIME.to_string();
         }
-    }
 
-    if text.contains("每月")
+    if (text.contains("每月")
         || text.contains("每个月")
         || lowered.contains("monthly")
-        || lowered.contains("every month")
-    {
-        if !extract_monthly_days(text).is_empty() {
+        || lowered.contains("every month"))
+        && !extract_monthly_days(text).is_empty() {
             return SCHEDULE_TYPE_MONTHLY_TIME.to_string();
         }
-    }
 
-    if text.contains("每隔")
+    if (text.contains("每隔")
         || lowered.contains("every ")
         || lowered.contains("hourly")
-        || lowered.contains("minute")
-    {
-        if extract_interval_minutes(text).is_some() {
+        || lowered.contains("minute"))
+        && extract_interval_minutes(text).is_some() {
             return SCHEDULE_TYPE_INTERVAL.to_string();
         }
-    }
 
-    if text.contains("每天")
+    if (text.contains("每天")
         || text.contains("每日")
         || lowered.contains("every day")
-        || lowered.contains("daily")
-    {
-        if !extract_daily_times(text).is_empty() {
+        || lowered.contains("daily"))
+        && !extract_daily_times(text).is_empty() {
             return SCHEDULE_TYPE_DAILY_TIME.to_string();
         }
-    }
 
     if text.contains("一次性")
         || text.contains("只执行一次")
@@ -326,7 +318,7 @@ pub fn extract_interval_minutes(prompt: &str) -> Option<i64> {
 }
 
 pub fn extract_daily_times(prompt: &str) -> Vec<String> {
-    let normalized = prompt.replace('：', ":").replace('点', ":");
+    let normalized = prompt.replace(['：', '点'], ":");
     let chars = normalized.chars().collect::<Vec<_>>();
     let mut times = Vec::new();
     let mut index = 0usize;
@@ -486,10 +478,7 @@ fn extract_relative_date(prompt: &str, timezone: &str) -> Option<NaiveDate> {
 
 fn extract_full_date(prompt: &str) -> Option<NaiveDate> {
     let normalized = prompt
-        .replace('/', "-")
-        .replace('.', "-")
-        .replace('年', "-")
-        .replace('月', "-")
+        .replace(['/', '.', '年', '月'], "-")
         .replace("日", "")
         .replace("号", "");
     let chars = normalized.chars().collect::<Vec<_>>();

@@ -213,7 +213,7 @@ pub fn export_agent_package_to_path(
     agent_workspace::ensure_root_scaffold(&workspace_root)?;
     let agent_home = workspace_root.join("agents").join(&agent_id);
     if !agent_home.is_dir() {
-        fs::create_dir_all(&agent_home.join("memory"))
+        fs::create_dir_all(agent_home.join("memory"))
             .map_err(|e| format!("创建工作区目录失败: {e}"))?;
     }
 

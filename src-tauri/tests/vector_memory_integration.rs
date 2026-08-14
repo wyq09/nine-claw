@@ -171,9 +171,9 @@ fn test_search_threshold_filters_low_similarity() {
     let conn = setup();
     insert_workspace(&conn, "ws1", "sup-1");
     insert_memory(&conn, "m1", "ws1", "test", "content", "workspace", None);
-    insert_vector(&conn, "m1", "ws1", &vec![1.0, 0.0], "model");
+    insert_vector(&conn, "m1", "ws1", &[1.0, 0.0], "model");
 
-    let results = search(&conn, "ws1", &vec![0.0, 1.0], 10, 0.5);
+    let results = search(&conn, "ws1", &[0.0, 1.0], 10, 0.5);
     assert!(results.is_empty());
 }
 
@@ -187,10 +187,10 @@ fn test_search_workspace_scoped() {
 
     insert_memory(&conn, "m1", "ws1", "ws1 记忆", "内容", "workspace", None);
     insert_memory(&conn, "m2", "ws2", "ws2 记忆", "内容", "workspace", None);
-    insert_vector(&conn, "m1", "ws1", &vec![1.0], "model");
-    insert_vector(&conn, "m2", "ws2", &vec![1.0], "model");
+    insert_vector(&conn, "m1", "ws1", &[1.0], "model");
+    insert_vector(&conn, "m2", "ws2", &[1.0], "model");
 
-    let results = search(&conn, "ws1", &vec![1.0], 10, 0.0);
+    let results = search(&conn, "ws1", &[1.0], 10, 0.0);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].memory_id, "m1");
 }
@@ -200,7 +200,7 @@ fn test_search_workspace_scoped() {
 #[test]
 fn test_search_empty_workspace() {
     let conn = setup();
-    let results = search(&conn, "ws-nonexistent", &vec![0.1; 8], 10, 0.0);
+    let results = search(&conn, "ws-nonexistent", &[0.1; 8], 10, 0.0);
     assert!(results.is_empty());
 }
 
@@ -229,7 +229,7 @@ fn test_find_missing_vectors() {
         "workspace",
         None,
     );
-    insert_vector(&conn, "m1", "ws1", &vec![0.1; 4], "model");
+    insert_vector(&conn, "m1", "ws1", &[0.1; 4], "model");
 
     let missing = app_lib::memory_vector::find_memories_without_vectors(&conn, "ws1", 10).unwrap();
     assert_eq!(missing.len(), 2);
@@ -246,10 +246,10 @@ fn test_different_dimensions_in_same_workspace() {
     insert_workspace(&conn, "ws1", "sup-1");
     insert_memory(&conn, "m1", "ws1", "8d", "content", "workspace", None);
     insert_memory(&conn, "m2", "ws1", "4d", "content", "workspace", None);
-    insert_vector(&conn, "m1", "ws1", &vec![1.0, 0.0], "model-2d-a");
-    insert_vector(&conn, "m2", "ws1", &vec![0.0, 1.0], "model-2d-b");
+    insert_vector(&conn, "m1", "ws1", &[1.0, 0.0], "model-2d-a");
+    insert_vector(&conn, "m2", "ws1", &[0.0, 1.0], "model-2d-b");
 
-    let results = search(&conn, "ws1", &vec![1.0, 0.0], 10, 0.5);
+    let results = search(&conn, "ws1", &[1.0, 0.0], 10, 0.5);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].memory_id, "m1");
 }
@@ -341,10 +341,10 @@ fn test_find_similar_above_threshold() {
     let conn = setup();
     insert_workspace(&conn, "ws1", "sup-1");
     insert_memory(&conn, "m1", "ws1", "test", "content", "workspace", None);
-    insert_vector(&conn, "m1", "ws1", &vec![1.0, 0.0], "model");
+    insert_vector(&conn, "m1", "ws1", &[1.0, 0.0], "model");
 
     let similar =
-        app_lib::memory_vector::vector_search::find_similar(&conn, "ws1", &vec![0.99, 0.01], 0.9)
+        app_lib::memory_vector::vector_search::find_similar(&conn, "ws1", &[0.99, 0.01], 0.9)
             .unwrap();
     assert!(similar.is_some());
     assert_eq!(similar.unwrap(), "m1");
@@ -357,10 +357,10 @@ fn test_find_similar_below_threshold() {
     let conn = setup();
     insert_workspace(&conn, "ws1", "sup-1");
     insert_memory(&conn, "m1", "ws1", "test", "content", "workspace", None);
-    insert_vector(&conn, "m1", "ws1", &vec![1.0, 0.0], "model");
+    insert_vector(&conn, "m1", "ws1", &[1.0, 0.0], "model");
 
     let similar =
-        app_lib::memory_vector::vector_search::find_similar(&conn, "ws1", &vec![0.0, 1.0], 0.9)
+        app_lib::memory_vector::vector_search::find_similar(&conn, "ws1", &[0.0, 1.0], 0.9)
             .unwrap();
     assert!(similar.is_none());
 }
@@ -382,14 +382,14 @@ fn test_three_layer_system_cross_workspace() {
         "system",
         None,
     );
-    insert_vector(&conn, "sys1", "ws2", &vec![1.0, 0.0], "model");
+    insert_vector(&conn, "sys1", "ws2", &[1.0, 0.0], "model");
 
     let results = app_lib::memory_vector::three_layer_search(
         &conn,
         "ws1",
         None,
         true,
-        &vec![0.99, 0.01],
+        &[0.99, 0.01],
         10,
         0.5,
     )
@@ -423,15 +423,15 @@ fn test_three_layer_agent_isolation() {
         "agent",
         Some("agent-b"),
     );
-    insert_vector(&conn, "a1", "ws1", &vec![1.0, 0.0], "model");
-    insert_vector(&conn, "a2", "ws1", &vec![1.0, 0.0], "model");
+    insert_vector(&conn, "a1", "ws1", &[1.0, 0.0], "model");
+    insert_vector(&conn, "a2", "ws1", &[1.0, 0.0], "model");
 
     let results = app_lib::memory_vector::three_layer_search(
         &conn,
         "ws1",
         Some("agent-a"),
         false,
-        &vec![1.0, 0.0],
+        &[1.0, 0.0],
         10,
         0.5,
     )
@@ -457,14 +457,14 @@ fn test_three_layer_supervisor_sees_all() {
         "agent",
         Some("agent-a"),
     );
-    insert_vector(&conn, "a1", "ws1", &vec![1.0, 0.0], "model");
+    insert_vector(&conn, "a1", "ws1", &[1.0, 0.0], "model");
 
     let results = app_lib::memory_vector::three_layer_search(
         &conn,
         "ws1",
         Some("sup-1"),
         true,
-        &vec![1.0, 0.0],
+        &[1.0, 0.0],
         10,
         0.5,
     )
@@ -481,7 +481,7 @@ fn test_backfill_finds_unindexed() {
     insert_workspace(&conn, "ws1", "sup-1");
     insert_memory(&conn, "m1", "ws1", "已索引", "content", "workspace", None);
     insert_memory(&conn, "m2", "ws1", "未索引", "content", "workspace", None);
-    insert_vector(&conn, "m1", "ws1", &vec![0.1; 4], "model");
+    insert_vector(&conn, "m1", "ws1", &[0.1; 4], "model");
 
     let missing = app_lib::memory_vector::find_memories_without_vectors(&conn, "ws1", 50).unwrap();
     assert_eq!(missing.len(), 1);
@@ -495,7 +495,7 @@ fn test_backfill_no_missing() {
     let conn = setup();
     insert_workspace(&conn, "ws1", "sup-1");
     insert_memory(&conn, "m1", "ws1", "t", "c", "workspace", None);
-    insert_vector(&conn, "m1", "ws1", &vec![0.1; 4], "model");
+    insert_vector(&conn, "m1", "ws1", &[0.1; 4], "model");
 
     let missing = app_lib::memory_vector::find_memories_without_vectors(&conn, "ws1", 50).unwrap();
     assert!(missing.is_empty());
@@ -605,7 +605,7 @@ fn test_three_layer_merge_all_scopes() {
         "ws1",
         Some("agent-a"),
         false,
-        &vec![0.99, 0.01],
+        &[0.99, 0.01],
         10,
         0.5,
     )

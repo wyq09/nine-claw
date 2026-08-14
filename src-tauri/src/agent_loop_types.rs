@@ -20,18 +20,15 @@ use tokio::sync::{oneshot, Mutex as TokioMutex};
 /// Strategy for handling failures within a batch of agent calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum BatchFailStrategy {
     /// Abort the entire batch as soon as one call fails.
     FailFast,
     /// Wait for every call to finish regardless of individual failures.
+    #[default]
     WaitAll,
 }
 
-impl Default for BatchFailStrategy {
-    fn default() -> Self {
-        Self::WaitAll
-    }
-}
 
 /// Top-level configuration for an agent loop run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

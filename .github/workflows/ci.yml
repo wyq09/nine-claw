@@ -47,5 +47,11 @@ jobs:
       - name: Unit tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
-      # `cargo clippy -- -D warnings` currently reports 142 pre-existing
-      # errors. Clean those up before turning clippy into a hard gate.
+      # 04-⑦：clippy 硬门禁（lib + tests）。噪音类 lint 的 allow 决策见
+      # src-tauri/Cargo.toml 的 [lints.clippy] 表。
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --lib --tests -- -D warnings
+
+      # `cargo fmt --all -- --check` is not wired yet: the repository has
+      # pre-existing rustfmt drift in multiple files. Format the tree once
+      # in a dedicated PR, then turn this into a hard gate.

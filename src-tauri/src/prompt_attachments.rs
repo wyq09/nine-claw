@@ -702,7 +702,7 @@ fn extract_video_frames(path: &Path, images: &mut Vec<PromptImageInput>) -> Resu
     let duration_secs = video_duration_seconds(path).unwrap_or(None);
     let timestamps = compute_video_frame_timestamps(duration_secs);
 
-    let result = (|| -> Result<usize, String> {
+    let result = {
         let mut count = 0usize;
         for (index, timestamp) in timestamps.iter().enumerate() {
             let frame_path = temp_dir.join(format!("frame-{index:02}.jpg"));
@@ -727,7 +727,7 @@ fn extract_video_frames(path: &Path, images: &mut Vec<PromptImageInput>) -> Resu
         }
 
         Ok(count)
-    })();
+    };
 
     let _ = fs::remove_dir_all(&temp_dir);
     result
@@ -868,7 +868,7 @@ fn truncate_inline_text(text: &str, path: &str) -> String {
 
         let separator = if output.is_empty() { "" } else { "\n" };
         let addition = format!("{separator}{line}");
-        let addition_bytes = addition.as_bytes().len();
+        let addition_bytes = addition.len();
         if output_bytes + addition_bytes > MAX_INLINE_TEXT_BYTES {
             truncated = true;
             break;

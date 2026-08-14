@@ -11,7 +11,7 @@ use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle};
 
@@ -251,7 +251,7 @@ fn emit_updated(
     app: Option<&AppHandle>,
     workspace_id: Option<&str>,
     session_id: &str,
-    path: &PathBuf,
+    path: &Path,
 ) {
     let Some(app) = app else {
         return;
@@ -563,7 +563,7 @@ pub fn list(workspace_id: Option<&str>, limit: usize) -> Result<Vec<SessionLlmLo
             items.push(info);
         }
     }
-    items.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    items.sort_by_key(|item| std::cmp::Reverse(item.modified_at));
     items.truncate(limit.clamp(1, 500));
     Ok(items)
 }

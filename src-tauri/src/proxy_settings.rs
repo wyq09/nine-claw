@@ -16,6 +16,7 @@ const PROXY_ENV_KEYS: [&str; 6] = [
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct NetworkProxySettings {
     #[serde(default)]
     pub use_system_proxy: bool,
@@ -23,14 +24,6 @@ pub struct NetworkProxySettings {
     pub custom_proxy_url: String,
 }
 
-impl Default for NetworkProxySettings {
-    fn default() -> Self {
-        Self {
-            use_system_proxy: false,
-            custom_proxy_url: String::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EffectiveProxyMode {

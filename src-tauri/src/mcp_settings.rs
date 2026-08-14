@@ -255,6 +255,7 @@ pub fn runtime_settings_snapshot(settings: &McpSettings) -> Value {
     )
 }
 
+#[allow(dead_code)] // 预留 API：写入运行期设置快照，尚未有调用方
 pub fn write_runtime_settings_snapshot(
     runtime_dir: &Path,
     settings: &McpSettings,
@@ -276,6 +277,7 @@ pub fn write_runtime_settings_snapshot(
 /// Returns the fixed global snapshot path: `{app_data_dir}/nineclaw-mcp-settings.json`.
 /// All sessions inject this same path as `NINECLAW_MCP_CONFIG_FILE`, so saving settings
 /// from the UI or via mcp_config takes effect immediately without a session restart.
+#[allow(dead_code)] // 预留 API：全局快照路径，尚未有调用方
 pub fn global_snapshot_path(app: &AppHandle) -> Result<PathBuf, String> {
     use tauri::Manager;
     let dir = app

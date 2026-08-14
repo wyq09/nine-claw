@@ -74,7 +74,7 @@ pub fn migrate_history_v1_to_structured(conn: &mut Connection) -> Result<Migrati
                 // agent is a nested object with its own id
                 serde_json::from_str::<serde_json::Value>(&format!("\"{a}\""))
                     .ok()
-                    .and_then(|_| None) // agent is an object, not a string
+                    .and(None) // agent is an object, not a string
             })
             .or_else(|| {
                 obj.get("agent")

@@ -2810,7 +2810,7 @@ fn truncate_for_memory(value: &str, limit: usize) -> String {
 }
 
 fn normalize_memory_snippet(value: &str) -> String {
-    dedupe_joined_clauses(&value.replace('\n', " ").trim().to_string())
+    dedupe_joined_clauses(value.replace('\n', " ").trim())
 }
 
 fn dedupe_joined_clauses(value: &str) -> String {

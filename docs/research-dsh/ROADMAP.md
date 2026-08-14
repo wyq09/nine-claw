@@ -35,6 +35,12 @@
 | 01-③ | compaction 锁事件 | 报告 01 | ✅ | `compaction_lock.rs`：start/end 生命周期事件（end 最后写）、孤儿锁检测、进程内 busy 互斥 |
 | 01-④ | 脱离式 TokenMeter | 报告 01 | ✅ | `token_meter.rs`：usage 锚点校验 + 角色启发式；provider 不回 usage 时压缩触发链不再失效 |
 
+## 第五批已落地（2026-08-14）
+
+| ID | 动作 | 来源 | 状态 | 备注 |
+|----|------|------|------|------|
+| 04-⑦ | clippy 纪律 | 报告 04 | ✅ | 存量 149 警告 + 1 硬错误清零；`[lints.clippy]` 显式 allow 两噪音类；CI 新增 `cargo clippy --lib --tests -- -D warnings` 硬门禁 |
+
 ## 待办池
 
 | ID | 动作 | 来源 | 优先级 | 备注 |
@@ -48,14 +54,13 @@
 | 02-⑥ | `ToolExecutor` trait 空壳 | 报告 02 | P3 | 前瞻扩展点 |
 | 03-④ | `execution_mode` 日志 fold | 报告 03 | P2 | 先做一个样板状态 |
 | 03-⑤ | Scope 原语能力隔离 | 报告 03 | P3 | 依赖 02-② 的 PI 侧拦截才真正 enforce |
-| 04-⑦ | clippy 纪律 | 报告 04 | P1 | 当前 142 个存量错误，需逐条 allow/fix |
 | 04-⑧ | coverage gate / snapshot / real-API e2e 自 skip | 报告 04 | P1 | |
 | 04-⑨ | postmortem 模板 + ADR | 报告 04 | P2 | |
 | 04-⑩ | 端到端 trace id | 报告 04 | P2 | |
 
 ## 建议下一批
 
-1. `04-⑦` clippy 纪律（存量 142 错误逐条 allow/fix）
-2. `03-④` `execution_mode` 日志 fold（先做一个样板状态）
-3. `04-⑧` coverage gate（先松后紧 ratchet）
+1. `03-④` `execution_mode` 日志 fold（先做一个样板状态）
+2. `04-⑧` coverage gate（先松后紧 ratchet）
+3. `04-⑨` postmortem 模板 + ADR（零代码）
 4. `01-⑤` / `02-①` 依赖 PI 配合的长期项

@@ -8,6 +8,9 @@
 use std::future::Future;
 use std::pin::Pin;
 
+/// 异步 fire-and-forget 调用点目前不存在（现有异步 spawn 均有 JoinHandle
+/// 消费方），该 helper 为 doc 规定的统一入口，保留待用。
+#[allow(dead_code)]
 /// Spawn a tokio task whose panic is contained: tokio already turns a task
 /// panic into a `JoinError` instead of aborting the runtime; an observer task
 /// awaits the handle and logs the failure with the task name for attribution.

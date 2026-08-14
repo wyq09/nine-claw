@@ -392,10 +392,8 @@ fn build_inbound_prompt(text: &str, attachments: &[InboundAttachment]) -> Inboun
                 .unwrap_or_default()
                 .to_string(),
             file_path: attachment.saved_path.clone(),
-            mime_type: Path::new(&attachment.saved_path)
-                .is_file()
-                .then(|| crate::infer_media_mime_type(Path::new(&attachment.saved_path), None))
-                .unwrap_or_default(),
+            mime_type: if Path::new(&attachment.saved_path)
+                .is_file() { crate::infer_media_mime_type(Path::new(&attachment.saved_path), None) } else { Default::default() },
             kind: match attachment.media_type {
                 MediaType::Image => "image",
                 MediaType::Video => "video",

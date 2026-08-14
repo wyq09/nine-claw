@@ -154,7 +154,7 @@ pub fn list_recents(
     session_id: &str,
     limit: usize,
 ) -> Result<Vec<SessionWorkspaceRecent>, String> {
-    let limit = limit.max(1).min(50) as i64;
+    let limit = limit.clamp(1, 50) as i64;
     let mut stmt = conn
         .prepare(
             "SELECT session_id, path, last_used_at

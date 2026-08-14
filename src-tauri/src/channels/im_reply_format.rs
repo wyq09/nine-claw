@@ -290,7 +290,7 @@ pub fn wechat_im_text_segments(items: &[ReplyCardItem]) -> Vec<String> {
             return vec![one.body.trim().to_string()];
         }
     }
-    items.iter().map(|i| format_one_wechat_card(i)).collect()
+    items.iter().map(format_one_wechat_card).collect()
 }
 
 #[cfg(test)]

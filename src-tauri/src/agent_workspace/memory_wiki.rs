@@ -555,7 +555,7 @@ fn vector_memory_hints(
     }
     .ok()?;
 
-    let query_vec = &embeddings.get(0)?;
+    let query_vec = &embeddings.first()?;
     let hits = match crate::memory_vector::three_layer_search(
         conn,
         workspace_id,

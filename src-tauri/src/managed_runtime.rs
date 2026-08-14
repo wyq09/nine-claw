@@ -206,7 +206,7 @@ fn stable_session_token(agent_id: &str, session_id: &str) -> String {
     hasher.update(agent_id.trim().as_bytes());
     hasher.update([0]);
     hasher.update(session_id.trim().as_bytes());
-    format!("nc_{}", format!("{:x}", hasher.finalize()))
+    format!("nc_{:x}", hasher.finalize())
 }
 
 fn normalize_delegate_lookup_key(value: &str) -> String {
@@ -257,8 +257,8 @@ fn build_delegate_lookup_keys(
 fn tokenize_delegate_lookup_text(value: &str) -> Vec<String> {
     value
         .split(|ch: char| {
-            !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-                && !('\u{4e00}' <= ch && ch <= '\u{9fff}')
+            !(matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_')
+                || ('\u{4e00}'..='\u{9fff}').contains(&ch))
         })
         .map(str::trim)
         .filter(|token| !token.is_empty())
@@ -2297,12 +2297,12 @@ async fn memory_search_handler(
                 .as_ref()
                 .and_then(|s| s.caller_agent_id.as_deref())
                 .filter(|s| !s.trim().is_empty());
-            let is_supervisor = if let Some(ref aid) = caller_agent_id {
+            let is_supervisor = if let Some(aid) = caller_agent_id {
                 // Check if this agent is the workspace supervisor
                 crate::storage::workspaces::get_workspace(&conn, &workspace_id)
                     .ok()
                     .flatten()
-                    .map(|ws| ws.supervisor_agent_id == *aid)
+                    .map(|ws| ws.supervisor_agent_id == aid)
                     .unwrap_or(false)
             } else {
                 true // No agent id = assume supervisor/omniscient
@@ -2754,7 +2754,7 @@ async fn memory_list_handler(
         .into_iter()
         .map(|record| {
             let value = serde_json::from_str::<Value>(&record.value_json)
-                .unwrap_or_else(|_| Value::String(record.value_json));
+                .unwrap_or(Value::String(record.value_json));
             json!({
                 "key": record.memory_key,
                 "value": value,

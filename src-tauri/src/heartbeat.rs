@@ -241,7 +241,7 @@ fn execute_due_heartbeat(app: &AppHandle, due: DueHeartbeat) -> Result<(), Strin
             .target_label
             .trim()
             .strip_prefix('@')
-            .unwrap_or_else(|| due.schedule.target_user_id.as_str())
+            .unwrap_or(due.schedule.target_user_id.as_str())
     );
     let memory_assistant_message = sent_message.unwrap_or_else(|| {
         if let Some(error) = error_message {

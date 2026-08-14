@@ -386,7 +386,7 @@ pub fn build_workspace_preface(
     if is_supervisor {
         s.push_str("**主智能体纪律（硬性）**：输出完该行后，本回合只允许再补 ≤ 2 句过渡语（例如「已排好分工，等成员完成我再汇总」）后**立即结束**。不得在同一回合继续写任何实质交付内容（方案/代码/长文/分析/表格/文案等）——那些内容交给成员的下一轮产出，再由你汇总。\n\n");
     } else {
-        s.push_str("\n");
+        s.push('\n');
     }
     s.push_str("### 协议 B：即时委派（单步、无需确认时仍可用）\n");
     s.push_str(
@@ -627,11 +627,11 @@ pub fn run_delegate_with_provider_events(
                         .unwrap_or("");
                     let tool_name = value.get("toolName").and_then(|v| v.as_str()).unwrap_or("");
                     let args_json = value.get("args").map(|v| v.to_string());
-                    let result_text = value.get("result").and_then(|v| {
+                    let result_text = value.get("result").map(|v| {
                         if let Some(s) = v.as_str() {
-                            Some(s.to_string())
+                            s.to_string()
                         } else {
-                            Some(v.to_string())
+                            v.to_string()
                         }
                     });
                     let status = if line_type == "tool_execution_start" {

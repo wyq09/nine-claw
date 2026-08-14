@@ -678,7 +678,7 @@ pub(crate) fn spawn_workspace_memory_extraction(
             request.workspace_id, request.session_id
         ),
     );
-    let _ = tauri::async_runtime::spawn_blocking(move || {
+    std::mem::drop(tauri::async_runtime::spawn_blocking(move || {
         match run_workspace_memory_extraction(&app, request.clone()) {
             Ok(inserted) => dev_trace(
                 "workspace.memory",
@@ -695,7 +695,7 @@ pub(crate) fn spawn_workspace_memory_extraction(
                 ),
             ),
         }
-    });
+    }));
 }
 
 #[cfg(test)]

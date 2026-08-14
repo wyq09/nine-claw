@@ -945,7 +945,7 @@ fn add_agents_column_if_missing(
     column_name: &str,
     column_definition: &str,
 ) -> Result<(), String> {
-    let pragma = format!("PRAGMA table_info(agents)");
+    let pragma = "PRAGMA table_info(agents)".to_string();
     let mut statement = connection
         .prepare(&pragma)
         .map_err(|error| format!("读取 agents 表结构失败: {error}"))?;
@@ -3356,7 +3356,7 @@ mod tests {
                     'openai', 'gpt-4.1', 0, 0, 'single',
                     NULL, NULL, NULL, ?1, NULL, NULL, NULL, NULL, 1, 1
                 )",
-                params![serialize_allowed_tool_ids(&vec![
+                params![serialize_allowed_tool_ids(&[
                     "read_file".to_string(),
                     "web_fetch".to_string(),
                 ])

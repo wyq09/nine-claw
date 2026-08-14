@@ -72,6 +72,7 @@ impl<T: Clone> SkillCache<T> {
     }
 
     /// Mark every known root dirty.
+    #[allow(dead_code)] // 缓存 API 完整性：目前只有单 root 失效调用方
     pub fn invalidate_all(&self) {
         let known: Vec<PathBuf> = self
             .entries

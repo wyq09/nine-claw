@@ -147,14 +147,8 @@ fn build_chat_digest(
 ) -> Result<String, String> {
     let sessions = chat_history::list_chat_sessions(conn)?;
     let mut out = String::new();
-    let mut inspected = 0usize;
 
-    for session in sessions {
-        if inspected >= MAX_SESSION_SCAN {
-            break;
-        }
-        inspected += 1;
-
+    for session in sessions.into_iter().take(MAX_SESSION_SCAN) {
         if let Some(filter_id) = agent_filter.map(str::trim).filter(|s| !s.is_empty()) {
             if session.agent_id.as_deref() != Some(filter_id) {
                 continue;
@@ -388,7 +382,7 @@ pub(crate) fn run_user_kv_memory_reorganize(
             continue;
         }
 
-        let vector_dup = registry.as_ref().cloned().map_or(false, |reg| {
+        let vector_dup = registry.as_ref().cloned().is_some_and(|reg| {
             match run_async(async {
                 let provider = {
                     let guard = reg.read().await;

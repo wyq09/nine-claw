@@ -79,3 +79,7 @@ tauri-plugin-single-instance = "2"
 [dev-dependencies]
 # "test" 特性提供 tauri::test::mock_app，用于 emit_safe 等单测
 tauri = { version = "2.10.3", features = ["protocol-asset", "test"] }
+
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"

@@ -526,6 +526,7 @@ pub struct PiProcessResult {
     pub control_command: Option<String>,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum PiProcessOutcome {
     Completed(PiProcessResult),
     Aborted,
@@ -829,12 +830,9 @@ impl PiBridge {
     }
 
     fn extract_text_content_from_message(value: Option<&serde_json::Value>) -> Option<String> {
-        let Some(content) = value
+        let content = value
             .and_then(|item| item.get("content"))
-            .and_then(|item| item.as_array())
-        else {
-            return None;
-        };
+            .and_then(|item| item.as_array())?;
 
         let joined = content
             .iter()

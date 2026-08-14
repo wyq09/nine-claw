@@ -416,11 +416,9 @@ pub fn list_tasks(
     );
     let mut values: Vec<rusqlite::types::Value> = Vec::new();
     let trimmed_agent_id = agent_id.map(str::trim).filter(|value| !value.is_empty());
-    if trimmed_agent_id.is_some() {
+    if let Some(agent_id) = trimmed_agent_id {
         sql.push_str(" WHERE t.agent_id = ?1 AND t.status != 'deleted'");
-        values.push(rusqlite::types::Value::from(
-            trimmed_agent_id.unwrap().to_string(),
-        ));
+        values.push(rusqlite::types::Value::from(agent_id.to_string()));
     } else {
         sql.push_str(" WHERE t.status != 'deleted'");
     }

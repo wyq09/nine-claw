@@ -266,7 +266,7 @@ pub fn list_user_memories_for_agent(
             limit_per_scope,
         )?);
     }
-    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    out.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
     Ok(out)
 }
 

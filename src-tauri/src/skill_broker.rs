@@ -148,8 +148,7 @@ fn select_static_skill_ids(
     let lazy_limit = agent
         .capability_policy
         .max_dynamic_skills
-        .min(STATIC_LAZY_MOUNT_LIMIT)
-        .max(1);
+        .clamp(1, STATIC_LAZY_MOUNT_LIMIT);
 
     for (_, skill_id, _) in scored.into_iter().take(lazy_limit) {
         mounted.push(skill_id);
