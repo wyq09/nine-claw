@@ -41,6 +41,7 @@ import { LlmLogPreview } from './settings/LlmLogPreview'
 import { McpSettingsPanel } from './settings/McpSettingsPanel'
 import { NumericDraftField } from './NumericDraftField'
 import { ImageGenerationSettingsSection } from './settings/ImageGenerationSettingsSection'
+import { ImageVisionSettingsPanel } from './settings/ImageVisionSettingsPanel'
 import { UserMemorySettingsPanel } from './settings/UserMemorySettingsPanel'
 import { VectorMemoryPanel } from './settings/VectorMemoryPanel'
 import { UsageStatsPanel } from './UsageStatsPanel'
@@ -140,7 +141,7 @@ function SettingsTabButton({ active, icon, label, onClick }: SettingsTabButtonPr
   )
 }
 
-type ProviderSettingsMode = 'llm' | 'image'
+type ProviderSettingsMode = 'llm' | 'image' | 'vision'
 
 type ProviderSettingsModeButtonProps = {
   active: boolean
@@ -1037,6 +1038,11 @@ export function SettingsModal({
                     label="图片大模型"
                     onClick={() => setProviderSettingsMode('image')}
                   />
+                  <ProviderSettingsModeButton
+                    active={providerSettingsMode === 'vision'}
+                    label="识图模型"
+                    onClick={() => setProviderSettingsMode('vision')}
+                  />
                 </div>
 
                 {providerSettingsMode === 'llm' ? (
@@ -1410,7 +1416,7 @@ export function SettingsModal({
                       )}
                     </div>
                   </div>
-                ) : (
+                ) : providerSettingsMode === 'image' ? (
                   <ImageGenerationSettingsSection
                     imageGenerationSystem={draftImageGenerationSystem}
                     imageProviderConfigs={draftImageProviderConfigs}
@@ -1419,14 +1425,8 @@ export function SettingsModal({
                       const providerId = `custom_image_${crypto.randomUUID().replace(/-/g, '')}`
                       const defaults =
                         adapterType === 'openai_images'
-                          ? {
-                              baseUrl: 'https://api.openai.com/v1',
-                              model: 'gpt-image-1',
-                            }
-                          : {
-                              baseUrl: 'https://api.example.com/v1',
-                              model: 'your-image-model',
-                            }
+                          ? { baseUrl: 'https://api.openai.com/v1', model: 'gpt-image-1' }
+                          : { baseUrl: 'https://api.example.com/v1', model: 'your-image-model' }
                       setDraftImageProviderConfigs((previous) => ({
                         ...previous,
                         [providerId]: {
@@ -1447,8 +1447,7 @@ export function SettingsModal({
                       setDraftImageGenerationSystem((previous) =>
                         typeof value === 'function' ? value(previous) : value,
                       )
-                      setImageSaveNotice('')
-                      setImageSaveError('')
+                      setImageSaveNotice(''); setImageSaveError('')
                     }}
                     onImageProviderConfigChange={(providerId, updates) => {
                       setDraftImageProviderConfigs((previous) => {
@@ -1491,6 +1490,8 @@ export function SettingsModal({
                       setImageSaveError('')
                     }}
                   />
+                ) : (
+                  <ImageVisionSettingsPanel />
                 )}
               </div>
             ) : null}
@@ -1678,8 +1679,7 @@ export function SettingsModal({
                     disabled={imageSaveBusy}
                     onClick={async () => {
                       setImageSaveBusy(true)
-                      setImageSaveError('')
-                      setImageSaveNotice('')
+                      setImageSaveError(''); setImageSaveNotice('')
                       try {
                         await onSaveImageGenerationSettings(draftImageProviderConfigs, draftImageGenerationSystem)
                         setImageSaveNotice('图片大模型配置已保存，重启后会自动恢复。')

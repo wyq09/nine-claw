@@ -1396,6 +1396,9 @@ impl PiBridge {
         if let (Some(agent_config), Some(provider_config)) =
             (agent_config.as_ref(), runtime_provider_config.as_ref())
         {
+            let vision_runtime_config = crate::managed_runtime::injected_app_handle()
+                .and_then(|app| crate::image_vision::resolve_default_image_vision_runtime(&app).ok())
+                .flatten();
             managed_runtime_prepared = Some(managed_runtime::prepare_managed_runtime(
                 &self.pi_runtime.executable,
                 &runtime_dir,
@@ -1404,6 +1407,7 @@ impl PiBridge {
                 &key,
                 Some(provider_config),
                 None,
+                vision_runtime_config.as_ref(),
             )?);
         }
 

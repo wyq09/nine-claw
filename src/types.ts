@@ -266,6 +266,7 @@ export type AgentToolId =
   | 'web_fetch'
   | 'image_generate'
   | 'image_task_query'
+  | 'image_analyze'
   | 'ask_user'
   | 'agent_spawn'
   | 'external_api'
@@ -282,8 +283,7 @@ export type AgentToolId =
   | 'create_scheduled_task'
   | 'query_scheduled_task'
   | 'query_scheduled_task_info'
-  | 'mcp_tool'
-  | 'mcp_config'
+  | 'mcp_tool' | 'mcp_config'
 
 export type AgentCapabilityPolicy = {
   strategy: AgentSkillStrategy

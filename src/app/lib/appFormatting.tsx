@@ -43,6 +43,7 @@ export const AGENT_TOOL_OPTIONS: { id: AgentToolId; label: string; description: 
   { id: 'web_fetch', label: 'web_fetch', description: '抓取网页内容' },
   { id: 'image_generate', label: 'image_generate', description: '生成图片' },
   { id: 'image_task_query', label: 'image_task_query', description: '查询图片任务' },
+  { id: 'image_analyze', label: 'image_analyze', description: '调用系统识图模型识别图片/视频画面' },
   { id: 'ask_user', label: 'ask_user', description: '向用户发起澄清提问卡片' },
   { id: 'agent_spawn', label: 'agent_spawn', description: '委派子智能体' },
   { id: 'external_api', label: 'external_api', description: '调用外部 API 扩展' },
@@ -65,8 +66,7 @@ export const AGENT_TOOL_OPTIONS: { id: AgentToolId; label: string; description: 
 const AGENT_TOOL_ID_SET = new Set<AgentToolId>(AGENT_TOOL_OPTIONS.map((tool) => tool.id))
 
 const AGENT_TOOL_ALIASES: Record<string, AgentToolId> = {
-  read: 'read_file',
-  write: 'write_file',
+  read: 'read_file', write: 'write_file',
   edit: 'edit_file',
   ls: 'list_dir',
   find: 'glob',

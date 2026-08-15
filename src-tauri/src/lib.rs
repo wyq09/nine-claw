@@ -16,6 +16,7 @@ mod emit_safe;
 mod execution_mode_fold;
 mod heartbeat;
 mod image_generation;
+mod image_vision;
 mod llm_log_export;
 mod llm_trace;
 mod macos_native_dictation_panel;
@@ -92,6 +93,10 @@ pub(crate) use history_app_state::{
 pub(crate) use image_generation::{
     load_image_generation_preferences, resolve_default_image_generation_runtime,
     save_image_generation_preferences,
+};
+pub(crate) use image_vision::{
+    load_image_vision_preferences, resolve_default_image_vision_runtime,
+    save_image_vision_preferences,
 };
 pub(crate) use pi_usage::{
     accumulate_pi_token_usage, aggregate_usage_from_agent_messages, extract_usage_metadata_payload,
@@ -4575,21 +4580,13 @@ async fn stream_pi_prompt(
             "该会话已有进行中的生成，请等待完成或先中止后再发。".to_string()
         })?;
 
-        emit_stream_event(
-            &app,
-            "start",
-            Some(runtime_session_id.clone()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )?;
+         emit_stream_event(
+             &app,
+             "start",
+             Some(runtime_session_id.clone()),
+             None, None, None, None, None,
+             None, None, None, None, None,
+         )?;
 
         let fresh_multimodal_session = !prepared_input.images.is_empty();
         let session_path = if fresh_multimodal_session {
@@ -4635,6 +4632,7 @@ async fn stream_pi_prompt(
 
             if let Some(agent_config) = agent_config.as_ref() {
                 let image_runtime_config = resolve_default_image_generation_runtime(&app)?;
+                let vision_runtime_config = resolve_default_image_vision_runtime(&app)?;
                 managed_runtime_prepared = Some(managed_runtime::prepare_managed_runtime(
                     &pi_location.executable,
                     &runtime_dir,
@@ -4643,6 +4641,7 @@ async fn stream_pi_prompt(
                     &normalized_session_id,
                     Some(provider_config),
                     image_runtime_config.as_ref(),
+                    vision_runtime_config.as_ref(),
                 )?);
             }
 
@@ -7574,6 +7573,8 @@ pub fn run() {
             trigger_embedding_reindex_command,
             load_image_generation_preferences,
             save_image_generation_preferences,
+            load_image_vision_preferences,
+            save_image_vision_preferences,
             load_mcp_settings,
             list_installed_skills,
             list_system_skill_catalog,

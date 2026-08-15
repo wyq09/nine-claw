@@ -6,6 +6,7 @@ const MANAGED_RUNTIME_WEB_SEARCH_FILE: &str = "nineclaw-web-search-tool.mjs";
 const MANAGED_RUNTIME_WEB_FETCH_FILE: &str = "nineclaw-web-fetch-tool.mjs";
 const MANAGED_RUNTIME_IMAGE_GENERATION_FILE: &str = "nineclaw-image-generation-tool.mjs";
 const MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE: &str = "nineclaw-image-task-query-tool.mjs";
+const MANAGED_RUNTIME_IMAGE_VISION_FILE: &str = "nineclaw-image-vision-tool.mjs";
 const MANAGED_RUNTIME_TOOL_RESULT_STORAGE_FILE: &str = "tool_result_storage.mjs";
 const MANAGED_RUNTIME_CURL_HTTP_FILE: &str = "curl_http.mjs";
 const MANAGED_RUNTIME_WEB_SEARCH_TRANSPORT_FILE: &str = "web_search_transport.mjs";
@@ -38,6 +39,8 @@ const IMAGE_GENERATION_TOOL_SOURCE: &str =
     include_str!("../../src/runtime-tools/image_generation_tool.mjs");
 const IMAGE_TASK_QUERY_TOOL_SOURCE: &str =
     include_str!("../../src/runtime-tools/image_task_query_tool.mjs");
+const IMAGE_VISION_TOOL_SOURCE: &str =
+    include_str!("../../src/runtime-tools/image_vision_tool.mjs");
 const TOOL_RESULT_STORAGE_SOURCE: &str =
     include_str!("../../src/runtime-tools/tool_result_storage.mjs");
 const CURL_HTTP_SOURCE: &str = include_str!("../../src/runtime-tools/curl_http.mjs");
@@ -81,6 +84,17 @@ const SKILL_AUTO_CREATION_PROMPT_SOURCE: &str =
 const SKILL_REFLECTION_PROMPT_SOURCE: &str =
     include_str!("../../src/runtime-tools/prompts/skill_reflection.md");
 
+fn write_runtime_module(
+    runtime_dir: &Path,
+    file_const: &str,
+    source: &str,
+    label: &str,
+) -> Result<(), String> {
+    let target = runtime_dir.join(file_const);
+    fs::write(&target, source)
+        .map_err(|error| format!("写入 {label} 失败 {}: {error}", target.display()))
+}
+
 pub(crate) fn write_managed_runtime_extension_files(
     runtime_dir: &Path,
     typebox_import_path: &Path,
@@ -92,237 +106,65 @@ pub(crate) fn write_managed_runtime_extension_files(
         )
     })?;
 
-    let helper_path = runtime_dir.join(MANAGED_RUNTIME_WEB_SEARCH_FILE);
-    fs::write(&helper_path, WEB_SEARCH_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 web_search 运行时模块失败 {}: {error}",
-            helper_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_WEB_SEARCH_FILE, WEB_SEARCH_TOOL_SOURCE, "web_search 运行时模块")?;
 
-    let fetch_helper_path = runtime_dir.join(MANAGED_RUNTIME_WEB_FETCH_FILE);
-    fs::write(&fetch_helper_path, WEB_FETCH_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 web_fetch 运行时模块失败 {}: {error}",
-            fetch_helper_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_WEB_FETCH_FILE, WEB_FETCH_TOOL_SOURCE, "web_fetch 运行时模块")?;
 
-    let storage_helper_path = runtime_dir.join(MANAGED_RUNTIME_TOOL_RESULT_STORAGE_FILE);
-    fs::write(&storage_helper_path, TOOL_RESULT_STORAGE_SOURCE).map_err(|error| {
-        format!(
-            "写入 tool result storage 运行时模块失败 {}: {error}",
-            storage_helper_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_TOOL_RESULT_STORAGE_FILE, TOOL_RESULT_STORAGE_SOURCE, "tool result storage 运行时模块")?;
 
-    let curl_http_path = runtime_dir.join(MANAGED_RUNTIME_CURL_HTTP_FILE);
-    fs::write(&curl_http_path, CURL_HTTP_SOURCE).map_err(|error| {
-        format!(
-            "写入 curl_http 运行时模块失败 {}: {error}",
-            curl_http_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_CURL_HTTP_FILE, CURL_HTTP_SOURCE, "curl_http 运行时模块")?;
 
-    let web_search_transport_path = runtime_dir.join(MANAGED_RUNTIME_WEB_SEARCH_TRANSPORT_FILE);
-    fs::write(&web_search_transport_path, WEB_SEARCH_TRANSPORT_SOURCE).map_err(|error| {
-        format!(
-            "写入 web_search_transport 运行时模块失败 {}: {error}",
-            web_search_transport_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_WEB_SEARCH_TRANSPORT_FILE, WEB_SEARCH_TRANSPORT_SOURCE, "web_search_transport 运行时模块")?;
 
-    let image_downloader_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_DOWNLOADER_FILE);
-    fs::write(&image_downloader_path, IMAGE_DOWNLOADER_SOURCE).map_err(|error| {
-        format!(
-            "写入 image_downloader 运行时模块失败 {}: {error}",
-            image_downloader_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_IMAGE_DOWNLOADER_FILE, IMAGE_DOWNLOADER_SOURCE, "image_downloader 运行时模块")?;
 
-    let image_generation_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_GENERATION_FILE);
-    fs::write(&image_generation_path, IMAGE_GENERATION_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 image_generation 运行时模块失败 {}: {error}",
-            image_generation_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_IMAGE_GENERATION_FILE, IMAGE_GENERATION_TOOL_SOURCE, "image_generation 运行时模块")?;
 
-    let image_task_query_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE);
-    fs::write(&image_task_query_path, IMAGE_TASK_QUERY_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 image_task_query 运行时模块失败 {}: {error}",
-            image_task_query_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE, IMAGE_TASK_QUERY_TOOL_SOURCE, "image_task_query 运行时模块")?;
 
-    let agent_delegate_path = runtime_dir.join(MANAGED_RUNTIME_AGENT_DELEGATE_FILE);
-    fs::write(&agent_delegate_path, AGENT_DELEGATE_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 agent_delegate 运行时模块失败 {}: {error}",
-            agent_delegate_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_IMAGE_VISION_FILE, IMAGE_VISION_TOOL_SOURCE, "image_vision 运行时模块")?;
 
-    let ask_user_path = runtime_dir.join(MANAGED_RUNTIME_ASK_USER_FILE);
-    fs::write(&ask_user_path, ASK_USER_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 ask_user 运行时模块失败 {}: {error}",
-            ask_user_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_AGENT_DELEGATE_FILE, AGENT_DELEGATE_TOOL_SOURCE, "agent_delegate 运行时模块")?;
 
-    let mcp_tool_path = runtime_dir.join(MANAGED_RUNTIME_MCP_TOOL_FILE);
-    fs::write(&mcp_tool_path, MCP_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 mcp_tool 运行时模块失败 {}: {error}",
-            mcp_tool_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_ASK_USER_FILE, ASK_USER_TOOL_SOURCE, "ask_user 运行时模块")?;
 
-    let mcp_config_path = runtime_dir.join(MANAGED_RUNTIME_MCP_CONFIG_FILE);
-    fs::write(&mcp_config_path, MCP_CONFIG_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 mcp_config 运行时模块失败 {}: {error}",
-            mcp_config_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_MCP_TOOL_FILE, MCP_TOOL_SOURCE, "mcp_tool 运行时模块")?;
 
-    let memory_update_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_UPDATE_FILE);
-    fs::write(&memory_update_path, MEMORY_UPDATE_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 memory_update 运行时模块失败 {}: {error}",
-            memory_update_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_MCP_CONFIG_FILE, MCP_CONFIG_TOOL_SOURCE, "mcp_config 运行时模块")?;
 
-    let memory_search_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_SEARCH_FILE);
-    fs::write(&memory_search_path, MEMORY_SEARCH_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 memory_search 运行时模块失败 {}: {error}",
-            memory_search_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_MEMORY_UPDATE_FILE, MEMORY_UPDATE_TOOL_SOURCE, "memory_update 运行时模块")?;
 
-    let memory_read_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_READ_FILE);
-    fs::write(&memory_read_path, MEMORY_READ_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 memory_read 运行时模块失败 {}: {error}",
-            memory_read_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_MEMORY_SEARCH_FILE, MEMORY_SEARCH_TOOL_SOURCE, "memory_search 运行时模块")?;
 
-    let memory_delete_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_DELETE_FILE);
-    fs::write(&memory_delete_path, MEMORY_DELETE_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 memory_delete 运行时模块失败 {}: {error}",
-            memory_delete_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_MEMORY_READ_FILE, MEMORY_READ_TOOL_SOURCE, "memory_read 运行时模块")?;
 
-    let memory_store_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_STORE_FILE);
-    fs::write(&memory_store_path, MEMORY_STORE_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 memory_store 运行时模块失败 {}: {error}",
-            memory_store_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_MEMORY_DELETE_FILE, MEMORY_DELETE_TOOL_SOURCE, "memory_delete 运行时模块")?;
 
-    let memory_save_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_SAVE_FILE);
-    fs::write(&memory_save_path, MEMORY_SAVE_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 memory_save 运行时模块失败 {}: {error}",
-            memory_save_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_MEMORY_STORE_FILE, MEMORY_STORE_TOOL_SOURCE, "memory_store 运行时模块")?;
 
-    let memory_get_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_GET_FILE);
-    fs::write(&memory_get_path, MEMORY_GET_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 memory_get 运行时模块失败 {}: {error}",
-            memory_get_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_MEMORY_SAVE_FILE, MEMORY_SAVE_TOOL_SOURCE, "memory_save 运行时模块")?;
 
-    let memory_forget_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_FORGET_FILE);
-    fs::write(&memory_forget_path, MEMORY_FORGET_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 memory_forget 运行时模块失败 {}: {error}",
-            memory_forget_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_MEMORY_GET_FILE, MEMORY_GET_TOOL_SOURCE, "memory_get 运行时模块")?;
 
-    let memory_list_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_LIST_FILE);
-    fs::write(&memory_list_path, MEMORY_LIST_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 memory_list 运行时模块失败 {}: {error}",
-            memory_list_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_MEMORY_FORGET_FILE, MEMORY_FORGET_TOOL_SOURCE, "memory_forget 运行时模块")?;
 
-    let chat_search_path = runtime_dir.join(MANAGED_RUNTIME_CHAT_SEARCH_FILE);
-    fs::write(&chat_search_path, CHAT_SEARCH_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 chat_search 运行时模块失败 {}: {error}",
-            chat_search_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_MEMORY_LIST_FILE, MEMORY_LIST_TOOL_SOURCE, "memory_list 运行时模块")?;
 
-    let memory_tool_transport_path = runtime_dir.join(MANAGED_RUNTIME_MEMORY_TOOL_TRANSPORT_FILE);
-    fs::write(&memory_tool_transport_path, MEMORY_TOOL_TRANSPORT_SOURCE).map_err(|error| {
-        format!(
-            "写入 memory_tool_transport 运行时模块失败 {}: {error}",
-            memory_tool_transport_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_CHAT_SEARCH_FILE, CHAT_SEARCH_TOOL_SOURCE, "chat_search 运行时模块")?;
 
-    let create_task_path = runtime_dir.join(MANAGED_RUNTIME_CREATE_TASK_FILE);
-    fs::write(&create_task_path, CREATE_SCHEDULED_TASK_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 create_scheduled_task 运行时模块失败 {}: {error}",
-            create_task_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_MEMORY_TOOL_TRANSPORT_FILE, MEMORY_TOOL_TRANSPORT_SOURCE, "memory_tool_transport 运行时模块")?;
 
-    let query_task_path = runtime_dir.join(MANAGED_RUNTIME_QUERY_TASK_FILE);
-    fs::write(&query_task_path, QUERY_SCHEDULED_TASK_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 query_scheduled_task 运行时模块失败 {}: {error}",
-            query_task_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_CREATE_TASK_FILE, CREATE_SCHEDULED_TASK_TOOL_SOURCE, "create_scheduled_task 运行时模块")?;
 
-    let query_task_info_path = runtime_dir.join(MANAGED_RUNTIME_QUERY_TASK_INFO_FILE);
-    fs::write(&query_task_info_path, QUERY_SCHEDULED_TASK_INFO_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 query_scheduled_task_info 运行时模块失败 {}: {error}",
-            query_task_info_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_QUERY_TASK_FILE, QUERY_SCHEDULED_TASK_TOOL_SOURCE, "query_scheduled_task 运行时模块")?;
 
-    let skill_creator_path = runtime_dir.join(MANAGED_RUNTIME_SKILL_CREATOR_FILE);
-    fs::write(&skill_creator_path, SKILL_CREATOR_TOOL_SOURCE).map_err(|error| {
-        format!(
-            "写入 skill_creator 运行时模块失败 {}: {error}",
-            skill_creator_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_QUERY_TASK_INFO_FILE, QUERY_SCHEDULED_TASK_INFO_TOOL_SOURCE, "query_scheduled_task_info 运行时模块")?;
 
-    let skill_evolution_path = runtime_dir.join(MANAGED_RUNTIME_SKILL_EVOLUTION_FILE);
-    fs::write(&skill_evolution_path, SKILL_EVOLUTION_RUNTIME_SOURCE).map_err(|error| {
-        format!(
-            "写入 skill_evolution 运行时模块失败 {}: {error}",
-            skill_evolution_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_SKILL_CREATOR_FILE, SKILL_CREATOR_TOOL_SOURCE, "skill_creator 运行时模块")?;
 
-    let skill_auto_prompt_path = runtime_dir.join(MANAGED_RUNTIME_SKILL_AUTO_CREATION_PROMPT_FILE);
-    fs::write(&skill_auto_prompt_path, SKILL_AUTO_CREATION_PROMPT_SOURCE).map_err(|error| {
-        format!(
-            "写入 skill auto-creation prompt 失败 {}: {error}",
-            skill_auto_prompt_path.display()
-        )
-    })?;
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_SKILL_EVOLUTION_FILE, SKILL_EVOLUTION_RUNTIME_SOURCE, "skill_evolution 运行时模块")?;
+
+    write_runtime_module(runtime_dir, MANAGED_RUNTIME_SKILL_AUTO_CREATION_PROMPT_FILE, SKILL_AUTO_CREATION_PROMPT_SOURCE, "skill auto-creation prompt")?;
 
     let skill_reflection_prompt_path =
         runtime_dir.join(MANAGED_RUNTIME_SKILL_REFLECTION_PROMPT_FILE);
@@ -338,15 +180,14 @@ pub(crate) fn write_managed_runtime_extension_files(
     })?;
 
     let extension_source = build_managed_runtime_extension_source(typebox_import_path)?;
-    let extension_path = runtime_dir.join(MANAGED_RUNTIME_EXTENSION_FILE);
-    fs::write(&extension_path, extension_source).map_err(|error| {
-        format!(
-            "写入 managed runtime 扩展失败 {}: {error}",
-            extension_path.display()
-        )
-    })?;
+    write_runtime_module(
+        runtime_dir,
+        MANAGED_RUNTIME_EXTENSION_FILE,
+        &extension_source,
+        "managed runtime 扩展",
+    )?;
 
-    Ok(extension_path)
+    Ok(runtime_dir.join(MANAGED_RUNTIME_EXTENSION_FILE))
 }
 
 fn build_managed_runtime_extension_source(typebox_import_path: &Path) -> Result<String, String> {
@@ -372,6 +213,7 @@ import {{ createWebSearchTool }} from "./{MANAGED_RUNTIME_WEB_SEARCH_FILE}";
 import {{ createWebFetchTool }} from "./{MANAGED_RUNTIME_WEB_FETCH_FILE}";
 import {{ createImageGenerationTool }} from "./{MANAGED_RUNTIME_IMAGE_GENERATION_FILE}";
 import {{ createImageTaskQueryTool }} from "./{MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE}";
+import {{ createImageVisionTool }} from "./{MANAGED_RUNTIME_IMAGE_VISION_FILE}";
 import {{ createAgentDelegateTool }} from "./{MANAGED_RUNTIME_AGENT_DELEGATE_FILE}";
 import {{ createAskUserTool }} from "./{MANAGED_RUNTIME_ASK_USER_FILE}";
 import {{ createMcpTool }} from "./{MANAGED_RUNTIME_MCP_TOOL_FILE}";
@@ -475,6 +317,7 @@ const NINECLAW_SYSTEM_PROMPT_APPEND = [
   "When you use ask_user and the user submits an answer, treat that tool result as clarification, not as the end of the turn.",
   "After a successful ask_user result, continue the task immediately and answer the user using the submitted information.",
   "Do not stop at the tool result unless the user explicitly asked you to only collect the answer.",
+  "When the user's message contains image or video attachment paths (markdown file links) or image URLs and you cannot view media directly, call the image_analyze tool with those paths/URLs first, then answer based on the returned description.",
 ].join("\\n");
 
 function stableToolInput(value) {{
@@ -513,6 +356,7 @@ export default function(pi) {{
   let webFetchToolRegistered = false;
   let imageGenerationToolRegistered = false;
   let imageTaskQueryToolRegistered = false;
+  let imageVisionToolRegistered = false;
   let agentDelegateToolRegistered = false;
   let askUserToolRegistered = false;
   let mcpToolRegistered = false;
@@ -618,6 +462,18 @@ export default function(pi) {{
         cryptoApi: crypto,
         processApi: process,
         withFileMutationQueue,
+      }})
+    );
+  }}
+
+  function ensureImageVisionTool() {{
+    if (imageVisionToolRegistered) return;
+    imageVisionToolRegistered = true;
+    pi.registerTool(
+      createImageVisionTool({{
+        Type,
+        fetchImpl: localHttpPost,
+        processApi: process,
       }})
     );
   }}
@@ -805,6 +661,7 @@ export default function(pi) {{
     ensureWebFetchTool();
     ensureImageGenerationTool();
     ensureImageTaskQueryTool();
+    ensureImageVisionTool();
     ensureAgentDelegateTool();
     ensureAskUserTool();
     ensureMcpTool();
@@ -835,6 +692,7 @@ export default function(pi) {{
     ensureWebFetchTool();
     ensureImageGenerationTool();
     ensureImageTaskQueryTool();
+    ensureImageVisionTool();
     ensureAgentDelegateTool();
     ensureAskUserTool();
     ensureMcpTool();
@@ -936,6 +794,7 @@ mod tests {
         let web_search_transport_path = runtime_dir.join(MANAGED_RUNTIME_WEB_SEARCH_TRANSPORT_FILE);
         let image_downloader_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_DOWNLOADER_FILE);
         let image_task_query_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_TASK_QUERY_FILE);
+        let image_vision_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_VISION_FILE);
         let image_generation_path = runtime_dir.join(MANAGED_RUNTIME_IMAGE_GENERATION_FILE);
         let mcp_tool_path = runtime_dir.join(MANAGED_RUNTIME_MCP_TOOL_FILE);
         let skill_creator_path = runtime_dir.join(MANAGED_RUNTIME_SKILL_CREATOR_FILE);
@@ -952,6 +811,7 @@ mod tests {
                 "ensureWebFetchTool",
                 "ensureImageGenerationTool",
                 "ensureImageTaskQueryTool",
+                "ensureImageVisionTool",
                 "ensureAskUserTool",
                 "ensureMcpTool",
                 "ensureMcpConfigTool",
@@ -995,6 +855,7 @@ mod tests {
         );
         assert!(read(&image_generation_path).contains("name: \"image_generate\""));
         assert!(read(&image_task_query_path).contains("name: \"image_task_query\""));
+        assert!(read(&image_vision_path).contains("name: \"image_analyze\""));
         assert!(read(&mcp_tool_path).contains("name: 'mcp_tool'"));
         let mcp_config_path = runtime_dir.join(MANAGED_RUNTIME_MCP_CONFIG_FILE);
         assert!(read(&mcp_config_path).contains("name: 'mcp_config'"));

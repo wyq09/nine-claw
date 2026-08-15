@@ -13,22 +13,11 @@ use tauri::AppHandle;
 use uuid::Uuid;
 
 const DEFAULT_AGENT_STATE_KEY: &str = "default_agent_id";
+// 历史默认工具白名单（仅用于识别并升级存量默认配置，勿再新增）。
 const LEGACY_DEFAULT_ALLOWED_TOOL_IDS: &[&str] = &[
-    "bash",
-    "read_file",
-    "write_file",
-    "edit_file",
-    "grep",
-    "list_dir",
-    "glob",
-    "web_search",
-    "web_fetch",
-    "image_generate",
-    "image_task_query",
-    "ask_user",
-    "agent_spawn",
-    "external_api",
-    "mcp_tool",
+    "bash", "read_file", "write_file", "edit_file", "grep", "list_dir", "glob", "web_search",
+    "web_fetch", "image_generate", "image_task_query", "ask_user", "agent_spawn",
+    "external_api", "mcp_tool",
 ];
 const DEFAULT_ALLOWED_TOOL_IDS: &[&str] = &[
     "bash",
@@ -42,6 +31,7 @@ const DEFAULT_ALLOWED_TOOL_IDS: &[&str] = &[
     "web_fetch",
     "image_generate",
     "image_task_query",
+    "image_analyze",
     "ask_user",
     "agent_spawn",
     "external_api",
@@ -394,6 +384,11 @@ fn legacy_default_allowed_tool_ids() -> Vec<String> {
         .iter()
         .map(|item| item.to_string())
         .collect()
+}
+
+/// 上一版默认工具列表（不含新加入的 image_analyze），用于把存量默认配置升级到最新默认。
+fn previous_default_allowed_tool_ids() -> Vec<String> {
+    DEFAULT_ALLOWED_TOOL_IDS.iter().filter(|item| **item != "image_analyze").map(|item| item.to_string()).collect()
 }
 
 pub fn normalize_allowed_tool_ids(tool_ids: Vec<String>) -> Vec<String> {
@@ -1092,7 +1087,7 @@ fn upgrade_legacy_default_allowed_tools(connection: &Connection) -> Result<(), S
             .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
             .map(normalize_allowed_tool_ids)
             .unwrap_or_else(default_allowed_tool_ids);
-        if normalized == legacy_default {
+        if normalized == legacy_default || normalized == previous_default_allowed_tool_ids() {
             ids_to_upgrade.push(agent_id);
         }
     }
@@ -3120,6 +3115,10 @@ fn list_active_agents_for_workspace(connection: &Connection) -> Result<Vec<Agent
 
     Ok(agents)
 }
+
+#[cfg(test)]
+#[path = "agents_tool_upgrade_test.rs"]
+mod agents_tool_upgrade_test;
 
 #[cfg(test)]
 mod tests {

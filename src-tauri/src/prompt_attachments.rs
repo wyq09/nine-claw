@@ -32,7 +32,7 @@ pub struct PromptAttachmentInput {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PromptImageInput {
+pub(crate) struct PromptImageInput {
     #[serde(rename = "type")]
     pub content_type: String,
     pub data: String,
@@ -697,7 +697,7 @@ fn extract_video_frames_best_effort(path: &Path, images: &mut Vec<PromptImageInp
     }
 }
 
-fn extract_video_frames(path: &Path, images: &mut Vec<PromptImageInput>) -> Result<usize, String> {
+pub(crate) fn extract_video_frames(path: &Path, images: &mut Vec<PromptImageInput>) -> Result<usize, String> {
     let temp_dir = create_temporary_artifact_dir("video-frames")?;
     let duration_secs = video_duration_seconds(path).unwrap_or(None);
     let timestamps = compute_video_frame_timestamps(duration_secs);

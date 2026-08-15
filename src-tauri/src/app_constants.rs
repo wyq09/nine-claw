@@ -11,3 +11,4 @@ pub(crate) const PROVIDER_CONFIGS_STATE_KEY: &str = "provider_configs_v1";
 pub(crate) const CUSTOM_PROVIDER_META_STATE_KEY: &str = "custom_provider_meta_v1";
 pub(crate) const IMAGE_PROVIDER_CONFIGS_STATE_KEY: &str = "image_provider_configs_v1";
 pub(crate) const IMAGE_GENERATION_SYSTEM_STATE_KEY: &str = "image_generation_system_v1";
+pub(crate) const IMAGE_VISION_SYSTEM_STATE_KEY: &str = "image_vision_system_v1";

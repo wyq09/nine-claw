@@ -2,6 +2,10 @@ use crate::agents::ConversationAgentConfig;
 use crate::image_generation::{
     dispatch_image_generation, ImageGenerateProxyRequest, ImageGenerationRuntimeConfig,
 };
+use crate::image_vision::{
+    dispatch_image_vision, ImageVisionAnalyzeRequest, ImageVisionAnalyzeResponse,
+    ImageVisionRuntimeConfig,
+};
 use crate::provider_runtime::{
     normalize_provider_api_format, normalized_provider_runtime_base_url, ProviderRuntimeConfig,
 };
@@ -129,6 +133,7 @@ pub struct LlmProxyBinding {
 struct ProxySessionConfig {
     llm: Option<LlmProxyBinding>,
     image: Option<ImageGenerationRuntimeConfig>,
+    vision: Option<ImageVisionRuntimeConfig>,
     external_apis: HashMap<String, ExternalApiCredential>,
     session_id: Option<String>,
     workspace_id: Option<String>,
@@ -1037,6 +1042,7 @@ pub fn prepare_managed_runtime(
     session_id: &str,
     provider_config: Option<&ProviderRuntimeConfig>,
     image_runtime_config: Option<&ImageGenerationRuntimeConfig>,
+    vision_runtime_config: Option<&ImageVisionRuntimeConfig>,
 ) -> Result<PreparedManagedRuntime, String> {
     let workspace_root = crate::agent_workspace::resolve_workspace_root()?;
     let agent_home = workspace_root.join("agents").join(&agent_config.id);
@@ -1081,6 +1087,7 @@ pub fn prepare_managed_runtime(
             ProxySessionConfig {
                 llm: llm_proxy.clone(),
                 image: image_runtime_config.cloned(),
+                vision: vision_runtime_config.cloned(),
                 external_apis,
                 session_id: Some(session_id.to_string()),
                 workspace_id: None,
@@ -1157,6 +1164,7 @@ fn credential_proxy_server() -> Result<&'static CredentialProxyServer, String> {
         .route("/external/:token/dispatch", post(external_proxy_handler))
         .route("/image/:token/generate", post(image_proxy_handler))
         .route("/image/:token/task/:task_id", get(image_task_query_handler))
+        .route("/vision/:token/describe", post(vision_proxy_handler))
         .route("/delegate/:token/dispatch", post(delegate_proxy_handler))
         .route("/ask-user/:token/dispatch", post(ask_user_proxy_handler))
         .route("/memory/:token/update", post(memory_update_handler))
@@ -1374,21 +1382,7 @@ async fn image_proxy_handler(
     AxumPath(token): AxumPath<String>,
     Json(payload): Json<ImageGenerateProxyRequest>,
 ) -> Result<Json<crate::image_generation::ImageGenerateProxyResponse>, (StatusCode, String)> {
-    let session = {
-        let guard = state.sessions.lock().map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "credential proxy session lock poisoned".to_string(),
-            )
-        })?;
-        guard.get(&token).cloned()
-    };
-    let Some(session) = session else {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "unknown credential proxy session".to_string(),
-        ));
-    };
+    let session = resolve_proxy_session(&state, &token)?;
     let Some(image_runtime) = session.image else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1405,21 +1399,7 @@ async fn image_task_query_handler(
     State(state): State<CredentialProxyState>,
     AxumPath((token, task_id)): AxumPath<(String, String)>,
 ) -> Result<Json<crate::image_generation::ImageTaskQueryResponse>, (StatusCode, String)> {
-    let session = {
-        let guard = state.sessions.lock().map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "credential proxy session lock poisoned".to_string(),
-            )
-        })?;
-        guard.get(&token).cloned()
-    };
-    let Some(session) = session else {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "unknown credential proxy session".to_string(),
-        ));
-    };
+    let session = resolve_proxy_session(&state, &token)?;
     let Some(image_runtime) = session.image else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1430,6 +1410,24 @@ async fn image_task_query_handler(
         crate::image_generation::dispatch_image_task_query(&state.client, &image_runtime, &task_id)
             .await
             .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
+    Ok(Json(response))
+}
+
+async fn vision_proxy_handler(
+    State(state): State<CredentialProxyState>,
+    AxumPath(token): AxumPath<String>,
+    Json(payload): Json<ImageVisionAnalyzeRequest>,
+) -> Result<Json<ImageVisionAnalyzeResponse>, (StatusCode, String)> {
+    let session = resolve_proxy_session(&state, &token)?;
+    let Some(vision_runtime) = session.vision else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "no image vision runtime configured".to_string(),
+        ));
+    };
+    let response = dispatch_image_vision(&state.client, &vision_runtime, &payload)
+        .await
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error))?;
     Ok(Json(response))
 }
 
