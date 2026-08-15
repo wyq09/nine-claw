@@ -16,6 +16,8 @@
     "tauri": "tauri",
     "build:macos": "bash scripts/build-macos.sh",
     "build:macos:dmg": "bash scripts/build-macos.sh --bundles dmg",
+    "cleanup:build": "node scripts/cleanup-build-artifacts.mjs",
+    "cleanup:build:dry": "node scripts/cleanup-build-artifacts.mjs --dry-run",
     "check": "npm run check:size && tsc -b && npm run test",
     "check:size": "node scripts/check-file-size.mjs",
     "check:size:update": "node scripts/check-file-size.mjs --update-baseline",

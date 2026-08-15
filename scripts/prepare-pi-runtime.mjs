@@ -36,7 +36,7 @@ function runCommand(command, args) {
 }
 
 function copyRecursive(sourcePath, targetPath) {
-  fs.rmSync(targetPath, { recursive: true, force: true })
+  fs.rmSync(targetPath, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
   fs.mkdirSync(path.dirname(targetPath), { recursive: true })
   // Dereference symlinks so the bundled runtime does not keep absolute links
   // back to the build machine's global npm install.
@@ -44,7 +44,7 @@ function copyRecursive(sourcePath, targetPath) {
 }
 
 function copyEntry(sourcePath, targetPath) {
-  fs.rmSync(targetPath, { recursive: true, force: true })
+  fs.rmSync(targetPath, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
   fs.mkdirSync(path.dirname(targetPath), { recursive: true })
   const stats = fs.statSync(sourcePath)
   if (stats.isDirectory()) {
@@ -492,7 +492,7 @@ function downloadOfficialNode(platformDir) {
   console.log(`[prepare-pi-runtime] URL: ${url}`)
 
   const tmpDir = path.join(officialNodeCacheDir(), '.tmp', cacheKey)
-  fs.rmSync(tmpDir, { recursive: true, force: true })
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
   fs.mkdirSync(tmpDir, { recursive: true })
 
   const archivePath = path.join(tmpDir, archiveName)
@@ -515,13 +515,13 @@ function downloadOfficialNode(platformDir) {
 
   if (curlResult.status !== 0 || !fs.existsSync(archivePath)) {
     console.warn(`[prepare-pi-runtime] Failed to download official Node.js: curl exit ${curlResult.status}`)
-    fs.rmSync(tmpDir, { recursive: true, force: true })
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
     return null
   }
 
   // Extract
   const extractDir = path.join(officialNodeCacheDir(), cacheKey)
-  fs.rmSync(extractDir, { recursive: true, force: true })
+  fs.rmSync(extractDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
   fs.mkdirSync(extractDir, { recursive: true })
 
   if (platformDir === 'windows') {
@@ -534,20 +534,20 @@ with zipfile.ZipFile(${JSON.stringify(archivePath)}) as zf:
     const pyResult = spawnSync('python3', ['-c', script], { encoding: 'utf8' })
     if (pyResult.status !== 0) {
       console.warn('[prepare-pi-runtime] Failed to extract Node.js zip')
-      fs.rmSync(tmpDir, { recursive: true, force: true })
+      fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
       return null
     }
   } else {
     const tarResult = spawnSync('tar', ['-xzf', archivePath, '-C', extractDir], { encoding: 'utf8' })
     if (tarResult.status !== 0) {
       console.warn('[prepare-pi-runtime] Failed to extract Node.js tarball')
-      fs.rmSync(tmpDir, { recursive: true, force: true })
+      fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
       return null
     }
   }
 
   // Cleanup temp download
-  fs.rmSync(tmpDir, { recursive: true, force: true })
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
 
   // Verify extraction — tar creates a versioned subdirectory
   let exePath = platformDir === 'windows' ? cachedWinExePath : cachedExePath
@@ -785,7 +785,7 @@ function writeMonoBundleReadme(targetPath, lines) {
 
 function stageRepoMonoBundle(targetDir, repoDir) {
   const monoTargetDir = path.join(targetDir, 'pi-mono')
-  fs.rmSync(monoTargetDir, { recursive: true, force: true })
+  fs.rmSync(monoTargetDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
   fs.mkdirSync(monoTargetDir, { recursive: true })
 
   const rootEntries = [
@@ -833,7 +833,7 @@ function stageRepoMonoBundle(targetDir, repoDir) {
 function stageInstalledMonoBundle(targetDir) {
   const monoTargetDir = path.join(targetDir, 'pi-mono')
   const monoNodeModulesDir = path.join(monoTargetDir, 'node_modules')
-  fs.rmSync(monoTargetDir, { recursive: true, force: true })
+  fs.rmSync(monoTargetDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
   fs.mkdirSync(monoNodeModulesDir, { recursive: true })
 
   const packages = []

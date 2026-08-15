@@ -86,6 +86,17 @@ npm run tauri build -- --bundles dmg
 - `.dmg`: `src-tauri/target/release/bundle/dmg/NineClaw_0.1.0_aarch64.dmg`
 - Windows 需要 Windows 机器或 GitHub Actions，无法在 macOS 交叉编译
 
+### 构建后清理（重要）
+
+一次完整打包会留下 ~20GB 过程文件（cargo target、node 二进制缓存、pi-runtime 暂存、dist）。打包验证完成后运行：
+
+```sh
+npm run cleanup:build         # 清理过程文件；.app/.dmg 自动挪到 release-artifacts/ 保全
+npm run cleanup:build:dry     # 只预览将释放的空间，不删除
+```
+
+清理脚本（`scripts/cleanup-build-artifacts.mjs`）只删白名单目录、保留 git 跟踪文件（含受保护的 `pi` launcher），下次构建自动重建全部内容。
+
 ### Build Pipeline（`npm run build`）
 
 1. `build:lark-helper` — esbuild 打包飞书 bot helper
