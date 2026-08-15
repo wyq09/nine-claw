@@ -347,7 +347,9 @@ function cleanPlatformDir(platformDir) {
   fs.mkdirSync(targetDir, { recursive: true })
   for (const entry of fs.readdirSync(targetDir)) {
     const fullPath = path.join(targetDir, entry)
-    fs.rmSync(fullPath, { recursive: true, force: true })
+    // maxRetries: on macOS, Spotlight/backup scanners briefly hold freshly written
+    // runtime files, which makes rmSync fail with ENOTEMPTY/EBUSY on first attempt.
+    fs.rmSync(fullPath, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
   }
   return targetDir
 }
