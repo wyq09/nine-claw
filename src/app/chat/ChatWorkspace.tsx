@@ -36,6 +36,8 @@ import {
   STARTER_CHIPS,
 } from '../lib'
 import { ImagePreviewModal } from './TurnAndTools'
+import { CreateBranchDialog } from './CreateBranchDialog'
+import { useCreateBranchFlow, type ForkSessionTurnHandler } from './useCreateBranchFlow'
 import { getStreamingTurnLayoutRevision } from './streamingLayout'
 import { useChatTurnWindow } from './useChatTurnWindow'
 import { useSessionContextWindow } from '../../hooks/useSessionContextWindow'
@@ -122,6 +124,8 @@ export type ChatViewProps = {
   workspaceComposerNoteMode?: boolean
   /** 覆盖输入框 placeholder（如旁白模式下的操作提示）。 */
   workspaceComposerPlaceholder?: string | null
+  /** 可选：在某轮上创建会话分支；缺省时消息区不显示「创建分支」按钮。 */
+  onForkSessionTurn?: ForkSessionTurnHandler
 }
 
 export function ChatView({
@@ -163,6 +167,7 @@ export function ChatView({
   workspaceComposerOverlay,
   onComposerInput,
   resolveSpeaker,
+  onForkSessionTurn,
   workspaceComposerNoteMode = false,
   workspaceComposerPlaceholder = null,
 }: ChatViewProps) {
@@ -232,6 +237,13 @@ export function ChatView({
     }
   }, [composerClearRef, composerDraftBackupRef, composerSetTextRef])
   const turns = activeHistoryItem?.turns ?? []
+  const { forkTarget, forkBusy, handleForkTurn, handleForkConfirm, cancelFork } =
+    useCreateBranchFlow({
+      activeHistoryId,
+      turns,
+      onForkSessionTurn,
+      onError: (message) => toast.error(message),
+    })
   const { visibleTurns, visibleRangeStart, hasMoreAbove, loadMoreAbove } = useChatTurnWindow(
     turns,
     activeHistoryId,
@@ -744,6 +756,7 @@ export function ChatView({
                 copiedPromptTurnId={copiedPromptTurnId}
                 onCopyAnswer={handleCopyAnswer}
                 onCopyPrompt={handleCopyPrompt}
+                onForkTurn={onForkSessionTurn ? handleForkTurn : undefined}
                 onCreateAgentDraft={onCreateAgentDraft}
                 onImageClick={handleMarkdownImageClick}
                 hasMoreOlder={hasMoreAbove}
@@ -763,6 +776,17 @@ export function ChatView({
           alt={previewImage.alt}
           src={previewImage.src}
           onClose={() => setPreviewImage(null)}
+        />
+      ) : null}
+
+      {forkTarget ? (
+        <CreateBranchDialog
+          forkPointPrompt={forkTarget.prompt}
+          busy={forkBusy}
+          onCancel={cancelFork}
+          onConfirm={(mode) => {
+            void handleForkConfirm(mode)
+          }}
         />
       ) : null}
     </div>

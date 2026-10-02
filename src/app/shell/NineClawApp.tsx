@@ -196,7 +196,7 @@ export function NineClawApp() {
     createEmptySession,
     selectHistoryItem,
     clearHistory,
-    deleteHistoryItem,
+    deleteHistoryItem, forkHistoryItem,
     renameHistoryItem,
     regenerateHistoryTitle,
     updateSessionLlm,
@@ -2555,7 +2555,7 @@ export function NineClawApp() {
           onComposerPickAttachment={openComposerAttachmentPicker}
           onComposerRemoveAttachment={removeComposerAttachment}
           onComposerClearAttachmentError={clearComposerAttachmentError}
-          onChatSubmit={handleSubmit}
+          onChatSubmit={handleSubmit} onForkSessionTurn={forkHistoryItem}
           activeChatAgent={activeChatAgent}
           submitShortcut={generalSettings.submitShortcut}
           activeHistoryItem={view === 'chat' ? standaloneActiveHistoryItem : activeHistoryItem}

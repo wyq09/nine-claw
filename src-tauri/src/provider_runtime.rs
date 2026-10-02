@@ -1,10 +1,44 @@
 use crate::app_constants::{CUSTOM_PROVIDER_META_STATE_KEY, PROVIDER_CONFIGS_STATE_KEY};
 use crate::history_app_state::open_history_db;
+use md5::{Digest, Md5};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::AppHandle;
+
+/// Stable runtime provider id derived from the configured provider id
+/// (moved here from lib.rs; pure md5-based helper).
+pub(crate) fn runtime_provider_id(provider_id: &str) -> String {
+    let trimmed = provider_id.trim();
+    if trimmed.is_empty() {
+        return "nineclaw-runtime-provider".to_string();
+    }
+
+    let digest = format!("{:x}", Md5::digest(trimmed.as_bytes()));
+    format!("nineclaw-runtime-{}", &digest[..12])
+}
+
+pub(crate) fn runtime_provider_suffix(provider_id: &str) -> String {
+    let trimmed = provider_id.trim();
+    if trimmed.is_empty() {
+        return "provider".to_string();
+    }
+
+    let digest = format!("{:x}", Md5::digest(trimmed.as_bytes()));
+    digest[..12].to_string()
+}
+
+pub(crate) fn anthropic_compat_provider_id(provider_id: &str) -> String {
+    format!("nineclaw-compat-{}", runtime_provider_suffix(provider_id))
+}
+
+pub(crate) fn anthropic_compat_api_key_env(provider_id: &str) -> String {
+    format!(
+        "NINECLAW_PI_COMPAT_API_KEY_{}",
+        runtime_provider_suffix(provider_id).to_ascii_uppercase()
+    )
+}
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]

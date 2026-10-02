@@ -59,7 +59,7 @@ describe('sessionLlmLogClient', () => {
     const dispose = await onSessionLlmLogEvent(handler)
     dispose()
 
-    expect(listen).toHaveBeenCalledWith('session.llm_log.updated', expect.any(Function))
+    expect(listen).toHaveBeenCalledWith('session:llm_log:updated', expect.any(Function))
     expect(handler).toHaveBeenCalledWith({ sessionId: 's1', path: '/tmp/s1.md' })
     expect(unlisten).toHaveBeenCalled()
   })

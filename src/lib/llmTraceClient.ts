@@ -111,7 +111,7 @@ export type LlmTraceEvent = {
 export async function onLlmTraceEvent(
   handler: (payload: LlmTraceEvent) => void,
 ): Promise<() => void> {
-  const unlisten = await listen<LlmTraceEvent>('workspace.llm_trace', (event) => {
+  const unlisten = await listen<LlmTraceEvent>('workspace:llm_trace', (event) => {
     handler(event.payload)
   })
   return () => unlisten()

@@ -35,13 +35,15 @@ import type {
   ImageProviderDefinition,
 } from '../types/imageGeneration'
 import type { ResourcesViewProps, SkillsViewProps } from '../app/pages/LibraryAndTasks'
-import { AppIcon, type IconName } from './AppIcon'
+import { AppIcon } from './AppIcon'
 import { ApplicationLogsPanel } from './settings/ApplicationLogsPanel'
 import { LlmLogPreview } from './settings/LlmLogPreview'
 import { McpSettingsPanel } from './settings/McpSettingsPanel'
 import { NumericDraftField } from './NumericDraftField'
 import { ImageGenerationSettingsSection } from './settings/ImageGenerationSettingsSection'
 import { ImageVisionSettingsPanel } from './settings/ImageVisionSettingsPanel'
+import { SettingsTabButton } from './settings/SettingsTabButton'
+import { ToolRouterSettingsPanel } from './settings/ToolRouterSettingsPanel'
 import { UserMemorySettingsPanel } from './settings/UserMemorySettingsPanel'
 import { VectorMemoryPanel } from './settings/VectorMemoryPanel'
 import { UsageStatsPanel } from './UsageStatsPanel'
@@ -125,23 +127,7 @@ function isFnLikeKeyboardEvent(
   return event.code === 'NumpadEnter' || event.location === globalThis.KeyboardEvent.DOM_KEY_LOCATION_NUMPAD
 }
 
-type SettingsTabButtonProps = {
-  active: boolean
-  icon: IconName
-  label: string
-  onClick: () => void
-}
-
-function SettingsTabButton({ active, icon, label, onClick }: SettingsTabButtonProps) {
-  return (
-    <button type="button" className={`settings-tab-button ${active ? 'active' : ''}`} onClick={onClick}>
-      <AppIcon name={icon} size={20} />
-      <span>{label}</span>
-    </button>
-  )
-}
-
-type ProviderSettingsMode = 'llm' | 'image' | 'vision'
+type ProviderSettingsMode = 'llm' | 'image' | 'vision' | 'tool-router'
 
 type ProviderSettingsModeButtonProps = {
   active: boolean
@@ -1043,6 +1029,11 @@ export function SettingsModal({
                     label="识图模型"
                     onClick={() => setProviderSettingsMode('vision')}
                   />
+                  <ProviderSettingsModeButton
+                    active={providerSettingsMode === 'tool-router'}
+                    label="工具路由"
+                    onClick={() => setProviderSettingsMode('tool-router')}
+                  />
                 </div>
 
                 {providerSettingsMode === 'llm' ? (
@@ -1490,6 +1481,8 @@ export function SettingsModal({
                       setImageSaveError('')
                     }}
                   />
+                ) : providerSettingsMode === 'tool-router' ? (
+                  <ToolRouterSettingsPanel />
                 ) : (
                   <ImageVisionSettingsPanel />
                 )}

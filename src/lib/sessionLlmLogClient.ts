@@ -54,7 +54,7 @@ export async function sessionLlmLogClear(options: {
 export async function onSessionLlmLogEvent(
   handler: (payload: SessionLlmLogEvent) => void,
 ): Promise<() => void> {
-  const unlisten = await listen<SessionLlmLogEvent>('session.llm_log.updated', (event) => {
+  const unlisten = await listen<SessionLlmLogEvent>('session:llm_log:updated', (event) => {
     handler(event.payload)
   })
   return () => unlisten()

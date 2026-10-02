@@ -1,5 +1,5 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { Check, Copy } from 'lucide-react'
+import { Check, Copy, GitBranch } from 'lucide-react'
 import {
   forwardRef,
   memo,
@@ -79,6 +79,8 @@ export type VirtualizedChatTurnsProps = {
   copiedPromptTurnId: string
   onCopyAnswer: (turnId: string, answer: string) => void
   onCopyPrompt: (turnId: string, prompt: string) => void
+  /** 可选：在该轮上创建会话分支（打开分支确认弹窗）。 */
+  onForkTurn?: (turnId: string) => void
   onCreateAgentDraft: (draft: AgentBuilderDraft, actionId: string) => Promise<void> | void
   onImageClick: (src: string, alt: string) => void
   /** 仍有更早轮次未挂载时，接近顶部触发（与 useChatTurnWindow 配合） */
@@ -115,6 +117,7 @@ const ChatTurnRow = memo(function ChatTurnRow({
   copiedPromptTurnId,
   onCopyAnswer,
   onCopyPrompt,
+  onForkTurn,
   showTurnTimeRow,
 }: {
   turn: ConversationTurn
@@ -146,6 +149,7 @@ const ChatTurnRow = memo(function ChatTurnRow({
   copiedPromptTurnId: string
   onCopyAnswer: (turnId: string, answer: string) => void
   onCopyPrompt: (turnId: string, prompt: string) => void
+  onForkTurn?: (turnId: string) => void
 }) {
   const [timeFullDetail, setTimeFullDetail] = useState(false)
   const timeLabel = timeFullDetail
@@ -156,7 +160,9 @@ const ChatTurnRow = memo(function ChatTurnRow({
   const showAnswerFooterToken =
     Boolean(turn.usage) && hasUsageMetrics(turn.usage) && !usageShownBesideAttachments
   const showAnswerFooterCopy = !inlineFileCopy
-  const showAnswerFooter = shouldShowActions && (showAnswerFooterToken || showAnswerFooterCopy)
+  const canForkTurn = Boolean(onForkTurn) && !isStreamingTurn && Boolean(turn.answer)
+  const showAnswerFooter =
+    shouldShowActions && (showAnswerFooterToken || showAnswerFooterCopy || canForkTurn)
 
   return (
     <article
@@ -311,6 +317,18 @@ const ChatTurnRow = memo(function ChatTurnRow({
                         </span>
                       </button>
                     ) : null}
+                    {canForkTurn ? (
+                      <button
+                        type="button"
+                        className="answer-fork-control"
+                        onClick={() => onForkTurn?.(turn.id)}
+                        aria-label="创建分支"
+                        title="从这条消息创建对话分支"
+                      >
+                        <GitBranch size={16} strokeWidth={1.75} aria-hidden />
+                        <span className="answer-copy-control-label">创建分支</span>
+                      </button>
+                    ) : null}
                   </div>
                 </div>
               ) : null}
@@ -347,6 +365,7 @@ export const VirtualizedChatTurns = forwardRef<VirtualizedChatTurnsHandle, Virtu
       copiedPromptTurnId,
       onCopyAnswer,
       onCopyPrompt,
+      onForkTurn,
       onCreateAgentDraft,
       onImageClick,
       hasMoreOlder = false,
@@ -560,6 +579,7 @@ export const VirtualizedChatTurns = forwardRef<VirtualizedChatTurnsHandle, Virtu
                   copiedPromptTurnId={copiedPromptTurnId}
                   onCopyAnswer={onCopyAnswer}
                   onCopyPrompt={onCopyPrompt}
+                  onForkTurn={onForkTurn}
                 />
               </div>
             )

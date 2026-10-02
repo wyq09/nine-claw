@@ -7,7 +7,7 @@
 //! 设计目标：
 //! - 不改动 Pi 流式解析主循环，只在「开始」「结束」「工具调用」三个关键点落点；
 //! - 文件按日切片，append-only，避免并发写冲突时覆盖历史；
-//! - 同时发出 `workspace.llm_trace` Tauri 事件，用于前端面板实时刷新。
+//! - 同时发出 `workspace:llm_trace` Tauri 事件，用于前端面板实时刷新。
 
 use crate::agent_workspace;
 use crate::pi_usage::PiTokenUsagePayload;
@@ -318,7 +318,7 @@ fn emit_event(app: &AppHandle, phase: &str, entry: &TraceEntry) {
         "phase": phase,
         "entry": entry,
     });
-    crate::emit_safe::emit_safe(app, "workspace.llm_trace", payload);
+    crate::emit_safe::emit_safe(app, "workspace:llm_trace", payload);
 }
 
 fn emit_text_delta_event(app: &AppHandle, entry: &TraceEntry, kind: &str, text: &str) {
@@ -353,7 +353,7 @@ fn emit_text_delta_event(app: &AppHandle, entry: &TraceEntry, kind: &str, text: 
             "text": text,
         },
     });
-    crate::emit_safe::emit_safe(app, "workspace.llm_trace", payload);
+    crate::emit_safe::emit_safe(app, "workspace:llm_trace", payload);
 }
 
 /// 开始一条追踪。返回 `trace_id`，用于后续补充工具调用与结束时落盘。

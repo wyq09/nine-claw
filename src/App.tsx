@@ -4,6 +4,7 @@ import './styles/agent-ui-upgrades.css'
 import './styles/widget-cards.css'
 import './styles/agent-editor.css'
 import './styles/application-logs.css'
+import './styles/branch-dialog.css'
 import { NineClawApp } from './app/shell/NineClawApp'
 
 export default NineClawApp

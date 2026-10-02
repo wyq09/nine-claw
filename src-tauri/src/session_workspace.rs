@@ -7,7 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
-
+pub(crate) mod session_fork; // 会话分支（fork），实现见 session_fork 子模块。
 const TEXT_PREVIEW_MAX: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]

@@ -261,7 +261,7 @@ fn emit_updated(
         session_id: session_id.to_string(),
         path: path.to_string_lossy().to_string(),
     };
-    crate::emit_safe::emit_safe(app, "session.llm_log.updated", payload);
+    crate::emit_safe::emit_safe(app, "session:llm_log:updated", payload);
 }
 
 fn append_to_file(

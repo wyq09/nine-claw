@@ -18,6 +18,7 @@ import type {
   ViewKey,
 } from '../../types'
 import type { BotStatusEvent } from '../../lib/piClient'
+import type { SessionForkWorkspaceMode } from '../../lib/chatForkClient'
 import { ChatView } from '../chat/ChatWorkspace'
 import { SessionWorkspacePanel } from '../workspaces/panels/SessionWorkspacePanel'
 import {
@@ -78,6 +79,12 @@ export type NineClawRouteOutletProps = {
     text: string,
     extras?: { overrideAgentId?: string | null },
   ) => void | Promise<void>
+  /** 在指定会话的某一轮上创建分支会话（消息区「创建分支」按钮入口）。 */
+  onForkSessionTurn?: (
+    historyId: string,
+    turnId: string,
+    workspaceMode: SessionForkWorkspaceMode,
+  ) => Promise<HistoryItem | null | void>
   activeChatAgent: ConversationAgentSnapshot | null
   submitShortcut: GeneralSettings['submitShortcut']
   activeHistoryItem: HistoryItem | null
@@ -205,6 +212,7 @@ export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
     onComposerRemoveAttachment,
     onComposerClearAttachmentError,
     onChatSubmit,
+    onForkSessionTurn,
     activeChatAgent,
     submitShortcut,
     activeHistoryItem,
@@ -347,6 +355,7 @@ export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
             onSubmit={(text) => {
               void onChatSubmit(text)
             }}
+            onForkSessionTurn={onForkSessionTurn}
             selectedAgent={activeChatAgent}
             submitShortcut={submitShortcut}
             activeHistoryItem={activeHistoryItem}
@@ -411,6 +420,7 @@ export const NineClawRouteOutlet = (props: NineClawRouteOutletProps) => {
             onComposerRemoveAttachment={onComposerRemoveAttachment}
             onComposerClearAttachmentError={onComposerClearAttachmentError}
             onChatSubmit={onChatSubmit}
+            onForkSessionTurn={onForkSessionTurn}
             onDispatchDelegatePlan={onDispatchDelegatePlan}
             onSubmitWidgetResponse={onSubmitWidgetResponse}
             onCancelWidgetResponse={onCancelWidgetResponse}
