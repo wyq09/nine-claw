@@ -18883,7 +18883,7 @@ var require_permessage_deflate = __commonJS({
       acceptAsServer(offers) {
         const opts = this._options;
         const accepted = offers.find((params) => {
-          if (opts.serverNoContextTakeover === false && params.server_no_context_takeover || params.server_max_window_bits && (opts.serverMaxWindowBits === false || typeof opts.serverMaxWindowBits === "number" && opts.serverMaxWindowBits > params.server_max_window_bits) || typeof opts.clientMaxWindowBits === "number" && !params.client_max_window_bits) {
+          if (opts.serverNoContextTakeover === false && params.server_no_context_takeover || params.server_max_window_bits && (opts.serverMaxWindowBits === false || typeof opts.serverMaxWindowBits === "number" && opts.serverMaxWindowBits > params.server_max_window_bits) || typeof opts.clientMaxWindowBits === "number" && (typeof params.client_max_window_bits === "number" ? opts.clientMaxWindowBits > params.client_max_window_bits : !params.client_max_window_bits)) {
             return false;
           }
           return true;
@@ -19373,6 +19373,10 @@ var require_receiver = __commonJS({
        *     extensions
        * @param {Boolean} [options.isServer=false] Specifies whether to operate in
        *     client or server mode
+       * @param {Number} [options.maxBufferedChunks=0] The maximum number of
+       *     buffered data chunks
+       * @param {Number} [options.maxFragments=0] The maximum number of message
+       *     fragments
        * @param {Number} [options.maxPayload=0] The maximum allowed message length
        * @param {Boolean} [options.skipUTF8Validation=false] Specifies whether or
        *     not to skip UTF-8 validation for text and close messages
@@ -19383,6 +19387,8 @@ var require_receiver = __commonJS({
         this._binaryType = options.binaryType || BINARY_TYPES[0];
         this._extensions = options.extensions || {};
         this._isServer = !!options.isServer;
+        this._maxBufferedChunks = options.maxBufferedChunks | 0;
+        this._maxFragments = options.maxFragments | 0;
         this._maxPayload = options.maxPayload | 0;
         this._skipUTF8Validation = !!options.skipUTF8Validation;
         this[kWebSocket] = void 0;
@@ -19397,6 +19403,7 @@ var require_receiver = __commonJS({
         this._opcode = 0;
         this._totalPayloadLength = 0;
         this._messageLength = 0;
+        this._numFragments = 0;
         this._fragments = [];
         this._errored = false;
         this._loop = false;
@@ -19412,6 +19419,18 @@ var require_receiver = __commonJS({
        */
       _write(chunk, encoding, cb) {
         if (this._opcode === 8 && this._state == GET_INFO) return cb();
+        if (this._maxBufferedChunks > 0 && this._buffers.length >= this._maxBufferedChunks) {
+          cb(
+            this.createError(
+              RangeError,
+              "Too many buffered chunks",
+              false,
+              1008,
+              "WS_ERR_TOO_MANY_BUFFERED_PARTS"
+            )
+          );
+          return;
+        }
         this._bufferedBytes += chunk.length;
         this._buffers.push(chunk);
         this.startLoop(cb);
@@ -19735,6 +19754,17 @@ var require_receiver = __commonJS({
           this.controlMessage(data, cb);
           return;
         }
+        if (this._maxFragments > 0 && ++this._numFragments > this._maxFragments) {
+          const error = this.createError(
+            RangeError,
+            "Too many message fragments",
+            false,
+            1008,
+            "WS_ERR_TOO_MANY_BUFFERED_PARTS"
+          );
+          cb(error);
+          return;
+        }
         if (this._compressed) {
           this._state = INFLATING;
           this.decompress(data, cb);
@@ -19792,6 +19822,7 @@ var require_receiver = __commonJS({
         this._totalPayloadLength = 0;
         this._messageLength = 0;
         this._fragmented = 0;
+        this._numFragments = 0;
         this._fragments = [];
         if (this._opcode === 2) {
           let data;
@@ -19936,6 +19967,9 @@ var require_sender = __commonJS({
     "use strict";
     var { Duplex } = require("stream");
     var { randomFillSync } = require("crypto");
+    var {
+      types: { isUint8Array }
+    } = require("util");
     var PerMessageDeflate = require_permessage_deflate();
     var { EMPTY_BUFFER, kWebSocket, NOOP } = require_constants();
     var { isBlob, isValidStatusCode } = require_validation();
@@ -20089,8 +20123,10 @@ var require_sender = __commonJS({
           buf.writeUInt16BE(code, 0);
           if (typeof data === "string") {
             buf.write(data, 2);
-          } else {
+          } else if (isUint8Array(data)) {
             buf.set(data, 2);
+          } else {
+            throw new TypeError("Second argument must be a string or a Uint8Array");
           }
         }
         const options = {
@@ -20865,11 +20901,23 @@ var require_websocket = __commonJS({
           this._isServer = false;
           this._redirects = 0;
           if (protocols === void 0) {
-            protocols = [];
+            if (!options || options.protocols === void 0) {
+              protocols = [];
+            } else if (Array.isArray(options.protocols)) {
+              protocols = options.protocols;
+            } else {
+              protocols = [options.protocols];
+            }
           } else if (!Array.isArray(protocols)) {
             if (typeof protocols === "object" && protocols !== null) {
               options = protocols;
-              protocols = [];
+              if (options.protocols === void 0) {
+                protocols = [];
+              } else if (Array.isArray(options.protocols)) {
+                protocols = options.protocols;
+              } else {
+                protocols = [options.protocols];
+              }
             } else {
               protocols = [protocols];
             }
@@ -20971,6 +21019,10 @@ var require_websocket = __commonJS({
        *     multiple times in the same tick
        * @param {Function} [options.generateMask] The function used to generate the
        *     masking key
+       * @param {Number} [options.maxBufferedChunks=0] The maximum number of
+       *     buffered data chunks
+       * @param {Number} [options.maxFragments=0] The maximum number of message
+       *     fragments
        * @param {Number} [options.maxPayload=0] The maximum allowed message size
        * @param {Boolean} [options.skipUTF8Validation=false] Specifies whether or
        *     not to skip UTF-8 validation for text and close messages
@@ -20982,6 +21034,8 @@ var require_websocket = __commonJS({
           binaryType: this.binaryType,
           extensions: this._extensions,
           isServer: this._isServer,
+          maxBufferedChunks: options.maxBufferedChunks,
+          maxFragments: options.maxFragments,
           maxPayload: options.maxPayload,
           skipUTF8Validation: options.skipUTF8Validation
         });
@@ -21060,7 +21114,6 @@ var require_websocket = __commonJS({
           }
           return;
         }
-        this._readyState = _WebSocket.CLOSING;
         this._sender.close(code, data, !this._isServer, (err) => {
           if (err) return;
           this._closeFrameSent = true;
@@ -21068,6 +21121,7 @@ var require_websocket = __commonJS({
             this._socket.end();
           }
         });
+        this._readyState = _WebSocket.CLOSING;
         setCloseTimer(this);
       }
       /**
@@ -21281,6 +21335,8 @@ var require_websocket = __commonJS({
         autoPong: true,
         closeTimeout: CLOSE_TIMEOUT,
         protocolVersion: protocolVersions[1],
+        maxBufferedChunks: 256 * 1024,
+        maxFragments: 16 * 1024,
         maxPayload: 100 * 1024 * 1024,
         skipUTF8Validation: false,
         perMessageDeflate: true,
@@ -21290,6 +21346,7 @@ var require_websocket = __commonJS({
         socketPath: void 0,
         hostname: void 0,
         protocol: void 0,
+        protocols: void 0,
         timeout: void 0,
         method: "GET",
         host: void 0,
@@ -21523,6 +21580,8 @@ var require_websocket = __commonJS({
         websocket.setSocket(socket, head, {
           allowSynchronousEvents: opts.allowSynchronousEvents,
           generateMask: opts.generateMask,
+          maxBufferedChunks: opts.maxBufferedChunks,
+          maxFragments: opts.maxFragments,
           maxPayload: opts.maxPayload,
           skipUTF8Validation: opts.skipUTF8Validation
         });
@@ -21865,6 +21924,10 @@ var require_websocket_server = __commonJS({
        *     called
        * @param {Function} [options.handleProtocols] A hook to handle protocols
        * @param {String} [options.host] The hostname where to bind the server
+       * @param {Number} [options.maxBufferedChunks=262144] The maximum number of
+       *     buffered data chunks
+       * @param {Number} [options.maxFragments=16384] The maximum number of message
+       *     fragments
        * @param {Number} [options.maxPayload=104857600] The maximum allowed message
        *     size
        * @param {Boolean} [options.noServer=false] Enable no server mode
@@ -21886,6 +21949,8 @@ var require_websocket_server = __commonJS({
         options = {
           allowSynchronousEvents: true,
           autoPong: true,
+          maxBufferedChunks: 256 * 1024,
+          maxFragments: 16 * 1024,
           maxPayload: 100 * 1024 * 1024,
           skipUTF8Validation: false,
           perMessageDeflate: false,
@@ -22165,6 +22230,8 @@ var require_websocket_server = __commonJS({
         socket.removeListener("error", socketOnError);
         ws.setSocket(socket, head, {
           allowSynchronousEvents: this.options.allowSynchronousEvents,
+          maxBufferedChunks: this.options.maxBufferedChunks,
+          maxFragments: this.options.maxFragments,
           maxPayload: this.options.maxPayload,
           skipUTF8Validation: this.options.skipUTF8Validation
         });

@@ -9,8 +9,8 @@ const publishedMonoPackageNames = [
   '@earendil-works/pi-agent-core',
   '@earendil-works/pi-ai',
   '@earendil-works/pi-tui',
-  '@earendil-works/pi-web-ui',
 ]
+// @earendil-works/pi-web-ui 停更在 0.75.3（未随 pi 1.0 发布），仓库内无代码引用，不再打包。
 const repoOnlyMonoPackageNames = ['@earendil-works/pi-pods']
 const projectRoot = process.cwd()
 const localNodeModulesRoot = path.resolve(projectRoot, 'node_modules')
