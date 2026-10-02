@@ -1,11 +1,12 @@
 use serde::Serialize;
 use std::env;
 use std::fs;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 use tauri::{AppHandle, Manager};
 
 const PI_RUNTIME_RESOURCE_DIR: &str = "pi-runtime";
@@ -312,6 +313,78 @@ fn extraction_state_path(root: &Path) -> PathBuf {
     root.join(".bundle-source")
 }
 
+/// 归档内容指纹："v1:{size}:{mtime_ms}:{head_hash}"。
+/// 与路径无关（修复 App Translocation / target 目录变动导致的每次启动全量重解压），
+/// 归档一旦更新（重新构建）大小或 mtime 或首尾内容哈希必变，能正确触发重解压。
+fn archive_fingerprint(archive: &Path) -> Option<String> {
+    let metadata = fs::metadata(archive).ok()?;
+    let mtime_ms = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let head_hash = partial_content_hash(archive)?;
+    Some(format!("v1:{}:{}:{}", metadata.len(), mtime_ms, head_hash))
+}
+
+/// 取文件首尾各 64KB 的 FNV-1a 哈希（hex）。大文件只读 128KB，避免每次启动全量读盘。
+fn partial_content_hash(path: &Path) -> Option<String> {
+    const WINDOW: u64 = 64 * 1024;
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+
+    let mut hasher: u64 = 0xcbf29ce484222325;
+    let feed = |chunk: &[u8], hasher: &mut u64| {
+        for byte in chunk {
+            *hasher ^= u64::from(*byte);
+            *hasher = hasher.wrapping_mul(0x100000001b3);
+        }
+    };
+
+    // read_to_end 是追加语义：buffer 必须为空，否则 feed 到的是预填零而不是文件内容。
+    let mut head = Vec::new();
+    let head_len = Read::by_ref(&mut file).take(WINDOW).read_to_end(&mut head).ok()?;
+    feed(&head[..head_len], &mut hasher);
+
+    if len > WINDOW {
+        let tail_start = len - WINDOW;
+        let mut tail = Vec::new();
+        file.seek(std::io::SeekFrom::Start(tail_start)).ok()?;
+        let tail_len = Read::by_ref(&mut file).read_to_end(&mut tail).ok()?;
+        feed(&tail[..tail_len], &mut hasher);
+    }
+
+    Some(format!("{hasher:016x}"))
+}
+
+/// 是否需要重新解压：目录缺失、可执行体缺失、或状态指纹与归档指纹不一致。
+fn extraction_needed(extract_root: &Path, state_path: &Path, expected_state: &str) -> bool {
+    if !extract_root.is_dir() {
+        return true;
+    }
+    if !platform_executable_names()
+        .iter()
+        .any(|name| extract_root.join(name).is_file())
+    {
+        return true;
+    }
+    fs::read_to_string(state_path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        != Some(expected_state.to_string())
+}
+
+/// repair 完成标记：repair 成本高（整树 chmod + xattr），目录内容不变时终身只需一次。
+fn repair_marker_path(root: &Path) -> PathBuf {
+    root.join(".pi-runtime-repaired")
+}
+
+/// 已修复过的目录直接跳过 repair：重解压会整树重建（标记随之消失），届时自然重跑。
+fn repair_marker_present(root: &Path) -> bool {
+    repair_marker_path(root).is_file()
+}
+
 fn desired_runtime_extract_root(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .path()
@@ -328,6 +401,11 @@ pub(crate) fn repair_runtime_directory(root: &Path) -> Result<(), String> {
     // Only run once per process — the repair is expensive (walks entire tree,
     // sets permissions on every file, runs xattr -cr on macOS).
     if REPAIR_DONE.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    // 已修复过的目录直接跳过：重解压会整树重建（标记随之消失），届时自然重跑。
+    if repair_marker_present(root) {
+        REPAIR_DONE.store(true, Ordering::Release);
         return Ok(());
     }
 
@@ -377,6 +455,7 @@ pub(crate) fn repair_runtime_directory(root: &Path) -> Result<(), String> {
         }
     }
 
+    let _ = fs::write(repair_marker_path(root), "v1");
     REPAIR_DONE.store(true, Ordering::Release);
     Ok(())
 }
@@ -392,15 +471,13 @@ fn ensure_extracted_runtime(app: &AppHandle) -> Result<PathBuf, String> {
     let archive_real = fs::canonicalize(&archive_path).unwrap_or(archive_path.clone());
     let extract_root = desired_runtime_extract_root(app)?;
     let state_path = extraction_state_path(&extract_root);
-    let expected_state = archive_real.to_string_lossy().to_string();
-    let needs_extract = !extract_root.is_dir()
-        || !platform_executable_names()
-            .iter()
-            .any(|name| extract_root.join(name).is_file())
-        || fs::read_to_string(&state_path)
-            .ok()
-            .map(|value| value.trim().to_string())
-            != Some(expected_state.clone());
+    let expected_state = archive_fingerprint(&archive_real).ok_or_else(|| {
+        format!(
+            "读取 pi runtime 归档元数据失败: {}",
+            archive_real.display()
+        )
+    })?;
+    let needs_extract = extraction_needed(&extract_root, &state_path, &expected_state);
 
     if needs_extract {
         if extract_root.exists() {
@@ -699,5 +776,111 @@ pub(crate) fn ensure_runtime_dependencies_impl(app: &AppHandle) -> RuntimeDepend
         auto_install_attempted,
         auto_install_succeeded,
         messages,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn set_mtime(path: &Path, mtime: SystemTime) {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(mtime)).unwrap();
+    }
+
+    #[test]
+    fn archive_fingerprint_is_path_independent_and_content_sensitive() {
+        let dir = std::env::temp_dir().join(format!("nineclaw-pi-fp-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000);
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+
+        let a = dir.join("a.tar.gz");
+        let b = dir.join("nested/b.tar.gz");
+        write_file(&a, &content);
+        write_file(&b, &content);
+        set_mtime(&a, mtime);
+        set_mtime(&b, mtime);
+
+        let fa = archive_fingerprint(&a).unwrap();
+        let fb = archive_fingerprint(&b).unwrap();
+        // 同内容同 mtime、不同路径 → 指纹一致（Translocation / 目录变动不触发重解压）
+        assert_eq!(fa, fb);
+        assert!(fa.starts_with("v1:"));
+
+        // 同 mtime 同大小、不同内容（尾部差异）→ 指纹变化
+        let mut tweaked = content.clone();
+        let last = tweaked.len() - 1;
+        tweaked[last] = tweaked[last].wrapping_add(1);
+        let c = dir.join("c.tar.gz");
+        write_file(&c, &tweaked);
+        set_mtime(&c, mtime);
+        let fc = archive_fingerprint(&c).unwrap();
+        assert_ne!(fa, fc);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extraction_needed_covers_missing_root_missing_binary_and_stale_state() {
+        let dir = std::env::temp_dir().join(format!("nineclaw-pi-ex-{}", std::process::id()));
+        let root = dir.join("extracted");
+        let state = root.join(".bundle-source");
+        let executable = platform_executable_names()[0];
+
+        // 根目录缺失
+        assert!(extraction_needed(&root, &state, "v1:1:1:aa"));
+
+        // 根目录存在 + 可执行体存在 + 状态一致 → 不重解压
+        write_file(&root.join(executable), b"stub");
+        fs::write(&state, "v1:1:1:aa").unwrap();
+        assert!(!extraction_needed(&root, &state, "v1:1:1:aa"));
+
+        // 指纹不一致（归档更新）
+        assert!(extraction_needed(&root, &state, "v1:2:2:bb"));
+
+        // 可执行体缺失（解压中断）
+        fs::remove_file(root.join(executable)).unwrap();
+        assert!(extraction_needed(&root, &state, "v1:1:1:aa"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn repair_runtime_directory_fixes_permissions_and_writes_marker_once() {
+        let dir = std::env::temp_dir().join(format!("nineclaw-pi-repair-{}", std::process::id()));
+        let root = dir.join("macos");
+        write_file(&root.join("pi"), b"#!/bin/sh\n");
+        write_file(&root.join("lib/dummy.dylib"), b"stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root.join("pi"), PermissionsExt::from_mode(0o600)).unwrap();
+            fs::set_permissions(root.join("lib/dummy.dylib"), PermissionsExt::from_mode(0o600))
+                .unwrap();
+        }
+
+        repair_runtime_directory(&root).expect("repair");
+
+        assert!(repair_marker_path(&root).is_file(), "repair 后应写入标记");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(root.join("pi")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "launcher 应恢复为可执行");
+            let dylib = fs::metadata(root.join("lib/dummy.dylib"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(dylib & 0o777, 0o755, "dylib 应恢复为可执行");
+        }
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

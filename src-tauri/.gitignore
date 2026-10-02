@@ -2,3 +2,8 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+
+# pi runtime 修复标记/解压状态（运行时产物，不入库）
+.pi-runtime-repaired
+.bundle-source
+/resources/pi-runtime-bundles/

@@ -7,6 +7,7 @@ pub(crate) const LEGACY_PI_SESSION_FILE_PREFIXES: &[&str] = &["yqagent-pi-sessio
 pub(crate) const PI_RUNTIME_DIR_NAME: &str = "nineclaw-pi-runtime";
 pub(crate) const HISTORY_STATE_KEY: &str = "history_v1";
 pub(crate) const HISTORY_RECOVERY_MARKER_KEY: &str = "history_v1_recovered_from_structured_v1";
+pub(crate) const HISTORY_BACKUP_FINGERPRINT_KEY: &str = "history_v1_backup_fingerprint";
 pub(crate) const PROVIDER_CONFIGS_STATE_KEY: &str = "provider_configs_v1";
 pub(crate) const CUSTOM_PROVIDER_META_STATE_KEY: &str = "custom_provider_meta_v1";
 pub(crate) const IMAGE_PROVIDER_CONFIGS_STATE_KEY: &str = "image_provider_configs_v1";

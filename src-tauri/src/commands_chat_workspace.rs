@@ -65,7 +65,7 @@ pub(crate) struct ChatSessionDetail {
     workspace_id: Option<String>,
     topic_workspace_dir: Option<String>,
     current_workspace_dir: Option<String>,
-    turns: Vec<storage::chat_history::ChatTurn>,
+    pub(crate) turns: Vec<storage::chat_history::ChatTurn>,
 }
 
 impl From<storage::chat_history::ChatSession> for ChatSessionDetail {
@@ -155,32 +155,66 @@ fn index_chat_turn_async(app: &AppHandle, turn_id: &str, session_id: &str) {
 }
 
 #[tauri::command]
-pub(crate) fn chat_list_sessions(app: AppHandle) -> Result<Vec<ChatSessionListItem>, String> {
-    let conn = storage_conn(&app)?;
-    let sessions = storage::chat_history::list_chat_sessions(&conn)?;
-    let mut items: Vec<ChatSessionListItem> = sessions
-        .into_iter()
-        .map(ChatSessionListItem::from)
-        .collect();
-    for item in &mut items {
-        item.turn_count = storage::chat_history::count_chat_turns(&conn, &item.id)?;
-    }
-    Ok(items)
+pub(crate) async fn chat_list_sessions(app: AppHandle) -> Result<Vec<ChatSessionListItem>, String> {
+    // 同步命令会在主线程执行；启动水合会对该命令+详情命令产生 N+1 风暴，
+    // 把主线程和后续 IPC（含 ensure_runtime_dependencies）全部堵死，
+    // 因此 SQLite/序列化工作放到线程池执行。
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage_conn(&app)?;
+        let sessions = storage::chat_history::list_chat_sessions(&conn)?;
+        let mut items: Vec<ChatSessionListItem> = sessions
+            .into_iter()
+            .map(ChatSessionListItem::from)
+            .collect();
+        for item in &mut items {
+            item.turn_count = storage::chat_history::count_chat_turns(&conn, &item.id)?;
+        }
+        Ok(items)
+    })
+    .await
+    .map_err(|error| format!("chat_list_sessions 任务失败: {error}"))?
 }
 
 #[tauri::command]
-pub(crate) fn chat_get_session_detail(
+pub(crate) async fn chat_get_session_detail(
     app: AppHandle,
     session_id: String,
 ) -> Result<Option<ChatSessionDetail>, String> {
-    let conn = storage_conn(&app)?;
-    let Some(session) = storage::chat_history::get_chat_session(&conn, &session_id)? else {
-        return Ok(None);
-    };
-    let turns = storage::chat_history::list_chat_turns(&conn, &session_id)?;
-    let mut detail = ChatSessionDetail::from(session);
-    detail.turns = turns;
-    Ok(Some(detail))
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage_conn(&app)?;
+        let Some(session) = storage::chat_history::get_chat_session(&conn, &session_id)? else {
+            return Ok(None);
+        };
+        let turns = storage::chat_history::list_chat_turns(&conn, &session_id)?;
+        Ok(Some(ChatSessionDetail::from_session_and_turns(
+            session, turns,
+        )))
+    })
+    .await
+    .map_err(|error| format!("chat_get_session_detail 任务失败: {error}"))?
+}
+
+/// 批量拉取会话详情：启动水合一次性取全部会话，替代 N+1 逐会话调用。
+/// 单个连接、单个 spawn_blocking 任务，避免数百并发任务形成的 SQLite/磁盘风暴。
+#[tauri::command]
+pub(crate) async fn chat_get_session_details(
+    app: AppHandle,
+    session_ids: Vec<String>,
+) -> Result<Vec<ChatSessionDetail>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage_conn(&app)?;
+        let mut details = Vec::with_capacity(session_ids.len());
+        for session_id in &session_ids {
+            let Some(session) = storage::chat_history::get_chat_session(&conn, session_id)? else {
+                continue;
+            };
+            let turns = storage::chat_history::list_chat_turns(&conn, session_id)?;
+            details.push(ChatSessionDetail::from_session_and_turns(session, turns));
+        }
+        Ok(details)
+    })
+    .await
+    .map_err(|error| format!("chat_get_session_details 任务失败: {error}"))?
 }
 
 #[tauri::command]

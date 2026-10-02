@@ -1,6 +1,7 @@
 use crate::agent_workspace;
 use crate::app_constants::{
-    HISTORY_DB_FILE, HISTORY_RECOVERY_MARKER_KEY, HISTORY_STATE_KEY, LEGACY_HISTORY_DB_FILES,
+    HISTORY_BACKUP_FINGERPRINT_KEY, HISTORY_DB_FILE, HISTORY_RECOVERY_MARKER_KEY, HISTORY_STATE_KEY,
+    LEGACY_HISTORY_DB_FILES,
 };
 use crate::pi_usage::{
     extract_usage_metadata_payload, extract_usage_payload, json_i64, json_string,
@@ -591,9 +592,70 @@ fn maybe_recover_structured_history_from_backup(conn: &Connection) -> Result<(),
     Ok(())
 }
 
+/// 结构化历史的廉价变更指纹：所有结构化写入（含 merge 路径）都会 bump
+/// `chat_sessions.updated_at`，配合两张表的行数即可可靠判定「自上次备份后是否有变化」。
+fn structured_history_fingerprint(conn: &Connection) -> Result<String, String> {
+    let session_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chat_sessions", [], |row| row.get(0))
+        .map_err(|error| format!("统计 chat_sessions 行数失败: {error}"))?;
+    let turn_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chat_turns", [], |row| row.get(0))
+        .map_err(|error| format!("统计 chat_turns 行数失败: {error}"))?;
+    let max_session_updated: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(updated_at), 0) FROM chat_sessions",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("读取 chat_sessions 最新时间戳失败: {error}"))?;
+    let max_turn_created: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(created_at), 0) FROM chat_turns",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("读取 chat_turns 最新时间戳失败: {error}"))?;
+    Ok(format!(
+        "{session_count}:{turn_count}:{max_session_updated}:{max_turn_created}"
+    ))
+}
+
+fn stored_backup_fingerprint(conn: &Connection) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT value FROM app_state WHERE key = ?1",
+        params![HISTORY_BACKUP_FINGERPRINT_KEY],
+        |row| row.get(0),
+    )
+    .map(Some)
+    .or_else(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(format!("读取 v1 备份指纹失败: {other}")),
+    })
+}
+
+fn store_backup_fingerprint(conn: &Connection, fingerprint: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO app_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![HISTORY_BACKUP_FINGERPRINT_KEY, fingerprint, chrono_like_timestamp()],
+    )
+    .map_err(|error| format!("写入 v1 备份指纹失败: {error}"))?;
+    Ok(())
+}
+
 pub(crate) fn sync_history_v1_backup_from_structured(conn: &Connection) -> Result<(), String> {
+    // v1 备份只是结构化表被清空时的恢复来源，不要求逐帧精确。启动/保存路径每次都
+    // 全量导出（O(全部 session × turn)）是「越用越慢」的主因之一，因此仅在结构化
+    // 历史指纹变化时才重新导出。极端情况下备份可能落后于一次并发中的在途写入，
+    // 下一次任何结构化写入都会再次触发同步，自愈。
+    let fingerprint = structured_history_fingerprint(conn)?;
+    if stored_backup_fingerprint(conn)?.as_deref() == Some(fingerprint.as_str()) {
+        return Ok(());
+    }
     let payload = storage::chat_history_snapshot::export_history_snapshot_json(conn)?;
-    write_history_v1_snapshot(conn, &payload)
+    write_history_v1_snapshot(conn, &payload)?;
+    store_backup_fingerprint(conn, &fingerprint)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -934,5 +996,64 @@ mod tests {
         let sessions = list_chat_sessions(&target_conn).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "target-session");
+    }
+    #[test]
+    fn v1_backup_sync_skips_when_structured_history_unchanged() {
+        let root_dir = temp_dir_path("backup-fingerprint");
+        let db_path = root_dir.join(HISTORY_DB_FILE);
+        let conn = open_at(&db_path).unwrap();
+        crate::storage::db::ensure_all_schemas(&conn).unwrap();
+
+        create_structured_session(&db_path, "fp-session", "hello");
+        sync_history_v1_backup_from_structured(&conn).unwrap();
+        let payload = load_history_v1_snapshot(&conn).unwrap().expect("首次同步应写入备份");
+        assert!(payload.contains("fp-session"));
+        let fingerprint = stored_backup_fingerprint(&conn).unwrap().expect("首次同步应写入指纹");
+
+        // 结构化数据未变：即使备份内容被破坏，同步也应跳过（不再全量导出回写）
+        conn.execute(
+            "UPDATE app_state SET value = 'corrupted' WHERE key = ?1",
+            params![HISTORY_STATE_KEY],
+        )
+        .unwrap();
+        sync_history_v1_backup_from_structured(&conn).unwrap();
+        assert_eq!(
+            load_history_v1_snapshot(&conn).unwrap().as_deref(),
+            Some("corrupted"),
+            "未变化时不应重写备份"
+        );
+
+        // 结构化数据变化（bump updated_at + 追加一轮）：同步应重写备份并更新指纹
+        conn.execute(
+            "UPDATE chat_sessions SET updated_at = updated_at + 1000 WHERE id = 'fp-session'",
+            [],
+        )
+        .unwrap();
+        append_chat_turn(
+            &conn,
+            &AppendChatTurnInput {
+                id: "fp-session-turn-2".to_string(),
+                session_id: "fp-session".to_string(),
+                turn_index: 1,
+                prompt: "second".to_string(),
+                answer: "answer-2".to_string(),
+                thinking: String::new(),
+                status: "done".to_string(),
+                usage_json: None,
+                response_segments_json: None,
+                tool_calls_json: None,
+                activity_json: None,
+                speaker_agent_id: None,
+            },
+        )
+        .unwrap();
+        sync_history_v1_backup_from_structured(&conn).unwrap();
+        let rewritten = load_history_v1_snapshot(&conn).unwrap().expect("变化后应重写备份");
+        assert!(rewritten.contains("second"), "重写后的备份应包含新轮次");
+        assert_ne!(rewritten, "corrupted");
+        let new_fingerprint = stored_backup_fingerprint(&conn).unwrap().unwrap();
+        assert_ne!(fingerprint, new_fingerprint);
+
+        fs::remove_dir_all(&root_dir).ok();
     }
 }

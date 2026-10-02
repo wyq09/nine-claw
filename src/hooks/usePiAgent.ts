@@ -7,7 +7,7 @@ import {
   chatClearAllSessions,
   chatCreateSession,
   chatDeleteSession,
-  chatGetSessionDetail,
+  chatGetSessionDetails,
   chatListSessions,
   chatUpdateSessionTitle,
   chatUpdateTurn,
@@ -38,6 +38,7 @@ import {
 } from '../lib/taskDeliveryNotification'
 import { useToast } from './useToast'
 import type {
+  ChatSessionDetail,
   ActivityState,
   AgentLoopIteration,
   AgentLoopSegment,
@@ -69,6 +70,8 @@ import {
   type StructuredHistoryLoadResult,
 } from './piAgent/historyHydration'
 import { persistAttachmentsForSessionWorkspace } from './piAgent/sessionWorkspaceAttachments'
+import { appendToolSelectionActivity, subscribeToolSelectionEvent, type ToolSelectionEventPayload } from './piAgent/toolSelectionActivity'
+import { useSessionActions } from './piAgent/sessionActions'
 import {
   appendAgentTaskDeliveriesToHistory,
   appendTextToSegments,
@@ -404,19 +407,21 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
       return { history: [], sessionIds: new Set() }
     }
 
-    const details = await Promise.all(
-      sessions.map(async (session) => {
-        try {
-          const detail = await chatGetSessionDetail(session.id)
-          return detail ? sessionDetailToHistoryItem(detail) : sessionListItemToHistoryItem(session)
-        } catch (error) {
-          console.warn('[NineClaw] load structured session detail failed:', session.id, error)
-          return sessionListItemToHistoryItem(session)
-        }
-      }),
-    )
+    // 批量拉取：N+1 逐会话 invoke 会形成数百并发的 IPC/SQLite 风暴，
+    // 堵死主线程并拖慢 ensure_runtime_dependencies（聊天解锁被推迟数十秒）。
+    let detailById = new Map<string, ChatSessionDetail>()
+    try {
+      const details = await chatGetSessionDetails(sessions.map((session) => session.id))
+      detailById = new Map(details.map((detail) => [detail.id, detail]))
+    } catch (error) {
+      console.warn('[NineClaw] batch load session details failed:', error)
+    }
 
-    const history = details
+    const history = sessions
+      .map((session) => {
+        const detail = detailById.get(session.id)
+        return detail ? sessionDetailToHistoryItem(detail) : sessionListItemToHistoryItem(session)
+      })
       .sort((left, right) => (right.updatedAt || right.createdAt) - (left.updatedAt || left.createdAt))
     return {
       history,
@@ -1048,24 +1053,24 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     }
   })
 
+  const handleToolSelectionPayload = useEffectEvent((payload: ToolSelectionEventPayload) => {
+    appendToolSelectionActivity(payload, activeHistoryId, currentTurnIdsRef.current, appendActivity)
+  })
+
   useEffect(() => {
     let isMounted = true
-    let unsubscribe: (() => void) | undefined
+    const unsubs: (() => void)[] = []
 
     void subscribePiStream((payload) => {
-      if (!isMounted) {
-        return
+      if (isMounted) {
+        handleStreamPayload(payload)
       }
-      handleStreamPayload(payload)
-    }).then((unlisten) => {
-      unsubscribe = unlisten
-    })
+    }).then((unlisten) => unsubs.push(unlisten))
+    void subscribeToolSelectionEvent(handleToolSelectionPayload).then((unlisten) => unsubs.push(unlisten))
 
     return () => {
       isMounted = false
-      if (unsubscribe) {
-        unsubscribe()
-      }
+      unsubs.forEach((unlisten) => unlisten())
     }
   }, [])
 
@@ -1983,15 +1988,12 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     }
   }
 
-  const clearSession = async () => {
-    try {
-      await clearPiSession()
-      setError('')
-    } catch (invokeError) {
-      const message = invokeError instanceof Error ? invokeError.message : String(invokeError)
-      setError(message)
-    }
-  }
+  const { forkHistoryItem, clearSession } = useSessionActions({
+    runningHistoryIds,
+    setError,
+    setHistory,
+    setActiveHistoryId,
+  })
 
   const activeHistoryItem = history.find((item) => item.id === activeHistoryId) ?? null
   const loading = runningHistoryIds.length > 0
@@ -2017,6 +2019,7 @@ export function usePiAgent(composerClearRef?: MutableRefObject<(() => void) | nu
     selectHistoryItem,
     clearHistory,
     deleteHistoryItem,
+    forkHistoryItem,
     renameHistoryItem,
     regenerateHistoryTitle,
     clearSession,

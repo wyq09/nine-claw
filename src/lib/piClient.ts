@@ -268,6 +268,12 @@ export async function chatGetSessionDetail(
   return invoke<ChatSessionDetail | null>('chat_get_session_detail', { sessionId })
 }
 
+export async function chatGetSessionDetails(
+  sessionIds: string[],
+): Promise<ChatSessionDetail[]> {
+  return invoke<ChatSessionDetail[]>('chat_get_session_details', { sessionIds })
+}
+
 export async function chatCreateSession(payload: {
   id: string
   title: string
@@ -493,7 +499,7 @@ export type LlmTraceEvent = {
 export async function onLlmTraceEvent(
   handler: (payload: LlmTraceEvent) => void,
 ): Promise<PiStreamUnsubscribe> {
-  const un = await listen<LlmTraceEvent>('workspace.llm_trace', (event) => {
+  const un = await listen<LlmTraceEvent>('workspace:llm_trace', (event) => {
     handler(event.payload)
   })
   return () => un()

@@ -27,6 +27,7 @@ mod media_directives;
 mod memory_gate;
 pub mod memory_vector;
 mod peer_gateway;
+mod pi_pool;
 mod pi_runtime;
 mod pi_timeouts;
 mod prompt_attachments;
@@ -74,6 +75,7 @@ mod session_llm_log;
 mod session_llm_titles;
 mod time_util;
 mod token_meter;
+mod tool_router;
 mod user_kv_memory_reorganize;
 
 pub(crate) use app_constants::*;
@@ -106,15 +108,19 @@ pub(crate) use pi_usage::{
 #[cfg(test)]
 pub(crate) use provider_runtime::should_force_pi_thinking_off;
 pub(crate) use provider_runtime::{
-    anthropic_messages_url, forced_pi_thinking_level, load_provider_preferences,
-    normalize_anthropic_base_url, normalize_provider_api_format, normalize_provider_base_url,
-    normalized_provider_runtime_base_url, openai_pi_compat_requires_explicit_thinking_disable,
-    openai_pi_compat_requires_reasoning_content_replay, openai_pi_compat_supports_reasoning_effort,
-    pi_runtime_dir, resolve_im_llm_runtime, save_provider_preferences, ProviderRuntimeConfig,
+    anthropic_compat_api_key_env, anthropic_compat_provider_id, anthropic_messages_url,
+    forced_pi_thinking_level, load_provider_preferences, normalize_anthropic_base_url,
+    normalize_provider_api_format, normalize_provider_base_url, normalized_provider_runtime_base_url,
+    openai_pi_compat_requires_explicit_thinking_disable, openai_pi_compat_requires_reasoning_content_replay,
+    openai_pi_compat_supports_reasoning_effort, pi_runtime_dir, resolve_im_llm_runtime,
+    runtime_provider_id, save_provider_preferences, ProviderRuntimeConfig,
 };
 pub(crate) use proxy_settings::build_http_client;
 pub(crate) use session_llm_titles::refine_agent_task_metadata;
 pub(crate) use time_util::chrono_like_timestamp;
+pub(crate) use tool_router::{
+    load_tool_router_settings_command, save_tool_router_settings_command,
+};
 
 use app_log::{app_log_export_all, app_log_list, app_log_open_dir, app_log_read};
 use commands_agents_skills::*;
@@ -179,7 +185,7 @@ pub(crate) fn workspace_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
-fn desktop_session_stream_mutex(session_id: &str) -> Arc<Mutex<()>> {
+pub(crate) fn desktop_session_stream_mutex(session_id: &str) -> Arc<Mutex<()>> {
     let map = DESKTOP_STREAM_SESSION_MUTEXES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = map.lock().expect("DESKTOP_STREAM_SESSION_MUTEXES poisoned");
     guard
@@ -196,6 +202,8 @@ struct DesktopPooledPi {
     workspace_id: Option<String>,
     session_path: PathBuf,
     last_usage: Option<PiTokenUsagePayload>,
+    /// 最近一次回池时间，用于 LRU 驱逐与空闲回收。
+    last_used: Instant,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1543,6 +1551,27 @@ mod lib_tests {
     }
 
     #[test]
+    fn anthropic_compat_extension_reads_system_prompt_from_transcript_messages() {
+        let source = build_desktop_anthropic_compat_extension_source(
+            Path::new("/tmp/pi-ai/index.js"),
+            "provider",
+            "API_KEY",
+            "https://example.com",
+            "model",
+            true,
+            false,
+        )
+        .expect("extension source");
+
+        // pi >= 0.86 的 TranscriptContext 只带 messages：systemPrompt 与 tools
+        // 必须通过重放 system message 获取，不得再读已被移除的 context 字段。
+        assert!(source.contains("getCurrentSystemPrompt(context.messages)"));
+        assert!(source.contains("getCurrentTools(context.messages)"));
+        assert!(!source.contains("context.systemPrompt"));
+        assert!(!source.contains("context.tools"));
+    }
+
+    #[test]
     fn anthropic_compat_extension_marks_mimo_models_as_reasoning_capable() {
         let source = build_desktop_anthropic_compat_extension_source(
             Path::new("/tmp/pi-ai/index.js"),
@@ -1823,6 +1852,7 @@ where
                     if let Ok(mut stderr) = buffer.lock() {
                         stderr.push_str(&line);
                         stderr.push('\n');
+                        pi_pool::truncate_stderr_tail(&mut stderr, pi_pool::STDERR_BUFFER_CAP_BYTES);
                     }
                 }
                 Err(error) => {
@@ -1831,6 +1861,7 @@ where
                     if let Ok(mut stderr) = buffer.lock() {
                         stderr.push_str(&message);
                         stderr.push('\n');
+                        pi_pool::truncate_stderr_tail(&mut stderr, pi_pool::STDERR_BUFFER_CAP_BYTES);
                     }
                     break;
                 }
@@ -2533,20 +2564,67 @@ fn desktop_pi_fingerprint(
 }
 
 fn take_pooled_desktop_pi(session_id: &str) -> Result<Option<DesktopPooledPi>, String> {
-    let mut guard = desktop_pi_pool()
-        .lock()
-        .map_err(|error| format!("无法锁定桌面 pi 进程池: {error}"))?;
-    Ok(guard.remove(session_id))
+    let policy = pi_pool::PiPoolPolicy::from_env();
+    let (target, victims) = {
+        let mut guard = desktop_pi_pool()
+            .lock()
+            .map_err(|error| format!("无法锁定桌面 pi 进程池: {error}"))?;
+        let target = guard.remove(session_id);
+        // 惰性空闲回收：借用本次访问顺带清理闲置进程（见 pi_pool::PiPoolPolicy）。
+        let now = Instant::now();
+        let snapshot: Vec<(String, Instant)> = guard
+            .iter()
+            .map(|(key, pooled)| (key.clone(), pooled.last_used))
+            .collect();
+        let mut victims = Vec::new();
+        for key in policy.entries_idle_since(&snapshot, now) {
+            if let Some(pooled) = guard.remove(&key) {
+                victims.push((key, pooled));
+            }
+        }
+        (target, victims)
+    };
+    for (key, victim) in victims {
+        kill_desktop_pooled_pi(victim, Some(&key), "pool_idle_reap");
+    }
+    Ok(target)
 }
 
 fn store_pooled_desktop_pi(session_id: &str, pooled: DesktopPooledPi) -> Result<(), String> {
-    let mut guard = desktop_pi_pool()
-        .lock()
-        .map_err(|error| format!("无法写入桌面 pi 进程池: {error}"))?;
-    let replaced = guard.insert(session_id.to_string(), pooled);
-    drop(guard);
-    if let Some(previous) = replaced {
-        kill_desktop_pooled_pi(previous, Some(session_id), "pool_replace_previous");
+    let policy = pi_pool::PiPoolPolicy::from_env();
+    let mut pooled = pooled;
+    pooled.last_used = Instant::now();
+    if !policy.pooling_enabled() {
+        kill_desktop_pooled_pi(pooled, Some(session_id), "pool_disabled");
+        return Ok(());
+    }
+    let victims: Vec<(String, DesktopPooledPi)> = {
+        let mut guard = desktop_pi_pool()
+            .lock()
+            .map_err(|error| format!("无法写入桌面 pi 进程池: {error}"))?;
+        let mut victims = Vec::new();
+        if let Some(previous) = guard.insert(session_id.to_string(), pooled) {
+            victims.push((session_id.to_string(), previous));
+        }
+        // 空闲回收 + LRU 容量驱逐。刚回池的进程 last_used=now，永远排最前不会被驱逐。
+        let now = Instant::now();
+        let snapshot: Vec<(String, Instant)> = guard
+            .iter()
+            .map(|(key, pooled)| (key.clone(), pooled.last_used))
+            .collect();
+        let mut evict_keys = policy.entries_idle_since(&snapshot, now);
+        evict_keys.extend(policy.entries_to_evict(&snapshot));
+        evict_keys.sort();
+        evict_keys.dedup();
+        for key in evict_keys {
+            if let Some(victim) = guard.remove(&key) {
+                victims.push((key, victim));
+            }
+        }
+        victims
+    };
+    for (key, victim) in victims {
+        kill_desktop_pooled_pi(victim, Some(&key), "pool_evict");
     }
     Ok(())
 }
@@ -2773,42 +2851,11 @@ fn session_cleanup_paths(session_id: Option<&str>) -> Vec<PathBuf> {
     paths
 }
 
-fn runtime_provider_id(provider_id: &str) -> String {
-    let trimmed = provider_id.trim();
-    if trimmed.is_empty() {
-        return "nineclaw-runtime-provider".to_string();
-    }
-
-    let digest = format!("{:x}", Md5::digest(trimmed.as_bytes()));
-    format!("nineclaw-runtime-{}", &digest[..12])
-}
-
 #[derive(Clone, Debug)]
 struct PiAnthropicCompatExtension {
     path: PathBuf,
     provider_id: String,
     api_key_env: String,
-}
-
-fn runtime_provider_suffix(provider_id: &str) -> String {
-    let trimmed = provider_id.trim();
-    if trimmed.is_empty() {
-        return "provider".to_string();
-    }
-
-    let digest = format!("{:x}", Md5::digest(trimmed.as_bytes()));
-    digest[..12].to_string()
-}
-
-fn anthropic_compat_provider_id(provider_id: &str) -> String {
-    format!("nineclaw-compat-{}", runtime_provider_suffix(provider_id))
-}
-
-fn anthropic_compat_api_key_env(provider_id: &str) -> String {
-    format!(
-        "NINECLAW_PI_COMPAT_API_KEY_{}",
-        runtime_provider_suffix(provider_id).to_ascii_uppercase()
-    )
 }
 
 fn should_use_desktop_anthropic_compat_extension(provider_config: &ProviderRuntimeConfig) -> bool {
@@ -2952,7 +2999,7 @@ fn build_desktop_anthropic_compat_extension_source(
     };
 
     Ok(format!(
-        r#"import {{ createAssistantMessageEventStream, calculateCost, parseStreamingJson }} from {import_path};
+        r#"import {{ createAssistantMessageEventStream, calculateCost, parseStreamingJson, getCurrentSystemPrompt, getCurrentTools }} from {import_path};
 
 {format_error_with_cause}
 
@@ -3290,16 +3337,20 @@ function streamNineclawAnthropicCompat(model, context, options) {{
         }};
       }}
 
-      if (context.systemPrompt) {{
+      // pi >= 0.86 (TranscriptContext): system prompt 与 tools 由 transcript 的
+      // system message 携带，需重放全部 system message 求当前值。
+      const systemPrompt = getCurrentSystemPrompt(context.messages);
+      if (systemPrompt) {{
         payload.system = [{{
           type: 'text',
-          text: sanitizeSurrogates(context.systemPrompt),
+          text: sanitizeSurrogates(systemPrompt),
           cache_control: {{ type: 'ephemeral' }},
         }}];
       }}
 
-      if (context.tools?.length) {{
-        payload.tools = convertTools(context.tools);
+      const tools = getCurrentTools(context.messages);
+      if (tools.length) {{
+        payload.tools = convertTools(tools);
       }}
 
       const response = await fetch(anthropicMessagesUrl(model.baseUrl), {{
@@ -6047,6 +6098,7 @@ async fn stream_pi_prompt(
                     workspace_id: workspace_id_for_stream.clone(),
                     session_path: session_path.clone(),
                     last_usage: final_usage.clone(),
+                    last_used: Instant::now(),
                 },
             )?;
             // 压缩可能再次调用模型；只在 idle 后台执行，避免主回复 done 后继续占用同会话输入通道。
@@ -6740,7 +6792,16 @@ async fn sync_runtime_parameters(
 async fn ensure_runtime_dependencies(
     app: tauri::AppHandle,
 ) -> Result<RuntimeDependencyStatus, String> {
-    Ok(pi_runtime::cached_ensure_runtime_dependencies(&app))
+    // 启动测量插桩：该 invoke 由前端水合挂载时发出，进入=前端已挂载，完成=聊天解锁
+    let started = std::time::Instant::now();
+    log::info!("ensure_runtime_dependencies 命令进入（前端已挂载）");
+    let status = pi_runtime::cached_ensure_runtime_dependencies(&app);
+    log::info!(
+        "ensure_runtime_dependencies 完成 耗时={:.2}s piAvailable={}",
+        started.elapsed().as_secs_f32(),
+        status.pi_available
+    );
+    Ok(status)
 }
 
 #[tauri::command]
@@ -7431,24 +7492,41 @@ pub fn run() {
                 dev_trace("app", "后台 runtime 初始化完成");
 
                 // Notify frontend that the PI runtime is ready
+                log::info!(
+                    "emit pi://runtime-ready piAvailable={}",
+                    status.pi_available
+                );
                 crate::emit_safe::emit_safe(&app_handle, "pi://runtime-ready", status.pi_available);
 
-                // Start IM services after runtime is ready
-                if let Err(error) = auto_start_bound_im_services(&app_handle) {
-                    log::warn!("应用启动时自动检测 IM 机器人绑定失败: {}", error);
+                // IM 机器人自启动涉及真实网络往返（慢时数秒到超时叠加），与对等网关、
+                // 调度器、embedding 初始化互不依赖，各自独立线程并行执行，避免最慢的
+                // 一个环节推迟其余服务的可用时间。
+                {
+                    let im_app = app_handle.clone();
+                    std::thread::spawn(move || {
+                        if let Err(error) = auto_start_bound_im_services(&im_app) {
+                            log::warn!("应用启动时自动检测 IM 机器人绑定失败: {}", error);
+                        }
+                    });
                 }
-                match agents::backfill_peer_inbound_secrets(&app_handle) {
-                    Ok(count) if count > 0 => {
-                        log::info!("已为 {count} 个智能体补全对等入站独立密钥");
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        log::warn!("对等入站密钥补全未执行: {error}");
-                    }
+                {
+                    let gateway_app = app_handle.clone();
+                    std::thread::spawn(move || {
+                        match agents::backfill_peer_inbound_secrets(&gateway_app) {
+                            Ok(count) if count > 0 => {
+                                log::info!("已为 {count} 个智能体补全对等入站独立密钥");
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                log::warn!("对等入站密钥补全未执行: {error}");
+                            }
+                        }
+                        if let Err(error) = peer_gateway::restart_peer_gateway(&gateway_app) {
+                            log::warn!("对等网关启动: {error}");
+                        }
+                    });
                 }
-                if let Err(error) = peer_gateway::restart_peer_gateway(&app_handle) {
-                    log::warn!("对等网关启动: {error}");
-                }
+
                 let post_scheduler_handle = app_handle.clone();
                 scheduler::start_embedded_scheduler(app_handle);
 
@@ -7556,11 +7634,12 @@ pub fn run() {
             clear_history_state,
             chat_list_sessions,
             chat_get_session_detail,
+            chat_get_session_details,
             chat_create_session,
             chat_update_session_title,
             chat_append_turn,
             chat_update_turn,
-            chat_delete_session,
+            chat_delete_session, session_workspace::session_fork::chat_fork_session,
             chat_clear_all_sessions,
             chat_migrate_history_v1,
             sync_history_backup_from_structured,
@@ -7575,6 +7654,8 @@ pub fn run() {
             save_image_generation_preferences,
             load_image_vision_preferences,
             save_image_vision_preferences,
+            load_tool_router_settings_command,
+            save_tool_router_settings_command,
             load_mcp_settings,
             list_installed_skills,
             list_system_skill_catalog,
@@ -7750,4 +7831,136 @@ pub fn run_scheduler_daemon() -> Result<(), String> {
 
 fn app_context() -> tauri::Context<tauri::Wry> {
     tauri::generate_context!()
+}
+
+#[cfg(test)]
+mod desktop_pi_pool_tests {
+    use super::{desktop_pi_pool, store_pooled_desktop_pi, take_pooled_desktop_pi, DesktopPooledPi};
+    use crate::pi_pool::PiPoolPolicy;
+    use std::process::{Command, Stdio};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn spawn_sleep_child() -> std::process::Child {
+        Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep child")
+    }
+
+    fn make_test_pooled() -> DesktopPooledPi {
+        let mut child = spawn_sleep_child();
+        let stdin = child.stdin.take().expect("child stdin");
+        DesktopPooledPi {
+            child,
+            stdin: Arc::new(Mutex::new(Some(stdin))),
+            stdout_rx: mpsc::channel().1,
+            stderr_buffer: Arc::new(Mutex::new(String::new())),
+            fingerprint: "test-fp".to_string(),
+            workspace_id: None,
+            session_path: std::path::PathBuf::from("/tmp/nineclaw-pool-test.jsonl"),
+            last_usage: None,
+            last_used: Instant::now(),
+        }
+    }
+
+    fn clear_pool() {
+        if let Ok(mut guard) = desktop_pi_pool().lock() {
+            for (_, pooled) in guard.iter_mut() {
+                let _ = pooled.child.kill();
+            }
+        }
+        // 再次取锁做 drain，kill 已释放子进程
+        if let Ok(mut guard) = desktop_pi_pool().lock() {
+            for (_, mut pooled) in guard.drain() {
+                let _ = pooled.child.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn store_evicts_least_recently_used_beyond_cap() {
+        let _env_guard = crate::workspace_env_test_lock();
+        clear_pool();
+        std::env::set_var("NINECLAW_PI_POOL_MAX", "2");
+        std::env::set_var("NINECLAW_PI_POOL_IDLE_SECS", "600");
+
+        let ids = ["pool-a", "pool-b", "pool-c"];
+        for id in ids {
+            store_pooled_desktop_pi(id, make_test_pooled()).expect("store");
+        }
+        // pool-a 最旧，应被驱逐；池内只剩 pool-b、pool-c
+        let guard = desktop_pi_pool().lock().unwrap();
+        assert_eq!(guard.len(), 2, "池应不超过容量上限");
+        assert!(!guard.contains_key("pool-a"), "最久未用的进程应被 LRU 驱逐");
+        assert!(guard.contains_key("pool-b"));
+        assert!(guard.contains_key("pool-c"));
+        drop(guard);
+
+        std::env::remove_var("NINECLAW_PI_POOL_MAX");
+        std::env::remove_var("NINECLAW_PI_POOL_IDLE_SECS");
+        clear_pool();
+    }
+
+    #[test]
+    fn take_reaps_idle_entries_lazily() {
+        let _env_guard = crate::workspace_env_test_lock();
+        clear_pool();
+        std::env::set_var("NINECLAW_PI_POOL_MAX", "4");
+        std::env::set_var("NINECLAW_PI_POOL_IDLE_SECS", "1");
+
+        // 直接构造池内容，把 pool-old 的 last_used 拨到过期
+        {
+            let mut guard = desktop_pi_pool().lock().unwrap();
+            guard.insert("pool-old".to_string(), make_test_pooled());
+            guard.insert("pool-fresh".to_string(), make_test_pooled());
+            if let Some(old) = guard.get_mut("pool-old") {
+                old.last_used = Instant::now() - Duration::from_secs(2);
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(1100));
+        // 访问另一个会话触发惰性回收
+        let target = take_pooled_desktop_pi("pool-fresh").expect("take");
+        assert!(target.is_some(), "目标会话应能从池中取出");
+
+        let guard = desktop_pi_pool().lock().unwrap();
+        assert!(!guard.contains_key("pool-old"), "过期进程应被惰性回收");
+        drop(guard);
+
+        std::env::remove_var("NINECLAW_PI_POOL_MAX");
+        std::env::remove_var("NINECLAW_PI_POOL_IDLE_SECS");
+        clear_pool();
+    }
+
+    #[test]
+    fn store_kills_process_when_pooling_disabled() {
+        let _env_guard = crate::workspace_env_test_lock();
+        clear_pool();
+        std::env::set_var("NINECLAW_PI_POOL_MAX", "0");
+
+        let pooled = make_test_pooled();
+        store_pooled_desktop_pi("pool-disabled", pooled).expect("store");
+
+        let guard = desktop_pi_pool().lock().unwrap();
+        assert!(guard.is_empty(), "禁用池化时不应驻留任何进程");
+        drop(guard);
+
+        std::env::remove_var("NINECLAW_PI_POOL_MAX");
+        clear_pool();
+    }
+
+    #[test]
+    fn policy_default_caps_are_sane() {
+        let policy = PiPoolPolicy {
+            max_entries: super::pi_pool::DEFAULT_POOL_MAX_ENTRIES,
+            idle_limit: Duration::from_secs(super::pi_pool::DEFAULT_POOL_IDLE_SECS),
+        };
+        assert!(policy.pooling_enabled());
+        assert_eq!(policy.max_entries, 4);
+        assert_eq!(policy.idle_limit, Duration::from_secs(600));
+    }
 }

@@ -15,7 +15,7 @@ vi.mock('../../lib/piClient', () => ({
   chatClearAllSessions: vi.fn().mockResolvedValue(undefined),
   chatCreateSession: vi.fn(),
   chatDeleteSession: vi.fn().mockResolvedValue(undefined),
-  chatGetSessionDetail: vi.fn().mockResolvedValue(null),
+  chatGetSessionDetails: vi.fn().mockResolvedValue([]),
   chatListSessions: vi.fn().mockResolvedValue([]),
   chatUpdateSessionTitle: vi.fn().mockResolvedValue({}),
   clearHistoryState: vi.fn(),
@@ -67,7 +67,7 @@ vi.mock('../../lib/taskDeliveryNotification', () => ({
 import {
   chatAppendTurn,
   chatCreateSession,
-  chatGetSessionDetail,
+  chatGetSessionDetails,
   chatListSessions,
   chatUpdateSessionTitle,
   loadHistoryState,
@@ -78,7 +78,7 @@ import {
 import { generateSessionConversationTitle } from '../../lib/sessionTitleClient'
 import { usePiAgent } from '../usePiAgent'
 
-const mockChatGetSessionDetail = vi.mocked(chatGetSessionDetail)
+const mockChatGetSessionDetails = vi.mocked(chatGetSessionDetails)
 const mockChatListSessions = vi.mocked(chatListSessions)
 const mockLoadHistoryState = vi.mocked(loadHistoryState)
 const mockPersistChatAttachments = vi.mocked(persistChatAttachments)
@@ -114,7 +114,7 @@ describe('usePiAgent', () => {
     piStreamHarness.listeners.length = 0
     mockLoadHistoryState.mockResolvedValue('[]')
     mockChatListSessions.mockResolvedValue([])
-    mockChatGetSessionDetail.mockResolvedValue(null)
+    mockChatGetSessionDetails.mockResolvedValue([])
     mockPersistChatAttachments.mockImplementation(async (payload) =>
       payload.attachments.map((attachment, index) => ({
         id: `session-attachment-${index}`,
@@ -205,7 +205,7 @@ describe('usePiAgent', () => {
         turn_count: 1,
       },
     ])
-    mockChatGetSessionDetail.mockResolvedValue({
+    mockChatGetSessionDetails.mockResolvedValue([{
       id: 'recovered-1',
       title: 'Recovered Session',
       status: 'done',
@@ -235,7 +235,7 @@ describe('usePiAgent', () => {
           speaker_agent_id: null,
         },
       ],
-    })
+    }])
 
     const { result } = renderHook(() => usePiAgent())
 
@@ -293,7 +293,7 @@ describe('usePiAgent', () => {
         turn_count: 1,
       },
     ])
-    mockChatGetSessionDetail.mockResolvedValueOnce({
+    mockChatGetSessionDetails.mockResolvedValueOnce([{
       id: 'recovered-1',
       title: 'Recovered Session',
       status: 'done',
@@ -323,7 +323,7 @@ describe('usePiAgent', () => {
           speaker_agent_id: null,
         },
       ],
-    })
+    }])
 
     const { result } = renderHook(() => usePiAgent())
 
@@ -360,7 +360,7 @@ describe('usePiAgent', () => {
         turn_count: 1,
       },
     ])
-    mockChatGetSessionDetail.mockResolvedValueOnce({
+    mockChatGetSessionDetails.mockResolvedValueOnce([{
       id: 'recovered-1',
       title: 'Recovered Session',
       status: 'done',
@@ -390,7 +390,7 @@ describe('usePiAgent', () => {
           speaker_agent_id: null,
         },
       ],
-    })
+    }])
 
     const { result } = renderHook(() => usePiAgent())
 
@@ -462,8 +462,9 @@ describe('usePiAgent', () => {
         turn_count: 0,
       })),
     )
-    mockChatGetSessionDetail.mockImplementation(async (sessionId) => ({
-      id: sessionId,
+    mockChatGetSessionDetails.mockImplementation(async (sessionIds) =>
+      sessionIds.map((sessionId) => ({
+        id: sessionId,
       title: `Detail ${sessionId}`,
       status: 'done',
       created_at: 1700000000000,
@@ -475,7 +476,8 @@ describe('usePiAgent', () => {
       session_llm_model: null,
       workspace_id: null,
       turns: [],
-    }))
+      })),
+    )
 
     const { result } = renderHook(() => usePiAgent())
 
